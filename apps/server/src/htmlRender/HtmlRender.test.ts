@@ -200,6 +200,42 @@ describe("HtmlRender", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect("keeps successive interactive diagram revisions as durable thread artifacts", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const config = yield* ServerConfig.ServerConfig;
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const threadId = ThreadId.make("thread-archify-revisions");
+
+      const first = yield* htmlRender.publish({
+        threadId,
+        html: '<main><button id="step">Request</button></main>',
+        title: "Request flow",
+        height: 480,
+      });
+      const revised = yield* htmlRender.publish({
+        threadId,
+        html: '<main><button id="step">Request</button><button id="cache">Cache</button></main>',
+        title: "Request flow",
+        height: 520,
+      });
+
+      expect(revised.attachmentId).not.toBe(first.attachmentId);
+      const firstPath = resolveAttachmentPathById({
+        attachmentsDir: config.attachmentsDir,
+        attachmentId: first.attachmentId,
+      });
+      const revisedPath = resolveAttachmentPathById({
+        attachmentsDir: config.attachmentsDir,
+        attachmentId: revised.attachmentId,
+      });
+      expect(firstPath).not.toBe(revisedPath);
+      expect(yield* fileSystem.readFileString(firstPath ?? "")).toContain(">Request</button>");
+      expect(yield* fileSystem.readFileString(revisedPath ?? "")).toContain(">Cache</button>");
+      expect(revised.title).toBe("Request flow");
+    }).pipe(Effect.provide(layerTest)),
+  );
+
   it.effect("removes the page when publishing is interrupted", () =>
     Effect.gen(function* () {
       const measuring = yield* Deferred.make<void>();
