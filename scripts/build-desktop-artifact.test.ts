@@ -712,7 +712,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         iconSize: 120,
         iconTextSize: 12,
       });
-      // A Linux AppImage build also emits the .deb from the same run.
+      // An upstream Linux AppImage build also emits the .deb from the same run.
       assert.deepStrictEqual((linux.linux as Record<string, unknown>).target, ["AppImage", "deb"]);
       // Linux must register the renderer schemes so the generated .desktop
       // entry advertises MimeType=x-scheme-handler/t3code; for OAuth deep links.
@@ -753,6 +753,32 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       assert.deepStrictEqual(mac.electronLanguages, DESKTOP_ELECTRON_LANGUAGES);
     }).pipe(Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })))),
   );
+
+  it.effect("does not emit an upstream-identified Debian package for Weasel Linux builds", () => {
+    const previousProfile = process.env.T3CODE_DESKTOP_PROFILE;
+    process.env.T3CODE_DESKTOP_PROFILE = "weasel";
+    return Effect.gen(function* () {
+      const config = yield* createBuildConfig(
+        "linux",
+        "AppImage",
+        "1.2.3-nightly.20261013.1",
+        false,
+        false,
+        undefined,
+        undefined,
+      );
+
+      assert.deepStrictEqual((config.linux as Record<string, unknown>).target, ["AppImage"]);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (previousProfile === undefined) delete process.env.T3CODE_DESKTOP_PROFILE;
+          else process.env.T3CODE_DESKTOP_PROFILE = previousProfile;
+        }),
+      ),
+      Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
+    );
+  });
 
   it("excludes foreign node-pty prebuilds from macOS and Linux packages", () => {
     assert.deepStrictEqual(MAC_FILE_EXCLUSIONS, [

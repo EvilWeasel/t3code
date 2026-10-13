@@ -1,4 +1,5 @@
 name: Weasel desktop nightly
+run-name: Weasel desktop release ${{ inputs.source_sha }}
 
 on:
   workflow_dispatch:
@@ -176,7 +177,7 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --output-dir release-linux
-          test -s release-linux/latest-linux.yml
+          test -s release-linux/nightly-linux.yml
           update_config="$(find /tmp "$RUNNER_TEMP" -path '*/resources/app-update.yml' -print -quit)"
           test -n "$update_config"
           rg -q 'owner: EvilWeasel' "$update_config"
@@ -190,7 +191,7 @@ jobs:
           test -n "$appimage"
           test "$(basename "$appimage")" = "T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage"
           tar -czf release-linux/weasel-linux-x64.tar.gz -C release-linux \
-            "$(basename "$appimage")" latest-linux.yml install-linux.sh
+            "$(basename "$appimage")" nightly-linux.yml install-linux.sh
 
       - name: Package and smoke-test Linux CLI archive
         run: |
@@ -291,7 +292,7 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/build-desktop-artifact.ts --platform win --target nsis --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --wsl-runtime "$GITHUB_WORKSPACE"/wsl-runtime/t3-*-linux-x64.tar.gz --output-dir release-windows
-          test -s release-windows/latest.yml
+          test -s release-windows/nightly.yml
           tmp_roots=("$RUNNER_TEMP")
           [[ -n "${TEMP:-}" ]] && tmp_roots+=("$TEMP")
           [[ -n "${TMP:-}" ]] && tmp_roots+=("$TMP")
@@ -349,8 +350,8 @@ jobs:
       - name: Verify isolated release payload
         run: |
           set -euo pipefail
-          test -s release-assets/latest-linux.yml
-          test -s release-assets/latest.yml
+          test -s release-assets/nightly-linux.yml
+          test -s release-assets/nightly.yml
           test -s release-assets/weasel-linux-x64.tar.gz
           test -s "release-assets/T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage"
           test -s release-assets/install-linux.sh
@@ -367,13 +368,22 @@ jobs:
           set -euo pipefail
           tag="${{ needs.preflight.outputs.tag }}"
           source_sha="${{ needs.preflight.outputs.source_sha }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            existing_target="$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)"
-            if [[ "$existing_target" != "$source_sha" ]]; then
-              echo "Release tag $tag already points to $existing_target, refusing to replace it." >&2
-              exit 1
+          assert_draft_release() {
+            local release_state is_draft target_commitish
+            release_state="$(gh release view "$tag" --json isDraft,targetCommitish)"
+            is_draft="$(jq -r .isDraft <<<"$release_state")"
+            target_commitish="$(jq -r .targetCommitish <<<"$release_state")"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "Release tag $tag is already published and immutable; refusing to overwrite its assets." >&2
+              return 1
             fi
-            gh release upload "$tag" release-assets/* --clobber
+            if [[ "$target_commitish" != "$source_sha" ]]; then
+              echo "Release tag $tag already points to $target_commitish, refusing to replace it." >&2
+              return 1
+            fi
+          }
+          if gh release view "$tag" >/dev/null 2>&1; then
+            assert_draft_release
           else
             gh release create "$tag" \
               --target "$source_sha" \
@@ -381,8 +391,12 @@ jobs:
               --prerelease \
               --draft \
               --notes "Fork channel build from $source_sha. Linux AppImage installs include a user-local installer. NixOS installs use the dedicated package and updater launcher when available at https://github.com/EvilWeasel/t3code/tree/main/packaging/nixos. Linux auto-updates stay disabled for Nix store installs. This build has no configured T3 Connect relay backend."
-            gh release upload "$tag" release-assets/* --clobber
           fi
+          # Asset replacement is permitted only while the release is still a
+          # draft. Recheck immediately before each clobber in case a maintainer
+          # published it while the job was preparing the payload.
+          assert_draft_release
+          gh release upload "$tag" release-assets/* --clobber
 
           lock_sha="$(sha256sum pnpm-lock.yaml | cut -d ' ' -f 1)"
           assets_json="$(gh api "repos/EvilWeasel/t3code/releases/tags/$tag" --jq '[.assets[] | select(.name != "RELEASE-RECEIPT.txt") | {name, digest}]')"
@@ -393,5 +407,6 @@ jobs:
             printf 'artifact_sha256:\n'
             cat release-assets/SHA256SUMS
           } > release-assets/RELEASE-RECEIPT.txt
+          assert_draft_release
           gh release upload "$tag" release-assets/RELEASE-RECEIPT.txt --clobber
           gh release edit "$tag" --draft=false

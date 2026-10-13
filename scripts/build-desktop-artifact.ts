@@ -2906,7 +2906,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       // electron-builder lists both in latest-linux.yml and writes
       // resources/package-type into the .deb only, so electron-updater updates
       // each install in its own format.
-      target: target === "AppImage" ? [target, "deb"] : [target],
+      target: target === "AppImage" && profile !== "weasel" ? [target, "deb"] : [target],
       executableName: "t3code",
       icon: "icons",
       category: "Development",
