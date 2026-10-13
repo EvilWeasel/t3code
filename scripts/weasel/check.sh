@@ -42,9 +42,4 @@ for voice_test in "${voice_tests[@]}"; do
   fi
 done
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
-# This upstream suite has one known failing cross-architecture probe assertion
-# on the checked-in baseline; actual Linux and Windows package builds still run
-# their platform-specific payload validation as release gates.
-(cd scripts && vp_cmd test run --config ../vite.config.ts \
-  --testNamePattern='^(?!.*skips the primary native probe for cross-architecture Windows payloads)' \
-  build-desktop-artifact.test.ts)
+(cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts)
