@@ -7709,8 +7709,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 >
                   {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
                     <VoiceDictationControl
-                      targetKey={composerDraftTargetKey}
-                      currentTargetKey={() => composerDraftTargetKeyRef.current}
+                      targetKey={`${composerDraftTargetKey}:${environmentId}`}
+                      currentTargetKey={() =>
+                        `${composerDraftTargetKeyRef.current}:${environmentId}`
+                      }
                       transcribe={transcribeVoiceRecording(environmentId)}
                       onTranscript={insertVoiceTranscript}
                     />

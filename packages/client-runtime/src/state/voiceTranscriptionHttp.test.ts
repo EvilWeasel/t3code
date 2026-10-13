@@ -3,7 +3,11 @@ import { EnvironmentId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 
-import { PrimaryConnectionTarget, type PreparedConnection } from "../connection/model.ts";
+import {
+  PrimaryConnectionTarget,
+  RelayConnectionTarget,
+  type PreparedConnection,
+} from "../connection/model.ts";
 import * as RpcHttp from "../rpc/http.ts";
 import { transcribeEnvironmentVoiceRecording } from "./voiceTranscriptionHttp.ts";
 
@@ -79,6 +83,79 @@ describe("transcribeEnvironmentVoiceRecording", () => {
       }).pipe(Effect.provide(RpcHttp.layerRemoteHttpClient(fetchFn)), Effect.flip);
       expect(error._tag).toBe("RemoteEnvironmentAuthUndeclaredStatusError");
       expect(JSON.stringify(error)).not.toContain("private challenge body");
+    }),
+  );
+
+  it.effect("signs the voice URL with the selected relay environment's DPoP session", () =>
+    Effect.gen(function* () {
+      const calls: Array<readonly [RequestInfo | URL, RequestInit]> = [];
+      const proofs: Array<{
+        readonly method: string;
+        readonly url: string;
+        readonly accessToken: string;
+      }> = [];
+      const fetchFn = ((request, init) => {
+        calls.push([request, init ?? {}]);
+        return Promise.resolve(Response.json({ transcript: "relay transcript" }));
+      }) satisfies typeof fetch;
+      const environmentId = EnvironmentId.make("environment-relay-voice");
+      const target = new RelayConnectionTarget({ environmentId, label: "Selected relay" });
+      const prepared: PreparedConnection = {
+        ...PREPARED,
+        environmentId,
+        target,
+        httpBaseUrl: "https://relay.invalid",
+        httpAuthorization: { _tag: "Dpop", accessToken: "stale-access-token", expiresAtEpochMs: 1 },
+      };
+      const remoteAuthorization = Option.some({
+        authorizeDpopHttp: () =>
+          Effect.succeed({
+            environmentId,
+            label: "Selected relay",
+            httpBaseUrl: "https://selected-environment.example.test",
+            httpAuthorization: {
+              _tag: "Dpop" as const,
+              accessToken: "fresh-access-token",
+              expiresAtEpochMs: 4_102_444_800_000,
+            },
+          }),
+      } as never);
+      const signer = Option.some({
+        thumbprint: Effect.succeed("thumbprint"),
+        createProof: (input: {
+          readonly method: string;
+          readonly url: string;
+          readonly accessToken: string;
+        }) => {
+          proofs.push(input);
+          return Effect.succeed("request-bound-proof");
+        },
+      } as never);
+
+      const result = yield* transcribeEnvironmentVoiceRecording({
+        prepared,
+        audio: new Blob(["sample"], { type: "audio/webm" }),
+        filename: "voice-message.webm",
+        signal: new AbortController().signal,
+        signer,
+        remoteAuthorization,
+      }).pipe(Effect.provide(RpcHttp.layerRemoteHttpClient(fetchFn)));
+
+      expect(result).toBe("relay transcript");
+      expect(String(calls[0]![0])).toBe(
+        "https://selected-environment.example.test/api/voice/transcription",
+      );
+      expect(new Headers(calls[0]![1].headers).get("authorization")).toBe(
+        "DPoP fresh-access-token",
+      );
+      expect(new Headers(calls[0]![1].headers).get("dpop")).toBe("request-bound-proof");
+      expect(proofs).toEqual([
+        {
+          method: "POST",
+          url: "https://selected-environment.example.test/api/voice/transcription",
+          accessToken: "fresh-access-token",
+        },
+      ]);
     }),
   );
 });
