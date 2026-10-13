@@ -12,6 +12,13 @@ export type VoiceDictationTranscriber = (
   options: { readonly signal: AbortSignal },
 ) => Promise<string>;
 
+export class VoiceDictationServiceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VoiceDictationServiceError";
+  }
+}
+
 const MAX_RECORDING_DURATION_MS = 5 * 60 * 1000;
 type ActiveCapture = {
   generation: number;
@@ -162,11 +169,14 @@ export function useVoiceDictation(input: {
       input.onTranscript(transcript);
       clearAudio();
       setState({ phase: "idle" });
-    } catch {
+    } catch (error) {
       if (generationRef.current !== generation || abortController.signal.aborted) return;
       setState({
         phase: "error",
-        message: "Transcription failed. Your recording is still available to retry.",
+        message:
+          error instanceof VoiceDictationServiceError
+            ? error.message
+            : "Transcription failed. Your recording is still available to retry.",
         audioUrl,
       });
     } finally {
