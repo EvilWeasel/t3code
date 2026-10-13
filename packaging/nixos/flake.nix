@@ -46,7 +46,7 @@
           buildInputs = with pkgs; [
             alsa-lib at-spi2-atk at-spi2-core cairo cups dbus dbus-glib expat
             gdk-pixbuf glib gtk3 libdrm libdbusmenu libdbusmenu-gtk3 libgbm
-            libnotify libsecret libxkbcommon nspr nss openssl pango
+            libnotify libpulseaudio libsecret libxkbcommon nspr nss openssl pango
             stdenv.cc.cc.lib systemd libx11 libxcomposite libxdamage libxext
             libxfixes libxrandr libxcb
           ];
@@ -67,7 +67,7 @@
               "''${gappsWrapperArgs[@]}" \
               --prefix PATH : ${lib.makeBinPath [ pkgs.xdg-utils ]} \
               --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath (with pkgs; [
-                alsa-lib at-spi2-core dbus expat glib libgbm libglvnd libsecret
+                alsa-lib at-spi2-core dbus expat glib libgbm libglvnd libpulseaudio libsecret
                 libx11 libxcomposite libxdamage libxext libxfixes libxrandr
                 libxcb libxkbcommon nspr nss systemd
               ])} \
