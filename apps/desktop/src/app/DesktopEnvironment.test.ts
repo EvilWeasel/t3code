@@ -119,6 +119,21 @@ describe("DesktopEnvironment", () => {
     }),
   );
 
+  it.effect("isolates packaged Weasel state defaults while honoring an explicit home", () =>
+    Effect.gen(function* () {
+      const fork = yield* makeEnvironment({}, { T3CODE_DESKTOP_PROFILE: "weasel" });
+      const explicit = yield* makeEnvironment(
+        {},
+        { T3CODE_DESKTOP_PROFILE: "weasel", T3CODE_HOME: "/custom/t3" },
+      );
+      assert.equal(fork.baseDir, "/Users/alice/.t3-weasel");
+      assert.equal(fork.displayName, "T3 Code (Weasel Nightly)");
+      assert.equal(fork.appUserModelId, "com.evilweasel.t3code");
+      assert.equal(fork.linuxDesktopEntryName, "com.evilweasel.T3Code.desktop");
+      assert.equal(explicit.baseDir, "/custom/t3");
+    }),
+  );
+
   it.effect("uses the packaged Windows server sidecar as the backend root", () =>
     Effect.gen(function* () {
       const environment = yield* makeEnvironment({

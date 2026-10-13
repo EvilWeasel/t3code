@@ -1,0 +1,425 @@
+name: Weasel desktop nightly
+run-name: Weasel desktop release ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Fork main commit to build (set by the sync workflow)
+        required: true
+        type: string
+
+concurrency:
+  group: weasel-desktop-nightly
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  preflight:
+    if: github.repository == 'EvilWeasel/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Checkout promoted source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Verify source is on fork main
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
+          test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Check source before release
+        run: |
+          set -euo pipefail
+          bash scripts/weasel/check.sh
+
+      - id: release
+        name: Resolve distinct fork version
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_RUN: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          upstream_metadata="$RUNNER_TEMP/upstream-nightly.txt"
+          run_created_at="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID" --jq .created_at)"
+          release_date="$(bash scripts/weasel/resolve-run-date.sh "$run_created_at")"
+          node scripts/resolve-nightly-release.ts \
+            --date "$release_date" \
+            --run-number "$RELEASE_RUN" \
+            --sha "$SOURCE_SHA" > "$upstream_metadata"
+          source_nightly_base="$(sed -n 's/^base_version=//p' "$upstream_metadata")"
+          fork_version="$(bash scripts/weasel/resolve-version.sh \
+            "$source_nightly_base" \
+            "$release_date" \
+            "$RELEASE_RUN" | sed -n 's/^version=//p')"
+          if [[ -z "$fork_version" ]]; then
+            echo "Could not resolve a fork release version." >&2
+            exit 1
+          fi
+          {
+            echo "source_sha=$SOURCE_SHA"
+            echo "version=$fork_version"
+            echo "tag=v$fork_version"
+          } >> "$GITHUB_OUTPUT"
+
+  build_bundle:
+    needs: [preflight]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install bundle dependencies
+        run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions and build shared assets
+        run: |
+          set -euo pipefail
+          node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config
+          vp run build:desktop
+
+      - name: Upload shared assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  build_linux:
+    needs: [preflight, build_bundle]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install Linux build dependencies
+        run: |
+          set -euo pipefail
+          vp install --frozen-lockfile --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config imagemagick
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Download shared assets
+        uses: actions/download-artifact@v4
+        with:
+          name: weasel-js-bundle
+          path: apps
+
+      - name: Align package versions
+        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+
+      - name: Build Linux CLI executable
+        env:
+          VP_NODE_VERSION: "26.8.2"
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Build Linux AppImage and updater metadata
+        env:
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: EvilWeasel/t3code
+          T3CODE_DESKTOP_APP_ID: com.evilweasel.t3code
+          T3CODE_DESKTOP_PRODUCT_NAME: T3 Code (Weasel Nightly)
+          T3CODE_DESKTOP_PROFILE: weasel
+          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "false"
+          T3CODE_DESKTOP_REUSE_LINUX_CAPTURE_HELPERS: "false"
+        run: |
+          set -euo pipefail
+          node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --output-dir release-linux
+          test -s release-linux/nightly-linux.yml
+          update_config="$(find /tmp "$RUNNER_TEMP" -path '*/resources/app-update.yml' -print -quit)"
+          test -n "$update_config"
+          rg -q 'owner: EvilWeasel' "$update_config"
+          rg -q 'repo: t3code' "$update_config"
+
+      - name: Prepare NixOS download bundle
+        run: |
+          set -euo pipefail
+          cp scripts/weasel/install-linux.sh release-linux/
+          appimage="$(find release-linux -maxdepth 1 -name '*.AppImage' -print -quit)"
+          test -n "$appimage"
+          test "$(basename "$appimage")" = "T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage"
+          tar -czf release-linux/weasel-linux-x64.tar.gz -C release-linux \
+            "$(basename "$appimage")" nightly-linux.yml install-linux.sh
+
+      - name: Package and smoke-test Linux CLI archive
+        run: |
+          set -euo pipefail
+          monitor_dir="$RUNNER_TEMP/cli-resource-monitor/linux-x64"
+          mkdir -p "$monitor_dir"
+          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$monitor_dir/"
+          node scripts/build-cli-archive.ts --platform linux --arch x64 --version "${{ needs.preflight.outputs.version }}" --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" --output-dir release-cli
+          node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ needs.preflight.outputs.version }}"
+
+      - name: Upload Linux release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-release-linux
+          path: release-linux/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Linux CLI archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-release-cli-linux
+          path: release-cli/*
+          if-no-files-found: error
+          retention-days: 1
+
+  build_windows:
+    needs: [preflight, build_bundle, build_linux]
+    runs-on: windows-2025
+    timeout-minutes: 50
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Install Windows build dependencies
+        run: vp install --frozen-lockfile --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Install Spectre-mitigated MSVC runtime libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
+            Write-Error "Visual Studio Installer failed with exit code $code"
+            exit $code
+          }
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Download shared assets
+        uses: actions/download-artifact@v4
+        with:
+          name: weasel-js-bundle
+          path: apps
+
+      - name: Align package versions
+        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
+
+      - name: Download same-build Linux CLI runtime for WSL
+        uses: actions/download-artifact@v4
+        with:
+          name: weasel-release-cli-linux
+          path: wsl-runtime
+
+      - name: Build Windows CLI executable
+        env:
+          VP_NODE_VERSION: "26.8.2"
+        shell: bash
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Build Windows x64 installer and updater metadata
+        env:
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: EvilWeasel/t3code
+          T3CODE_DESKTOP_APP_ID: com.evilweasel.t3code
+          T3CODE_DESKTOP_PRODUCT_NAME: T3 Code (Weasel Nightly)
+          T3CODE_DESKTOP_PROFILE: weasel
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/build-desktop-artifact.ts --platform win --target nsis --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --wsl-runtime "$GITHUB_WORKSPACE"/wsl-runtime/t3-*-linux-x64.tar.gz --output-dir release-windows
+          test -s release-windows/nightly.yml
+          tmp_roots=("$RUNNER_TEMP")
+          [[ -n "${TEMP:-}" ]] && tmp_roots+=("$TEMP")
+          [[ -n "${TMP:-}" ]] && tmp_roots+=("$TMP")
+          update_config="$(find "${tmp_roots[@]}" -path '*/resources/app-update.yml' -print -quit 2>/dev/null || true)"
+          test -n "$update_config"
+          rg -q 'owner: EvilWeasel' "$update_config"
+          rg -q 'repo: t3code' "$update_config"
+
+      - name: Package and smoke-test Windows CLI archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          monitor_dir="$RUNNER_TEMP/cli-resource-monitor/win32-x64"
+          mkdir -p "$monitor_dir"
+          cp native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe "$monitor_dir/"
+          node scripts/build-cli-archive.ts --platform win --arch x64 --version "${{ needs.preflight.outputs.version }}" --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" --output-dir release-cli
+          node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ needs.preflight.outputs.version }}"
+
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-release-windows
+          path: release-windows/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Windows CLI archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-release-cli-windows
+          path: release-cli/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [preflight, build_linux, build_windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout promoted source for receipt metadata
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+          fetch-depth: 1
+
+      - name: Download dedicated release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: weasel-release-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Verify isolated release payload
+        run: |
+          set -euo pipefail
+          test -s release-assets/nightly-linux.yml
+          test -s release-assets/nightly.yml
+          test -s release-assets/weasel-linux-x64.tar.gz
+          test -s "release-assets/T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage"
+          test -s release-assets/install-linux.sh
+          test -n "$(find release-assets -maxdepth 1 -name 't3-*-linux-x64.tar.gz' -print -quit)"
+          test -n "$(find release-assets -maxdepth 1 -name 't3-*-win32-x64.zip' -print -quit)"
+          ! find release-assets -maxdepth 1 -type f \( -name '*apk' -o -name '*aab' -o -name '*ipa' \) | grep -q .
+          (cd release-assets && sha256sum ./* > SHA256SUMS)
+
+      - name: Create fork-only prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: EvilWeasel/t3code
+        run: |
+          set -euo pipefail
+          tag="${{ needs.preflight.outputs.tag }}"
+          source_sha="${{ needs.preflight.outputs.source_sha }}"
+          version="${{ needs.preflight.outputs.version }}"
+          assert_draft_release() {
+            local release_state is_draft target_commitish
+            release_state="$(gh release view "$tag" --json isDraft,targetCommitish)"
+            is_draft="$(jq -r .isDraft <<<"$release_state")"
+            target_commitish="$(jq -r .targetCommitish <<<"$release_state")"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "Release tag $tag is already published and immutable; refusing to overwrite its assets." >&2
+              return 1
+            fi
+            if [[ "$target_commitish" != "$source_sha" ]]; then
+              echo "Release tag $tag already points to $target_commitish, refusing to replace it." >&2
+              return 1
+            fi
+          }
+          if gh release view "$tag" >/dev/null 2>&1; then
+            release_state="$(gh release view "$tag" --json isDraft,targetCommitish)"
+            if [[ "$(jq -r .isDraft <<<"$release_state")" == "false" ]]; then
+              bash scripts/weasel/verify-published-release.sh \
+                "$tag" "$source_sha" "$version" release-assets
+              exit 0
+            fi
+            assert_draft_release
+          else
+            gh release create "$tag" \
+              --target "$source_sha" \
+              --title "Weasel Nightly ${{ needs.preflight.outputs.version }}" \
+              --prerelease \
+              --draft \
+              --notes "Fork channel build from $source_sha. Linux AppImage installs include a user-local installer. NixOS installs use the dedicated package and updater launcher when available at https://github.com/EvilWeasel/t3code/tree/main/packaging/nixos. Linux auto-updates stay disabled for Nix store installs. This build has no configured T3 Connect relay backend."
+          fi
+          # Asset replacement is permitted only while the release is still a
+          # draft. Recheck immediately before each clobber in case a maintainer
+          # published it while the job was preparing the payload.
+          assert_draft_release
+          gh release upload "$tag" release-assets/* --clobber
+
+          lock_sha="$(sha256sum pnpm-lock.yaml | cut -d ' ' -f 1)"
+          assets_json="$(gh api "repos/EvilWeasel/t3code/releases/tags/$tag" --jq '[.assets[] | select(.name != "RELEASE-RECEIPT.txt") | {name, digest}]')"
+          jq -e 'length > 0 and all(.[]; (.digest | type == "string") and (.digest | startswith("sha256:")))' <<<"$assets_json"
+          expected_assets="$(find release-assets -maxdepth 1 -type f ! -name 'RELEASE-RECEIPT.txt' -printf '%f\n' | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')"
+          jq -e --argjson expected "$expected_assets" '([.[].name] | sort) == $expected' <<<"$assets_json"
+          {
+            printf 'fork_release=%s\nsource_sha=%s\npnpm_lock_sha256=%s\n' "$tag" "$source_sha" "$lock_sha"
+            printf 'github_asset_digests=%s\n' "$(jq -c '[.[] | {name, digest}]' <<<"$assets_json")"
+            printf 'artifact_sha256:\n'
+            cat release-assets/SHA256SUMS
+          } > release-assets/RELEASE-RECEIPT.txt
+          assert_draft_release
+          gh release upload "$tag" release-assets/RELEASE-RECEIPT.txt --clobber
+          gh release edit "$tag" --draft=false

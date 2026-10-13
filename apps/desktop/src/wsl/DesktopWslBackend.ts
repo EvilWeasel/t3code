@@ -31,6 +31,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as NetService from "@t3tools/shared/Net";
 
 import * as DesktopObservability from "../app/DesktopObservability.ts";
+import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopBackendConfiguration from "../backend/DesktopBackendConfiguration.ts";
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
 import * as DesktopServerExposure from "../backend/DesktopServerExposure.ts";
@@ -96,6 +97,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const pool = yield* DesktopBackendPool.DesktopBackendPool;
     const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+    const environment = yield* DesktopEnvironment.DesktopEnvironment;
     const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
     const wslEnvironment = yield* DesktopWslEnvironment.DesktopWslEnvironment;
     const appSettings = yield* DesktopAppSettings.DesktopAppSettings;
@@ -189,6 +191,17 @@ export const layer = Layer.effect(
     const reconcileBody = Effect.gen(function* () {
       const settings = yield* appSettings.get;
       if (!settings.localEnvironmentEnabled) return;
+      if (Option.getOrUndefined(environment.profileId) === "weasel") {
+        // Do not even prewarm the distro for this profile. The WSL runtime
+        // currently shares ~/.t3 and its cache with upstream T3 installations.
+        yield* Ref.set(
+          preflightErrorRef,
+          Option.some(
+            "Weasel WSL is disabled until its Linux T3 home and WSL runtime cache are isolated from the upstream profile.",
+          ),
+        );
+        return;
+      }
       const available = yield* wslEnvironment.isAvailable;
       const existing = yield* findExistingWslInstance;
       const existingId = Option.map(existing, (instance) => instance.id);

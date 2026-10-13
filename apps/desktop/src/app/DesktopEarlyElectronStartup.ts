@@ -31,8 +31,13 @@ export interface EarlyLinuxElectronOptions {
   readonly passwordStore: LinuxPasswordStoreSwitch | null;
 }
 
-export const resolveLinuxDesktopEntryName = (isDevelopment: boolean): string =>
-  isDevelopment ? "com.t3tools.T3Code.Development.desktop" : "com.t3tools.T3Code.desktop";
+export const resolveLinuxDesktopEntryName = (
+  isDevelopment: boolean,
+  profileId?: string,
+): string => {
+  if (profileId === "weasel") return "com.evilweasel.T3Code.desktop";
+  return isDevelopment ? "com.t3tools.T3Code.Development.desktop" : "com.t3tools.T3Code.desktop";
+};
 
 const trimNonEmpty = (value: string | undefined): string | null => {
   const trimmed = value?.trim();
@@ -158,10 +163,12 @@ export function resolveEarlyLinuxElectronOptions(
 ): EarlyLinuxElectronOptions {
   const preference = resolveEarlyLinuxPasswordStorePreference(input);
   const isDevelopment = isDevelopmentEnvironment(input.env);
+  const profileId = trimNonEmpty(input.env.T3CODE_DESKTOP_PROFILE);
   return {
     isDevelopment,
-    linuxWmClass: isDevelopment ? "t3code-dev" : "t3code",
-    linuxDesktopEntryName: resolveLinuxDesktopEntryName(isDevelopment),
+    linuxWmClass:
+      profileId === "weasel" ? "t3code-weasel" : isDevelopment ? "t3code-dev" : "t3code",
+    linuxDesktopEntryName: resolveLinuxDesktopEntryName(isDevelopment, profileId ?? undefined),
     passwordStore: resolveLinuxPasswordStoreSwitch({
       preference,
       env: input.env,

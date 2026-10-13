@@ -241,6 +241,22 @@ describe("DesktopLinuxUrlHandler", () => {
     },
   );
 
+  it.effect("leaves the global scheme default unchanged for the Weasel profile", () => {
+    const recorded = emptyRecording();
+    return Effect.gen(function* () {
+      yield* runRegister(recorded, {
+        environment: { profileId: Option.some("weasel") },
+      });
+      assert.equal(recorded.files.length, 1);
+      assert.deepEqual(recorded.commands, [
+        {
+          command: "update-desktop-database",
+          args: ["/home/alice/.local/share/applications"],
+        },
+      ]);
+    });
+  });
+
   it.effect("falls back to the process executable outside an AppImage", () => {
     const recorded = emptyRecording();
 

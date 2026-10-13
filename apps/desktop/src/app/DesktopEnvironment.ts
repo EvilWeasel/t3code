@@ -81,6 +81,7 @@ export class DesktopEnvironment extends Context.Service<
     readonly otlpProtocol: OtlpProtocol;
     readonly branding: DesktopAppBranding;
     readonly displayName: string;
+    readonly profileId: Option.Option<string>;
     readonly appUserModelId: string;
     readonly linuxDesktopEntryName: string;
     readonly linuxWmClass: string;
@@ -109,12 +110,16 @@ function resolveDesktopAppStageLabel(input: {
 export function resolveDesktopAppBranding(input: {
   readonly isDevelopment: boolean;
   readonly appVersion: string;
+  readonly profileId?: string;
 }): DesktopAppBranding {
   const stageLabel = resolveDesktopAppStageLabel(input);
   return {
     baseName: APP_BASE_NAME,
     stageLabel,
-    displayName: `${APP_BASE_NAME} (${stageLabel})`,
+    displayName:
+      input.profileId === "weasel"
+        ? "T3 Code (Weasel Nightly)"
+        : `${APP_BASE_NAME} (${stageLabel})`,
   };
 }
 
@@ -153,6 +158,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
 ): Effect.fn.Return<DesktopEnvironment["Service"], Config.ConfigError, Path.Path> {
   const path = yield* Path.Path;
   const config = yield* DesktopConfig.DesktopConfig;
+  const profileId = config.desktopProfile;
   const homeDirectory = input.homeDirectory;
   const devServerUrl = config.devServerUrl;
   const isDevelopment = Option.isSome(devServerUrl);
@@ -167,7 +173,10 @@ const make = Effect.fn("desktop.environment.make")(function* (
   const baseDir = resolveDesktopBaseDir({
     homeDirectory,
     joinPath: path.join,
-    t3Home: config.t3Home,
+    t3Home:
+      Option.isNone(config.t3Home) && Option.getOrUndefined(profileId) === "weasel"
+        ? Option.some(path.join(homeDirectory, ".t3-weasel"))
+        : config.t3Home,
   });
   const rootDir = path.resolve(input.dirname, "../../..");
   const appRoot = input.isPackaged ? input.appPath : rootDir;
@@ -178,6 +187,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
   const branding = resolveDesktopAppBranding({
     isDevelopment,
     appVersion: input.appVersion,
+    ...(Option.isSome(profileId) ? { profileId: profileId.value } : {}),
   });
   const displayName = branding.displayName;
   const stateDir = resolveDesktopStateDir({
@@ -235,11 +245,24 @@ const make = Effect.fn("desktop.environment.make")(function* (
     otlpProtocol: config.otlpProtocol,
     branding,
     displayName,
+    profileId,
     appUserModelId: Option.getOrElse(config.appUserModelIdOverride, () =>
-      isDevelopment ? "com.t3tools.t3code.dev" : "com.t3tools.t3code",
+      Option.getOrUndefined(profileId) === "weasel"
+        ? "com.evilweasel.t3code"
+        : isDevelopment
+          ? "com.t3tools.t3code.dev"
+          : "com.t3tools.t3code",
     ),
-    linuxDesktopEntryName: resolveLinuxDesktopEntryName(isDevelopment),
-    linuxWmClass: isDevelopment ? "t3code-dev" : "t3code",
+    linuxDesktopEntryName:
+      Option.getOrUndefined(profileId) === "weasel"
+        ? "com.evilweasel.T3Code.desktop"
+        : resolveLinuxDesktopEntryName(isDevelopment, Option.getOrUndefined(profileId)),
+    linuxWmClass:
+      Option.getOrUndefined(profileId) === "weasel"
+        ? "t3code-weasel"
+        : isDevelopment
+          ? "t3code-dev"
+          : "t3code",
     linuxApplicationsDir,
     appImagePath: config.appImagePath,
     defaultDesktopSettings: DesktopAppSettings.resolveDefaultDesktopSettings(input.appVersion),

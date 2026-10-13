@@ -57,6 +57,8 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 const LINUX_ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256, 512] as const;
 const DESKTOP_APP_ID = "com.t3tools.t3code";
+const resolveDesktopAppId = (): string =>
+  process.env.T3CODE_DESKTOP_APP_ID?.trim() || DESKTOP_APP_ID;
 const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/u;
 
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
@@ -1304,7 +1306,7 @@ export function resolveMacPasskeySigningConfiguration(
   }
 
   return {
-    appId: DESKTOP_APP_ID,
+    appId: resolveDesktopAppId(),
     teamId,
     rpDomains: uniqueRpDomains,
     provisioningProfilePath,
@@ -2744,6 +2746,8 @@ export function resolvePackageManagerUserAgent(packageManager: string): string {
 }
 
 export function resolveDesktopProductName(version: string): string {
+  const override = process.env.T3CODE_DESKTOP_PRODUCT_NAME?.trim();
+  if (override) return override;
   return resolveDesktopUpdateChannel(version) === "nightly"
     ? "T3 Code (Nightly)"
     : (desktopPackageJson.productName ?? "T3 Code");
@@ -2768,10 +2772,16 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   wslRuntimeBundled = false,
   arch?: typeof BuildArch.Type,
 ) {
+  const appId = resolveDesktopAppId();
+  const profile = process.env.T3CODE_DESKTOP_PROFILE?.trim();
   const buildConfig: Record<string, unknown> = {
-    appId: DESKTOP_APP_ID,
+    appId,
     productName: resolveDesktopProductName(version),
-    artifactName: "T3-Code-${version}-${arch}.${ext}",
+    ...(profile ? { extraMetadata: { t3codeProfile: profile } } : {}),
+    artifactName:
+      profile === "weasel" && platform === "linux"
+        ? "T3-Code-${version}-x86_64.${ext}"
+        : "T3-Code-${version}-${arch}.${ext}",
     electronLanguages: [...DESKTOP_ELECTRON_LANGUAGES],
     files: [
       ...DESKTOP_FILE_EXCLUSIONS,
@@ -2836,19 +2846,22 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
           },
         ],
       },
-      protocols: [
-        {
-          name: "T3 Code",
-          schemes: ["t3code", "t3code-dev"],
-        },
-        // Lets people choose T3 Code as their default web browser, which opens
-        // each link in a new thread's browser panel.
-        {
-          name: "Web site URL",
-          schemes: ["http", "https"],
-          role: "Viewer",
-        },
-      ],
+      protocols:
+        profile === "weasel"
+          ? []
+          : [
+              {
+                name: "T3 Code",
+                schemes: ["t3code", "t3code-dev"],
+              },
+              // Lets people choose T3 Code as their default web browser, which opens
+              // each link in a new thread's browser panel.
+              {
+                name: "Web site URL",
+                schemes: ["http", "https"],
+                role: "Viewer",
+              },
+            ],
       ...(signed ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") } : {}),
       ...(macPasskeySigning
         ? {
@@ -2893,7 +2906,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       // electron-builder lists both in latest-linux.yml and writes
       // resources/package-type into the .deb only, so electron-updater updates
       // each install in its own format.
-      target: target === "AppImage" ? [target, "deb"] : [target],
+      target: target === "AppImage" && profile !== "weasel" ? [target, "deb"] : [target],
       executableName: "t3code",
       icon: "icons",
       category: "Development",
@@ -2903,12 +2916,15 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       // electron-builder turns these into MimeType=x-scheme-handler/<scheme>;
       // in the .desktop entry (Exec already gets %U), so browsers can hand
       // t3code:// OAuth callbacks to the app.
-      protocols: [
-        {
-          name: "T3 Code",
-          schemes: ["t3code", "t3code-dev"],
-        },
-      ],
+      protocols:
+        profile === "weasel"
+          ? []
+          : [
+              {
+                name: "T3 Code",
+                schemes: ["t3code", "t3code-dev"],
+              },
+            ],
       desktop: {
         entry: {
           StartupWMClass: "t3code",

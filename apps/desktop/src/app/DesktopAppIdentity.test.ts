@@ -159,6 +159,19 @@ describe("DesktopAppIdentity", () => {
     ),
   );
 
+  it.effect("uses a separate packaged user data profile without inspecting upstream data", () =>
+    withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        assert.equal(
+          yield* identity.resolveUserDataPath,
+          "/Users/alice/Library/Application Support/t3code-weasel",
+        );
+      }),
+      { environment: { env: { T3CODE_DESKTOP_PROFILE: "weasel" } }, legacyPathExists: true },
+    ),
+  );
+
   it.effect("keeps using the legacy development profile", () =>
     withIdentity(
       Effect.gen(function* () {
