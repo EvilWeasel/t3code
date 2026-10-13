@@ -66,6 +66,7 @@ function layerEnvironment(
     readonly otlpTracesUrl?: string;
     readonly otlpMetricsUrl?: string;
     readonly otlpLogsUrl?: string;
+    readonly profileId?: string;
   },
 ) {
   return DesktopEnvironment.layer({
@@ -91,6 +92,7 @@ function layerEnvironment(
           T3CODE_OTLP_TRACES_URL: options?.otlpTracesUrl,
           T3CODE_OTLP_METRICS_URL: options?.otlpMetricsUrl,
           T3CODE_OTLP_LOGS_URL: options?.otlpLogsUrl,
+          T3CODE_DESKTOP_PROFILE: options?.profileId,
         }),
       ),
     ),
@@ -146,6 +148,7 @@ interface PackagedWslHarnessContext {
 const withPackagedWslHarness = <A, E, R>(
   input: {
     readonly archiveHash: string;
+    readonly profileId?: string;
     readonly wsl: (
       context: PackagedWslHarnessContext,
     ) => DesktopWslEnvironment.DesktopWslEnvironmentTestStub;
@@ -219,6 +222,7 @@ const withPackagedWslHarness = <A, E, R>(
               appPath: baseDir,
               platform: "win32",
               resourcesPath: baseDir,
+              ...(input.profileId === undefined ? {} : { profileId: input.profileId }),
             }),
           ),
         ),
@@ -486,6 +490,46 @@ describe("DesktopBackendConfiguration", () => {
         }),
     );
   });
+
+  it.effect(
+    "blocks Weasel WSL before staging the upstream runtime or forwarding Windows home",
+    () => {
+      const previousT3Home = process.env.T3CODE_HOME;
+      process.env.T3CODE_HOME = "C:\\Users\\Tester\\.t3-weasel";
+      let prepareRuntimeCount = 0;
+      return withPackagedWslHarness(
+        {
+          archiveHash: "a".repeat(64),
+          profileId: "weasel",
+          forbidFallback: "Weasel WSL must not write the upstream mounted runtime tree",
+          wsl: () => ({
+            prepareRuntime: () => {
+              prepareRuntimeCount += 1;
+              return { ok: false, reason: "must not prepare before Weasel WSL isolation exists" };
+            },
+          }),
+        },
+        () =>
+          Effect.gen(function* () {
+            const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+            const config = yield* configuration.resolveWsl({ port: 5000, distro: "Ubuntu" });
+            const preflightFailure = Option.getOrUndefined(config.preflightFailure);
+
+            assert.equal(prepareRuntimeCount, 0);
+            assert.equal(config.env.T3CODE_HOME, undefined);
+            assert.isTrue(preflightFailure?.fatal);
+            assert.match(preflightFailure?.reason ?? "", /Weasel WSL is disabled/u);
+            assert.match(preflightFailure?.reason ?? "", /Linux T3 home/u);
+          }),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            restoreEnv("T3CODE_HOME", previousT3Home);
+          }),
+        ),
+      );
+    },
+  );
 
   it.effect("resolveWsl changes the cache id when the packaged archive changes", () => {
     const firstHash = "a".repeat(64);

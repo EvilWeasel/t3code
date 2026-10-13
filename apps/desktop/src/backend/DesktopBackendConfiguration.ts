@@ -314,6 +314,8 @@ interface WslPreflightFailure {
 const WSL_TRANSIENT_PREFLIGHT_RETRY_LIMIT = 12;
 const WSL_RUNTIME_ARCHIVE_NAME = "wsl-runtime.tar.gz";
 const WSL_RUNTIME_ARCHIVE_HASH_NAME = `${WSL_RUNTIME_ARCHIVE_NAME}.sha256`;
+const WEASEL_WSL_ISOLATION_UNAVAILABLE =
+  "Weasel WSL is disabled until its Linux T3 home and WSL runtime cache are isolated from the upstream profile. Use the Windows backend for this build.";
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/i;
 
 const parseWslRuntimeArchiveHash = (value: string): string | null => {
@@ -339,6 +341,17 @@ const runWslPreflight = Effect.fn("desktop.backendConfiguration.wslPreflight")(f
   | FileSystem.FileSystem
 > {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
+  if (Option.getOrUndefined(environment.profileId) === "weasel") {
+    // This guard runs before the mounted-tree fallback or runtime installer can
+    // write into ~/.t3. The fork must stay isolated until WSL gets its own Linux
+    // home and runtime-cache root.
+    return {
+      _tag: "Failed",
+      reason: WEASEL_WSL_ISOLATION_UNAVAILABLE,
+      fatal: true,
+    } as const;
+  }
+
   const wslEnv = yield* DesktopWslEnvironment.DesktopWslEnvironment;
   const wslServerTree = yield* DesktopWslServerTree.DesktopWslServerTree;
   const fileSystem = yield* FileSystem.FileSystem;
