@@ -176,8 +176,11 @@ const selectorDiagnosticsFromInput = (
   return {};
 };
 
+// App-server provider sessions can carry several T3 threads. A browser lease
+// belongs to the thread as well as that provider session, or one thread can
+// inherit another thread's implicit tab after background work interleaves.
 const hostAssignmentKey = (scope: McpInvocationContext.McpThreadInvocationScope): string =>
-  `${scope.environmentId}\u0000${scope.thread.providerSessionId}`;
+  `${scope.environmentId}\u0000${scope.thread.threadId}\u0000${scope.thread.providerSessionId}`;
 
 const isPreviewTabId = Schema.is(PreviewTabId);
 const decodeControlReason = Schema.decodeUnknownOption(PreviewAutomationControlReason);
