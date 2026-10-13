@@ -20,13 +20,29 @@ git fetch origin "$fork_branch"
 git switch --detach FETCH_HEAD
 base_sha="$(git rev-parse HEAD)"
 
+# Sync commits are authored by the Actions bot. This identity is local to the
+# ephemeral runner and does not depend on, or copy, a human signing key.
+git config user.name "github-actions[bot]"
+git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
 if git merge-base --is-ancestor "$nightly_sha" "$base_sha"; then
   echo "Upstream nightly $nightly_tag is already contained in origin/$fork_branch."
   exit 0
 fi
 
-if ! git merge --no-edit "$nightly_sha"; then
-  git merge --abort || true
+if git merge --no-edit "$nightly_sha"; then
+  :
+else
+  merge_status=$?
+  unmerged_paths="$(git diff --name-only --diff-filter=U)"
+  if [[ -z "$unmerged_paths" ]]; then
+    echo "git merge failed with exit $merge_status and no unmerged paths; not classifying this as a conflict." >&2
+    git status --short >&2
+    exit "$merge_status"
+  fi
+
+  printf 'Conflicting paths:\n%s\n' "$unmerged_paths" >&2
+  git merge --abort
   open_issue="$(gh issue list --state open --search "\"$issue_title\" in:title" --json number --jq '.[0].number // empty')"
   issue_marker="<!-- weasel-upstream-conflict:$nightly_tag -->"
   issue_update="$issue_marker
