@@ -182,7 +182,10 @@ jobs:
           set -euo pipefail
           node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --output-dir release-linux
           test -s release-linux/nightly-linux.yml
-          update_config="$(find /tmp "$RUNNER_TEMP" -path '*/resources/app-update.yml' -print -quit)"
+          shopt -s nullglob
+          stage_roots=(/tmp/t3code-desktop-linux-stage-* "$RUNNER_TEMP"/t3code-desktop-linux-stage-*)
+          test "${#stage_roots[@]}" -gt 0
+          update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
           test -n "$update_config"
           rg -q 'owner: EvilWeasel' "$update_config"
           rg -q 'repo: t3code' "$update_config"
