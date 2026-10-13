@@ -26,7 +26,7 @@ permissions:
 jobs:
   test:
     name: Test (${{ inputs.package || 'all non-server' }})
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: nscloud-windows-2022-amd64-8x16
     timeout-minutes: 45
     steps:
       - name: Checkout

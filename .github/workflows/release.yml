@@ -561,7 +561,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: macOS arm64
-      runner: blacksmith-12vcpu-macos-26
+      runner: nscloud-macos-tahoe-arm64-12x28
       platform: mac
       target: dmg
       arch: arm64
@@ -584,7 +584,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: macOS x64
-      runner: blacksmith-12vcpu-macos-26
+      runner: nscloud-macos-tahoe-arm64-12x28
       platform: mac
       target: dmg
       arch: x64
@@ -635,7 +635,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: Linux arm64
-      runner: blacksmith-16vcpu-ubuntu-2404-arm
+      runner: nscloud-ubuntu-24.04-arm64-16x32
       platform: linux
       target: AppImage
       arch: arm64
@@ -661,7 +661,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: Windows x64
-      runner: blacksmith-32vcpu-windows-2025
+      runner: nscloud-windows-2022-amd64-32x64
       platform: win
       target: nsis
       arch: x64

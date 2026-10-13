@@ -306,7 +306,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.resolve.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.resolve.outputs.relay_url }}
       label: macOS arm64 preview
-      runner: blacksmith-12vcpu-macos-26
+      runner: nscloud-macos-tahoe-arm64-12x28
       platform: mac
       target: dmg
       arch: arm64

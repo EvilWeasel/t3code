@@ -257,7 +257,7 @@ jobs:
 
   build_windows:
     needs: [preflight, build_bundle, build_linux]
-    runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'windows-2025' }}
+    runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'nscloud-windows-2022-amd64-8x16' }}
     timeout-minutes: 50
     steps:
       - name: Checkout source
