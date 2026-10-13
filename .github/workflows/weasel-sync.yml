@@ -20,11 +20,22 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
+      - name: Require workflow-capable upstream sync token
+        env:
+          WEASEL_UPSTREAM_TOKEN: ${{ secrets.WEASEL_UPSTREAM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$WEASEL_UPSTREAM_TOKEN" ]]; then
+            echo "Repository Actions secret WEASEL_UPSTREAM_TOKEN is required for sync checkout, GitHub API calls, and fast-forward promotion." >&2
+            exit 1
+          fi
+
       - name: Checkout fork main
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.WEASEL_UPSTREAM_TOKEN }}
 
       - name: Configure upstream remote
         run: git remote add upstream https://github.com/pingdotgg/t3code.git
@@ -38,7 +49,7 @@ jobs:
 
       - name: Sync, validate, and promote latest published nightly
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.WEASEL_UPSTREAM_TOKEN }}
         run: |
           set -euo pipefail
           bash scripts/weasel/sync-upstream-nightly.sh
