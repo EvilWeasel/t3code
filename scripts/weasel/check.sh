@@ -25,7 +25,9 @@ focused_tests=(
   apps/desktop/src/app/DesktopEarlyElectronStartup.test.ts \
   apps/desktop/src/app/DesktopEnvironment.test.ts \
   apps/desktop/src/app/DesktopAppIdentity.test.ts \
-  apps/desktop/src/app/DesktopLinuxUrlHandler.test.ts
+  apps/desktop/src/app/DesktopLinuxUrlHandler.test.ts \
+  apps/desktop/src/backend/DesktopBackendConfiguration.test.ts \
+  apps/desktop/src/wsl/DesktopWslBackend.test.ts
 )
 voice_tests=(
   apps/web/src/voice/useVoiceDictation.test.tsx
