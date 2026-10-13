@@ -686,7 +686,10 @@ it.effect(
         const firstTabId = PreviewTabId.make("tab-background-one");
         const secondTabId = PreviewTabId.make("tab-background-two");
         const requests: RoutedRequest[] = [];
-        const hostRequests = requestsFrom(yield* broker.connect(makeHost()));
+        let originalConnectionId = "";
+        const hostRequests = requestsFrom(yield* broker.connect(makeHost()), (connectionId) => {
+          originalConnectionId = connectionId;
+        });
         yield* Stream.runForEach(hostRequests, (request) => {
           requests.push(request);
           const tabId =
@@ -758,6 +761,18 @@ it.effect(
 
         yield* broker.invoke({ scope: firstScope, operation: "snapshot", input: {} });
         yield* broker.invoke({ scope: secondScope, operation: "snapshot", input: {} });
+        yield* broker.invoke<void>({
+          scope: firstScope,
+          operation: "click",
+          input: { x: 31, y: 47 },
+          tabId: firstTabId,
+        });
+        yield* broker.invoke<void>({
+          scope: secondScope,
+          operation: "click",
+          input: { x: 53, y: 71 },
+          tabId: secondTabId,
+        });
 
         expect(
           requests
@@ -766,6 +781,14 @@ it.effect(
         ).toEqual([
           [firstThreadId, firstTabId],
           [secondThreadId, secondTabId],
+        ]);
+        expect(
+          requests
+            .filter((request) => request.operation === "click")
+            .map((request) => [request.threadId, request.tabId, request.connectionId]),
+        ).toEqual([
+          [firstThreadId, firstTabId, originalConnectionId],
+          [secondThreadId, secondTabId, originalConnectionId],
         ]);
         expect(requestsFromFocusedHost).toHaveLength(0);
       }),
