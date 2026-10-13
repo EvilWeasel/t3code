@@ -21,7 +21,7 @@ import * as NodeDgram from "node:dgram";
 import * as NodeHttp from "node:http";
 import * as NodeURL from "node:url";
 
-import { resolveAttachmentPathById } from "../attachmentStore.ts";
+import { resolveAttachmentPathById, threadHtmlRenderAttachmentIds } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as HtmlRender from "./HtmlRender.ts";
 import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
@@ -197,6 +197,52 @@ describe("HtmlRender", () => {
       const html = yield* fileSystem.readFileString(stored ?? "");
       expect(html).toContain('<style id="t3-theme">');
       expect(html).toContain("<p>Quarterly revenue</p>");
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("keeps interactive diagram revisions discoverable only in their thread", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const config = yield* ServerConfig.ServerConfig;
+      const htmlRender = yield* HtmlRender.HtmlRender;
+      const threadId = ThreadId.make("thread-archify-revisions");
+
+      const first = yield* htmlRender.publish({
+        threadId,
+        html: '<main><button id="step">Request</button></main>',
+        title: "Request flow",
+        height: 480,
+      });
+      const revised = yield* htmlRender.publish({
+        threadId,
+        html: '<main><button id="step">Request</button><button id="cache">Cache</button></main>',
+        title: "Request flow",
+        height: 520,
+      });
+
+      expect(revised.attachmentId).not.toBe(first.attachmentId);
+      const firstPath = resolveAttachmentPathById({
+        attachmentsDir: config.attachmentsDir,
+        attachmentId: first.attachmentId,
+      });
+      const revisedPath = resolveAttachmentPathById({
+        attachmentsDir: config.attachmentsDir,
+        attachmentId: revised.attachmentId,
+      });
+      expect(firstPath).not.toBe(revisedPath);
+      expect(yield* fileSystem.readFileString(firstPath ?? "")).toContain(">Request</button>");
+      expect(yield* fileSystem.readFileString(revisedPath ?? "")).toContain(">Cache</button>");
+      expect(revised.title).toBe("Request flow");
+
+      const history = [first, revised].map((htmlRender) => ({
+        toolName: "mcp__t3-code__html_render",
+        output: [{ type: "text", text: JSON.stringify({ htmlRender }) }],
+      }));
+      expect(threadHtmlRenderAttachmentIds(threadId, history)).toEqual([
+        first.attachmentId,
+        revised.attachmentId,
+      ]);
+      expect(threadHtmlRenderAttachmentIds(ThreadId.make("other-thread"), history)).toEqual([]);
     }).pipe(Effect.provide(layerTest)),
   );
 

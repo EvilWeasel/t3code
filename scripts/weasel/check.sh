@@ -23,6 +23,8 @@ done
 vp_cmd run --filter=@t3tools/scripts typecheck
 focused_tests=(
   apps/server/src/mcp/PreviewAutomationBroker.test.ts
+  apps/server/src/mcp/toolkits/html/tools.test.ts
+  apps/server/src/htmlRender/HtmlRender.test.ts
   apps/desktop/src/app/DesktopEarlyElectronStartup.test.ts \
   apps/desktop/src/app/DesktopEnvironment.test.ts \
   apps/desktop/src/app/DesktopAppIdentity.test.ts \
