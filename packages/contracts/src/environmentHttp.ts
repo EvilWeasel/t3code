@@ -680,12 +680,45 @@ export const VoiceTranscriptionUpload = HttpApiSchema.asMultipart({
   maxTotalSize: 25 * 1024 * 1024,
 })(Schema.Struct({ audio: Multipart.SingleFileSchema }));
 export const VoiceTranscriptionResult = Schema.Struct({ transcript: Schema.String });
+export const VoiceTranscriptionFailureReason = Schema.Literals([
+  "audio_too_large",
+  "auth_required",
+  "invalid_routing",
+  "provider_unavailable",
+  "upstream_unauthorized",
+  "upstream_forbidden",
+  "upstream_failure",
+  "invalid_response",
+  "timeout",
+]);
+export class VoiceTranscriptionHttpError extends Schema.TaggedError<VoiceTranscriptionHttpError>()(
+  "VoiceTranscriptionHttpError",
+  {
+    code: Schema.Literal("voice_transcription_failed"),
+    reason: VoiceTranscriptionFailureReason,
+    detail: Schema.String.check(Schema.isMaxLength(180)),
+  },
+  { httpApiStatus: 502 },
+) {
+  [HttpServerRespondable.symbol]() {
+    return HttpServerResponse.schemaJson(VoiceTranscriptionHttpError)(this, { status: 502 });
+  }
+
+  override get message(): string {
+    return this.detail;
+  }
+}
 class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice").add(
   HttpApiEndpoint.post("voiceTranscription", "/api/voice/transcription", {
     headers: OptionalBearerHeaders,
     payload: VoiceTranscriptionUpload,
     success: VoiceTranscriptionResult,
-    error: [EnvironmentAuthInvalidError, EnvironmentScopeRequiredError, EnvironmentInternalError],
+    error: [
+      EnvironmentAuthInvalidError,
+      EnvironmentScopeRequiredError,
+      EnvironmentInternalError,
+      VoiceTranscriptionHttpError,
+    ],
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
