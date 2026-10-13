@@ -1071,6 +1071,11 @@ it.effect("starts the provider when checkpoint baseline capture fails", () =>
                 ...current,
                 { events: input.events, effects: input.effects },
               ]).pipe(Effect.as([])),
+            writeIfRunCurrent: (input) =>
+              Ref.update(writes, (current) => [
+                ...current,
+                { events: input.events, effects: [] },
+              ]).pipe(Effect.as({ committed: true, storedEvents: [] })),
           }),
           IdAllocator.layer,
           Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
@@ -1083,7 +1088,7 @@ it.effect("starts the provider when checkpoint baseline capture fails", () =>
 
     yield* Effect.gen(function* () {
       const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
-      yield* runExecution.startRootRun({
+      const input: RunExecutionService.RunExecutionServiceV2StartRootRunInput = {
         commandId: CommandId.make("command:run-execution-baseline-failure"),
         appThread: { id: threadId } as OrchestrationV2AppThread,
         providerSessionId,
@@ -1128,10 +1133,28 @@ it.effect("starts the provider when checkpoint baseline capture fails", () =>
             networkAccess: false,
           },
         },
+      };
+      yield* runExecution.startRootRun(input);
+      assert.equal(yield* Ref.get(providerStarts), 1);
+      yield* Ref.set(providerStarts, 0);
+      yield* runExecution.startRootRun({
+        ...input,
+        commandId: CommandId.make("command:run-execution-voice-baseline-failure"),
+        run: { ...input.run, id: RunId.make("run:run-execution-voice-baseline-failure") },
+        attempt: {
+          ...input.attempt,
+          id: RunAttemptId.make("attempt:run-execution-voice-baseline-failure"),
+        },
+        attemptId: RunAttemptId.make("attempt:run-execution-voice-baseline-failure"),
+        message: {
+          ...input.message,
+          messageId: MessageId.make("message:run-execution-voice-baseline-failure"),
+          creationSource: "voice" as const,
+        },
       });
     }).pipe(Effect.provide(layerTest));
 
-    assert.equal(yield* Ref.get(providerStarts), 1);
+    assert.equal(yield* Ref.get(providerStarts), 0);
 
     const events = (yield* Ref.get(writes)).flatMap((write) => [...write.events]);
     const failedEvent = events.find(
@@ -1139,13 +1162,17 @@ it.effect("starts the provider when checkpoint baseline capture fails", () =>
         (event.type === "run.updated" ||
           event.type === "run-attempt.updated" ||
           event.type === "node.updated") &&
+        event.runId === RunId.make("run:run-execution-voice-baseline-failure") &&
         event.payload.status === "failed",
     );
-    assert.isUndefined(failedEvent);
+    assert.isDefined(failedEvent);
     const errorItem = events.find(
-      (event) => event.type === "turn-item.updated" && event.payload.type === "error",
+      (event) =>
+        event.type === "turn-item.updated" &&
+        event.runId === RunId.make("run:run-execution-voice-baseline-failure") &&
+        event.payload.type === "error",
     );
-    assert.isUndefined(errorItem);
+    assert.isDefined(errorItem);
   }),
 );
 
