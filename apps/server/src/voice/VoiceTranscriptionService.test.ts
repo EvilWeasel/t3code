@@ -4,18 +4,31 @@ import {
   AuthOrchestrationReadScope,
   AuthSessionId,
   EnvironmentAuthenticatedPrincipal,
+  CodexSettings,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
+import * as Fiber from "effect/Fiber";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/http/HttpClientResponse";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as PlatformError from "effect/PlatformError";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as TestClock from "effect/testing/TestClock";
+import * as FileSystem from "effect/FileSystem";
+import * as Schema from "effect/Schema";
+import * as CodexProvider from "../provider/CodexProvider.ts";
 
 import {
   MAX_VOICE_AUDIO_BYTES,
+  prepareCodexTranscriptionHome,
   VoiceTranscriptionError,
   createNoRedirectFetch,
   readTrustedAccountContext,
   safeProviderError,
+  selectCodexTranscriptionInstance,
   transcribeCodexAccount,
   transcribeOpenAiApi,
   validateVoiceAudio,
@@ -46,12 +59,14 @@ const jwt = (userId: string, accountId = "account-1") => {
 function mockCodex(input: {
   readonly users?: ReadonlyArray<string>;
   readonly accountIds?: ReadonlyArray<string>;
+  readonly refreshArguments?: Array<boolean>;
 }) {
   let authIndex = 0;
   const users = input.users ?? ["user-1"];
   const codex = {
-    request: () =>
+    request: (_method: string, args: { readonly refreshToken?: boolean }) =>
       Effect.sync(() => {
+        input.refreshArguments?.push(args.refreshToken ?? false);
         const index = Math.min(authIndex++, users.length - 1);
         return {
           authMethod: "chatgpt",
@@ -81,6 +96,27 @@ it.effect("does not accept an account id outside the trusted JWT namespace match
       false,
     ).pipe(Effect.result);
     assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
+it.effect("sanitizes trusted broker failures before they can escape", () =>
+  Effect.gen(function* () {
+    const secret = "fakebrokersecret-for-voice-test";
+    class BrokerFailure extends Data.TaggedError("BrokerFailure")<{ readonly message: string }> {}
+    const codex = {
+      request: () =>
+        Effect.fail(new BrokerFailure({ message: `broker returned Bearer ${secret}` })),
+      raw: { request: () => Effect.succeed(routeContext) },
+    } as unknown as import("effect-codex-app-server/client").CodexAppServerClient["Service"];
+    const result = yield* readTrustedAccountContext(codex, false).pipe(
+      Effect.withTracerEnabled(false),
+      Effect.result,
+    );
+    assert.strictEqual(result._tag, "Failure");
+    if (result._tag === "Failure") {
+      assert(!JSON.stringify(result.failure).includes(secret));
+      assert(!Object.keys(result.failure).includes("cause"));
+    }
   }),
 );
 
@@ -173,7 +209,8 @@ it.effect(
   "retries once after 401 when the refreshed token still belongs to the same principal",
   () =>
     Effect.gen(function* () {
-      const codex = mockCodex({ users: ["user-1", "user-1", "user-1"] });
+      const refreshArguments: boolean[] = [];
+      const codex = mockCodex({ users: ["user-1", "user-1", "user-1"], refreshArguments });
       let requests = 0;
       const httpClient = {
         execute: (request: HttpClientRequest.HttpClientRequest) => {
@@ -195,7 +232,59 @@ it.effect(
       });
       assert.strictEqual(result, "recovered");
       assert.strictEqual(requests, 2);
+      assert.deepStrictEqual(refreshArguments, [false, true, false]);
     }),
+);
+
+it.effect("passes an explicit environment to Codex spawn without extending ambient API keys", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const crypto = yield* Crypto.Crypto;
+    const suffix = yield* crypto.randomUUIDv4;
+    const root = `/tmp/t3-voice-transcription-${suffix}`;
+    const sharedHome = `${root}/shared`;
+    const shadowHome = `${root}/shadow`;
+    const settings = yield* Schema.decodeUnknownEffect(CodexSettings)({
+      binaryPath: "/usr/bin/env",
+      homePath: sharedHome,
+      shadowHomePath: shadowHome,
+    });
+    const effectiveHomePath = yield* prepareCodexTranscriptionHome(settings);
+    assert.strictEqual(effectiveHomePath, shadowHome);
+    let spawnCommand: unknown;
+    const failedSpawn = PlatformError.badArgument({
+      module: "ChildProcessSpawner",
+      method: "spawn",
+      description: "captured spawn command",
+    });
+    const spawner = ChildProcessSpawner.make((command) =>
+      Effect.sync(() => {
+        spawnCommand = command;
+      }).pipe(Effect.andThen(Effect.fail(failedSpawn))),
+    );
+    const exit = yield* CodexProvider.withCodexAppServerClient({
+      binaryPath: settings.binaryPath ?? "/usr/bin/env",
+      homePath: effectiveHomePath,
+      cwd: process.cwd(),
+      environment: { PATH: process.env.PATH },
+      extendEnv: false,
+    }).pipe(
+      Effect.scoped,
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      Effect.exit,
+    );
+    assert.strictEqual(exit._tag, "Failure");
+    const captured = spawnCommand as
+      | {
+          readonly options?: { readonly env?: NodeJS.ProcessEnv; readonly extendEnv?: boolean };
+        }
+      | undefined;
+    assert.strictEqual(captured?.options?.extendEnv, false);
+    assert.strictEqual(captured?.options?.env?.OPENAI_API_KEY, undefined);
+    assert.strictEqual(captured?.options?.env?.T3CODE_TRANSCRIPTION_API_KEY, undefined);
+    assert.strictEqual(captured?.options?.env?.CODEX_HOME, shadowHome);
+    yield* fileSystem.remove(root, { recursive: true });
+  }).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect("reports upstream 403 without retaining the raw response or request", () =>
@@ -225,6 +314,27 @@ it.effect("reports upstream 403 without retaining the raw response or request", 
   }),
 );
 
+it.effect("cancels a stalled account request when the service timeout expires", () =>
+  Effect.gen(function* () {
+    let canceled = false;
+    const codex = mockCodex({});
+    const httpClient = {
+      execute: () =>
+        Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => (canceled = true)))),
+    } as unknown as HttpClient.HttpClient;
+    const fiber = yield* transcribeCodexAccount(codex, httpClient, {
+      bytes: new Uint8Array([1]),
+      contentType: "audio/webm",
+      fileName: "stall.webm",
+    }).pipe(Effect.timeout("1 second"), Effect.mapError(safeProviderError), Effect.forkScoped);
+    yield* TestClock.adjust("1 second");
+    const result = yield* Fiber.join(fiber).pipe(Effect.result);
+    assert.strictEqual(result._tag, "Failure");
+    if (result._tag === "Failure") assert.strictEqual(result.failure.reason, "timeout");
+    assert.strictEqual(canceled, true);
+  }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+);
+
 it("redacts secrets and outbound request details from errors", () => {
   const secret = "sk-fake-voice-secret";
   const safe = safeProviderError(new Error(`Authorization: Bearer ${secret}`));
@@ -232,6 +342,33 @@ it("redacts secrets and outbound request details from errors", () => {
   assert(!JSON.stringify(safe).includes(secret));
   assert(!Object.keys(safe).includes("cause"));
   assert.strictEqual(MAX_VOICE_AUDIO_BYTES, 25 * 1024 * 1024);
+  assert.strictEqual(safeProviderError({ _tag: "TimeoutException" }).reason, "timeout");
+});
+
+it("selects only enabled Codex instances with explicit override precedence", () => {
+  const entries = {
+    codex: { driver: "codex", enabled: true },
+    codex_work: { driver: "codex", enabled: true },
+    disabled: { driver: "codex", enabled: false },
+    claude: { driver: "claude", enabled: true },
+  };
+  assert.strictEqual(selectCodexTranscriptionInstance(entries, "claude", undefined)?.[0], "codex");
+  assert.strictEqual(
+    selectCodexTranscriptionInstance(entries, "codex_work", undefined)?.[0],
+    "codex_work",
+  );
+  assert.strictEqual(selectCodexTranscriptionInstance(entries, undefined, "missing"), undefined);
+  assert.strictEqual(
+    selectCodexTranscriptionInstance(
+      {
+        codex_z: { driver: "codex", enabled: true },
+        codex_a: { driver: "codex", enabled: true },
+      },
+      undefined,
+      undefined,
+    )?.[0],
+    "codex_a",
+  );
 });
 
 it.effect("rejects audio above the service byte bound", () =>

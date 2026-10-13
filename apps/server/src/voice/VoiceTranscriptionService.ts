@@ -9,6 +9,8 @@ import * as HttpClientRequest from "effect/http/HttpClientRequest";
 import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as Schema from "effect/Schema";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import { decodeJwt } from "jose";
 import { CodexSettings } from "@t3tools/contracts";
 import * as CodexClient from "effect-codex-app-server/client";
@@ -16,8 +18,22 @@ import * as CodexProvider from "../provider/CodexProvider.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { resolveCodexLaunchArgs } from "../provider/codexLaunchArgs.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
+import {
+  materializeCodexShadowHome,
+  resolveCodexHomeLayout,
+} from "../provider/Drivers/CodexHomeLayout.ts";
 
 export class VoiceTranscriptionError extends Data.TaggedError("VoiceTranscriptionError")<{
+  readonly reason:
+    | "audio_too_large"
+    | "auth_required"
+    | "invalid_routing"
+    | "provider_unavailable"
+    | "upstream_unauthorized"
+    | "upstream_forbidden"
+    | "upstream_failure"
+    | "invalid_response"
+    | "timeout";
   readonly detail: string;
   readonly status?: number;
 }> {}
@@ -29,7 +45,10 @@ export const validateVoiceAudio = (audio: VoiceAudio) =>
   audio.bytes.byteLength <= MAX_VOICE_AUDIO_BYTES
     ? Effect.void
     : Effect.fail(
-        new VoiceTranscriptionError({ detail: "Audio upload exceeds the 25 MiB limit." }),
+        new VoiceTranscriptionError({
+          reason: "audio_too_large",
+          detail: "Audio upload exceeds the 25 MiB limit.",
+        }),
       );
 
 // The upstream account endpoint may redirect through a login page; following
@@ -43,11 +62,30 @@ const fetchWithoutRedirects = createNoRedirectFetch(globalThis.fetch);
 
 export function safeProviderError(cause: unknown): VoiceTranscriptionError {
   const status = HttpClientError.isHttpClientError(cause) ? cause.response?.status : undefined;
+  const isTimeout =
+    cause instanceof Error && (cause.name === "TimeoutException" || cause.name === "TimeoutError")
+      ? true
+      : typeof cause === "object" &&
+        cause !== null &&
+        "_tag" in cause &&
+        (cause._tag === "TimeoutException" || cause._tag === "TimeoutError");
+  const reason = isTimeout
+    ? "timeout"
+    : status === 401
+      ? "upstream_unauthorized"
+      : status === 403
+        ? "upstream_forbidden"
+        : status !== undefined && status >= 500
+          ? "provider_unavailable"
+          : "upstream_failure";
   return new VoiceTranscriptionError({
+    reason,
     detail:
-      status === undefined
-        ? "Transcription provider request failed."
-        : `Transcription provider returned HTTP ${status}.`,
+      reason === "timeout"
+        ? "Transcription provider request timed out."
+        : status === undefined
+          ? "Transcription provider request failed."
+          : `Transcription provider returned HTTP ${status}.`,
     ...(status === undefined ? {} : { status }),
   });
 }
@@ -72,22 +110,39 @@ export const readTrustedAccountContext = Effect.fn("voice.readTrustedAccountCont
   client: CodexClient.CodexAppServerClient["Service"],
   refreshToken: boolean,
 ) {
-  const auth = yield* client.request("getAuthStatus", { includeToken: true, refreshToken });
+  const auth = yield* client.request("getAuthStatus", { includeToken: true, refreshToken }).pipe(
+    Effect.mapError(
+      () =>
+        new VoiceTranscriptionError({
+          reason: "auth_required",
+          detail: "Codex account authorization could not be read.",
+        }),
+    ),
+  );
   if (!auth.authToken || auth.authMethod !== "chatgpt") {
     return yield* Effect.fail(
-      new VoiceTranscriptionError({ detail: "Codex is not signed in with a ChatGPT account." }),
+      new VoiceTranscriptionError({
+        reason: "auth_required",
+        detail: "Codex is not signed in with a ChatGPT account.",
+      }),
     );
   }
   const account = yield* client.raw.request("account/read", {}).pipe(
     Effect.flatMap(Schema.decodeUnknownEffect(RawAccountRead)),
     Effect.mapError(
       () =>
-        new VoiceTranscriptionError({ detail: "Codex did not provide trusted workspace routing." }),
+        new VoiceTranscriptionError({
+          reason: "invalid_routing",
+          detail: "Codex did not provide trusted workspace routing.",
+        }),
     ),
   );
   if (!account.account || account.account.type !== "chatgpt") {
     return yield* Effect.fail(
-      new VoiceTranscriptionError({ detail: "Codex is not signed in with a ChatGPT account." }),
+      new VoiceTranscriptionError({
+        reason: "auth_required",
+        detail: "Codex is not signed in with a ChatGPT account.",
+      }),
     );
   }
   if (
@@ -95,18 +150,27 @@ export const readTrustedAccountContext = Effect.fn("voice.readTrustedAccountCont
     account.account.id !== account.workspaceRouting.chatgptAccountId
   ) {
     return yield* Effect.fail(
-      new VoiceTranscriptionError({ detail: "Codex account does not match workspace routing." }),
+      new VoiceTranscriptionError({
+        reason: "invalid_routing",
+        detail: "Codex account does not match workspace routing.",
+      }),
     );
   }
   const claims = yield* Effect.try({
     try: () => decodeJwt(auth.authToken!),
     catch: () =>
-      new VoiceTranscriptionError({ detail: "Codex account identity could not be verified." }),
+      new VoiceTranscriptionError({
+        reason: "auth_required",
+        detail: "Codex account identity could not be verified.",
+      }),
   });
   const authClaims = claims["https://api.openai.com/auth"];
   if (!authClaims || typeof authClaims !== "object") {
     return yield* Effect.fail(
-      new VoiceTranscriptionError({ detail: "Codex account identity could not be verified." }),
+      new VoiceTranscriptionError({
+        reason: "auth_required",
+        detail: "Codex account identity could not be verified.",
+      }),
     );
   }
   const claimsRecord = authClaims as Record<string, unknown>;
@@ -119,12 +183,29 @@ export const readTrustedAccountContext = Effect.fn("voice.readTrustedAccountCont
   ) {
     return yield* Effect.fail(
       new VoiceTranscriptionError({
+        reason: "invalid_routing",
         detail: "Codex account identity does not match workspace routing.",
       }),
     );
   }
   return { token: auth.authToken, routing: account.workspaceRouting, userId: claimUserId };
 });
+
+export const prepareCodexTranscriptionHome = Effect.fn("voice.prepareCodexTranscriptionHome")(
+  function* (config: typeof CodexSettings.Type) {
+    const layout = yield* resolveCodexHomeLayout(config);
+    yield* materializeCodexShadowHome(layout).pipe(
+      Effect.mapError(
+        () =>
+          new VoiceTranscriptionError({
+            reason: "provider_unavailable",
+            detail: "The selected Codex home could not be prepared.",
+          }),
+      ),
+    );
+    return layout.effectiveHomePath;
+  },
+);
 
 export const transcribeCodexAccount = Effect.fn("voice.transcribeCodexAccount")(function* (
   client: CodexClient.CodexAppServerClient["Service"],
@@ -137,7 +218,17 @@ export const transcribeCodexAccount = Effect.fn("voice.transcribeCodexAccount")(
     readonly routing: RoutingContext;
     readonly userId: string;
   }) => {
-    const origin = new URL(context.routing.backendOrigin);
+    let origin: URL;
+    try {
+      origin = new URL(context.routing.backendOrigin);
+    } catch {
+      return Effect.fail(
+        new VoiceTranscriptionError({
+          reason: "invalid_routing",
+          detail: "Codex workspace routing origin is invalid.",
+        }),
+      );
+    }
     if (
       origin.protocol !== "https:" ||
       origin.username ||
@@ -147,7 +238,10 @@ export const transcribeCodexAccount = Effect.fn("voice.transcribeCodexAccount")(
       origin.pathname !== "/"
     ) {
       return Effect.fail(
-        new VoiceTranscriptionError({ detail: "Codex workspace routing origin is invalid." }),
+        new VoiceTranscriptionError({
+          reason: "invalid_routing",
+          detail: "Codex workspace routing origin is invalid.",
+        }),
       );
     }
     origin.pathname = "/backend-api/transcribe";
@@ -172,6 +266,7 @@ export const transcribeCodexAccount = Effect.fn("voice.transcribeCodexAccount")(
         response.status === 401
           ? Effect.fail(
               new VoiceTranscriptionError({
+                reason: "upstream_unauthorized",
                 detail: "Codex account authorization was rejected.",
                 status: 401,
               }),
@@ -184,6 +279,7 @@ export const transcribeCodexAccount = Effect.fn("voice.transcribeCodexAccount")(
           ? Effect.succeed((value as { text: string }).text)
           : Effect.fail(
               new VoiceTranscriptionError({
+                reason: "invalid_response",
                 detail: "Codex returned an invalid transcription response.",
               }),
             ),
@@ -196,6 +292,7 @@ export const transcribeCodexAccount = Effect.fn("voice.transcribeCodexAccount")(
     if (!samePrincipal(current, initial)) {
       return yield* Effect.fail(
         new VoiceTranscriptionError({
+          reason: "invalid_routing",
           detail: "Codex workspace routing changed during transcription.",
         }),
       );
@@ -207,6 +304,7 @@ export const transcribeCodexAccount = Effect.fn("voice.transcribeCodexAccount")(
   if (!samePrincipal(refreshed, initial)) {
     return yield* Effect.fail(
       new VoiceTranscriptionError({
+        reason: "auth_required",
         detail: "Codex account changed during authorization refresh.",
       }),
     );
@@ -216,6 +314,7 @@ export const transcribeCodexAccount = Effect.fn("voice.transcribeCodexAccount")(
   if (!samePrincipal(current, refreshed)) {
     return yield* Effect.fail(
       new VoiceTranscriptionError({
+        reason: "invalid_routing",
         detail: "Codex workspace routing changed during transcription.",
       }),
     );
@@ -245,6 +344,7 @@ export const transcribeOpenAiApi = Effect.fn("voice.transcribeOpenAiApi")(functi
         ? Effect.succeed((value as { text: string }).text)
         : Effect.fail(
             new VoiceTranscriptionError({
+              reason: "invalid_response",
               detail: "Transcription provider returned an invalid response.",
             }),
           ),
@@ -272,28 +372,59 @@ export interface VoiceAudio {
   readonly fileName: string;
 }
 
+export function selectCodexTranscriptionInstance<
+  T extends { readonly driver: string; readonly enabled?: boolean },
+>(
+  instances: Readonly<Record<string, T>>,
+  defaultInstanceId: string | undefined,
+  requestedInstanceId: string | undefined,
+) {
+  const codexInstances = Object.entries(instances)
+    .filter(([, entry]) => entry.driver === "codex" && entry.enabled !== false)
+    .sort(([left], [right]) => left.localeCompare(right));
+  const enabledIds = new Set(codexInstances.map(([id]) => id));
+  const selectedId = requestedInstanceId
+    ? requestedInstanceId
+    : defaultInstanceId && enabledIds.has(defaultInstanceId)
+      ? defaultInstanceId
+      : enabledIds.has("codex")
+        ? "codex"
+        : codexInstances[0]?.[0];
+  return selectedId ? codexInstances.find(([id]) => id === selectedId) : undefined;
+}
+
 export class VoiceTranscriptionService extends Context.Service<
   VoiceTranscriptionService,
   {
-    readonly transcribe: (audio: VoiceAudio) => Effect.Effect<string, VoiceTranscriptionError>;
+    readonly transcribe: (
+      audio: VoiceAudio,
+    ) => Effect.Effect<string, VoiceTranscriptionError, FileSystem.FileSystem | Path.Path>;
   }
 >()("t3/voice/VoiceTranscriptionService") {}
 
 export const layer: Layer.Layer<
   VoiceTranscriptionService,
   never,
-  ServerSettings.ServerSettingsService | ChildProcessSpawner.ChildProcessSpawner
+  | ServerSettings.ServerSettingsService
+  | ChildProcessSpawner.ChildProcessSpawner
+  | FileSystem.FileSystem
+  | Path.Path
 > = Layer.effect(
   VoiceTranscriptionService,
   Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient;
     const settingsService = yield* ServerSettings.ServerSettingsService;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
     return VoiceTranscriptionService.of({
       transcribe: (audio) => {
         if (audio.bytes.byteLength > MAX_VOICE_AUDIO_BYTES) {
           return Effect.fail(
-            new VoiceTranscriptionError({ detail: "Audio upload exceeds the 25 MiB limit." }),
+            new VoiceTranscriptionError({
+              reason: "audio_too_large",
+              detail: "Audio upload exceeds the 25 MiB limit.",
+            }),
           );
         }
         const provider = process.env.T3CODE_TRANSCRIPTION_PROVIDER ?? "codex-account";
@@ -301,15 +432,19 @@ export const layer: Layer.Layer<
           return Effect.gen(function* () {
             const settings = yield* settingsService.getSettings;
             const requestedId = process.env.T3CODE_TRANSCRIPTION_CODEX_INSTANCE_ID;
-            const selectedId = requestedId ?? settings.defaultModelSelection?.instanceId ?? "codex";
-            const selected = Object.entries(settings.providerInstances).find(
-              ([id, entry]) =>
-                id === selectedId && entry.driver === "codex" && entry.enabled !== false,
+            const defaultId = settings.defaultModelSelection?.instanceId;
+            const selected = selectCodexTranscriptionInstance(
+              settings.providerInstances,
+              defaultId,
+              requestedId,
             );
             if (!selected) {
               return yield* Effect.fail(
                 new VoiceTranscriptionError({
-                  detail: "No enabled Codex provider instance is configured.",
+                  reason: "provider_unavailable",
+                  detail: requestedId
+                    ? "The requested Codex provider instance is unavailable or disabled."
+                    : "No enabled Codex provider instance is configured.",
                 }),
               );
             }
@@ -320,6 +455,7 @@ export const layer: Layer.Layer<
               Effect.mapError(
                 () =>
                   new VoiceTranscriptionError({
+                    reason: "provider_unavailable",
                     detail: "The selected Codex configuration is invalid.",
                   }),
               ),
@@ -327,6 +463,7 @@ export const layer: Layer.Layer<
             if (!config.binaryPath) {
               return yield* Effect.fail(
                 new VoiceTranscriptionError({
+                  reason: "provider_unavailable",
                   detail: "The selected Codex instance has no executable.",
                 }),
               );
@@ -337,14 +474,18 @@ export const layer: Layer.Layer<
             delete codexEnvironment.OPENAI_API_KEY;
             // withCodexAppServerClient supplies the T3 Code originator itself.
             delete codexEnvironment.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
+            const effectiveHomePath = yield* prepareCodexTranscriptionHome(config);
             const { client: codex } = yield* CodexProvider.withCodexAppServerClient({
               binaryPath: config.binaryPath,
-              homePath: config.homePath,
+              homePath: effectiveHomePath,
               launchArgs: resolveCodexLaunchArgs(config.launchArgs, codexEnvironment),
               cwd: process.cwd(),
               environment: codexEnvironment,
+              extendEnv: false,
             });
-            return yield* transcribeCodexAccount(codex, client, audio);
+            return yield* transcribeCodexAccount(codex, client, audio).pipe(
+              Effect.withTracerEnabled(false),
+            );
           }).pipe(
             Effect.scoped,
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -352,11 +493,13 @@ export const layer: Layer.Layer<
             Effect.mapError((cause) =>
               cause instanceof VoiceTranscriptionError ? cause : safeProviderError(cause),
             ),
+            Effect.withTracerEnabled(false),
           );
         }
         if (provider !== "openai-api") {
           return Effect.fail(
             new VoiceTranscriptionError({
+              reason: "provider_unavailable",
               detail: "T3CODE_TRANSCRIPTION_PROVIDER must be codex-account or openai-api.",
             }),
           );
@@ -364,14 +507,17 @@ export const layer: Layer.Layer<
         const apiKey = process.env.T3CODE_TRANSCRIPTION_API_KEY;
         if (!apiKey)
           return Effect.fail(
-            new VoiceTranscriptionError({ detail: "T3CODE_TRANSCRIPTION_API_KEY is required." }),
+            new VoiceTranscriptionError({
+              reason: "provider_unavailable",
+              detail: "T3CODE_TRANSCRIPTION_API_KEY is required.",
+            }),
           );
         return transcribeOpenAiApi(
           client,
           audio,
           apiKey,
           process.env.T3CODE_TRANSCRIPTION_MODEL || "gpt-transcribe",
-        );
+        ).pipe(Effect.withTracerEnabled(false));
       },
     });
   }),
