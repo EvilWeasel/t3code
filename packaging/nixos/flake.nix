@@ -1,5 +1,5 @@
 {
-  description = "NixOS package for the EvilWeasel T3 Code fork";
+  description = "NixOS package for the morrowbyte T3 Code fork";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/0954f7ee2f6bb3dc7d4e3d0d8bcb8fd4bde4cfc5";
 
@@ -8,13 +8,16 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       lib = pkgs.lib;
+      repositoryEnv = builtins.getEnv "T3_WEASEL_REPOSITORY";
+      repository = if repositoryEnv == "" then "morrowbyte/t3code" else repositoryEnv;
+      validRepository = builtins.match "[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" repository != null;
       version = builtins.getEnv "T3_WEASEL_VERSION";
       artifactUrl = builtins.getEnv "T3_WEASEL_ARTIFACT_URL";
       artifactHash = builtins.getEnv "T3_WEASEL_ARTIFACT_SHA256";
       validVersion = builtins.match "[0-9A-Za-z][0-9A-Za-z.+_-]*" version != null;
       validHash = builtins.match "[0-9a-f]{64}" artifactHash != null;
-      validUrl = builtins.match "https://github\\.com/EvilWeasel/t3code/releases/download/.+" artifactUrl != null;
-      package = if !(validVersion && validHash && validUrl) then
+      validUrl = lib.hasPrefix "https://github.com/${repository}/releases/download/v${version}/" artifactUrl;
+      package = if !(validRepository && validVersion && validHash && validUrl) then
         throw "Set T3_WEASEL_VERSION, T3_WEASEL_ARTIFACT_URL and T3_WEASEL_ARTIFACT_SHA256 to verified release values"
       else
         let
@@ -78,7 +81,7 @@
 
           meta = {
             description = "EvilWeasel's T3 Code fork (Weasel Nightly)";
-            homepage = "https://github.com/EvilWeasel/t3code";
+            homepage = "https://github.com/${repository}";
             license = lib.licenses.mit;
             mainProgram = "t3code-weasel";
             platforms = [ system ];
