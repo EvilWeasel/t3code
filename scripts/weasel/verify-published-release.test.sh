@@ -58,6 +58,7 @@ cat > "$fake_bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "$1" == "api" ]]; then
+  printf '%s\n' "$2" >> "$WEASEL_FIXTURE_GH_LOG"
   cat "$WEASEL_FIXTURE_API"
 elif [[ "$1" == "release" && "$2" == "download" ]]; then
   destination=""
@@ -80,12 +81,21 @@ chmod +x "$fake_bin/gh"
 export PATH="$fake_bin:$PATH"
 export WEASEL_FIXTURE_API="$fixture_api"
 export WEASEL_FIXTURE_ASSETS="$fixture_assets"
+export WEASEL_FIXTURE_GH_LOG="$test_root/gh-api-calls.log"
 export WEASEL_VERIFY_GIT_REMOTE=origin
 export GH_REPO=fixture/t3code
 
 cd "$fixture_repo"
 bash "$repo_root/scripts/weasel/verify-published-release.sh" \
   "$tag" "$source_sha" "$version" "$fixture_assets" >/dev/null
+grep -Fxq "repos/fixture/t3code/releases/tags/$tag" "$WEASEL_FIXTURE_GH_LOG"
+
+: > "$WEASEL_FIXTURE_GH_LOG"
+unset GH_REPO
+bash "$repo_root/scripts/weasel/verify-published-release.sh" \
+  "$tag" "$source_sha" "$version" "$fixture_assets" >/dev/null
+grep -Fxq "repos/EvilWeasel/t3code/releases/tags/$tag" "$WEASEL_FIXTURE_GH_LOG"
+export GH_REPO=fixture/t3code
 
 if bash "$repo_root/scripts/weasel/verify-published-release.sh" \
   "$tag" "0000000000000000000000000000000000000000" "$version" "$fixture_assets" >/dev/null 2>&1; then

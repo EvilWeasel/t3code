@@ -13,11 +13,12 @@ if [[ ! -f "$source_image" ]]; then
 fi
 
 if [[ -r /etc/os-release ]] && grep -Eiq '^(ID|ID_LIKE)=([^\n]*[" ]|)nixos([" ]|$)' /etc/os-release; then
+  release_repository="${WEASEL_RELEASE_REPOSITORY:-EvilWeasel/t3code}"
   cat >&2 <<'EOF'
 This AppImage installer does not support NixOS. Use the dedicated NixOS
 package and user updater launcher documented at:
-https://github.com/EvilWeasel/t3code/tree/main/packaging/nixos
 EOF
+  printf 'https://github.com/%s/tree/main/packaging/nixos\n' "$release_repository" >&2
   exit 1
 fi
 

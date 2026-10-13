@@ -15,8 +15,8 @@ permissions:
 
 jobs:
   check:
-    if: github.repository == 'EvilWeasel/t3code'
-    runs-on: ubuntu-24.04
+    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

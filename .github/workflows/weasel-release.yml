@@ -19,8 +19,8 @@ permissions:
 
 jobs:
   preflight:
-    if: github.repository == 'EvilWeasel/t3code'
-    runs-on: ubuntu-24.04
+    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 15
     outputs:
       source_sha: ${{ steps.release.outputs.source_sha }}
@@ -60,7 +60,7 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
           RELEASE_RUN: ${{ github.run_number }}
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+          GH_REPO: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
         run: |
           set -euo pipefail
           upstream_metadata="$RUNNER_TEMP/upstream-nightly.txt"
@@ -87,7 +87,7 @@ jobs:
 
   build_bundle:
     needs: [preflight]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 30
     steps:
       - name: Checkout source
@@ -126,7 +126,7 @@ jobs:
 
   build_linux:
     needs: [preflight, build_bundle]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 80
     permissions:
       contents: read
@@ -172,7 +172,7 @@ jobs:
 
       - name: Build Linux AppImage and updater metadata
         env:
-          T3CODE_DESKTOP_UPDATE_REPOSITORY: EvilWeasel/t3code
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
           T3CODE_DESKTOP_APP_ID: com.evilweasel.t3code
           T3CODE_DESKTOP_PRODUCT_NAME: T3 Code (Weasel Nightly)
           T3CODE_DESKTOP_PROFILE: weasel
@@ -187,13 +187,15 @@ jobs:
           test "${#stage_roots[@]}" -gt 0
           update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
           test -n "$update_config"
-          grep -Fq 'owner: EvilWeasel' "$update_config"
-          grep -Fq 'repo: t3code' "$update_config"
+          IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
+          grep -Fq "owner: $expected_owner" "$update_config"
+          grep -Fq "repo: $expected_repo" "$update_config"
 
       - name: Prepare NixOS download bundle
         run: |
           set -euo pipefail
-          cp scripts/weasel/install-linux.sh release-linux/
+          sed "s|EvilWeasel/t3code|${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}|g" \
+            scripts/weasel/install-linux.sh > release-linux/install-linux.sh
           appimage="$(find release-linux -maxdepth 1 -name '*.AppImage' -print -quit)"
           test -n "$appimage"
           test "$(basename "$appimage")" = "T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage"
@@ -236,7 +238,7 @@ jobs:
 
   build_windows:
     needs: [preflight, build_bundle, build_linux]
-    runs-on: windows-2025
+    runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'windows-2025' }}
     timeout-minutes: 50
     steps:
       - name: Checkout source
@@ -300,7 +302,7 @@ jobs:
 
       - name: Build Windows x64 installer and updater metadata
         env:
-          T3CODE_DESKTOP_UPDATE_REPOSITORY: EvilWeasel/t3code
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
           T3CODE_DESKTOP_APP_ID: com.evilweasel.t3code
           T3CODE_DESKTOP_PRODUCT_NAME: T3 Code (Weasel Nightly)
           T3CODE_DESKTOP_PROFILE: weasel
@@ -314,8 +316,9 @@ jobs:
           [[ -n "${TMP:-}" ]] && tmp_roots+=("$TMP")
           update_config="$(find "${tmp_roots[@]}" -path '*/resources/app-update.yml' -print -quit 2>/dev/null || true)"
           test -n "$update_config"
-          grep -Fq 'owner: EvilWeasel' "$update_config"
-          grep -Fq 'repo: t3code' "$update_config"
+          IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
+          grep -Fq "owner: $expected_owner" "$update_config"
+          grep -Fq "repo: $expected_repo" "$update_config"
 
       - name: Package and smoke-test Windows CLI archive
         shell: bash
@@ -345,7 +348,7 @@ jobs:
 
   publish:
     needs: [preflight, build_linux, build_windows]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 15
     permissions:
       contents: write
@@ -379,7 +382,7 @@ jobs:
       - name: Create fork-only prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: EvilWeasel/t3code
+          GH_REPO: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
         run: |
           set -euo pipefail
           tag="${{ needs.preflight.outputs.tag }}"
@@ -413,7 +416,7 @@ jobs:
               --title "Weasel Nightly ${{ needs.preflight.outputs.version }}" \
               --prerelease \
               --draft \
-              --notes "Fork channel build from $source_sha. Linux AppImage installs include a user-local installer. NixOS installs use the dedicated package and updater launcher when available at https://github.com/EvilWeasel/t3code/tree/main/packaging/nixos. Linux auto-updates stay disabled for Nix store installs. This build has no configured T3 Connect relay backend."
+              --notes "Fork channel build from $source_sha. Linux AppImage installs include a user-local installer. NixOS installs use the dedicated package and updater launcher when available at https://github.com/$GH_REPO/tree/main/packaging/nixos. Linux auto-updates stay disabled for Nix store installs. This build has no configured T3 Connect relay backend."
           fi
           # Asset replacement is permitted only while the release is still a
           # draft. Recheck immediately before each clobber in case a maintainer
@@ -422,7 +425,7 @@ jobs:
           gh release upload "$tag" release-assets/* --clobber
 
           lock_sha="$(sha256sum pnpm-lock.yaml | cut -d ' ' -f 1)"
-          assets_json="$(gh api "repos/EvilWeasel/t3code/releases/tags/$tag" --jq '[.assets[] | select(.name != "RELEASE-RECEIPT.txt") | {name, digest}]')"
+          assets_json="$(gh api "repos/$GH_REPO/releases/tags/$tag" --jq '[.assets[] | select(.name != "RELEASE-RECEIPT.txt") | {name, digest}]')"
           jq -e 'length > 0 and all(.[]; (.digest | type == "string") and (.digest | startswith("sha256:")))' <<<"$assets_json"
           expected_assets="$(find release-assets -maxdepth 1 -type f ! -name 'RELEASE-RECEIPT.txt' -printf '%f\n' | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')"
           jq -e --argjson expected "$expected_assets" '([.[].name] | sort) == $expected' <<<"$assets_json"
