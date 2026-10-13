@@ -59,6 +59,10 @@
       "types": "./src/authorization/index.ts",
       "default": "./src/authorization/index.ts"
     },
+    "./authorization/service": {
+      "types": "./src/authorization/service.ts",
+      "default": "./src/authorization/service.ts"
+    },
     "./environment": {
       "types": "./src/environment/index.ts",
       "default": "./src/environment/index.ts"
@@ -118,6 +122,10 @@
     "./relay": {
       "types": "./src/relay/index.ts",
       "default": "./src/relay/index.ts"
+    },
+    "./relay/managed-relay": {
+      "types": "./src/relay/managedRelay.ts",
+      "default": "./src/relay/managedRelay.ts"
     },
     "./state/auth": {
       "types": "./src/state/auth.ts",
@@ -202,6 +210,10 @@
     "./state/pull-requests": {
       "types": "./src/state/pullRequests.ts",
       "default": "./src/state/pullRequests.ts"
+    },
+    "./state/voice-transcription": {
+      "types": "./src/state/voiceTranscriptionHttp.ts",
+      "default": "./src/state/voiceTranscriptionHttp.ts"
     },
     "./state/project-grouping": {
       "types": "./src/state/projectGrouping.ts",
