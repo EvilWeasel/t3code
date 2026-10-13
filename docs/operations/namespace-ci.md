@@ -15,5 +15,7 @@ Reference: https://namespace.so/docs/solutions/github-actions
 The x86-64 Linux runner labels in all workflows, including reusable desktop
 build callers, are now `namespace-profile-ci-builder`. ARM, macOS and Windows
 retain their architecture-specific runners. Blacksmith-only apt mirror rewriting
-is conditional. Validation: actionlint and git diff --check. Runner execution is
+is conditional. Validation: git diff --check and actionlint comparison against the unmodified
+baseline. Four preexisting actionlint findings remain identical (discussion
+events, concurrency queue and run_started_at context); no new findings. Runner execution is
 separate from source migration.
