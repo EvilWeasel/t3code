@@ -27,3 +27,34 @@ it.effect("starts each subscription with its correlated current status", () =>
     assert.deepEqual(Option.getOrThrow(first), { type: "status", session });
   }).pipe(Effect.provide(CodexLiveEventHub.layer)),
 );
+
+it.effect("registers delivery before yielding the initial status barrier", () =>
+  Effect.gen(function* () {
+    const hub = yield* CodexLiveEventHub.CodexLiveEventHub;
+    yield* hub.register(session);
+    const events = yield* Stream.runCollect(
+      hub.subscribe({ leaseId: session.leaseId, generation: session.generation }).pipe(
+        Stream.tap((event) =>
+          event.type === "status"
+            ? hub.publish({
+                type: "answer",
+                leaseId: session.leaseId,
+                generation: session.generation,
+                sdp: "v=0",
+              })
+            : Effect.void,
+        ),
+        Stream.take(2),
+      ),
+    );
+    assert.deepEqual(Array.from(events), [
+      { type: "status", session },
+      {
+        type: "answer",
+        leaseId: session.leaseId,
+        generation: session.generation,
+        sdp: "v=0",
+      },
+    ]);
+  }).pipe(Effect.provide(CodexLiveEventHub.layer)),
+);
