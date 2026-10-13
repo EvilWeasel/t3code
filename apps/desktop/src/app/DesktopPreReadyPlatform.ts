@@ -99,6 +99,9 @@ export const make = Effect.gen(function* () {
             displayName: resolveDesktopAppBranding({
               isDevelopment: linux.isDevelopment,
               appVersion: Electron.app.getVersion(),
+              ...(process.env.T3CODE_DESKTOP_PROFILE === undefined
+                ? {}
+                : { profileId: process.env.T3CODE_DESKTOP_PROFILE }),
             }).displayName,
             execTarget: process.env.APPIMAGE?.trim() || process.execPath,
             scheme: ElectronProtocol.getDesktopScheme(linux.isDevelopment),

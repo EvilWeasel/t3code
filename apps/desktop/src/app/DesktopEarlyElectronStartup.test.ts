@@ -89,6 +89,17 @@ describe("DesktopEarlyElectronStartup", () => {
     });
   });
 
+  it("uses a distinct early desktop entry for the packaged Weasel profile", () => {
+    const options = resolveEarlyLinuxElectronOptions({
+      env: { T3CODE_DESKTOP_PROFILE: "weasel", T3CODE_HOME: "/home/user/.t3-weasel" },
+      homeDirectory: "/home/user",
+      joinPath,
+      readFileString: () => JSON.stringify({ linuxPasswordStore: "auto" }),
+    });
+    assert.equal(options.linuxDesktopEntryName, "com.evilweasel.T3Code.desktop");
+    assert.equal(options.linuxWmClass, "t3code-weasel");
+  });
+
   it("keeps implicit development state under ~/.t3/dev when T3CODE_HOME is unset", () => {
     const preference = resolveEarlyLinuxPasswordStorePreference({
       env: {

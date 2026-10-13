@@ -77,6 +77,22 @@ import * as DesktopWslBackend from "./wsl/DesktopWslBackend.ts";
 import * as DesktopWslEnvironment from "./wsl/DesktopWslEnvironment.ts";
 import * as DesktopWslServerTree from "./wsl/DesktopWslServerTree.ts";
 
+if (Electron.app.isPackaged) {
+  try {
+    const packageMetadata = JSON.parse(
+      NodeFS.readFileSync(`${Electron.app.getAppPath()}/package.json`, "utf8"),
+    ) as { t3codeProfile?: unknown };
+    if (packageMetadata.t3codeProfile === "weasel") {
+      process.env.T3CODE_DESKTOP_PROFILE = "weasel";
+      if (!process.env.T3CODE_HOME?.trim()) {
+        process.env.T3CODE_HOME = `${NodeOS.homedir()}/.t3-weasel`;
+      }
+    }
+  } catch {
+    // Upstream and development packages have no fork profile marker.
+  }
+}
+
 if (process.argv.includes("--version")) {
   try {
     NodeFS.writeSync(process.stdout.fd, `${Electron.app.getVersion()}\n`);

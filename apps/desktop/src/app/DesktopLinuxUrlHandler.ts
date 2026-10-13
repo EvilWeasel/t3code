@@ -252,8 +252,14 @@ export const make = Effect.gen(function* () {
       ),
     );
 
-    yield* setDefaultHandler;
-    yield* logInfo("registered URL scheme handler", { scheme });
+    if (Option.getOrUndefined(environment.profileId ?? Option.none()) !== "weasel") {
+      yield* setDefaultHandler;
+    }
+    yield* logInfo("registered URL scheme handler", {
+      scheme,
+      defaultHandlerSelected:
+        Option.getOrUndefined(environment.profileId ?? Option.none()) !== "weasel",
+    });
   }).pipe(
     // Registration is best-effort: a missing xdg-mime or read-only home must
     // never block startup — the OS chooser remains as fallback.
