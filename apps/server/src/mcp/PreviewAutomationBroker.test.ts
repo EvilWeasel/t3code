@@ -630,6 +630,8 @@ it.effect("removes host availability when the authoritative request stream disco
         .invoke<void>({ scope, operation: "status", input: {} })
         .pipe(Effect.flip);
       expect(error).toBeInstanceOf(PreviewAutomationNoAvailableHostError);
+      expect(error.message).toContain("No preview automation host is available");
+      expect(error.message).toContain("server-owned browser may be starting or reconnecting");
     }),
   ),
 );
@@ -670,6 +672,104 @@ it.effect("routes requests for background threads through an environment-level h
       expect(routedThreadId).toBe(backgroundThreadId);
     }),
   ),
+);
+
+it.effect(
+  "keeps browser tab assignments isolated across threads sharing one provider session",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const broker = yield* makeBroker;
+        const firstThreadId = ThreadId.make("thread-background-one");
+        const secondThreadId = ThreadId.make("thread-background-two");
+        const focusedThreadId = ThreadId.make("thread-focused-three");
+        const firstTabId = PreviewTabId.make("tab-background-one");
+        const secondTabId = PreviewTabId.make("tab-background-two");
+        const requests: RoutedRequest[] = [];
+        const hostRequests = requestsFrom(yield* broker.connect(makeHost()));
+        yield* Stream.runForEach(hostRequests, (request) => {
+          requests.push(request);
+          const tabId =
+            request.threadId === firstThreadId
+              ? firstTabId
+              : request.threadId === secondThreadId
+                ? secondTabId
+                : undefined;
+          return broker.respond({
+            clientId: "client-1",
+            connectionId: request.connectionId,
+            requestId: request.requestId,
+            ok: true,
+            result:
+              request.operation === "open"
+                ? { available: true, ...(tabId === undefined ? {} : { tabId }) }
+                : { url: "https://example.test/" },
+          });
+        }).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+
+        const firstScope = {
+          ...scope,
+          thread: { ...scope.thread, threadId: firstThreadId, providerSessionId: "shared-session" },
+        };
+        const secondScope = {
+          ...scope,
+          thread: {
+            ...scope.thread,
+            threadId: secondThreadId,
+            providerSessionId: "shared-session",
+          },
+        };
+        yield* broker.invoke({ scope: firstScope, operation: "open", input: {} });
+        yield* broker.invoke({ scope: secondScope, operation: "open", input: {} });
+
+        let focusedConnectionId = "";
+        const focusedRequests = requestsFrom(
+          yield* broker.connect(makeHost({ clientId: "client-focused" })),
+          (connectionId) => {
+            focusedConnectionId = connectionId;
+          },
+        );
+        const requestsFromFocusedHost: RoutedRequest[] = [];
+        yield* Stream.runForEach(focusedRequests, (request) => {
+          requestsFromFocusedHost.push(request);
+          return broker.respond({
+            clientId: "client-focused",
+            connectionId: request.connectionId,
+            requestId: request.requestId,
+            ok: true,
+            result: { url: "https://focused.test/" },
+          });
+        }).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        yield* broker.focusHost({
+          clientId: "client-focused",
+          environmentId: scope.environmentId,
+          connectionId: focusedConnectionId,
+          focused: true,
+          liveTabs: [
+            {
+              threadId: focusedThreadId,
+              tabId: PreviewTabId.make("tab-focused-three"),
+              visible: true,
+            },
+          ],
+        });
+
+        yield* broker.invoke({ scope: firstScope, operation: "snapshot", input: {} });
+        yield* broker.invoke({ scope: secondScope, operation: "snapshot", input: {} });
+
+        expect(
+          requests
+            .filter((request) => request.operation === "snapshot")
+            .map((request) => [request.threadId, request.tabId]),
+        ).toEqual([
+          [firstThreadId, firstTabId],
+          [secondThreadId, secondTabId],
+        ]);
+        expect(requestsFromFocusedHost).toHaveLength(0);
+      }),
+    ),
 );
 
 it.effect("never routes a provider session to a host from another environment", () =>
