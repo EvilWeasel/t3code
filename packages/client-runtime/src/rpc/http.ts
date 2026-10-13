@@ -7,6 +7,7 @@ import {
   type EnvironmentRequestInvalidError,
   type EnvironmentResourceNotFoundError,
   type EnvironmentScopeRequiredError,
+  VoiceTranscriptionHttpError,
 } from "@t3tools/contracts";
 import * as HttpObservability from "@t3tools/shared/httpObservability";
 import * as Data from "effect/Data";
@@ -19,6 +20,7 @@ import { FetchHttpClient, HttpClient, HttpClientError } from "effect/http";
 import * as HttpApiClient from "effect/http-api/HttpApiClient";
 
 const isEnvironmentHttpCommonError = Schema.is(EnvironmentHttpCommonError);
+const isVoiceTranscriptionHttpError = Schema.is(VoiceTranscriptionHttpError);
 
 export class RemoteEnvironmentAuthFetchError extends Data.TaggedError(
   "RemoteEnvironmentAuthFetchError",
@@ -70,6 +72,7 @@ export type RemoteEnvironmentRequestError =
   | EnvironmentRequestInvalidError
   | EnvironmentAuthInvalidError
   | EnvironmentScopeRequiredError
+  | VoiceTranscriptionHttpError
   | EnvironmentOperationForbiddenError
   | EnvironmentResourceNotFoundError
   | EnvironmentInternalError
@@ -124,6 +127,9 @@ const failRemoteRequest = (
   cause: unknown,
 ): Effect.Effect<never, RemoteEnvironmentRequestError> => {
   if (cause instanceof RemoteEnvironmentAuthTimeoutError) {
+    return Effect.fail(cause);
+  }
+  if (isVoiceTranscriptionHttpError(cause)) {
     return Effect.fail(cause);
   }
   if (isEnvironmentHttpCommonError(cause)) {

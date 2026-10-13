@@ -1,7 +1,11 @@
 import { act } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { useVoiceDictation, type VoiceDictationTranscriber } from "./useVoiceDictation";
+import {
+  useVoiceDictation,
+  VoiceDictationServiceError,
+  type VoiceDictationTranscriber,
+} from "./useVoiceDictation";
 
 class FakeMediaRecorder {
   static instance: FakeMediaRecorder | null = null;
@@ -119,6 +123,24 @@ describe("useVoiceDictation", () => {
     await act(async () => latest?.transcribe());
     expect(onTranscript).toHaveBeenCalledWith("retry worked");
     expect(revokedUrls).toEqual(["blob:voice-review"]);
+  });
+
+  it("shows a validated provider failure message and keeps the recording available to retry", async () => {
+    const transcribe = vi
+      .fn<VoiceDictationTranscriber>()
+      .mockRejectedValue(
+        new VoiceDictationServiceError("The transcription provider denied this request."),
+      );
+    render(transcribe);
+    await startAndStop();
+
+    await act(async () => latest?.transcribe());
+    expect(latest?.state).toEqual({
+      phase: "error",
+      message: "The transcription provider denied this request.",
+      audioUrl: "blob:voice-review",
+    });
+    expect(revokedUrls).toEqual([]);
   });
 
   it("cancels in-flight transcription and ignores a late result", async () => {

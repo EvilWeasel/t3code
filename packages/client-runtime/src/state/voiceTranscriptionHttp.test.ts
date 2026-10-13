@@ -86,6 +86,37 @@ describe("transcribeEnvironmentVoiceRecording", () => {
     }),
   );
 
+  it.effect("decodes only the typed provider failure contract from upstream 502 responses", () =>
+    Effect.gen(function* () {
+      const fetchFn = (() =>
+        Promise.resolve(
+          Response.json(
+            {
+              _tag: "VoiceTranscriptionHttpError",
+              code: "voice_transcription_failed",
+              reason: "upstream_forbidden",
+              detail: "Provider response detail is bounded by the service contract.",
+            },
+            { status: 502 },
+          ),
+        )) satisfies typeof fetch;
+      const error = yield* transcribeEnvironmentVoiceRecording({
+        prepared: PREPARED,
+        audio: new Blob(["sample"], { type: "audio/webm" }),
+        filename: "voice-message.webm",
+        signal: new AbortController().signal,
+        signer: Option.none(),
+        remoteAuthorization: Option.none(),
+      }).pipe(Effect.provide(RpcHttp.layerRemoteHttpClient(fetchFn)), Effect.flip);
+
+      expect(error._tag).toBe("VoiceTranscriptionHttpError");
+      if (error._tag === "VoiceTranscriptionHttpError") {
+        expect(error.reason).toBe("upstream_forbidden");
+        expect(error.detail).toBe("Provider response detail is bounded by the service contract.");
+      }
+    }),
+  );
+
   it.effect("signs the voice URL with the selected relay environment's DPoP session", () =>
     Effect.gen(function* () {
       const calls: Array<readonly [RequestInfo | URL, RequestInit]> = [];
