@@ -21,12 +21,15 @@ done
 [[ "$(uname -m)" == x86_64 ]] || die 'this installer currently supports x86_64 only'
 releases_json="$(curl --fail --silent --show-error --location "https://api.github.com/repos/$repo/releases?per_page=100")" \
   || die 'could not read public fork releases'
-release_json="$(jq -cer '[.[] | select(.draft == false and (.tag_name | test("weasel"; "i")))] | sort_by(.published_at) | last' <<<"$releases_json")" \
-  || die 'no fork-owned Weasel prerelease found'
+release_json="$(jq -cer '[.[] | select(
+  .draft == false and .prerelease == true and
+  (.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{8}\\.[0-9]+$")) and
+  (.name | startswith("Weasel Nightly"))
+)] | sort_by(.published_at) | last' <<<"$releases_json")" \
+  || die 'no fork-owned Weasel Nightly release found'
 tag="$(jq -er '.tag_name' <<<"$release_json")" \
   || die 'selected release has no tag'
 version="${tag#v}"
-version="${version#weasel-}"
 asset_name="$asset_prefix$version$asset_suffix"
 asset_url="$(jq -er --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$release_json")" \
   || die "release $tag does not contain $asset_name"

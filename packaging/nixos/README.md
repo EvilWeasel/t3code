@@ -37,8 +37,12 @@ That command downloads the installer and its Nix expression from the fork's
 
 The command reads only the latest release of `EvilWeasel/t3code` and requires
 its versioned `T3-Code-<version>-x86_64.AppImage` asset and GitHub SHA-256
-digest. It selects only a release tag containing `weasel` and orders matching
-releases by GitHub publication time, so pre-fork releases cannot be installed.
+digest. It selects only prereleases with the standard
+`v<major>.<minor>.<patch>-nightly.<date>.<run>` tag and a release name starting
+with `Weasel Nightly`, then orders matches by GitHub publication time. The
+fixed `EvilWeasel/t3code` repository plus this release-name marker exclude
+pre-fork releases while keeping the standard channel shape expected by the
+desktop updater.
 It creates a user-local launcher at `~/.local/bin/t3code-weasel`, a
 visible `T3 Code (Weasel Nightly)` desktop entry, and versioned package links
 below `~/.local/share/t3code-weasel/versions`. Each version link is a Nix build
