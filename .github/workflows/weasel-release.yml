@@ -14,6 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -58,10 +59,13 @@ jobs:
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           RELEASE_RUN: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           upstream_metadata="$RUNNER_TEMP/upstream-nightly.txt"
-          release_date="$(date -u +%Y%m%d)"
+          run_created_at="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID" --jq .created_at)"
+          release_date="$(bash scripts/weasel/resolve-run-date.sh "$run_created_at")"
           node scripts/resolve-nightly-release.ts \
             --date "$release_date" \
             --run-number "$RELEASE_RUN" \
@@ -368,6 +372,7 @@ jobs:
           set -euo pipefail
           tag="${{ needs.preflight.outputs.tag }}"
           source_sha="${{ needs.preflight.outputs.source_sha }}"
+          version="${{ needs.preflight.outputs.version }}"
           assert_draft_release() {
             local release_state is_draft target_commitish
             release_state="$(gh release view "$tag" --json isDraft,targetCommitish)"
@@ -383,6 +388,12 @@ jobs:
             fi
           }
           if gh release view "$tag" >/dev/null 2>&1; then
+            release_state="$(gh release view "$tag" --json isDraft,targetCommitish)"
+            if [[ "$(jq -r .isDraft <<<"$release_state")" == "false" ]]; then
+              bash scripts/weasel/verify-published-release.sh \
+                "$tag" "$source_sha" "$version" release-assets
+              exit 0
+            fi
             assert_draft_release
           else
             gh release create "$tag" \
@@ -401,6 +412,8 @@ jobs:
           lock_sha="$(sha256sum pnpm-lock.yaml | cut -d ' ' -f 1)"
           assets_json="$(gh api "repos/EvilWeasel/t3code/releases/tags/$tag" --jq '[.assets[] | select(.name != "RELEASE-RECEIPT.txt") | {name, digest}]')"
           jq -e 'length > 0 and all(.[]; (.digest | type == "string") and (.digest | startswith("sha256:")))' <<<"$assets_json"
+          expected_assets="$(find release-assets -maxdepth 1 -type f ! -name 'RELEASE-RECEIPT.txt' -printf '%f\n' | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')"
+          jq -e --argjson expected "$expected_assets" '([.[].name] | sort) == $expected' <<<"$assets_json"
           {
             printf 'fork_release=%s\nsource_sha=%s\npnpm_lock_sha256=%s\n' "$tag" "$source_sha" "$lock_sha"
             printf 'github_asset_digests=%s\n' "$(jq -c '[.[] | {name, digest}]' <<<"$assets_json")"

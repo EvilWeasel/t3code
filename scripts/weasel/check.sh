@@ -30,7 +30,6 @@ focused_tests=(
 voice_tests=(
   apps/web/src/voice/useVoiceDictation.test.tsx
   packages/client-runtime/src/state/voiceTranscriptionHttp.test.ts
-  apps/server/src/voice/VoiceTranscriptionService.test.ts
 )
 for voice_test in "${voice_tests[@]}"; do
   if [[ -f "$voice_test" ]]; then
@@ -42,5 +41,11 @@ for voice_test in "${voice_tests[@]}"; do
     exit 1
   fi
 done
+server_voice_test=apps/server/src/voice/VoiceTranscriptionService.test.ts
+if [[ ! -f "$server_voice_test" ]]; then
+  echo "Required server voice gate is missing: $server_voice_test" >&2
+  exit 1
+fi
+focused_tests+=("$server_voice_test")
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts)

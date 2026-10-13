@@ -12,3 +12,11 @@ if bash scripts/weasel/resolve-version.sh invalid 20261013 1 >/dev/null 2>&1; th
   echo "Invalid base versions must be rejected." >&2
   exit 1
 fi
+
+run_date="$(bash scripts/weasel/resolve-run-date.sh 2026-10-13T23:59:58Z)"
+if [[ "$run_date" != "20261013" ]]; then
+  echo "Release date must come from the immutable workflow run creation time." >&2
+  exit 1
+fi
+
+bash scripts/weasel/verify-published-release.test.sh
