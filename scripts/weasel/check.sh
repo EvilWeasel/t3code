@@ -30,6 +30,7 @@ focused_tests=(
 voice_tests=(
   apps/web/src/voice/useVoiceDictation.test.tsx
   packages/client-runtime/src/state/voiceTranscriptionHttp.test.ts
+  apps/server/src/voice/VoiceTranscriptionService.test.ts
 )
 for voice_test in "${voice_tests[@]}"; do
   if [[ -f "$voice_test" ]]; then

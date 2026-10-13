@@ -953,14 +953,17 @@ export const make = Effect.gen(function* () {
   const describePrimary = Effect.gen(function* () {
     const persistedSettings = yield* settings.get;
     const wslRequested = persistedSettings.wslOnly && persistedSettings.wslBackendEnabled;
+    const weaselProfile = Option.getOrUndefined(environment.profileId) === "weasel";
     // Only honor wsl-only when WSL is actually usable. If the user
     // persisted wsl-only but WSL has since become unavailable (wsl.exe
     // removed, no distro), fall back to the Windows primary instead of
     // looping forever on preflight failures: the Connections backend
     // control is hidden while WSL is unavailable, so a stuck WSL primary
-    // would otherwise leave no in-app way back to Windows.
-    const useWsl = wslRequested && (yield* wslEnvironment.isAvailable);
-    return { useWsl, wslRequested, distro: persistedSettings.wslDistro };
+    // would otherwise leave no in-app way back to Windows. The Weasel profile
+    // always starts its native Windows primary; its WSL path is blocked before
+    // any distro prewarm or runtime staging can run.
+    const useWsl = wslRequested && !weaselProfile && (yield* wslEnvironment.isAvailable);
+    return { useWsl, wslRequested, weaselProfile, distro: persistedSettings.wslDistro };
   });
 
   const currentBootstrapToken = Effect.gen(function* () {
@@ -971,13 +974,15 @@ export const make = Effect.gen(function* () {
   return DesktopBackendConfiguration.of({
     currentBootstrapToken,
     resolvePrimary: Effect.gen(function* () {
-      const { useWsl, wslRequested } = yield* describePrimary;
+      const { useWsl, wslRequested, weaselProfile } = yield* describePrimary;
       if (useWsl) {
         return yield* buildWslPrimaryConfig;
       }
       if (wslRequested) {
         yield* Effect.logWarning(
-          "WSL-only backend requested but WSL is unavailable; starting the Windows primary instead.",
+          weaselProfile
+            ? "WSL-only backend requested for the Weasel profile; starting the Windows primary instead."
+            : "WSL-only backend requested but WSL is unavailable; starting the Windows primary instead.",
         );
       }
       return yield* buildWindowsPrimaryConfig;

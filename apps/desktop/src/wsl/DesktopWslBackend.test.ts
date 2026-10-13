@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -6,6 +7,8 @@ import * as Option from "effect/Option";
 
 import * as NetService from "@t3tools/shared/Net";
 
+import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopBackendConfiguration from "../backend/DesktopBackendConfiguration.ts";
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
 import type {
@@ -83,6 +86,26 @@ const layerNet = Layer.succeed(NetService.NetService, {
   findAvailablePort: (preferred) => Effect.succeed(preferred),
 } satisfies NetService.NetService["Service"]);
 
+const layerEnvironment = (profileId?: string) =>
+  DesktopEnvironment.layer({
+    dirname: "/repo/apps/desktop/src",
+    homeDirectory: "/tmp/t3-wsl-backend-test",
+    platform: "win32",
+    processArch: "x64",
+    appVersion: "1.2.3",
+    appPath: "/repo",
+    isPackaged: true,
+    resourcesPath: "/repo/resources",
+    runningUnderArm64Translation: false,
+  }).pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        DesktopConfig.layerTest({ T3CODE_DESKTOP_PROFILE: profileId }),
+      ),
+    ),
+  );
+
 describe("DesktopWslBackend", () => {
   it.effect("does not discover or start WSL when local execution is disabled", () =>
     Effect.gen(function* () {
@@ -91,6 +114,7 @@ describe("DesktopWslBackend", () => {
     }).pipe(
       Effect.provide(
         DesktopWslBackend.layer.pipe(
+          Layer.provide(layerEnvironment()),
           Layer.provide(Layer.mock(DesktopBackendPool.DesktopBackendPool, {})),
           Layer.provide(layerBackendConfiguration),
           Layer.provide(layerServerExposure),
@@ -107,6 +131,44 @@ describe("DesktopWslBackend", () => {
       ),
     ),
   );
+  it.effect("does not probe or prewarm WSL for the Weasel profile", () => {
+    const layerPool = Layer.succeed(DesktopBackendPool.DesktopBackendPool, {
+      get: () => Effect.die("unexpected get"),
+      list: Effect.succeed([]),
+      primary: Effect.die("unexpected primary"),
+      register: () => Effect.die("Weasel must not register WSL"),
+      unregister: () => Effect.die("unexpected unregister"),
+    } satisfies DesktopBackendPool.DesktopBackendPool["Service"]);
+
+    return Effect.gen(function* () {
+      const backend = yield* DesktopWslBackend.DesktopWslBackend;
+      yield* backend.reconcile;
+      assert.deepEqual(
+        yield* backend.lastPreflightError,
+        Option.some(
+          "Weasel WSL is disabled until its Linux T3 home and WSL runtime cache are isolated from the upstream profile.",
+        ),
+      );
+    }).pipe(
+      Effect.provide(
+        DesktopWslBackend.layer.pipe(
+          Layer.provideMerge(layerPool),
+          Layer.provideMerge(layerBackendConfiguration),
+          Layer.provideMerge(layerServerExposure),
+          Layer.provideMerge(layerNet),
+          Layer.provideMerge(layerEnvironment("weasel")),
+          Layer.provideMerge(
+            DesktopAppSettings.layerTest({
+              ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
+              wslBackendEnabled: true,
+              wslOnly: false,
+            }),
+          ),
+          Layer.provideMerge(Layer.mock(DesktopWslEnvironment.DesktopWslEnvironment, {})),
+        ),
+      ),
+    );
+  });
   it.effect("clears the stored preflight error when a registered WSL backend becomes ready", () => {
     let registeredSpec: DesktopBackendPool.BackendInstanceSpec | undefined;
     const primary = makeStubInstance({
@@ -161,6 +223,7 @@ describe("DesktopWslBackend", () => {
     }).pipe(
       Effect.provide(
         DesktopWslBackend.layer.pipe(
+          Layer.provideMerge(layerEnvironment()),
           Layer.provideMerge(layerPool),
           Layer.provideMerge(layerBackendConfiguration),
           Layer.provideMerge(layerServerExposure),
@@ -204,6 +267,7 @@ describe("DesktopWslBackend", () => {
     }).pipe(
       Effect.provide(
         DesktopWslBackend.layer.pipe(
+          Layer.provideMerge(layerEnvironment()),
           Layer.provideMerge(DesktopBackendPool.layerTest([primary, wsl])),
           Layer.provideMerge(layerBackendConfiguration),
           Layer.provideMerge(layerServerExposure),

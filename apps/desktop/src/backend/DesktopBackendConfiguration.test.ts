@@ -1262,6 +1262,47 @@ describe("DesktopBackendConfiguration", () => {
   );
 
   it.effect(
+    "resolvePrimary keeps the Weasel profile on Windows without probing WSL when wsl-only is persisted",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-desktop-backend-config-test-",
+        });
+
+        yield* Effect.gen(function* () {
+          const environment = yield* DesktopEnvironment.DesktopEnvironment;
+          const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+          const config = yield* configuration.resolvePrimary;
+          const label = yield* configuration.resolvePrimaryLabel;
+
+          assert.equal(config.executablePath, process.execPath);
+          assert.equal(config.bootstrap.t3Home, environment.baseDir);
+          assert.equal(label, "Windows");
+          assert.isTrue(Option.isNone(config.preflightFailure));
+        }).pipe(
+          Effect.provide(
+            DesktopBackendConfiguration.layer.pipe(
+              Layer.provideMerge(layerServerExposure),
+              Layer.provideMerge(
+                DesktopAppSettings.layerTest({
+                  ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
+                  wslBackendEnabled: true,
+                  wslOnly: true,
+                }),
+              ),
+              Layer.provideMerge(DesktopWslServerTree.layerTest()),
+              Layer.provideMerge(DesktopWslEnvironment.layerTest({ isAvailable: true })),
+              Layer.provideMerge(
+                layerEnvironment(baseDir, { platform: "win32", profileId: "weasel" }),
+              ),
+            ),
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
     "resolvePrimary marks a removed persisted WSL distro as a fatal preflight failure",
     () =>
       Effect.gen(function* () {
