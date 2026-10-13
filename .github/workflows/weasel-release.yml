@@ -187,8 +187,8 @@ jobs:
           test "${#stage_roots[@]}" -gt 0
           update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
           test -n "$update_config"
-          rg -q 'owner: EvilWeasel' "$update_config"
-          rg -q 'repo: t3code' "$update_config"
+          grep -Fq 'owner: EvilWeasel' "$update_config"
+          grep -Fq 'repo: t3code' "$update_config"
 
       - name: Prepare NixOS download bundle
         run: |
@@ -222,6 +222,15 @@ jobs:
         with:
           name: weasel-release-cli-linux
           path: release-cli/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Preserve built Linux files after a later failure
+        if: ${{ failure() && hashFiles('release-linux/*.AppImage') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-linux-built-diagnostic
+          path: release-linux/*
           if-no-files-found: error
           retention-days: 1
 
@@ -305,8 +314,8 @@ jobs:
           [[ -n "${TMP:-}" ]] && tmp_roots+=("$TMP")
           update_config="$(find "${tmp_roots[@]}" -path '*/resources/app-update.yml' -print -quit 2>/dev/null || true)"
           test -n "$update_config"
-          rg -q 'owner: EvilWeasel' "$update_config"
-          rg -q 'repo: t3code' "$update_config"
+          grep -Fq 'owner: EvilWeasel' "$update_config"
+          grep -Fq 'repo: t3code' "$update_config"
 
       - name: Package and smoke-test Windows CLI archive
         shell: bash
