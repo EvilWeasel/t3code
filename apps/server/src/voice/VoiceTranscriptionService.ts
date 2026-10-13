@@ -335,6 +335,8 @@ export const layer: Layer.Layer<
             const codexEnvironment = { ...environment };
             delete codexEnvironment.T3CODE_TRANSCRIPTION_API_KEY;
             delete codexEnvironment.OPENAI_API_KEY;
+            // withCodexAppServerClient supplies the T3 Code originator itself.
+            delete codexEnvironment.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
             const { client: codex } = yield* CodexProvider.withCodexAppServerClient({
               binaryPath: config.binaryPath,
               homePath: config.homePath,
