@@ -16,7 +16,7 @@ permissions:
 jobs:
   forward:
     name: POST to Cursor
-    runs-on: ubuntu-24.04
+    runs-on: namespace-profile-ci-builder
     steps:
       - name: POST to Cursor
         env:

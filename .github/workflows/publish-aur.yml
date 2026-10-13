@@ -37,7 +37,7 @@ concurrency:
 jobs:
   publish:
     name: Validate and publish
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: namespace-profile-ci-builder
     timeout-minutes: 30
     container:
       image: archlinux:base-devel

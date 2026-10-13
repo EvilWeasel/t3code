@@ -17,7 +17,7 @@ permissions:
 jobs:
   sync:
     if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
     timeout-minutes: 35
     steps:
       - name: Require workflow-capable upstream sync token

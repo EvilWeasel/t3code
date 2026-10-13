@@ -92,7 +92,7 @@ concurrency:
 jobs:
   production:
     name: EAS ${{ inputs.profile || 'production' }} ${{ github.event_name == 'push' && 'auto' || inputs.mode }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: namespace-profile-ci-builder
     permissions:
       contents: read
     env:

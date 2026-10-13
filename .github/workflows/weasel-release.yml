@@ -20,7 +20,7 @@ permissions:
 jobs:
   preflight:
     if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
     timeout-minutes: 15
     outputs:
       source_sha: ${{ steps.release.outputs.source_sha }}
@@ -46,8 +46,15 @@ jobs:
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: true
-          run-install: true
+          cache: ${{ !startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-') }}
+          run-install: false
+      - name: Restore Namespace dependency volume
+        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          cache: pnpm
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
 
       - name: Check source before release
         run: |
@@ -87,7 +94,7 @@ jobs:
 
   build_bundle:
     needs: [preflight]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
     timeout-minutes: 30
     steps:
       - name: Checkout source
@@ -100,8 +107,14 @@ jobs:
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: true
+          cache: ${{ !startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-') }}
           run-install: false
+
+      - name: Restore Namespace dependency volume
+        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          cache: pnpm
 
       - name: Install bundle dependencies
         run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
@@ -126,7 +139,7 @@ jobs:
 
   build_linux:
     needs: [preflight, build_bundle]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
     timeout-minutes: 80
     permissions:
       contents: read
@@ -143,6 +156,12 @@ jobs:
           node-version-file: package.json
           cache: true
           run-install: false
+
+      - name: Restore Namespace dependency volume
+        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          cache: pnpm
 
       - name: Install Linux build dependencies
         run: |
@@ -348,7 +367,7 @@ jobs:
 
   publish:
     needs: [preflight, build_linux, build_windows]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
     timeout-minutes: 15
     permissions:
       contents: write
