@@ -10,7 +10,8 @@ import { ProviderInstanceId } from "./providerInstance.ts";
 export const LiveVoiceLeaseId = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
 export const LiveVoiceGeneration = Schema.Number.check(
   Schema.makeFilter(
-    (value) => (Number.isInteger(value) && value >= 1) || "Expected a positive integer generation.",
+    (value) =>
+      (Number.isSafeInteger(value) && value >= 1) || "Expected a positive integer generation.",
   ),
 );
 export const LiveVoiceClientRequestId = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
@@ -60,14 +61,47 @@ export const LiveVoiceStatus = Schema.Literals([
 ]);
 export type LiveVoiceStatus = typeof LiveVoiceStatus.Type;
 
+export const LiveVoiceErrorCode = Schema.Literals([
+  "unsupported_provider",
+  "managed_account_required",
+  "session_not_found",
+  "stale_lease",
+  "planner_restriction_failed",
+  "invalid_state",
+  "dispatch_conflict",
+  "runtime_unavailable",
+]);
+export type LiveVoiceErrorCode = typeof LiveVoiceErrorCode.Type;
+
+export const liveVoicePublicErrorMessage = (code: LiveVoiceErrorCode): string => {
+  switch (code) {
+    case "unsupported_provider":
+      return "Live voice is available only for a managed Codex thread.";
+    case "managed_account_required":
+      return "Sign in to a supported ChatGPT account to use Live voice.";
+    case "session_not_found":
+      return "This Live voice session is no longer available.";
+    case "stale_lease":
+      return "This Live voice session has changed. Reconnect to continue.";
+    case "planner_restriction_failed":
+      return "Live voice could not establish its restricted planning session.";
+    case "invalid_state":
+      return "This action is not available in the current Live voice state.";
+    case "dispatch_conflict":
+      return "This voice request conflicts with a request already submitted.";
+    case "runtime_unavailable":
+      return "The Codex runtime is currently unavailable.";
+  }
+};
+
 export const LiveVoiceSession = Schema.Struct({
   leaseId: LiveVoiceLeaseId,
   generation: LiveVoiceGeneration,
   environmentId: EnvironmentId,
   threadId: ThreadId,
   providerInstanceId: ProviderInstanceId,
-  providerSessionId: ProviderSessionId,
-  plannerNativeThreadId: TrimmedNonEmptyString,
+  providerSessionId: Schema.NullOr(ProviderSessionId),
+  plannerNativeThreadId: Schema.NullOr(TrimmedNonEmptyString),
   status: LiveVoiceStatus,
 });
 export type LiveVoiceSession = typeof LiveVoiceSession.Type;
@@ -91,25 +125,15 @@ export const LiveVoiceEvent = Schema.Union([
     type: Schema.Literal("error"),
     leaseId: LiveVoiceLeaseId,
     generation: LiveVoiceGeneration,
-    message: TrimmedNonEmptyString.check(Schema.isMaxLength(1_024)),
+    code: LiveVoiceErrorCode,
   }),
 ]);
 export type LiveVoiceEvent = typeof LiveVoiceEvent.Type;
 
 export class LiveVoiceError extends Schema.TaggedError<LiveVoiceError>()("LiveVoiceError", {
-  code: Schema.Literals([
-    "unsupported_provider",
-    "managed_account_required",
-    "session_not_found",
-    "stale_lease",
-    "planner_restriction_failed",
-    "invalid_state",
-    "dispatch_conflict",
-    "runtime_unavailable",
-  ]),
-  detail: TrimmedNonEmptyString.check(Schema.isMaxLength(1_024)),
+  code: LiveVoiceErrorCode,
 }) {
   override get message(): string {
-    return this.detail;
+    return liveVoicePublicErrorMessage(this.code);
   }
 }

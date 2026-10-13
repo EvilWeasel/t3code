@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import {
+  LiveVoiceGeneration,
+  LiveVoiceSession,
   LiveVoicePrepareInput,
   LiveVoiceStartInput,
   LiveVoiceSubscribeInput,
@@ -27,6 +29,24 @@ describe("subscription Codex Live contracts", () => {
         clientRequestId: "request-1",
       }),
     ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(LiveVoiceGeneration)(Number.MAX_SAFE_INTEGER + 1),
+    ).toThrow();
+  });
+
+  it("represents preparation and recovery without fabricated provider identities", () => {
+    expect(
+      Schema.decodeUnknownSync(LiveVoiceSession)({
+        leaseId: "lease-1",
+        generation: 1,
+        environmentId: "env-1",
+        threadId: "thread-1",
+        providerInstanceId: "codex-default",
+        providerSessionId: null,
+        plannerNativeThreadId: null,
+        status: "preparing",
+      }).plannerNativeThreadId,
+    ).toBeNull();
   });
 
   it("keeps client signaling free of provider credentials and arbitrary targets", () => {
