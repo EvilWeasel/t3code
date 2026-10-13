@@ -8,6 +8,7 @@ import * as HttpApiMiddleware from "effect/http-api/HttpApiMiddleware";
 import * as HttpApiSchema from "effect/http-api/HttpApiSchema";
 import * as HttpServerRespondable from "effect/http/HttpServerRespondable";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
+import * as Multipart from "effect/http/Multipart";
 
 import {
   AuthAccessTokenResult,
@@ -673,6 +674,21 @@ class EnvironmentPullRequestsHttpApi extends HttpApiGroup.make("pullRequests").a
   }).middleware(EnvironmentAuthenticatedAuth),
 ) {}
 
+export const VoiceTranscriptionUpload = HttpApiSchema.asMultipart({
+  maxParts: 1,
+  maxFileSize: 25 * 1024 * 1024,
+  maxTotalSize: 25 * 1024 * 1024,
+})(Schema.Struct({ audio: Multipart.SingleFileSchema }));
+export const VoiceTranscriptionResult = Schema.Struct({ transcript: Schema.String });
+class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice").add(
+  HttpApiEndpoint.post("voiceTranscription", "/api/voice/transcription", {
+    headers: OptionalBearerHeaders,
+    payload: VoiceTranscriptionUpload,
+    success: VoiceTranscriptionResult,
+    error: [EnvironmentAuthInvalidError, EnvironmentScopeRequiredError, EnvironmentInternalError],
+  }).middleware(EnvironmentAuthenticatedAuth),
+) {}
+
 class EnvironmentConnectHttpApi extends HttpApiGroup.make("connect")
   .add(
     HttpApiEndpoint.post("linkProof", "/api/connect/link-proof", {
@@ -764,6 +780,7 @@ export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMcpOAuthHttpApi)
   .add(EnvironmentOrchestrationHttpApi)
   .add(EnvironmentPullRequestsHttpApi)
+  .add(EnvironmentVoiceHttpApi)
   .add(EnvironmentProjectsHttpApi)
   .add(EnvironmentConnectHttpApi)
   .add(EnvironmentWebhooksHttpApi) {}
