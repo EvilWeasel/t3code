@@ -20,3 +20,4 @@ if [[ "$run_date" != "20261013" ]]; then
 fi
 
 bash scripts/weasel/verify-published-release.test.sh
+bash scripts/weasel/read-draft-release-assets.test.sh

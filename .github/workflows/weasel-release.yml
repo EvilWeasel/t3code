@@ -425,7 +425,7 @@ jobs:
           gh release upload "$tag" release-assets/* --clobber
 
           lock_sha="$(sha256sum pnpm-lock.yaml | cut -d ' ' -f 1)"
-          assets_json="$(gh api "repos/$GH_REPO/releases/tags/$tag" --jq '[.assets[] | select(.name != "RELEASE-RECEIPT.txt") | {name, digest}]')"
+          assets_json="$(bash scripts/weasel/read-draft-release-assets.sh "$tag" "$source_sha")"
           jq -e 'length > 0 and all(.[]; (.digest | type == "string") and (.digest | startswith("sha256:")))' <<<"$assets_json"
           expected_assets="$(find release-assets -maxdepth 1 -type f ! -name 'RELEASE-RECEIPT.txt' -printf '%f\n' | jq -Rsc 'split("\n") | map(select(length > 0)) | sort')"
           jq -e --argjson expected "$expected_assets" '([.[].name] | sort) == $expected' <<<"$assets_json"
