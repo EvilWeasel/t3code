@@ -49,5 +49,11 @@ if [[ ! -f "$server_voice_test" ]]; then
   exit 1
 fi
 focused_tests+=("$server_voice_test")
+server_http_test=apps/server/src/voice/http.test.ts
+if [[ ! -f "$server_http_test" ]]; then
+  echo "Required server voice HTTP gate is missing: $server_http_test" >&2
+  exit 1
+fi
+focused_tests+=("$server_http_test")
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts)
