@@ -271,6 +271,8 @@ import { ComposerPendingApprovalActions } from "./ComposerPendingApprovalActions
 import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerImageThumbnail } from "./ComposerImageThumbnail";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
+import { VoiceDictationControl } from "../../voice/VoiceDictationControl";
+import { transcribeVoiceRecording } from "../../voice/transcriptionClient";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
@@ -3081,6 +3083,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       setComposerDraftPrompt(composerDraftTarget, nextPrompt);
     },
     [composerDraftTarget, setComposerDraftPrompt],
+  );
+
+  const insertVoiceTranscript = useCallback(
+    (transcript: string, targetKey: string) => {
+      if (composerDraftTargetKeyRef.current !== targetKey) return;
+      const currentPrompt = promptRef.current;
+      const separator = currentPrompt.length === 0 || /\s$/.test(currentPrompt) ? "" : "\n";
+      const nextPrompt = `${currentPrompt}${separator}${transcript}`;
+      promptRef.current = nextPrompt;
+      setPrompt(nextPrompt);
+      setComposerCursor(collapseExpandedComposerCursor(nextPrompt, nextPrompt.length));
+      setComposerTrigger(null);
+      scheduleComposerFocus();
+    },
+    [promptRef, scheduleComposerFocus, setComposerTrigger, setPrompt],
   );
 
   const addComposerImage = useCallback(
@@ -7690,6 +7707,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   }
                   className="flex shrink-0 flex-nowrap items-center justify-end gap-2"
                 >
+                  {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
+                    <VoiceDictationControl
+                      targetKey={composerDraftTargetKey}
+                      currentTargetKey={() => composerDraftTargetKeyRef.current}
+                      transcribe={transcribeVoiceRecording(environmentId)}
+                      onTranscript={insertVoiceTranscript}
+                    />
+                  ) : null}
                   {showComposerAttachAction ? (
                     <>
                       <input
