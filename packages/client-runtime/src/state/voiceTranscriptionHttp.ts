@@ -12,7 +12,6 @@ import type { PreparedConnection } from "../connection/model.ts";
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import { executeAuthenticatedEnvironmentHttpRequest } from "./environmentHttpAuth.ts";
 
-const VOICE_PATH = "/api/voice/transcription";
 const TRANSCRIPTION_RESPONSE = Schema.Struct({ transcript: Schema.String });
 const decodeTranscriptionResponse = Schema.decodeUnknownEffect(TRANSCRIPTION_RESPONSE);
 
@@ -33,9 +32,9 @@ export const transcribeEnvironmentVoiceRecording = (input: {
     prepared: input.prepared,
     signer: input.signer,
     remoteAuthorization: input.remoteAuthorization,
-    group: "pullRequests",
+    group: "voice",
     method: "POST",
-    url: (urls) => new URL(VOICE_PATH, urls.diff()).toString(),
+    url: (urls) => urls.voiceTranscription(),
     timeoutMs: 60_000,
     request: ({ headers, url }) =>
       Effect.gen(function* () {

@@ -2,6 +2,7 @@ import { MicIcon, SquareIcon, Trash2Icon } from "lucide-react";
 import { useVoiceDictation, type VoiceDictationTranscriber } from "./useVoiceDictation";
 import { Button } from "~/components/ui/button";
 import { useEffect, useRef } from "react";
+import { useCallback } from "react";
 
 export function VoiceDictationControl(props: {
   readonly targetKey: string;
@@ -10,8 +11,23 @@ export function VoiceDictationControl(props: {
   readonly onTranscript: (text: string, targetKey: string) => void;
 }) {
   const recordedTargetKey = useRef(props.targetKey);
+  const recordingTranscriber = useRef<VoiceDictationTranscriber | null>(props.transcribe);
+  const transcribeCapturedRecording = useCallback<VoiceDictationTranscriber>(
+    (audio, options) => {
+      if (recordedTargetKey.current !== props.currentTargetKey()) {
+        return Promise.reject(
+          new Error("The selected environment changed. Discard and record again."),
+        );
+      }
+      const transcribe = recordingTranscriber.current;
+      return transcribe
+        ? transcribe(audio, options)
+        : Promise.reject(new Error("Transcription is unavailable for this environment."));
+    },
+    [props.currentTargetKey],
+  );
   const dictation = useVoiceDictation({
-    transcribe: props.transcribe,
+    transcribe: transcribeCapturedRecording,
     onTranscript: (text) => {
       const targetKey = recordedTargetKey.current;
       if (props.currentTargetKey() === targetKey) {
@@ -27,6 +43,7 @@ export function VoiceDictationControl(props: {
   useEffect(() => {
     if (recordedTargetKey.current !== props.targetKey) {
       cancelRef.current();
+      recordingTranscriber.current = null;
     }
     recordedTargetKey.current = props.targetKey;
   }, [props.targetKey]);
@@ -46,6 +63,7 @@ export function VoiceDictationControl(props: {
           onPointerDown={(event) => event.preventDefault()}
           onClick={() => {
             recordedTargetKey.current = props.targetKey;
+            recordingTranscriber.current = props.transcribe;
             void dictation.start();
           }}
           aria-label="Record voice message"
