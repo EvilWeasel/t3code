@@ -2713,6 +2713,13 @@ export function resolveDesktopWebAssetBrand(version: string): WebAssetBrand {
 }
 
 export function resolveDesktopBuildIconAssets(version: string): DesktopBuildIconAssets {
+  if (process.env.T3CODE_DESKTOP_PROFILE?.trim() === "weasel") {
+    return {
+      macIconPng: "assets/weasel/fork-1024.png",
+      linuxIconPng: "assets/weasel/fork-1024.png",
+      windowsIconIco: "assets/weasel/fork.ico",
+    };
+  }
   if (resolveDesktopUpdateChannel(version) === "nightly") {
     return {
       macIconPng: BRAND_ASSET_PATHS.nightlyMacIconPng,
