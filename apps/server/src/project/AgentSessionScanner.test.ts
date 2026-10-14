@@ -1859,7 +1859,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
                     thread: { messages: [{ text: "Replacement prompt" }] },
                   });
                 } else {
-                  expect(outcomes).toEqual([{ _tag: "Skipped" }]);
+                  expect(outcomes).toMatchObject([{ _tag: "Skipped", outcome: { reason: "workspace-mismatch", nativeContinuationEligible: false } }]);
                 }
               }).pipe(Effect.provide(layerScannerTest({ claudeHomePath, codexHomePath })));
             }),
@@ -2049,7 +2049,8 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           workspaceRoot: workspace,
         }).pipe(Effect.provideService(FileSystem.FileSystem, simulatedFileSystem));
 
-        expect(outcomes).toEqual([{ _tag: "Skipped" }, { _tag: "Skipped" }, { _tag: "Skipped" }]);
+        expect(outcomes.map((outcome) => outcome._tag)).toEqual(["Skipped", "Skipped", "Skipped"]);
+        expect(outcomes.every((outcome) => outcome._tag === "Skipped" && outcome.outcome?.nativeContinuationEligible === false)).toBe(true);
       }),
     );
 
@@ -2109,7 +2110,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
 
         expect(transcriptStatCount).toBe(2);
         expect(transcriptOpenCount).toBe(1);
-        expect(outcomes).toEqual([{ _tag: "Skipped" }]);
+        expect(outcomes).toMatchObject([{ _tag: "Skipped", outcome: { reason: "read-failed", nativeContinuationEligible: false } }]);
       }),
     );
 
@@ -2223,7 +2224,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
 
         expect(transcriptOpenCount).toBe(2);
         expect(fullReadBytes).toBe(new TextEncoder().encode(contents).byteLength);
-        expect(outcomes).toEqual([{ _tag: "Skipped" }]);
+        expect(outcomes).toMatchObject([{ _tag: "Skipped", outcome: { reason: "read-failed", nativeContinuationEligible: false } }]);
       }),
     );
 
@@ -2282,7 +2283,7 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         }).pipe(Effect.provideService(FileSystem.FileSystem, simulatedFileSystem));
 
         expect(transcriptOpenCount).toBe(2);
-        expect(outcomes).toEqual([{ _tag: "Skipped" }]);
+        expect(outcomes).toMatchObject([{ _tag: "Skipped", outcome: { reason: "read-failed", nativeContinuationEligible: false } }]);
       }),
     );
 
@@ -3200,3 +3201,128 @@ describe("parseAgentSessionTranscript", () => {
     expect(thread?.messages.at(-1)?.text).toBe("Assistant update 249");
   });
 });
+
+function opaqueFixtureAtWorkspace(contents: string, workspace: string) {
+  const lines = contents.trim().split("\n");
+  const metadata = JSON.parse(lines[0]!) as { type: string; payload: { id: string; cwd: string } };
+  lines[0] = JSON.stringify({ ...metadata, payload: { ...metadata.payload, cwd: workspace } });
+  return { contents: lines.join("\n"), providerSessionId: metadata.payload.id };
+}
+
+const scanRecoveryFixture = (contents: string, duplicate = false) =>
+  Effect.gen(function* () {
+    const path = yield* Path.Path;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const nowMs = Date.parse("2026-10-14T12:00:00.000Z");
+    yield* TestClock.setTime(nowMs);
+    const claudeHomePath = yield* makeTempDir("t3code-recovery-claude-");
+    const codexHomePath = yield* makeTempDir("t3code-recovery-codex-");
+    const workspace = yield* makeTempDir("t3code-recovery-workspace-");
+    const fixture = opaqueFixtureAtWorkspace(contents, workspace);
+    const filePath = path.join(codexHomePath, "sessions", "2026", "10", "14", "rollout.jsonl");
+    yield* writeTranscript({ filePath, contents: fixture.contents, mtimeMs: nowMs });
+    if (duplicate) {
+      yield* writeTranscript({
+        filePath: path.join(path.dirname(filePath), "rollout-copy.jsonl"),
+        contents: fixture.contents,
+        mtimeMs: nowMs - 1,
+      });
+    }
+    const outcomes = yield* runRecentThreadOutcomes({ claudeHomePath, codexHomePath, workspaceRoot: workspace });
+    expect(yield* fileSystem.readFileString(filePath)).toBe(fixture.contents);
+    return { outcomes, providerSessionId: fixture.providerSessionId };
+  });
+
+it.layer(NodeServices.layer)("Codex compaction recovery outcomes", (it) => {
+  it.effect.each([0, 1, 2, 3, 4, 5])("reports shape-equivalent native opaque case %s without synthetic chat", (index) =>
+    Effect.gen(function* () {
+      const { outcomes, providerSessionId } = yield* scanRecoveryFixture(opaqueCompactionShapeFixtures[index]!);
+      expect(outcomes).toEqual([{
+        _tag: "Skipped",
+        outcome: {
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerSessionId,
+          status: "skipped",
+          recoverability: "compaction-context",
+          reason: "opaque-context",
+          nativeContinuationEligible: false,
+        },
+      }]);
+      expect(outcomes.some((outcome) => outcome._tag === "Importable")).toBe(false);
+    }),
+  );
+
+  it.effect.each([undefined, "", "   ", 0, false, [], {}].map((encrypted) => ({ encrypted })))("rejects absent/empty/wrong-type opaque presence proof %s", ({ encrypted }) =>
+    Effect.gen(function* () {
+      const base = opaqueCompactionShapeFixtures[0].trim().split("\n");
+      base[1] = JSON.stringify({ type: "response_item", payload: { type: "compaction", encrypted_content: encrypted } });
+      const { outcomes } = yield* scanRecoveryFixture(base.join("\n"));
+      expect(outcomes).toMatchObject([{ _tag: "Skipped", outcome: {
+        recoverability: "unrecoverable", reason: "malformed-compaction", nativeContinuationEligible: false,
+      } }]);
+    }),
+  );
+
+  it.effect("distinguishes metadata-only from a synthetic generic plaintext summary", () =>
+    Effect.gen(function* () {
+      const lines = opaqueCompactionShapeFixtures[0].trim().split("\n");
+      const metadataOnly = yield* scanRecoveryFixture([lines[0], lines[2]].join("\n"));
+      expect(metadataOnly.outcomes).toMatchObject([{ outcome: { recoverability: "metadata-only", reason: "no-visible-messages" } }]);
+      // Generic negative fixture, not the format observed in the six native records.
+      lines[1] = JSON.stringify({ type: "response_item", payload: { type: "compaction", message: "Synthetic summary context" } });
+      const summary = yield* scanRecoveryFixture(lines.join("\n"));
+      expect(summary.outcomes).toMatchObject([{ _tag: "Skipped", outcome: {
+        recoverability: "summary-only", reason: "summary-only", nativeContinuationEligible: false,
+      } }]);
+    }),
+  );
+
+  it.effect("does not invent conversation from an unsupported synthetic replacement history", () =>
+    Effect.gen(function* () {
+      const lines = opaqueCompactionShapeFixtures[0].trim().split("\n");
+      lines[1] = JSON.stringify({ type: "response_item", payload: {
+        type: "compaction", replacement_history: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Synthetic context, not a proven prompt" }] }],
+      } });
+      const { outcomes } = yield* scanRecoveryFixture(lines.join("\n"));
+      expect(outcomes).toMatchObject([{ _tag: "Skipped", outcome: {
+        reason: "malformed-compaction", nativeContinuationEligible: false,
+      } }]);
+    }),
+  );
+
+  it.effect("reports duplicate opaque records without promoting them to imports", () =>
+    Effect.gen(function* () {
+      const { outcomes } = yield* scanRecoveryFixture(opaqueCompactionShapeFixtures[0], true);
+      expect(outcomes.map((outcome) => outcome._tag === "Skipped" ? outcome.outcome?.status : outcome._tag)).toEqual(["skipped", "duplicate"]);
+      expect(outcomes.every((outcome) => outcome._tag === "Skipped" && outcome.outcome?.nativeContinuationEligible === false)).toBe(true);
+    }),
+  );
+
+  it.effect("does not derive a native session ID from a filename or compaction item ID", () =>
+    Effect.gen(function* () {
+      const lines = opaqueCompactionShapeFixtures[0].trim().split("\n");
+      lines[0] = JSON.stringify({ type: "session_meta", payload: { id: "", cwd: "unused" } });
+      const { outcomes } = yield* scanRecoveryFixture(lines.join("\n"));
+      expect(outcomes).toMatchObject([{ outcome: { providerSessionId: null, reason: "missing-session-id", nativeContinuationEligible: false } }]);
+    }),
+  );
+
+  it.effect("keeps the existing allocation budget when opaque content exceeds selected-history limits", () =>
+    Effect.gen(function* () {
+      const lines = opaqueCompactionShapeFixtures[0].trim().split("\n");
+      lines[1] = JSON.stringify({ type: "response_item", payload: { type: "compaction", encrypted_content: "x".repeat(17 * 1024 * 1024) } });
+      const { outcomes } = yield* scanRecoveryFixture(lines.join("\n"));
+      expect(outcomes).toMatchObject([{ _tag: "Skipped", outcome: { reason: "read-failed", nativeContinuationEligible: false } }]);
+    }),
+  );
+});
+
+// Structural copies of the six redacted native records; no original transcript values.
+const opaqueCompactionShapeFixtures = [
+  "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"creator_user_id\":\"SYNTHETIC_VALUE_CANARY\",\"creator_account_id\":\"00000000-0000-4000-8000-4fdff518a5be\",\"session_id\":\"00000000-0000-4000-8000-64fef5e958f6\",\"id\":\"00000000-0000-4000-8000-61454364973c\",\"parent_thread_id\":\"00000000-0000-4000-8000-64fef5e958f6\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"originator\":\"SYNTHETIC_VALUE_CANARY\",\"cli_version\":\"SYNTHETIC_VALUE_CANARY\",\"source\":{\"subagent\":{\"other\":\"SYNTHETIC_VALUE_CANARY\"}},\"thread_source\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider\":\"SYNTHETIC_VALUE_CANARY\",\"base_instructions\":{\"text\":\"SYNTHETIC_CONVERSATION_CANARY\",\"provenance\":{\"type\":\"SYNTHETIC_VALUE_CANARY\"}},\"history_mode\":\"SYNTHETIC_VALUE_CANARY\",\"subagent_history_start_ordinal\":1,\"multi_agent_version\":\"SYNTHETIC_VALUE_CANARY\",\"context_window\":{\"window_id\":\"00000000-0000-4000-8000-368e1df21b6b\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"compaction\",\"id\":\"SYNTHETIC_VALUE_CANARY\",\"encrypted_content\":\"SYNTHETIC_CONVERSATION_CANARY\",\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"00000000-0000-4000-8000-5e2fe49d8780\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_id\":\"00000000-0000-4000-8000-61454364973c\",\"thread_settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider_id\":\"SYNTHETIC_VALUE_CANARY\",\"service_tier\":\"SYNTHETIC_VALUE_CANARY\",\"approval_policy\":\"SYNTHETIC_VALUE_CANARY\",\"approvals_reviewer\":\"SYNTHETIC_VALUE_CANARY\",\"permission_profile\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"file_system\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"entries\":[{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"value\":{\"kind\":\"SYNTHETIC_VALUE_CANARY\"}},\"access\":\"SYNTHETIC_VALUE_CANARY\"}]},\"network\":\"SYNTHETIC_VALUE_CANARY\"},\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_summary\":\"SYNTHETIC_CONVERSATION_CANARY\",\"collaboration_mode\":{\"mode\":\"SYNTHETIC_VALUE_CANARY\",\"settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"developer_instructions\":null}},\"disabled_plugin_ids\":[]}}}\n",
+  "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"creator_user_id\":\"SYNTHETIC_VALUE_CANARY\",\"creator_account_id\":\"00000000-0000-4000-8000-4fdff518a5be\",\"session_id\":\"00000000-0000-4000-8000-fd2d88e1f651\",\"id\":\"00000000-0000-4000-8000-fdca7505f3fe\",\"parent_thread_id\":\"00000000-0000-4000-8000-fd2d88e1f651\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"originator\":\"SYNTHETIC_VALUE_CANARY\",\"cli_version\":\"SYNTHETIC_VALUE_CANARY\",\"source\":{\"subagent\":{\"other\":\"SYNTHETIC_VALUE_CANARY\"}},\"thread_source\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider\":\"SYNTHETIC_VALUE_CANARY\",\"base_instructions\":{\"text\":\"SYNTHETIC_CONVERSATION_CANARY\",\"provenance\":{\"type\":\"SYNTHETIC_VALUE_CANARY\"}},\"history_mode\":\"SYNTHETIC_VALUE_CANARY\",\"subagent_history_start_ordinal\":1,\"multi_agent_version\":\"SYNTHETIC_VALUE_CANARY\",\"context_window\":{\"window_id\":\"00000000-0000-4000-8000-373d4e025b52\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"compaction\",\"id\":\"SYNTHETIC_VALUE_CANARY\",\"encrypted_content\":\"SYNTHETIC_CONVERSATION_CANARY\",\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"00000000-0000-4000-8000-046be8d2f1cc\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_id\":\"00000000-0000-4000-8000-fdca7505f3fe\",\"thread_settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider_id\":\"SYNTHETIC_VALUE_CANARY\",\"service_tier\":\"SYNTHETIC_VALUE_CANARY\",\"approval_policy\":\"SYNTHETIC_VALUE_CANARY\",\"approvals_reviewer\":\"SYNTHETIC_VALUE_CANARY\",\"permission_profile\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"file_system\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"entries\":[{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"value\":{\"kind\":\"SYNTHETIC_VALUE_CANARY\"}},\"access\":\"SYNTHETIC_VALUE_CANARY\"}]},\"network\":\"SYNTHETIC_VALUE_CANARY\"},\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_summary\":\"SYNTHETIC_CONVERSATION_CANARY\",\"collaboration_mode\":{\"mode\":\"SYNTHETIC_VALUE_CANARY\",\"settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"developer_instructions\":null}},\"disabled_plugin_ids\":[]}}}\n",
+  "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"creator_user_id\":\"SYNTHETIC_VALUE_CANARY\",\"creator_account_id\":\"00000000-0000-4000-8000-4fdff518a5be\",\"session_id\":\"00000000-0000-4000-8000-fd2d88e1f651\",\"id\":\"00000000-0000-4000-8000-520d82533a07\",\"parent_thread_id\":\"00000000-0000-4000-8000-fd2d88e1f651\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"originator\":\"SYNTHETIC_VALUE_CANARY\",\"cli_version\":\"SYNTHETIC_VALUE_CANARY\",\"source\":{\"subagent\":{\"other\":\"SYNTHETIC_VALUE_CANARY\"}},\"thread_source\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider\":\"SYNTHETIC_VALUE_CANARY\",\"base_instructions\":{\"text\":\"SYNTHETIC_CONVERSATION_CANARY\",\"provenance\":{\"type\":\"SYNTHETIC_VALUE_CANARY\"}},\"history_mode\":\"SYNTHETIC_VALUE_CANARY\",\"subagent_history_start_ordinal\":1,\"multi_agent_version\":\"SYNTHETIC_VALUE_CANARY\",\"context_window\":{\"window_id\":\"00000000-0000-4000-8000-b62b540df152\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"compaction\",\"id\":\"SYNTHETIC_VALUE_CANARY\",\"encrypted_content\":\"SYNTHETIC_CONVERSATION_CANARY\",\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"00000000-0000-4000-8000-046be8d2f1cc\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_id\":\"00000000-0000-4000-8000-520d82533a07\",\"thread_settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider_id\":\"SYNTHETIC_VALUE_CANARY\",\"service_tier\":\"SYNTHETIC_VALUE_CANARY\",\"approval_policy\":\"SYNTHETIC_VALUE_CANARY\",\"approvals_reviewer\":\"SYNTHETIC_VALUE_CANARY\",\"permission_profile\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"file_system\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"entries\":[{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"value\":{\"kind\":\"SYNTHETIC_VALUE_CANARY\"}},\"access\":\"SYNTHETIC_VALUE_CANARY\"}]},\"network\":\"SYNTHETIC_VALUE_CANARY\"},\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_summary\":\"SYNTHETIC_CONVERSATION_CANARY\",\"collaboration_mode\":{\"mode\":\"SYNTHETIC_VALUE_CANARY\",\"settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"developer_instructions\":null}},\"disabled_plugin_ids\":[]}}}\n",
+  "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"creator_user_id\":\"SYNTHETIC_VALUE_CANARY\",\"creator_account_id\":\"00000000-0000-4000-8000-4fdff518a5be\",\"session_id\":\"00000000-0000-4000-8000-fd2d88e1f651\",\"id\":\"00000000-0000-4000-8000-39d295e8d8c1\",\"parent_thread_id\":\"00000000-0000-4000-8000-fd2d88e1f651\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"originator\":\"SYNTHETIC_VALUE_CANARY\",\"cli_version\":\"SYNTHETIC_VALUE_CANARY\",\"source\":{\"subagent\":{\"other\":\"SYNTHETIC_VALUE_CANARY\"}},\"thread_source\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider\":\"SYNTHETIC_VALUE_CANARY\",\"base_instructions\":{\"text\":\"SYNTHETIC_CONVERSATION_CANARY\",\"provenance\":{\"type\":\"SYNTHETIC_VALUE_CANARY\"}},\"history_mode\":\"SYNTHETIC_VALUE_CANARY\",\"subagent_history_start_ordinal\":1,\"multi_agent_version\":\"SYNTHETIC_VALUE_CANARY\",\"context_window\":{\"window_id\":\"00000000-0000-4000-8000-6256a5cca788\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"compaction\",\"id\":\"SYNTHETIC_VALUE_CANARY\",\"encrypted_content\":\"SYNTHETIC_CONVERSATION_CANARY\",\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"00000000-0000-4000-8000-046be8d2f1cc\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_id\":\"00000000-0000-4000-8000-39d295e8d8c1\",\"thread_settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider_id\":\"SYNTHETIC_VALUE_CANARY\",\"service_tier\":\"SYNTHETIC_VALUE_CANARY\",\"approval_policy\":\"SYNTHETIC_VALUE_CANARY\",\"approvals_reviewer\":\"SYNTHETIC_VALUE_CANARY\",\"permission_profile\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"file_system\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"entries\":[{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"value\":{\"kind\":\"SYNTHETIC_VALUE_CANARY\"}},\"access\":\"SYNTHETIC_VALUE_CANARY\"}]},\"network\":\"SYNTHETIC_VALUE_CANARY\"},\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_summary\":\"SYNTHETIC_CONVERSATION_CANARY\",\"collaboration_mode\":{\"mode\":\"SYNTHETIC_VALUE_CANARY\",\"settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"developer_instructions\":null}},\"disabled_plugin_ids\":[]}}}\n",
+  "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"creator_user_id\":\"SYNTHETIC_VALUE_CANARY\",\"creator_account_id\":\"00000000-0000-4000-8000-4fdff518a5be\",\"session_id\":\"00000000-0000-4000-8000-96b159a32eb7\",\"id\":\"00000000-0000-4000-8000-f81e3f5671ec\",\"parent_thread_id\":\"00000000-0000-4000-8000-96b159a32eb7\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"originator\":\"SYNTHETIC_VALUE_CANARY\",\"cli_version\":\"SYNTHETIC_VALUE_CANARY\",\"source\":{\"subagent\":{\"other\":\"SYNTHETIC_VALUE_CANARY\"}},\"thread_source\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider\":\"SYNTHETIC_VALUE_CANARY\",\"base_instructions\":{\"text\":\"SYNTHETIC_CONVERSATION_CANARY\",\"provenance\":{\"type\":\"SYNTHETIC_VALUE_CANARY\"}},\"history_mode\":\"SYNTHETIC_VALUE_CANARY\",\"subagent_history_start_ordinal\":1,\"multi_agent_version\":\"SYNTHETIC_VALUE_CANARY\",\"context_window\":{\"window_id\":\"00000000-0000-4000-8000-e0c658f5f779\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"compaction\",\"id\":\"SYNTHETIC_VALUE_CANARY\",\"encrypted_content\":\"SYNTHETIC_CONVERSATION_CANARY\",\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"00000000-0000-4000-8000-c74d6a2737e2\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_id\":\"00000000-0000-4000-8000-f81e3f5671ec\",\"thread_settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider_id\":\"SYNTHETIC_VALUE_CANARY\",\"service_tier\":\"SYNTHETIC_VALUE_CANARY\",\"approval_policy\":\"SYNTHETIC_VALUE_CANARY\",\"approvals_reviewer\":\"SYNTHETIC_VALUE_CANARY\",\"permission_profile\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"file_system\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"entries\":[{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"value\":{\"kind\":\"SYNTHETIC_VALUE_CANARY\"}},\"access\":\"SYNTHETIC_VALUE_CANARY\"}]},\"network\":\"SYNTHETIC_VALUE_CANARY\"},\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_summary\":\"SYNTHETIC_CONVERSATION_CANARY\",\"collaboration_mode\":{\"mode\":\"SYNTHETIC_VALUE_CANARY\",\"settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"developer_instructions\":null}},\"disabled_plugin_ids\":[]}}}\n",
+  "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"creator_user_id\":\"SYNTHETIC_VALUE_CANARY\",\"creator_account_id\":\"00000000-0000-4000-8000-4fdff518a5be\",\"session_id\":\"00000000-0000-4000-8000-96b159a32eb7\",\"id\":\"00000000-0000-4000-8000-a8b20d450abe\",\"parent_thread_id\":\"00000000-0000-4000-8000-42162d6d448b\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"originator\":\"SYNTHETIC_VALUE_CANARY\",\"cli_version\":\"SYNTHETIC_VALUE_CANARY\",\"source\":{\"subagent\":{\"other\":\"SYNTHETIC_VALUE_CANARY\"}},\"thread_source\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider\":\"SYNTHETIC_VALUE_CANARY\",\"base_instructions\":{\"text\":\"SYNTHETIC_CONVERSATION_CANARY\",\"provenance\":{\"type\":\"SYNTHETIC_VALUE_CANARY\"}},\"history_mode\":\"SYNTHETIC_VALUE_CANARY\",\"subagent_history_start_ordinal\":1,\"multi_agent_version\":\"SYNTHETIC_VALUE_CANARY\",\"context_window\":{\"window_id\":\"00000000-0000-4000-8000-f84b7ee6681e\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{\"type\":\"compaction\",\"id\":\"SYNTHETIC_VALUE_CANARY\",\"encrypted_content\":\"SYNTHETIC_CONVERSATION_CANARY\",\"internal_chat_message_metadata_passthrough\":{\"turn_id\":\"00000000-0000-4000-8000-c74d6a2737e2\"}}}\n{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\",\"thread_id\":\"00000000-0000-4000-8000-a8b20d450abe\",\"thread_settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"model_provider_id\":\"SYNTHETIC_VALUE_CANARY\",\"service_tier\":\"SYNTHETIC_VALUE_CANARY\",\"approval_policy\":\"SYNTHETIC_VALUE_CANARY\",\"approvals_reviewer\":\"SYNTHETIC_VALUE_CANARY\",\"permission_profile\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"file_system\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"entries\":[{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"value\":{\"kind\":\"SYNTHETIC_VALUE_CANARY\"}},\"access\":\"SYNTHETIC_VALUE_CANARY\"},{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"path\":\"SYNTHETIC_VALUE_CANARY\"},\"access\":\"SYNTHETIC_VALUE_CANARY\"},{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"value\":{\"kind\":\"SYNTHETIC_VALUE_CANARY\"}},\"access\":\"SYNTHETIC_VALUE_CANARY\"},{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"value\":{\"kind\":\"SYNTHETIC_VALUE_CANARY\"}},\"access\":\"SYNTHETIC_VALUE_CANARY\"},{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"path\":\"SYNTHETIC_VALUE_CANARY\"},\"access\":\"SYNTHETIC_VALUE_CANARY\",\"missing_path_behavior\":\"SYNTHETIC_VALUE_CANARY\"},{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"path\":\"SYNTHETIC_VALUE_CANARY\"},\"access\":\"SYNTHETIC_VALUE_CANARY\",\"missing_path_behavior\":\"SYNTHETIC_VALUE_CANARY\"},{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"path\":\"SYNTHETIC_VALUE_CANARY\"},\"access\":\"SYNTHETIC_VALUE_CANARY\",\"missing_path_behavior\":\"SYNTHETIC_VALUE_CANARY\"},{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"path\":\"SYNTHETIC_VALUE_CANARY\"},\"access\":\"SYNTHETIC_VALUE_CANARY\",\"missing_path_behavior\":\"SYNTHETIC_VALUE_CANARY\"},{\"path\":{\"type\":\"SYNTHETIC_VALUE_CANARY\",\"path\":\"SYNTHETIC_VALUE_CANARY\"},\"access\":\"SYNTHETIC_VALUE_CANARY\",\"missing_path_behavior\":\"SYNTHETIC_VALUE_CANARY\"}]},\"network\":\"SYNTHETIC_VALUE_CANARY\"},\"cwd\":\"C:\\\\synthetic\\\\workspace\",\"runtime_workspace_roots\":[\"C:\\\\synthetic\\\\workspace\"],\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_summary\":\"SYNTHETIC_CONVERSATION_CANARY\",\"collaboration_mode\":{\"mode\":\"SYNTHETIC_VALUE_CANARY\",\"settings\":{\"model\":\"SYNTHETIC_VALUE_CANARY\",\"reasoning_effort\":\"SYNTHETIC_VALUE_CANARY\",\"developer_instructions\":null}},\"disabled_plugin_ids\":[]}}}\n"
+] as const;

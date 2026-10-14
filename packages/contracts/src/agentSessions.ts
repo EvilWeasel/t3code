@@ -92,9 +92,54 @@ export class AgentSessionImportProjectChangedError extends Schema.TaggedError<Ag
   }
 }
 
+export const AgentSessionImportOutcome = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  /** Codex's recorded session metadata, never a rollout filename or a generated ID. */
+  providerSessionId: Schema.NullOr(TrimmedNonEmptyString),
+  status: Schema.Literals(["imported", "already-imported", "duplicate", "skipped"]),
+  recoverability: Schema.Literals([
+    "conversation",
+    "compaction-context",
+    "summary-only",
+    "metadata-only",
+    "unrecoverable",
+  ]),
+  reason: Schema.Literals([
+    "imported",
+    "already-imported",
+    "duplicate",
+    "missing-session-id",
+    "no-visible-messages",
+    "summary-only",
+    "malformed-compaction",
+    "opaque-context",
+    "read-failed",
+    "workspace-mismatch",
+    "budget-exceeded",
+    "import-failed",
+  ]),
+  /**
+   * The import contains canonical history and a recorded native ID suitable for
+   * a later continuation attempt. It does not verify provider availability,
+   * authorization or that resuming the native session will succeed.
+   */
+  nativeContinuationEligible: Schema.Boolean,
+}).check(
+  Schema.makeFilter(
+    (outcome) =>
+      !outcome.nativeContinuationEligible ||
+      (outcome.providerSessionId !== null &&
+        outcome.recoverability === "conversation" &&
+        ((outcome.status === "imported" && outcome.reason === "imported") ||
+          (outcome.status === "already-imported" && outcome.reason === "already-imported"))),
+  ),
+);
+export type AgentSessionImportOutcome = typeof AgentSessionImportOutcome.Type;
+
 export const AgentSessionImportResult = Schema.Struct({
   importedCount: NonNegativeInt,
   skippedCount: NonNegativeInt,
+  outcomes: Schema.optionalKey(Schema.Array(AgentSessionImportOutcome)),
 });
 export type AgentSessionImportResult = typeof AgentSessionImportResult.Type;
 

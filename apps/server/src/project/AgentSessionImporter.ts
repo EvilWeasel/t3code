@@ -15,6 +15,7 @@ import {
   ThreadId,
   TurnItemId,
   type AgentSessionImportInput,
+  type AgentSessionImportOutcome,
   type AgentSessionImportResult,
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
@@ -215,29 +216,53 @@ const make = Effect.gen(function* () {
     const importedThreadIds = new Set<ThreadId>();
     let importedCount = 0;
     let skippedCount = 0;
+    const importOutcomes: Array<AgentSessionImportOutcome> = [];
 
     yield* Stream.runForEach(outcomes, (outcome) =>
       Effect.gen(function* () {
         if (outcome._tag === "Skipped") {
           skippedCount += 1;
+          if (outcome.outcome !== undefined) importOutcomes.push(outcome.outcome);
           return;
         }
         const source = outcome.source;
+        const verifiedNativeId =
+          source.provider === "codex" &&
+          (outcome._tag !== "Importable" || outcome.thread.nativeSessionIdVerified === true)
+            ? source.providerSessionId
+            : null;
+        const report = (
+          status: AgentSessionImportOutcome["status"],
+          reason: AgentSessionImportOutcome["reason"],
+        ) => {
+          importOutcomes.push({
+            providerInstanceId: source.providerInstanceId,
+            providerSessionId: verifiedNativeId,
+            status,
+            recoverability: "conversation",
+            reason,
+            nativeContinuationEligible:
+              verifiedNativeId !== null && (status === "imported" || status === "already-imported"),
+          });
+        };
         const threadId = ThreadId.make(
           `import:${source.providerInstanceId}:${source.providerSessionId}`,
         );
         if (outcome._tag === "AlreadyImported") {
           importedThreadIds.add(threadId);
           importedCount += 1;
+          report("already-imported", "already-imported");
           return;
         }
         if (outcome._tag === "Duplicate") {
+          report("duplicate", "duplicate");
           if (importedThreadIds.has(threadId)) {
             yield* runtimes.recordImportedTranscript({ threadId, source }).pipe(Effect.ignore);
           }
           return;
         }
 
+        let alreadyPresent = false;
         const imported = yield* Effect.gen(function* () {
           const thread = outcome.thread;
           if (
@@ -262,6 +287,7 @@ const make = Effect.gen(function* () {
               return yield* new AgentSessionThreadModifiedError({ threadId });
             }
             yield* runtimes.recordImportedTranscript({ threadId, source });
+            alreadyPresent = true;
             return true;
           }
 
@@ -387,13 +413,15 @@ const make = Effect.gen(function* () {
         if (imported) {
           importedThreadIds.add(threadId);
           importedCount += 1;
+          report(alreadyPresent ? "already-imported" : "imported", alreadyPresent ? "already-imported" : "imported");
         } else {
           skippedCount += 1;
+          report("skipped", "import-failed");
         }
       }),
     );
 
-    return { importedCount, skippedCount } satisfies AgentSessionImportResult;
+    return { importedCount, skippedCount, outcomes: importOutcomes } satisfies AgentSessionImportResult;
   });
 
   return { importRecentAgentThreads };

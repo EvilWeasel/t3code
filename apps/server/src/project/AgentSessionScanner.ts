@@ -23,6 +23,7 @@ import {
   ProviderInstanceId,
   resolveProviderInstanceEnabled,
   type AgentSessionImportSource,
+  type AgentSessionImportOutcome,
   type AgentSessionProjectCandidate,
   type AgentSessionProjectGit,
   type AgentSessionScanResult,
@@ -130,6 +131,9 @@ const TranscriptRecord = Schema.Struct({
       model: Schema.optional(Schema.String),
       cwd: Schema.optional(Schema.String),
       content: Schema.optional(Schema.Array(TranscriptContentBlock)),
+      // Keep the value only inside the existing selected-history allocation
+      // budget to check its type/nonblank presence; never decode or export it.
+      encrypted_content: Schema.optional(Schema.Unknown),
       internal_chat_message_metadata_passthrough: Schema.optional(Schema.Unknown),
     }),
   ),
@@ -166,6 +170,8 @@ export interface AgentSessionThread {
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
+  /** Provenance for reporting continuation candidates, not a successful native resume. */
+  readonly nativeSessionIdVerified?: boolean;
 }
 
 export type AgentSessionRecentThread =
@@ -176,7 +182,28 @@ export type AgentSessionRecentThread =
     }
   | { readonly _tag: "AlreadyImported"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
-  | { readonly _tag: "Skipped" };
+  | { readonly _tag: "Skipped"; readonly outcome?: AgentSessionImportOutcome };
+
+type AgentSessionParseResult =
+  | { readonly _tag: "Importable"; readonly thread: AgentSessionThread }
+  | { readonly _tag: "Skipped"; readonly outcome: AgentSessionImportOutcome };
+
+function skippedThread(
+  providerInstanceId: ProviderInstanceId,
+  reason: AgentSessionImportOutcome["reason"],
+): AgentSessionRecentThread {
+  return {
+    _tag: "Skipped",
+    outcome: {
+      providerInstanceId,
+      providerSessionId: null,
+      status: "skipped",
+      recoverability: "unrecoverable",
+      reason,
+      nativeContinuationEligible: false,
+    },
+  };
+}
 
 /** Service tag for agent session discovery. */
 export class AgentSessionScanner extends Context.Service<
@@ -292,13 +319,14 @@ export function parseAgentSessionTranscript(
 ): AgentSessionThread | null {
   if (lines.length > MAX_IMPORT_RECORDS) return null;
   const records = lines.flatMap((line) => Option.toArray(decodeTranscriptRecord(line)));
-  return parseAgentSessionRecords(input, records);
+  const result = parseAgentSessionRecords(input, records);
+  return result._tag === "Importable" ? result.thread : null;
 }
 
 function parseAgentSessionRecords(
   input: AgentSessionTranscriptMetadata,
   records: ReadonlyArray<DecodedTranscriptRecord>,
-): AgentSessionThread | null {
+): AgentSessionParseResult {
   const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
   // Claude filenames are session IDs. Codex rollout filenames include extra
   // timestamp text, so only transcript metadata can provide a resumable ID.
@@ -306,6 +334,9 @@ function parseAgentSessionRecords(
   let title: string | null = null;
   let model: string | null = null;
   let hasCodexSessionId = false;
+  let hasCompactionContext = false;
+  let hasCompactionSummary = false;
+  let hasMalformedCompaction = false;
   const messages: Array<AgentSessionThreadMessage & { readonly codexResponseUser: boolean }> = [];
   let firstUserMessage:
     | (AgentSessionThreadMessage & { readonly codexResponseUser: boolean })
@@ -424,6 +455,15 @@ function parseAgentSessionRecords(
       continue;
     }
 
+    if (record.type === "response_item" && record.payload?.type === "compaction") {
+      const encrypted = record.payload.encrypted_content;
+      const opaque = typeof encrypted === "string" && /\S/u.test(encrypted);
+      const summary = (record.payload.message?.trim().length ?? 0) > 0;
+      hasCompactionContext ||= opaque;
+      hasCompactionSummary ||= summary;
+      hasMalformedCompaction ||= !opaque && !summary;
+      continue;
+    }
     if (record.type === "session_meta") {
       const sessionId = record.payload?.id?.trim() || record.payload?.session_id?.trim();
       if (!hasCodexSessionId && sessionId) {
@@ -486,7 +526,39 @@ function parseAgentSessionRecords(
   const visibleMessages = messages.map(
     ({ codexResponseUser: _codexResponseUser, ...message }) => message,
   );
-  if (providerSessionId.trim().length === 0 || firstUserMessage === undefined) return null;
+  if (providerSessionId.trim().length === 0 || firstUserMessage === undefined) {
+    return {
+      _tag: "Skipped",
+      outcome: {
+        providerInstanceId: input.providerInstanceId,
+        providerSessionId: hasCodexSessionId ? providerSessionId : null,
+        status: "skipped",
+        recoverability:
+          providerSessionId.length === 0
+            ? "unrecoverable"
+            : hasCompactionContext
+              ? "compaction-context"
+              : hasCompactionSummary
+                ? "summary-only"
+                : hasMalformedCompaction
+                  ? "unrecoverable"
+                  : messages.length === 0
+                    ? "metadata-only"
+                    : "unrecoverable",
+        reason:
+          providerSessionId.length === 0
+            ? "missing-session-id"
+            : hasCompactionContext
+              ? "opaque-context"
+              : hasCompactionSummary
+                ? "summary-only"
+                : hasMalformedCompaction
+                  ? "malformed-compaction"
+                  : "no-visible-messages",
+        nativeContinuationEligible: false,
+      },
+    };
+  }
   const firstUserMessageRetained = messages.includes(firstUserMessage);
   const { codexResponseUser: _codexResponseUser, ...visibleFirstUserMessage } = firstUserMessage;
   const retainedMessages = firstUserMessageRetained
@@ -495,14 +567,18 @@ function parseAgentSessionRecords(
   const derivedTitle = visibleFirstUserMessage.text.trim().split("\n")[0]?.slice(0, 100).trim();
 
   return {
-    source: input.source,
-    providerInstanceId: input.providerInstanceId,
-    providerSessionId,
-    title: title ?? (derivedTitle && derivedTitle.length > 0 ? derivedTitle : "Imported thread"),
-    model,
-    createdAt: retainedMessages[0]?.createdAt ?? fallbackTimestamp,
-    updatedAt: fallbackTimestamp,
-    messages: retainedMessages,
+    _tag: "Importable",
+    thread: {
+      source: input.source,
+      providerInstanceId: input.providerInstanceId,
+      providerSessionId,
+      title: title ?? (derivedTitle && derivedTitle.length > 0 ? derivedTitle : "Imported thread"),
+      model,
+      createdAt: retainedMessages[0]?.createdAt ?? fallbackTimestamp,
+      updatedAt: fallbackTimestamp,
+      messages: retainedMessages,
+      nativeSessionIdVerified: hasCodexSessionId,
+    },
   };
 }
 
@@ -528,6 +604,7 @@ function shouldRetainDecodedRecord(
   return (
     record.type === "session_meta" ||
     record.type === "turn_context" ||
+    (record.type === "response_item" && record.payload?.type === "compaction") ||
     (record.type === "event_msg" && record.payload?.type === "user_message") ||
     (record.type === "response_item" &&
       record.payload?.type === "message" &&
@@ -1375,6 +1452,7 @@ export const make = Effect.gen(function* () {
       (source) => `${source.providerInstanceId}\0${source.filePath}`,
     );
     const importedSessions = new Set<string>();
+    const skippedSessions = new Set<string>();
     let bytesRemaining = MAX_IMPORT_BYTES;
     let transcriptsRemaining = MAX_IMPORT_TRANSCRIPTS;
     let recordsRemaining = MAX_IMPORT_RECORDS;
@@ -1388,11 +1466,11 @@ export const make = Effect.gen(function* () {
             completed === undefined &&
             (transcriptsRemaining === 0 || bytesRemaining === 0 || recordsRemaining === 0)
           ) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            return Option.some(skippedThread(candidate.providerInstanceId, "budget-exceeded"));
           }
           const stats = yield* statOption(transcript.filePath);
           if (Option.isNone(stats) || stats.value.type !== "File") {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            return Option.some(skippedThread(candidate.providerInstanceId, "read-failed"));
           }
           const identity = transcriptIdentity(transcript.filePath, stats.value);
           const completedSource = completed?.find(
@@ -1414,7 +1492,7 @@ export const make = Effect.gen(function* () {
             identity.size > MAX_IMPORTED_TRANSCRIPT_BYTES ||
             identity.size > bytesRemaining
           ) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            return Option.some(skippedThread(candidate.providerInstanceId, "budget-exceeded"));
           }
           // Reserve the whole file even if its read or parse fails.
           transcriptsRemaining -= 1;
@@ -1426,7 +1504,7 @@ export const make = Effect.gen(function* () {
             candidate.source,
           );
           if (snapshot === null) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            return Option.some(skippedThread(candidate.providerInstanceId, "read-failed"));
           }
           recordsRemaining -= snapshot.recordCount;
 
@@ -1437,17 +1515,17 @@ export const make = Effect.gen(function* () {
             if (snapshotCwd !== null) break;
           }
           if (snapshotCwd === null) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            return Option.some(skippedThread(candidate.providerInstanceId, "workspace-mismatch"));
           }
           const expandedCwd = expandHomePath(snapshotCwd.trim(), homeDir);
           if (
             !path.isAbsolute(expandedCwd) ||
             (yield* directoryIdentity(path.resolve(expandedCwd))) !== rootIdentity
           ) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+            return Option.some(skippedThread(candidate.providerInstanceId, "workspace-mismatch"));
           }
 
-          const parsedThread = parseAgentSessionRecords(
+          const parsed = parseAgentSessionRecords(
             {
               source: candidate.source,
               providerInstanceId: candidate.providerInstanceId,
@@ -1456,9 +1534,21 @@ export const make = Effect.gen(function* () {
             },
             snapshot.records,
           );
-          if (parsedThread === null) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+          if (parsed._tag === "Skipped") {
+            const nativeId = parsed.outcome.providerSessionId;
+            if (nativeId !== null) {
+              const sessionKey = `${candidate.providerInstanceId}\0${nativeId}`;
+              if (skippedSessions.has(sessionKey)) {
+                return Option.some<AgentSessionRecentThread>({
+                  _tag: "Skipped",
+                  outcome: { ...parsed.outcome, status: "duplicate", reason: "duplicate" },
+                });
+              }
+              skippedSessions.add(sessionKey);
+            }
+            return Option.some<AgentSessionRecentThread>(parsed);
           }
+          const parsedThread = parsed.thread;
 
           const source: AgentSessionImportSource = {
             ...identity,
