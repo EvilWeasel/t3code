@@ -266,6 +266,8 @@ jobs:
       - uses: cachix/install-nix-action@3c6342b75005b9cc7c7d4069c3e9179247c89012 # v31
       - name: Install closure packaging tools
         run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Verify updater against a real Nix Store fixture
+        run: python3 packaging/nixos/test-updater.py
       - uses: actions/download-artifact@v4
         with:
           name: weasel-release-linux
