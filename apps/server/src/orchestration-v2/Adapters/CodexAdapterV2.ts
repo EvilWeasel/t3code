@@ -150,6 +150,12 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const CODEX_PROVIDER = ProviderDriverKind.make("codex");
+type CodexLiveVoiceSubmitWork = (input: {
+  readonly plannerNativeThreadId: string;
+  readonly plannerTurnId: string;
+  readonly callId: string;
+  readonly message: string;
+}) => Effect.Effect<string, ProviderAdapter.ProviderAdapterV2Error>;
 export const CODEX_DRIVER_KIND = CODEX_PROVIDER;
 export const CODEX_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(CODEX_DRIVER_KIND);
 
@@ -1819,6 +1825,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           now,
         });
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        const liveVoiceEvents =
+          yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2LiveVoiceEvent>();
+        const liveVoicePlanners = yield* Ref.make(
+          new Map<string, { readonly onSubmitWork: CodexLiveVoiceSubmitWork }>(),
+        );
+        const liveVoiceSettingsWaiters = yield* Ref.make(
+          new Map<
+            string,
+            Deferred.Deferred<CodexSchema.V2ThreadSettingsUpdatedNotification["threadSettings"]>
+          >(),
+        );
         const rateLimitSnapshot = yield* Ref.make<CodexRateLimitSnapshot | undefined>(undefined);
         const limitedTurnItems = yield* Ref.make(
           new Map<ProviderThreadId, Extract<OrchestrationV2TurnItem, { type: "error" }>>(),
@@ -4382,12 +4399,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         );
 
         yield* client.handleServerNotification("thread/settings/updated", (payload) =>
-          updateSubagentSelection(
-            payload.threadId,
-            payload.threadSettings.model,
-            payload.threadSettings.effort,
-            payload.threadSettings.serviceTier,
-          ),
+          Effect.gen(function* () {
+            const waiter = (yield* Ref.get(liveVoiceSettingsWaiters)).get(payload.threadId);
+            if (waiter !== undefined) yield* Deferred.succeed(waiter, payload.threadSettings);
+            yield* updateSubagentSelection(
+              payload.threadId,
+              payload.threadSettings.model,
+              payload.threadSettings.effort,
+              payload.threadSettings.serviceTier,
+            );
+          }),
         );
         yield* client.handleServerNotification("model/rerouted", (payload) =>
           updateSubagentSelection(payload.threadId, payload.toModel),
@@ -6421,6 +6442,92 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }).pipe(Effect.mapError(mcpAppsError("Codex MCP resource read failed."))),
         };
 
+        const offerLiveVoiceEvent = (event: ProviderAdapter.ProviderAdapterV2LiveVoiceEvent) =>
+          Queue.offer(liveVoiceEvents, event).pipe(Effect.asVoid);
+        yield* client.handleServerNotification("thread/realtime/started", (payload) =>
+          offerLiveVoiceEvent({
+            type: "started",
+            plannerNativeThreadId: payload.threadId,
+            ...(payload.realtimeSessionId === undefined
+              ? {}
+              : { realtimeSessionId: payload.realtimeSessionId }),
+          }),
+        );
+        yield* client.handleServerNotification("thread/realtime/sdp", (payload) =>
+          offerLiveVoiceEvent({
+            type: "sdp",
+            plannerNativeThreadId: payload.threadId,
+            sdp: payload.sdp,
+          }),
+        );
+        yield* client.handleServerNotification("thread/realtime/error", (payload) =>
+          offerLiveVoiceEvent({ type: "error", plannerNativeThreadId: payload.threadId }),
+        );
+        yield* client.handleServerNotification("thread/realtime/closed", (payload) =>
+          offerLiveVoiceEvent({ type: "closed", plannerNativeThreadId: payload.threadId }),
+        );
+        yield* client.handleServerNotification("thread/realtime/transcript/done", (payload) =>
+          payload.role === "user" || payload.role === "assistant"
+            ? offerLiveVoiceEvent({
+                type: "transcript",
+                plannerNativeThreadId: payload.threadId,
+                role: payload.role,
+                text: payload.text.slice(0, 16_384),
+              })
+            : Effect.void,
+        );
+        yield* client.handleServerRequest("item/tool/call", (payload) =>
+          Effect.gen(function* () {
+            const planner = (yield* Ref.get(liveVoicePlanners)).get(payload.threadId);
+            const args = payload.arguments;
+            const message =
+              typeof args === "object" && args !== null && !Array.isArray(args)
+                ? (args as Record<string, unknown>).message
+                : undefined;
+            if (
+              planner === undefined ||
+              payload.namespace !== "t3" ||
+              payload.tool !== "t3_submit_voice_work" ||
+              typeof message !== "string" ||
+              message.trim().length === 0 ||
+              message.length > 8_000 ||
+              Object.keys(args as object).length !== 1
+            ) {
+              return {
+                contentItems: [{ type: "inputText" as const, text: '{"accepted":false}' }],
+                success: false,
+              } satisfies CodexSchema.DynamicToolCallResponse;
+            }
+            const result = yield* Effect.result(
+              planner.onSubmitWork({
+                plannerNativeThreadId: payload.threadId,
+                plannerTurnId: payload.turnId,
+                callId: payload.callId,
+                message,
+              }),
+            );
+            return result._tag === "Success"
+              ? {
+                  contentItems: [{ type: "inputText" as const, text: result.success }],
+                  success: true,
+                }
+              : {
+                  contentItems: [{ type: "inputText" as const, text: '{"accepted":false}' }],
+                  success: false,
+                };
+          }),
+        );
+
+        const liveVoiceFailure = (operation: string) => (cause: unknown) =>
+          new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: CODEX_PROVIDER,
+            detail:
+              Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(cause) &&
+              cause.detail === "Managed ChatGPT account is required for Codex Live."
+                ? cause.detail
+                : `Codex Live ${operation} failed.`,
+            cause,
+          });
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
           instanceId: adapterOptions.instanceId,
           driver: CODEX_PROVIDER,
@@ -7172,6 +7279,151 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ),
             ),
           mcpApps,
+          liveVoice: {
+            events: Stream.fromQueue(liveVoiceEvents),
+            preparePlanner: (plannerInput) =>
+              Effect.gen(function* () {
+                yield* ensureInitialized;
+                const account = yield* client.raw.request("account/read", {});
+                if (
+                  typeof account !== "object" ||
+                  account === null ||
+                  typeof (account as { account?: unknown }).account !== "object" ||
+                  (account as { account: { type?: unknown } }).account?.type !== "chatgpt"
+                ) {
+                  return yield* Effect.fail(
+                    new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: CODEX_PROVIDER,
+                      detail: "Managed ChatGPT account is required for Codex Live.",
+                    }),
+                  );
+                }
+                const cwd = yield* fileSystem.makeTempDirectory({ prefix: "t3-live-planner-" });
+                const response = yield* client.raw.request("thread/start", {
+                  model: plannerInput.modelSelection.model,
+                  ...(plannerInput.serviceTier == null
+                    ? {}
+                    : { serviceTier: plannerInput.serviceTier }),
+                  cwd,
+                  approvalPolicy: "never",
+                  approvalsReviewer: "user",
+                  sandbox: "read-only",
+                  config: {
+                    mcp_servers: {},
+                    features: {
+                      shell_tool: false,
+                      multi_agent_v2: false,
+                      plugins: false,
+                      web_search_request: false,
+                    },
+                  },
+                  dynamicTools: [
+                    {
+                      type: "function",
+                      name: "t3_submit_voice_work",
+                      description:
+                        "Submit one bounded work request to the selected T3 thread. A receipt means accepted or queued, never completed.",
+                      inputSchema: {
+                        type: "object",
+                        properties: {
+                          message: { type: "string", minLength: 1, maxLength: 8_000 },
+                        },
+                        required: ["message"],
+                        additionalProperties: false,
+                      },
+                    },
+                  ],
+                  baseInstructions:
+                    "You are a restricted voice planner, not a workspace executor. For workspace work call t3_submit_voice_work exactly once with the request. Do not use any other tool.",
+                });
+                const started = yield* Schema.decodeUnknownEffect(
+                  CodexSchema.V2ThreadStartResponse,
+                )(response);
+                if (
+                  started.approvalPolicy !== "never" ||
+                  started.sandbox.type !== "readOnly" ||
+                  started.sandbox.networkAccess !== false
+                ) {
+                  return yield* Effect.fail(
+                    new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: CODEX_PROVIDER,
+                      detail: "Codex Live planner restrictions were not confirmed.",
+                    }),
+                  );
+                }
+                const plannerNativeThreadId = started.thread.id;
+                const ready =
+                  yield* Deferred.make<
+                    CodexSchema.V2ThreadSettingsUpdatedNotification["threadSettings"]
+                  >();
+                yield* Ref.update(liveVoiceSettingsWaiters, (current) =>
+                  new Map(current).set(plannerNativeThreadId, ready),
+                );
+                yield* client.raw.request("thread/settings/update", {
+                  threadId: plannerNativeThreadId,
+                  model: plannerInput.modelSelection.model,
+                  ...(plannerInput.serviceTier == null
+                    ? {}
+                    : { serviceTier: plannerInput.serviceTier }),
+                  ...(plannerInput.reasoningEffort == null
+                    ? {}
+                    : { effort: plannerInput.reasoningEffort }),
+                  approvalPolicy: "never",
+                  sandboxPolicy: { type: "readOnly", networkAccess: false },
+                });
+                const settings = yield* Deferred.await(ready).pipe(Effect.timeout("5 seconds"));
+                yield* Ref.update(liveVoiceSettingsWaiters, (current) => {
+                  const next = new Map(current);
+                  next.delete(plannerNativeThreadId);
+                  return next;
+                });
+                if (
+                  settings.approvalPolicy !== "never" ||
+                  settings.sandboxPolicy.type !== "readOnly" ||
+                  settings.sandboxPolicy.networkAccess !== false ||
+                  settings.model !== plannerInput.modelSelection.model
+                ) {
+                  return yield* Effect.fail(
+                    new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: CODEX_PROVIDER,
+                      detail: "Codex Live planner settings were not confirmed.",
+                    }),
+                  );
+                }
+                yield* Ref.update(liveVoicePlanners, (current) =>
+                  new Map(current).set(plannerNativeThreadId, {
+                    onSubmitWork: plannerInput.onSubmitWork,
+                  }),
+                );
+                return { plannerNativeThreadId };
+              }).pipe(Effect.mapError(liveVoiceFailure("planner preparation"))),
+            start: (input) =>
+              client.raw
+                .request("thread/realtime/start", {
+                  threadId: input.plannerNativeThreadId,
+                  version: "v3",
+                  transport: { type: "webrtc", sdp: input.offerSdp },
+                  outputModality: "audio",
+                  model: "gpt-live-1-codex",
+                  realtimeSessionId: input.realtimeSessionId,
+                  clientManagedHandoffs: true,
+                  includeStartupContext: false,
+                  backendReasoningStatus: false,
+                  flushTranscriptTailOnSessionEnd: false,
+                })
+                .pipe(Effect.asVoid, Effect.mapError(liveVoiceFailure("realtime start"))),
+            stop: (plannerNativeThreadId) =>
+              client.raw
+                .request("thread/realtime/stop", { threadId: plannerNativeThreadId })
+                .pipe(Effect.asVoid, Effect.mapError(liveVoiceFailure("realtime stop"))),
+            appendSpeech: (input) =>
+              client.raw
+                .request("thread/realtime/appendSpeech", {
+                  threadId: input.plannerNativeThreadId,
+                  text: input.text.slice(0, 3_800),
+                })
+                .pipe(Effect.asVoid, Effect.mapError(liveVoiceFailure("speech output"))),
+          },
           readThreadSnapshot: (threadInput) =>
             Effect.gen(function* () {
               const threadId = yield* getNativeThreadId(threadInput.providerThread);

@@ -121,6 +121,7 @@ import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "./orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts";
+import * as CodexLiveSessionService from "./voice/CodexLiveSessionService.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
@@ -1219,6 +1220,7 @@ const layerWsRpc = (
       const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
       const projectStore = yield* ProjectStore.ProjectStoreV2;
       const projectService = yield* ProjectService.ProjectService;
+      const liveVoiceService = yield* CodexLiveSessionService.CodexLiveSessionService;
       const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
       const threadSearch = yield* ThreadSearch.ThreadSearch;
 
@@ -1833,6 +1835,12 @@ const layerWsRpc = (
       });
 
       const handlers = ServerWsRpcGroup.of({
+        [WS_METHODS.liveVoicePrepare]: (input) => liveVoiceService.prepare(currentSession, input),
+        [WS_METHODS.liveVoiceStart]: (input) => liveVoiceService.start(currentSession, input),
+        [WS_METHODS.liveVoiceStop]: (input) => liveVoiceService.stop(currentSession, input),
+        [WS_METHODS.liveVoiceStatus]: (input) => liveVoiceService.status(currentSession, input),
+        [WS_METHODS.liveVoiceSubscribe]: (input) =>
+          liveVoiceService.subscribe(currentSession, input),
         [ORCHESTRATION_V2_WS_METHODS.dispatchCommand]: (command) =>
           Effect.annotateCurrentSpan({
             "orchestration_v2.command_id": command.commandId,

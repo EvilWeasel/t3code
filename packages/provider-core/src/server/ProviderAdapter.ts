@@ -544,6 +544,8 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly providerSessionId: ProviderSessionId;
   readonly providerSession: OrchestrationV2ProviderSession;
   readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
+  /** Present only when this managed runtime supports subscription-backed Live voice. */
+  readonly liveVoice?: ProviderAdapterV2LiveVoiceRuntime;
   /**
    * Manager-owned runtimes expose a synchronous subscription so concurrent
    * provider threads receive independent copies of the process event stream.
@@ -651,6 +653,47 @@ export interface ProviderAdapterV2SessionRuntime {
     input: ProviderAdapterV2ForkThreadInput,
   ) => Effect.Effect<OrchestrationV2ProviderThread, ProviderAdapterV2Error>;
 }
+
+export interface ProviderAdapterV2LiveVoiceRuntime {
+  readonly events: Stream.Stream<ProviderAdapterV2LiveVoiceEvent, ProviderAdapterV2Error>;
+  readonly preparePlanner: (input: {
+    readonly modelSelection: ModelSelection;
+    readonly serviceTier?: string | null;
+    readonly reasoningEffort?: string | null;
+    readonly onSubmitWork: (input: {
+      readonly plannerNativeThreadId: string;
+      readonly plannerTurnId: string;
+      readonly callId: string;
+      readonly message: string;
+    }) => Effect.Effect<string, ProviderAdapterV2Error>;
+  }) => Effect.Effect<{ readonly plannerNativeThreadId: string }, ProviderAdapterV2Error>;
+  readonly start: (input: {
+    readonly plannerNativeThreadId: string;
+    readonly realtimeSessionId: string;
+    readonly offerSdp: string;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  readonly stop: (plannerNativeThreadId: string) => Effect.Effect<void, ProviderAdapterV2Error>;
+  readonly appendSpeech: (input: {
+    readonly plannerNativeThreadId: string;
+    readonly text: string;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
+}
+
+export type ProviderAdapterV2LiveVoiceEvent =
+  | {
+      readonly type: "started";
+      readonly plannerNativeThreadId: string;
+      readonly realtimeSessionId?: string | null;
+    }
+  | { readonly type: "sdp"; readonly plannerNativeThreadId: string; readonly sdp: string }
+  | { readonly type: "error"; readonly plannerNativeThreadId: string }
+  | { readonly type: "closed"; readonly plannerNativeThreadId: string }
+  | {
+      readonly type: "transcript";
+      readonly plannerNativeThreadId: string;
+      readonly role: "user" | "assistant";
+      readonly text: string;
+    };
 
 export class ProviderAdapterV2 extends Context.Service<
   ProviderAdapterV2,
