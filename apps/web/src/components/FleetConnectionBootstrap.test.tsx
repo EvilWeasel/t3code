@@ -21,7 +21,7 @@ vi.mock("../connection/fleetClient", () => ({
   readFleetConnections: state.read,
   createFleetPairing: state.grant,
 }));
-vi.mock("../connection/onboarding", () => ({ connectPairing: state.connect }));
+vi.mock("../connection/onboarding", () => ({ connectPairing: { run: state.connect } }));
 vi.mock("./ui/toast", () => ({ toastManager: { add: state.toast } }));
 import { FleetConnectionBootstrap } from "./FleetConnectionBootstrap";
 
@@ -71,7 +71,7 @@ it("pairs once across strict remounts using a pinned environment and stores no c
   await mount();
   expect(state.read).toHaveBeenCalledTimes(1);
   expect(state.grant).toHaveBeenCalledTimes(1);
-  expect(state.connect).toHaveBeenCalledWith({
+  expect(state.connect).toHaveBeenCalledWith(expect.anything(), {
     host: "https://nixy.example.test/",
     pairingCode: "one-time-private-code",
     expectedEnvironmentId: "nixy",
@@ -110,4 +110,14 @@ it("rejects a changed grant target without redeeming its code", async () => {
   expect(state.connect).not.toHaveBeenCalled();
   expect(state.toast).toHaveBeenCalledWith({ type: "error", title: "Could not connect: Nixy" });
   expect(JSON.stringify(state.toast.mock.calls)).not.toContain("do-not-display");
+});
+
+it("lets a saved disabled connection created during the grant request win", async () => {
+  state.grant.mockImplementation(async () => {
+    state.catalog.entries.set("nixy", { enabled: false });
+    return { environmentId: "nixy", httpBaseUrl: "https://nixy.example.test/", credential: "unused" };
+  });
+  await mount();
+  expect(state.connect).not.toHaveBeenCalled();
+  expect(state.toast).not.toHaveBeenCalled();
 });

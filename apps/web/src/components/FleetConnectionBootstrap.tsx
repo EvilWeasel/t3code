@@ -56,7 +56,11 @@ function connectFleet(primary: EnvironmentId) {
         if (grant.environmentId !== peer.environmentId || grant.httpBaseUrl !== peer.httpBaseUrl) {
           throw new Error("Fleet pairing target changed.");
         }
-        const result = await connectPairing({
+        if (appAtomRegistry.get(environmentCatalog.catalogValueAtom).entries.has(peer.environmentId)) {
+          acknowledged.remember(peer.environmentId);
+          return;
+        }
+        const result = await connectPairing.run(appAtomRegistry, {
           host: grant.httpBaseUrl,
           pairingCode: grant.credential,
           expectedEnvironmentId: peer.environmentId,
