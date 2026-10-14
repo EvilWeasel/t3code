@@ -399,7 +399,7 @@ const layerVcs = Layer.empty.pipe(
       // Auto-pull reads the project row. The orchestration runtime also
       // consumes the broadcaster (run finalization), so the policy cannot read
       // the store from the runtime's output.
-      Layer.provide(
+      Layer.provideMerge(
         VcsStatusBroadcaster.layerAutoPullPolicy.pipe(Layer.provide(ProjectStore.layer)),
       ),
     ),

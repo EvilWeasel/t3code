@@ -4,6 +4,7 @@ import {
   LiveVoiceError,
   MessageId,
   ModelSelection,
+  ProviderDriverKind,
   ProviderSessionId,
   type LiveVoiceEvent,
   type LiveVoicePrepareInput,
@@ -112,7 +113,7 @@ export const layer: Layer.Layer<
   | ThreadManagementService.ThreadManagementService
   | ProviderInstanceRegistry.ProviderInstanceRegistry
   | Crypto.Crypto
-> = Layer.scoped(
+> = Layer.effect(
   CodexLiveSessionService,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -310,7 +311,7 @@ export const layer: Layer.Layer<
                     ...(providerSession === undefined
                       ? {}
                       : { resumeFromSession: providerSession }),
-                    ...(providerThread?.nativeThreadRef?.nativeId === undefined
+                    ...(providerThread?.nativeThreadRef?.nativeId == null
                       ? {}
                       : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
                   })
@@ -343,7 +344,7 @@ export const layer: Layer.Layer<
             const prepared = yield* runtime.liveVoice
               .preparePlanner({
                 modelSelection: projection.thread.modelSelection,
-                ...(getCodexServiceTierOptionValue(projection.thread.modelSelection) === undefined
+                ...(getCodexServiceTierOptionValue(projection.thread.modelSelection) == null
                   ? {}
                   : {
                       serviceTier: getCodexServiceTierOptionValue(projection.thread.modelSelection),
@@ -351,7 +352,7 @@ export const layer: Layer.Layer<
                 ...(getModelSelectionStringOptionValue(
                   projection.thread.modelSelection,
                   "reasoningEffort",
-                ) === undefined
+                ) == null
                   ? {}
                   : {
                       reasoningEffort: getModelSelectionStringOptionValue(
@@ -372,7 +373,7 @@ export const layer: Layer.Layer<
                     Effect.mapError(
                       (cause) =>
                         new ProviderAdapter.ProviderAdapterProtocolError({
-                          driver: "codex",
+                          driver: ProviderDriverKind.make("codex"),
                           detail: "Live work could not be submitted.",
                           cause,
                         }),
@@ -464,7 +465,7 @@ export const layer: Layer.Layer<
             const lease = active.get(leaseKey(input.leaseId, input.generation));
             if (lease === undefined) {
               yield* updateStatus(row, "unknown");
-              return sessionFromRow(yield* getLease(input.leaseId, input.generation) ?? row);
+              return sessionFromRow((yield* getLease(input.leaseId, input.generation)) ?? row);
             }
             yield* lease.runtime
               .liveVoice!.start({

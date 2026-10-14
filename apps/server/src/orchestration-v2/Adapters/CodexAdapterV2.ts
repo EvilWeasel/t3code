@@ -155,7 +155,7 @@ type CodexLiveVoiceSubmitWork = (input: {
   readonly plannerTurnId: string;
   readonly callId: string;
   readonly message: string;
-}) => Effect.Effect<string>;
+}) => Effect.Effect<string, ProviderAdapter.ProviderAdapterV2Error>;
 export const CODEX_DRIVER_KIND = CODEX_PROVIDER;
 export const CODEX_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(CODEX_DRIVER_KIND);
 
