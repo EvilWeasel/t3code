@@ -6,6 +6,7 @@ import {
   VoiceDictationServiceError,
   type VoiceDictationTranscriber,
 } from "./useVoiceDictation";
+import { acquireMicrophoneOwnership } from "@t3tools/client-runtime/live-voice";
 
 class FakeMediaRecorder {
   static instance: FakeMediaRecorder | null = null;
@@ -96,6 +97,9 @@ describe("useVoiceDictation", () => {
     expect(trackStop).toHaveBeenCalledOnce();
     expect(transcribe).not.toHaveBeenCalled();
     expect(onTranscript).not.toHaveBeenCalled();
+    const liveCanStartDuringReview = acquireMicrophoneOwnership();
+    expect(liveCanStartDuringReview).not.toBeNull();
+    liveCanStartDuringReview?.();
 
     await act(async () => latest?.transcribe());
     expect(transcribe).toHaveBeenCalledOnce();
@@ -220,6 +224,68 @@ describe("useVoiceDictation", () => {
     expect(latest?.state.phase).toBe("recording");
   });
 
+  it("does not request another stream after cancellation until the pending permission request settles", async () => {
+    let grantFirst!: (stream: MediaStream) => void;
+    let grantSecond!: (stream: MediaStream) => void;
+    const getUserMedia = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise<MediaStream>((resolve) => (grantFirst = resolve)))
+      .mockImplementationOnce(() => new Promise<MediaStream>((resolve) => (grantSecond = resolve)));
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+    render(async () => "unused");
+
+    let first: Promise<void> | undefined;
+    act(() => {
+      first = latest?.start();
+    });
+    act(() => latest?.cancel());
+    await act(async () => latest?.start());
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    expect(latest?.state).toMatchObject({ phase: "error" });
+
+    const lateTrackStop = vi.fn();
+    await act(async () => {
+      grantFirst({ getTracks: () => [{ stop: lateTrackStop }] } as unknown as MediaStream);
+      await first;
+    });
+    expect(lateTrackStop).toHaveBeenCalledOnce();
+
+    let second: Promise<void> | undefined;
+    act(() => {
+      second = latest?.start();
+    });
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      grantSecond({ getTracks: () => [{ stop: trackStop }] } as unknown as MediaStream);
+      await second;
+    });
+    expect(latest?.state.phase).toBe("recording");
+    act(() => latest?.cancel());
+  });
+
+  it("does not start dictation while Live owns the renderer microphone", async () => {
+    const releaseLive = acquireMicrophoneOwnership();
+    expect(releaseLive).not.toBeNull();
+    const getUserMedia = vi.mocked(navigator.mediaDevices.getUserMedia);
+    render(async () => "unused");
+
+    await act(async () => latest?.start());
+
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(latest?.state).toEqual({
+      phase: "error",
+      message: "Another microphone session is active. End it before recording.",
+    });
+    const stillOwned = acquireMicrophoneOwnership();
+    expect(stillOwned).toBeNull();
+    stillOwned?.();
+    releaseLive?.();
+    await act(async () => latest?.start());
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    expect(latest?.state.phase).toBe("recording");
+    act(() => latest?.cancel());
+  });
+
   it("ignores a rejected permission request after cancellation", async () => {
     let reject!: (error: Error) => void;
     vi.stubGlobal("navigator", {
@@ -243,6 +309,9 @@ describe("useVoiceDictation", () => {
       await start;
     });
     expect(latest?.state.phase).toBe("idle");
+    const releaseLive = acquireMicrophoneOwnership();
+    expect(releaseLive).not.toBeNull();
+    releaseLive?.();
   });
 
   it("does not let a late stop callback from a cancelled recorder affect a new capture", async () => {

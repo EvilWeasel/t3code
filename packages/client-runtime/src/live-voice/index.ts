@@ -14,3 +14,4 @@ export {
   type LiveVoiceState,
   type LiveVoiceTarget,
 } from "./controller.ts";
+export { acquireMicrophoneOwnership } from "./microphoneOwnership.ts";
