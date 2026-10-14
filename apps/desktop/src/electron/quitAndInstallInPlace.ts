@@ -2,7 +2,7 @@
 import { win32 } from "node:path";
 
 interface UpdaterInstaller {
-  installDirectory?: string;
+  installDirectory?: string | undefined;
   quitAndInstall(isSilent: boolean, isForceRunAfter: boolean): void | Promise<void>;
 }
 

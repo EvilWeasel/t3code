@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - Tests the synchronous pre-bootstrap filesystem boundary.
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import * as Fs from "node:fs";
 import * as Os from "node:os";
