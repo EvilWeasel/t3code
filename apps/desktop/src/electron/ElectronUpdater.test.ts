@@ -24,6 +24,11 @@ vi.mock("electron-updater", () => ({
   autoUpdater: autoUpdaterMock,
 }));
 
+vi.mock("electron", () => ({
+  app: { getVersion: () => "1.2.3", relaunch: vi.fn(), quit: vi.fn() },
+  autoUpdater: { emit: vi.fn() },
+}));
+
 import * as ElectronUpdater from "./ElectronUpdater.ts";
 
 describe("ElectronUpdater", () => {

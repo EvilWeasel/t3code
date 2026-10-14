@@ -5,7 +5,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 
 import { autoUpdater as electronAutoUpdater } from "electron-updater";
-import { app, autoUpdater as nativeAutoUpdater } from "electron";
+import * as Electron from "electron";
 import { NixManagedUpdater } from "./NixManagedUpdater.ts";
 
 const autoUpdater =
@@ -13,14 +13,15 @@ const autoUpdater =
     ? new NixManagedUpdater({
         command: process.env.T3CODE_NIX_UPDATER,
         launcher: process.env.T3CODE_NIX_LAUNCHER ?? "",
-        currentVersion: app.getVersion(),
+        currentVersion: Electron.app.getVersion(),
         relaunch: (launcher) => {
-          app.relaunch({ execPath: launcher, args: process.argv.slice(1) });
-          nativeAutoUpdater.emit("before-quit-for-update");
-          app.quit();
+          Electron.app.relaunch({ execPath: launcher, args: process.argv.slice(1) });
+          Electron.autoUpdater.emit("before-quit-for-update");
+          Electron.app.quit();
         },
       })
     : electronAutoUpdater;
+
 
 type AutoUpdater = typeof electronAutoUpdater;
 
