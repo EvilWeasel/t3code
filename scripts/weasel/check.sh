@@ -81,6 +81,19 @@ for approval_test in "${approval_tests[@]}"; do
   fi
   focused_tests+=("$approval_test")
 done
+execution_tests=(
+  apps/web/src/rightPanelStore.test.ts
+  apps/web/src/components/RightPanelTabs.test.tsx
+  apps/web/src/lib/executionCode.test.ts
+  apps/web/src/components/chat/ExecutionCodePanel.test.tsx
+)
+for execution_test in "${execution_tests[@]}"; do
+  if [[ ! -f "$execution_test" ]]; then
+    echo "Required execution code gate is missing: $execution_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$execution_test")
+done
 voice_tests=(
   apps/web/src/voice/useVoiceDictation.test.tsx
   packages/client-runtime/src/state/voiceTranscriptionHttp.test.ts

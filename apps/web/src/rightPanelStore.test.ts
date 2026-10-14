@@ -1,5 +1,5 @@
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
-import { type EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { type EnvironmentId, ThreadId, TurnItemId, RunId } from "@t3tools/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import { useClosedViewStore } from "./closedViewStore";
@@ -30,6 +30,54 @@ beforeEach(() => {
 });
 
 describe("rightPanelStore", () => {
+  it("keeps execution references scoped, replaces the selected item and never persists raw code", () => {
+    const store = useRightPanelStore.getState();
+    const target = {
+      threadId: refA.threadId,
+      itemId: TurnItemId.make("execution-a"),
+      runId: RunId.make("run-a"),
+      input: "PRIVATE ORIGINAL CODE",
+    };
+    store.openExecution(refA, target);
+    expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      id: "execution",
+      kind: "execution",
+      target: { threadId: refA.threadId, itemId: target.itemId, runId: target.runId },
+    });
+    expect(
+      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refB),
+    ).toBeNull();
+    store.openExecution(refA, { ...target, itemId: TurnItemId.make("execution-b") });
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toHaveLength(1);
+    const persisted = useRightPanelStore.persist.getOptions().partialize!(
+      useRightPanelStore.getState(),
+    );
+    expect(JSON.stringify(persisted)).not.toContain("PRIVATE ORIGINAL CODE");
+    const restored = migratePersistedRightPanelState(persisted);
+    expect(selectActiveRightPanelSurface(restored.byThreadKey, refA)).toEqual(
+      expect.objectContaining({
+        kind: "execution",
+        target: expect.objectContaining({ itemId: "execution-b" }),
+      }),
+    );
+  });
+  it("keeps manual close and manual tab choices until the user selects execution code again", () => {
+    const store = useRightPanelStore.getState();
+    const target = { threadId: refA.threadId, itemId: TurnItemId.make("execution"), runId: null };
+    store.openExecution(refA, target);
+    store.open(refA, "files");
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe("files");
+    const revision = store.getUserActionRevision(refA);
+    store.close(refA);
+    expect(store.getUserActionRevision(refA)).toBeGreaterThan(revision);
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBeNull();
+    store.openExecution(refA, target);
+    expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe(
+      "execution",
+    );
+  });
   it("records single and bulk tab closes, newest first", () => {
     const store = useRightPanelStore.getState();
     const pr = pullRequestSurface({

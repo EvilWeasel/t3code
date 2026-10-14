@@ -5775,6 +5775,26 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
       }
       trailing={
         <>
+          {ctx.threadRef &&
+          (workEntry.projectedItem?.item.type === "command_execution" ||
+            workEntry.projectedItem?.item.type === "dynamic_tool") ? (
+            <InlineButton
+              aria-label="View recorded execution code"
+              onClick={(event) => {
+                event.stopPropagation();
+                const projected = workEntry.projectedItem;
+                if (!ctx.threadRef || !projected) return;
+                useRightPanelStore.getState().openExecution(ctx.threadRef, {
+                  threadId: projected.sourceThreadId,
+                  itemId: projected.sourceItemId,
+                  runId: projected.item.runId,
+                });
+              }}
+              onKeyDown={stopRowToggle}
+            >
+              View code
+            </InlineButton>
+          ) : null}
           {createdThread ? (
             <button
               type="button"

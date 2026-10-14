@@ -714,6 +714,9 @@ const DevicePanel = lazy(() =>
   import("./device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
 );
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
+const ExecutionCodePanel = lazy(() =>
+  import("./chat/ExecutionCodePanel").then((module) => ({ default: module.ExecutionCodePanel })),
+);
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
@@ -11137,6 +11140,19 @@ export default function ChatView(props: ChatViewProps) {
           onSendAnnotation={(annotation, image) => {
             void onSend(undefined, "auto", "foreground", { annotation, image });
           }}
+        />
+      </Suspense>
+    ) : renderedRightPanelSurface?.kind === "execution" ? (
+      <Suspense fallback={null}>
+        <ExecutionCodePanel
+          threadRef={activeThreadRef}
+          target={renderedRightPanelSurface.target}
+          environmentLabel={activeEnvironment?.label}
+          wireItem={serverProjection?.turnItems.find(
+            (item) =>
+              item.id === renderedRightPanelSurface.target.itemId &&
+              item.threadId === renderedRightPanelSurface.target.threadId,
+          )}
         />
       </Suspense>
     ) : renderedRightPanelSurface?.kind === "terminal" ? (

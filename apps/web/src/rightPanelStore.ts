@@ -20,6 +20,7 @@ import { useClosedViewStore } from "./closedViewStore";
 import { resolveStorage } from "./lib/storage";
 import type { ThreadPanelPresentation } from "./rightPanelLayout";
 import type { ChatFileAttachment } from "./types";
+import type { ExecutionCodeTarget } from "./lib/executionCode";
 
 const RIGHT_PANEL_KINDS = [
   "diff",
@@ -30,6 +31,7 @@ const RIGHT_PANEL_KINDS = [
   "terminal",
   "pull-request",
   "pull-requests",
+  "execution",
 ] as const;
 export type RightPanelKind = (typeof RIGHT_PANEL_KINDS)[number];
 
@@ -41,6 +43,7 @@ export interface DeviceTabTarget {
 }
 
 export type RightPanelSurface =
+  | { id: "execution"; kind: "execution"; target: ExecutionCodeTarget }
   | { id: `browser:${string}`; kind: "preview"; resourceId: string }
   | { id: "browser:new"; kind: "preview"; resourceId: null }
   | { id: "device" | `device:${string}`; kind: "device"; target?: DeviceTabTarget; title?: string }
@@ -93,7 +96,7 @@ const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
 // v11 stops persisting the pull-request list's shared panel, so a restart opens the page fresh.
 // v12 adds the device surface.
 // v14 removes the agents surface; lineage lives in the thread title bar.
-const RIGHT_PANEL_STORAGE_VERSION = 14;
+const RIGHT_PANEL_STORAGE_VERSION = 15;
 
 /** A fixed workspace-level ref: each PR surface carries its own real environment. */
 export const PULL_REQUESTS_PANEL_REF = scopeThreadRef(
@@ -146,8 +149,9 @@ interface RightPanelStoreState {
   ) => boolean;
   open: (
     ref: ScopedThreadRef,
-    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request">,
+    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request" | "execution">,
   ) => void;
+  openExecution: (ref: ScopedThreadRef, target: ExecutionCodeTarget) => void;
   openDevice: (ref: ScopedThreadRef, target: DeviceTabTarget, automatic?: boolean) => void;
   renameDevice: (ref: ScopedThreadRef, surfaceId: string, title: string) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
@@ -191,7 +195,7 @@ interface RightPanelStoreState {
   toggleVisibility: (ref: ScopedThreadRef) => void;
   toggle: (
     ref: ScopedThreadRef,
-    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request">,
+    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request" | "execution">,
   ) => void;
   setThreadPanelOpen: (
     ref: ScopedThreadRef,
@@ -214,7 +218,7 @@ const DEFAULT_THREAD_PANEL_VISIBILITY: ThreadPanelVisibility = {
 };
 
 const singletonSurface = (
-  kind: Exclude<RightPanelKind, "file" | "preview" | "terminal" | "pull-request">,
+  kind: Exclude<RightPanelKind, "file" | "preview" | "terminal" | "pull-request" | "execution">,
 ): RightPanelSurface => {
   switch (kind) {
     case "diff":
@@ -471,6 +475,28 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                     // Removed surfaces: plans render inline, agents in thread lineage.
                     const kind = (surface as { kind?: string }).kind;
                     if (kind === "plan" || kind === "agents") return [];
+                    if (surface.kind === "execution") {
+                      const target = surface.target;
+                      if (
+                        !target ||
+                        typeof target.threadId !== "string" ||
+                        typeof target.itemId !== "string" ||
+                        (target.runId !== null && typeof target.runId !== "string")
+                      )
+                        return [];
+                      // Reconstruct the descriptor: discard any extra persisted payload fields.
+                      return [
+                        {
+                          id: "execution",
+                          kind: "execution",
+                          target: {
+                            threadId: target.threadId,
+                            itemId: target.itemId,
+                            runId: target.runId,
+                          },
+                        },
+                      ];
+                    }
                     if (surface.kind === "file") {
                       const revealLine =
                         typeof surface.revealLine === "number" &&
@@ -646,6 +672,22 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             }
             return upsertSurface(current, singletonSurface(kind));
           }),
+        ),
+      openExecution: (ref, target) =>
+        set((state) =>
+          userAction(state, scopedThreadKey(ref), (current) => ({
+            ...current,
+            isOpen: true,
+            activeSurfaceId: "execution",
+            surfaces: [
+              ...current.surfaces.filter((surface) => surface.kind !== "execution"),
+              {
+                id: "execution",
+                kind: "execution",
+                target: { threadId: target.threadId, itemId: target.itemId, runId: target.runId },
+              },
+            ],
+          })),
         ),
       openDevice: (ref, target, automatic = false) =>
         set((state) =>
