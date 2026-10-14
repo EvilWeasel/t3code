@@ -4,7 +4,8 @@ Record a message from the chat composer. **Stop** transcribes it into editable
 prompt text. **Send** transcribes it and sends the prompt directly, including any
 text already in your draft. A failed transcription or send keeps the recording
 for playback and retry. Retrying a failed send uses the editable prompt without
-inserting the same transcript twice.
+inserting the same transcript twice. If the original text was removed or replaced
+while sending, restore it with **Insert text** before retrying the recording.
 
 Recordings stay with their original draft when you open Settings or switch
 threads. Leaving during recording stops capture and keeps the audio for review;

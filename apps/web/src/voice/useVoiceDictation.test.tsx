@@ -33,7 +33,8 @@ class FakeMediaRecorder {
 
 let renderer: ReactTestRenderer | null = null;
 let latest: ReturnType<typeof useVoiceDictation> | null = null;
-let onSend: ReturnType<typeof vi.fn<() => Promise<boolean>>>;
+let onSend: ReturnType<typeof vi.fn<(transcript: string) => Promise<boolean>>>;
+let hasTranscript: ReturnType<typeof vi.fn<(transcript: string) => boolean>>;
 let onTranscript: ReturnType<typeof vi.fn<(transcript: string) => void>>;
 let trackStop: ReturnType<typeof vi.fn>;
 let revokedUrls: string[];
@@ -49,6 +50,7 @@ function Probe({
     transcribe,
     onTranscript,
     onSend,
+    hasTranscript,
     ...(targetKey ? { targetKey } : {}),
   });
   return null;
@@ -71,6 +73,7 @@ async function startAndStop() {
 beforeEach(() => {
   onTranscript = vi.fn();
   onSend = vi.fn(async () => true);
+  hasTranscript = vi.fn(() => true);
   trackStop = vi.fn();
   revokedUrls = [];
   FakeMediaRecorder.instance = null;
@@ -179,6 +182,52 @@ describe("useVoiceDictation", () => {
     });
     expect(onTranscript).toHaveBeenCalledOnce();
     expect(await readRecordingDraft(targetKey)).toBeNull();
+    expect(latest?.state.phase).toBe("idle");
+  });
+
+  it("removes the remounted recording when the original Send succeeds without a retry", async () => {
+    let accept!: (accepted: boolean) => void;
+    onSend.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          accept = resolve;
+        }),
+    );
+    const targetKey = "voice-send:late-admission";
+    const transcribe = vi.fn(async () => "already delivered");
+    render(transcribe, targetKey);
+    await act(async () => latest?.start());
+    await act(async () => latest?.stop("send"));
+    act(() => {
+      renderer?.unmount();
+      renderer = null;
+    });
+    await act(async () => render(transcribe, targetKey));
+    expect(latest?.state.phase).toBe("review");
+    await act(async () => accept(true));
+    expect(latest?.state.phase).toBe("idle");
+    await act(async () => latest?.transcribe("send"));
+    expect(onSend).toHaveBeenCalledOnce();
+    expect(await readRecordingDraft(targetKey)).toBeNull();
+  });
+
+  it("does not send a replacement prompt as a recording retry", async () => {
+    const targetKey = "voice-send:replacement-prompt";
+    render(async () => "original speech", targetKey);
+    onSend.mockResolvedValueOnce(false);
+    await act(async () => latest?.start());
+    await act(async () => latest?.stop("send"));
+    hasTranscript.mockReturnValue(false);
+    await act(async () => latest?.transcribe("send"));
+    expect(onSend).toHaveBeenCalledOnce();
+    expect(onTranscript).toHaveBeenCalledOnce();
+    expect(latest?.state).toMatchObject({
+      phase: "error",
+      message: expect.stringContaining("Insert text"),
+    });
+    expect((await readRecordingDraft(targetKey))?.audio.size).toBeGreaterThan(0);
+    await act(async () => latest?.transcribe());
+    expect(onTranscript).toHaveBeenCalledTimes(2);
     expect(latest?.state.phase).toBe("idle");
   });
 

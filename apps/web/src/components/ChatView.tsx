@@ -9023,6 +9023,7 @@ export default function ChatView(props: ChatViewProps) {
       }
       queuedEditSaveInFlightRef.current = true;
       setIsSavingQueuedEdit(true);
+      let queuedEditAccepted = false;
       try {
         const uploads = await prepareQueuedEditAttachments({
           existingAttachments: editingQueuedRun.existingAttachments,
@@ -9103,6 +9104,7 @@ export default function ChatView(props: ChatViewProps) {
           setThreadError(editingQueuedRun.threadId, "Could not save the edited queued message.");
           return;
         }
+        queuedEditAccepted = true;
         setThreadError(editingQueuedRun.threadId, null);
         releaseDraftAttachments(newEditAttachments);
         promptRef.current = "";
@@ -9119,7 +9121,7 @@ export default function ChatView(props: ChatViewProps) {
         queuedEditSaveInFlightRef.current = false;
         setIsSavingQueuedEdit(false);
       }
-      return;
+      return queuedEditAccepted;
     }
     const {
       trimmedPrompt: trimmed,

@@ -7,6 +7,7 @@ import {
   type VoiceDictationTranscriber,
 } from "./useVoiceDictation";
 import { Button } from "~/components/ui/button";
+import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { useEffect, useRef } from "react";
 import { useCallback } from "react";
 
@@ -16,7 +17,8 @@ export function VoiceDictationControl(props: {
   readonly currentTargetKey: () => string;
   readonly transcribe: VoiceDictationTranscriber | null;
   readonly onTranscript: (text: string, targetKey: string) => boolean;
-  readonly onSend?: (targetKey: string) => Promise<boolean>;
+  readonly onSend?: (targetKey: string, transcript: string) => Promise<boolean>;
+  readonly hasTranscript?: (transcript: string) => boolean;
 }) {
   const recordedTargetKey = useRef(props.targetKey);
   const recordingTranscriber = useRef<VoiceDictationTranscriber | null>(props.transcribe);
@@ -39,10 +41,11 @@ export function VoiceDictationControl(props: {
   const dictation = useVoiceDictation({
     targetKey: props.targetKey,
     transcribe: transcribeCapturedRecording,
-    onSend: async () => {
+    ...(props.hasTranscript ? { hasTranscript: props.hasTranscript } : {}),
+    onSend: async (transcript) => {
       const targetKey = recordedTargetKey.current;
       if (props.currentTargetKey() !== targetKey) return false;
-      return (await props.onSend?.(targetKey)) ?? false;
+      return (await props.onSend?.(targetKey, transcript)) ?? false;
     },
     onTranscript: (text) => {
       const targetKey = recordedTargetKey.current;
@@ -152,47 +155,61 @@ export function VoiceDictationControl(props: {
   const busy = state.phase === "transcribing";
   const error = state.phase === "error" ? state.message : null;
   return (
-    <div className="flex max-w-[min(30rem,60vw)] items-center gap-2 rounded-md border border-border bg-background px-2 py-1">
-      <audio
-        className="h-8 min-w-0 max-w-32 sm:max-w-48"
-        controls
-        src={audioUrl}
-        aria-label="Review recording"
-      />
-      {settingsLink}
-      {error ? (
-        <span role="status" className="max-w-40 text-xs text-destructive">
-          {error} Check this environment’s voice settings.
-        </span>
-      ) : null}
-      <Button
-        type="button"
-        variant="secondary"
-        size="sm"
-        disabled={busy || !props.transcribe}
-        onClick={() => void dictation.transcribe()}
+    <Popover defaultOpen>
+      <PopoverTrigger
+        render={<Button variant="ghost" size="icon-sm" />}
+        aria-label={busy ? "Voice message processing" : "Review saved voice recording"}
+        title={busy ? "Voice message processing" : "Review saved voice recording"}
+        aria-busy={busy}
       >
-        {busy ? "Transcribing…" : "Insert text"}
-      </Button>
-      <Button
-        type="button"
-        variant="secondary"
-        size="sm"
-        disabled={busy || !props.transcribe || !props.onSend}
-        onClick={() => void dictation.transcribe("send")}
-      >
-        Send
-      </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-sm"
-        onClick={dictation.cancel}
-        aria-label="Discard recording"
-        title="Discard recording"
-      >
-        <Trash2Icon />
-      </Button>
-    </div>
+        <MicIcon />
+      </PopoverTrigger>
+      <PopoverPopup side="top" align="end" width="md" padding="compact">
+        <div className="flex flex-col gap-2">
+          <audio className="h-8 w-full" controls src={audioUrl} aria-label="Review recording" />
+          {error ? (
+            <span role="status" className="text-xs text-destructive">
+              {error}
+            </span>
+          ) : null}
+          {busy ? (
+            <span role="status" className="text-xs text-muted-foreground">
+              Processing voice message…
+            </span>
+          ) : null}
+          <div className="flex flex-wrap items-center gap-2">
+            {settingsLink}
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              disabled={busy || !props.transcribe}
+              onClick={() => void dictation.transcribe()}
+            >
+              Insert text
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              disabled={busy || !props.transcribe || !props.onSend}
+              onClick={() => void dictation.transcribe("send")}
+            >
+              Send
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              onClick={dictation.cancel}
+              aria-label="Discard recording"
+              title="Discard recording"
+            >
+              <Trash2Icon />
+            </Button>
+          </div>
+        </div>
+      </PopoverPopup>
+    </Popover>
   );
 }

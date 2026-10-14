@@ -10,6 +10,21 @@ export interface RecordingDraft {
 // Audio belongs to the draft, not to a mounted composer. The memory copy also
 // keeps navigation safe where IndexedDB is unavailable (private browser policy).
 const drafts = new Map<string, RecordingDraft | null>();
+const listeners = new Map<string, Set<(draft: RecordingDraft | null) => void>>();
+
+export function subscribeRecordingDraft(
+  key: string,
+  listener: (draft: RecordingDraft | null) => void,
+): () => void {
+  let group = listeners.get(key);
+  if (!group) listeners.set(key, (group = new Set()));
+  group.add(listener);
+  return () => {
+    group?.delete(listener);
+    if (group?.size === 0) listeners.delete(key);
+  };
+}
+
 let database: Promise<IDBDatabase> | undefined;
 let writes = Promise.resolve();
 
@@ -47,6 +62,7 @@ export async function readRecordingDraft(key: string): Promise<RecordingDraft | 
 export function writeRecordingDraft(key: string, value: RecordingDraft | null): void {
   if (value && value.audio.size > MAX_RECORDING_BYTES) return;
   drafts.set(key, value);
+  listeners.get(key)?.forEach((listener) => listener(value));
   if (typeof indexedDB === "undefined") return;
   writes = writes
     .then(async () => {

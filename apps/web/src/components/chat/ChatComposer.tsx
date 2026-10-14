@@ -4371,11 +4371,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     ],
   );
   const sendVoiceTranscript = useCallback(
-    async (targetKey: string) => {
-      if (voiceDraftTargetKeyRef.current !== targetKey) return false;
+    async (targetKey: string, transcript: string) => {
+      if (voiceDraftTargetKeyRef.current !== targetKey || !promptRef.current.includes(transcript))
+        return false;
       return (await submitComposer()) ?? false;
     },
-    [submitComposer],
+    [promptRef, submitComposer],
   );
   const handleSubmitMessage = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -7745,6 +7746,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       transcribe={transcribeVoiceRecording(environmentId)}
                       onTranscript={insertVoiceTranscript}
                       onSend={sendVoiceTranscript}
+                      hasTranscript={(text) => promptRef.current.includes(text)}
                     />
                   ) : null}
                   <LiveVoiceControl

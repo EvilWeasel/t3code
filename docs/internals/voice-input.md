@@ -1,12 +1,15 @@
 # Voice input
 
-Transcription edits a composer draft. It does not submit an agent turn. Audio is
-temporary client input, and only normal message submission sends the resulting
-text. Mobile transcribes locally on supported iOS devices. The Weasel fork also
-supports reviewed web/desktop recordings through the selected environment's
-authenticated HTTP API. Its host owns provider authentication; browser clients
-never receive transcription credentials. Account transcription and explicit
-API transcription are separate modes, with no automatic billing fallback.
+Transcription edits a composer draft. Mobile transcribes locally on supported iOS
+devices; sending remains a separate action there. The Weasel web/desktop recorder
+uses the selected environment's authenticated HTTP API. Stop inserts text; its
+explicit Send action uses normal message submission and retains audio until the
+server accepts the message. Navigation cancels transcription delivery but does
+not cancel an already submitted agent turn. Its admission receipt must settle
+against the original draft, so returning to a pending recording cannot submit
+it twice. The host owns provider authentication; browser clients never receive
+transcription credentials. Account transcription and explicit API transcription
+are separate modes, with no automatic billing fallback.
 
 The [shared controller](../../packages/client-runtime/src/voice-input/controller.ts)
 owns the operation while the client supplies capture and transcription. Preparation

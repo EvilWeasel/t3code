@@ -3,6 +3,7 @@ import { acquireMicrophoneOwnership } from "@t3tools/client-runtime/live-voice";
 import {
   MAX_RECORDING_BYTES,
   readRecordingDraft,
+  subscribeRecordingDraft,
   writeRecordingDraft,
 } from "./recordingDraftStore";
 
@@ -48,7 +49,8 @@ export function useVoiceDictation(input: {
   readonly targetKey?: string;
   readonly transcribe: VoiceDictationTranscriber | null;
   readonly onTranscript: (transcript: string) => void;
-  readonly onSend?: () => Promise<boolean>;
+  readonly onSend?: (transcript: string) => Promise<boolean>;
+  readonly hasTranscript?: (transcript: string) => boolean;
 }) {
   const [state, setState] = useState<VoiceDictationState>({ phase: "idle" });
   const captureRef = useRef<ActiveCapture | null>(null);
@@ -123,7 +125,13 @@ export function useVoiceDictation(input: {
           });
           return;
         }
-        if (!insertedTranscriptRef.current) {
+        const transcriptMissing =
+          insertedTranscriptRef.current && inputRef.current.hasTranscript?.(transcript) === false;
+        if (transcriptMissing && delivery === "send")
+          throw new VoiceDictationServiceError(
+            "The recorded text is no longer in this prompt. Choose Insert text to restore it before sending.",
+          );
+        if (!insertedTranscriptRef.current || transcriptMissing) {
           inputRef.current.onTranscript(transcript);
           insertedTranscriptRef.current = transcript;
           if (targetKey) writeRecordingDraft(targetKey, { audio, transcript });
@@ -131,7 +139,7 @@ export function useVoiceDictation(input: {
         if (delivery === "send") {
           let sending = pendingSends.get(audio);
           if (!sending) {
-            sending = inputRef.current.onSend?.() ?? Promise.resolve(false);
+            sending = inputRef.current.onSend?.(transcript) ?? Promise.resolve(false);
             pendingSends.set(audio, sending);
             void sending
               .finally(() => {
@@ -311,7 +319,18 @@ export function useVoiceDictation(input: {
             : { phase: "review", audioUrl, audioType: draft.audio.type },
         );
       });
+    const unsubscribe = targetKey
+      ? subscribeRecordingDraft(targetKey, (draft) => {
+          if (draft || !audioRef.current) return;
+          generationRef.current += 1;
+          abortRef.current?.abort();
+          abortRef.current = null;
+          clearAudio();
+          setState({ phase: "idle" });
+        })
+      : undefined;
     return () => {
+      unsubscribe?.();
       generationRef.current += 1;
       abortRef.current?.abort();
       abortRef.current = null;
