@@ -1,5 +1,9 @@
 import { MicIcon, SquareIcon, Trash2Icon } from "lucide-react";
-import { useVoiceDictation, type VoiceDictationTranscriber } from "./useVoiceDictation";
+import {
+  useVoiceDictation,
+  VoiceDictationServiceError,
+  type VoiceDictationTranscriber,
+} from "./useVoiceDictation";
 import { Button } from "~/components/ui/button";
 import { useEffect, useRef } from "react";
 import { useCallback } from "react";
@@ -8,7 +12,7 @@ export function VoiceDictationControl(props: {
   readonly targetKey: string;
   readonly currentTargetKey: () => string;
   readonly transcribe: VoiceDictationTranscriber | null;
-  readonly onTranscript: (text: string, targetKey: string) => void;
+  readonly onTranscript: (text: string, targetKey: string) => boolean;
 }) {
   const recordedTargetKey = useRef(props.targetKey);
   const recordingTranscriber = useRef<VoiceDictationTranscriber | null>(props.transcribe);
@@ -16,7 +20,9 @@ export function VoiceDictationControl(props: {
     (audio, options) => {
       if (recordedTargetKey.current !== props.currentTargetKey()) {
         return Promise.reject(
-          new Error("The selected environment changed. Discard and record again."),
+          new VoiceDictationServiceError(
+            "The selected draft changed. Return to the original draft to retry this recording.",
+          ),
         );
       }
       const transcribe = recordingTranscriber.current;
@@ -31,8 +37,15 @@ export function VoiceDictationControl(props: {
     transcribe: transcribeCapturedRecording,
     onTranscript: (text) => {
       const targetKey = recordedTargetKey.current;
-      if (props.currentTargetKey() === targetKey) {
-        props.onTranscript(text, targetKey);
+      if (props.currentTargetKey() !== targetKey) {
+        throw new VoiceDictationServiceError(
+          "The selected draft changed. Return to the original draft to retry this recording.",
+        );
+      }
+      if (!props.onTranscript(text, targetKey)) {
+        throw new VoiceDictationServiceError(
+          "The transcript could not be inserted. Your recording is still available to retry.",
+        );
       }
     },
   });

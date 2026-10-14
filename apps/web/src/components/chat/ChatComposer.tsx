@@ -1859,6 +1859,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // happened while they awaited.
   const composerDraftTargetKeyRef = useRef("");
   composerDraftTargetKeyRef.current = composerDraftTargetKey;
+  const voiceDraftTargetKeyRef = useRef("");
+  voiceDraftTargetKeyRef.current = `${composerDraftTargetKey}:${environmentId}`;
   const questionAttachmentTarget =
     pendingUserInputs[0] && activePendingProgress?.activeQuestion
       ? questionAttachmentDraftId(
@@ -3100,7 +3102,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const insertVoiceTranscript = useCallback(
     (transcript: string, targetKey: string) => {
-      if (composerDraftTargetKeyRef.current !== targetKey) return;
+      if (voiceDraftTargetKeyRef.current !== targetKey) return false;
       const currentPrompt = promptRef.current;
       const separator = currentPrompt.length === 0 || /\s$/.test(currentPrompt) ? "" : "\n";
       const nextPrompt = `${currentPrompt}${separator}${transcript}`;
@@ -3109,6 +3111,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       setComposerCursor(collapseExpandedComposerCursor(nextPrompt, nextPrompt.length));
       setComposerTrigger(null);
       scheduleComposerFocus();
+      return true;
     },
     [promptRef, scheduleComposerFocus, setComposerTrigger, setPrompt],
   );
@@ -7726,10 +7729,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 >
                   {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
                     <VoiceDictationControl
-                      targetKey={`${composerDraftTargetKey}:${environmentId}`}
-                      currentTargetKey={() =>
-                        `${composerDraftTargetKeyRef.current}:${environmentId}`
-                      }
+                      targetKey={voiceDraftTargetKeyRef.current}
+                      currentTargetKey={() => voiceDraftTargetKeyRef.current}
                       transcribe={transcribeVoiceRecording(environmentId)}
                       onTranscript={insertVoiceTranscript}
                     />

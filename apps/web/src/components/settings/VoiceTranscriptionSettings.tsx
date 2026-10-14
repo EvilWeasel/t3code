@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AuthSettingsWriteScope, type VoiceTranscriptionSettings } from "@t3tools/contracts";
 import { voiceSettingsRequest } from "../../voice/voiceSettingsClient";
 import { useSettingsScope } from "./SettingsScopeContext";
@@ -18,30 +18,34 @@ export function VoiceTranscriptionSettingsPanel() {
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const generationRef = useRef(0);
   const editable = environmentId && readEnvironmentScope(environmentId, AuthSettingsWriteScope);
   useEffect(() => {
-    let current = true;
+    const generation = ++generationRef.current;
     setSettings(null);
     setApiKey("");
     setError("");
+    setBusy(false);
     if (environmentId)
       void voiceSettingsRequest(environmentId)
         .then((value) => {
-          if (!current) return;
+          if (generationRef.current !== generation) return;
           setSettings(value);
           setProvider(value.provider);
           setInstanceId(value.instanceId ?? "");
           setModel(value.model);
         })
         .catch(() => {
-          if (current) setError("Could not read voice settings from this environment.");
+          if (generationRef.current === generation)
+            setError("Could not read voice settings from this environment.");
         });
     return () => {
-      current = false;
+      if (generationRef.current === generation) generationRef.current += 1;
     };
   }, [environmentId]);
   const save = async (clearKey = false) => {
     if (!environmentId || !editable) return;
+    const generation = generationRef.current;
     setBusy(true);
     setError("");
     try {
@@ -51,14 +55,16 @@ export function VoiceTranscriptionSettingsPanel() {
         model,
         ...(clearKey ? { apiKey: null } : apiKey.trim() ? { apiKey } : {}),
       });
+      if (generationRef.current !== generation) return;
       setApiKey("");
       setSettings(value);
     } catch {
+      if (generationRef.current !== generation) return;
       setError(
         "Could not save voice settings. Check this environment's connection and settings permission.",
       );
     } finally {
-      setBusy(false);
+      if (generationRef.current === generation) setBusy(false);
     }
   };
   return (
