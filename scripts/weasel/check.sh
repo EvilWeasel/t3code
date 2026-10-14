@@ -41,6 +41,7 @@ focused_tests=(
   apps/desktop/src/electron/NixManagedUpdater.test.ts
   apps/desktop/src/electron/quitAndInstallInPlace.test.ts
   apps/web/src/components/sidebar/updateEverything.logic.test.ts
+  apps/web/src/branding.test.ts
   packages/shared/src/cliRelease.test.ts
   apps/server/src/cli/update.test.ts
   apps/server/src/cloud/selfUpdate.test.ts
@@ -147,4 +148,4 @@ for agent_session_test in "${agent_session_tests[@]}"; do
   focused_tests+=("$agent_session_test")
 done
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
-(cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts)
+(cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)
