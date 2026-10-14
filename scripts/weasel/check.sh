@@ -119,6 +119,8 @@ agent_session_tests=(
   packages/contracts/src/agentSessions.test.ts
   apps/server/src/project/AgentSessionScanner.test.ts
   apps/server/src/project/AgentSessionImporter.test.ts
+  apps/web/src/components/onboarding/WelcomeWizard.test.tsx
+  apps/web/src/components/onboarding/WelcomeWizard.import.test.tsx
 )
 for agent_session_test in "${agent_session_tests[@]}"; do
   if [[ ! -f "$agent_session_test" ]]; then
