@@ -8,18 +8,19 @@ import { autoUpdater as electronAutoUpdater } from "electron-updater";
 import { app, autoUpdater as nativeAutoUpdater } from "electron";
 import { NixManagedUpdater } from "./NixManagedUpdater.ts";
 
-const autoUpdater = process.platform === "linux" && process.env.T3CODE_NIX_UPDATER
-  ? new NixManagedUpdater({
-      command: process.env.T3CODE_NIX_UPDATER,
-      launcher: process.env.T3CODE_NIX_LAUNCHER ?? "",
-      currentVersion: app.getVersion(),
-      relaunch: (launcher) => {
-        app.relaunch({ execPath: launcher, args: process.argv.slice(1) });
-        nativeAutoUpdater.emit("before-quit-for-update");
-        app.quit();
-      },
-    })
-  : electronAutoUpdater;
+const autoUpdater =
+  process.platform === "linux" && process.env.T3CODE_NIX_UPDATER
+    ? new NixManagedUpdater({
+        command: process.env.T3CODE_NIX_UPDATER,
+        launcher: process.env.T3CODE_NIX_LAUNCHER ?? "",
+        currentVersion: app.getVersion(),
+        relaunch: (launcher) => {
+          app.relaunch({ execPath: launcher, args: process.argv.slice(1) });
+          nativeAutoUpdater.emit("before-quit-for-update");
+          app.quit();
+        },
+      })
+    : electronAutoUpdater;
 
 type AutoUpdater = typeof electronAutoUpdater;
 
