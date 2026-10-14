@@ -47,6 +47,7 @@ export const make = Effect.gen(function* () {
     register: (session) =>
       lock.withPermits(1)(
         Ref.update(sessions, (current) => {
+          if (current.has(keyOf(session.leaseId, session.generation))) return current;
           const next = new Map(current);
           next.set(keyOf(session.leaseId, session.generation), session);
           return next;

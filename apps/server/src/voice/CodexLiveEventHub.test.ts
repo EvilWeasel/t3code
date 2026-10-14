@@ -58,3 +58,17 @@ it.effect("registers delivery before yielding the initial status barrier", () =>
     ]);
   }).pipe(Effect.provide(CodexLiveEventHub.layer)),
 );
+
+it.effect("a stale status registration cannot replace a newer status snapshot", () =>
+  Effect.gen(function* () {
+    const hub = yield* CodexLiveEventHub.CodexLiveEventHub;
+    const active = { ...session, status: "active" as const };
+    yield* hub.register(session);
+    yield* hub.publish({ type: "status", session: active });
+    yield* hub.register(session);
+    const first = yield* Stream.runHead(
+      hub.subscribe({ leaseId: session.leaseId, generation: session.generation }),
+    );
+    assert.deepEqual(Option.getOrThrow(first), { type: "status", session: active });
+  }).pipe(Effect.provide(CodexLiveEventHub.layer)),
+);
