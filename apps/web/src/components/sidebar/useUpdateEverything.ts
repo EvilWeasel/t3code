@@ -21,8 +21,8 @@ import {
 /**
  * The remote half of the sidebar update button: outdated providers on every
  * connected machine, and servers behind the version this client runs or is
- * about to install (`localUpdateVersion`). Servers that install from npm appear
- * only once npm confirms that version. `run` performs the whole pass, including
+ * about to install (`localUpdateVersion`). Managed servers use verified release
+ * archives. `run` performs the whole pass, including
  * this app's own download and install when given.
  */
 export function useUpdateEverything(localUpdateVersion: string | null) {

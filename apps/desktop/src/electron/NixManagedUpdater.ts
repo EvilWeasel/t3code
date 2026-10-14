@@ -1,8 +1,14 @@
 import { compareSemverVersions } from "@t3tools/shared/semver";
 import { EventEmitter } from "node:events";
+// This imperative adapter implements electron-updater's EventEmitter/Promise
+// interface at the Electron boundary, outside an Effect runtime.
+// @effect-diagnostics-next-line nodeBuiltinImport:off
 import { execFile } from "node:child_process";
+// @effect-diagnostics-next-line nodeBuiltinImport:off
 import { access } from "node:fs/promises";
+// @effect-diagnostics-next-line nodeBuiltinImport:off
 import { constants } from "node:fs";
+// @effect-diagnostics-next-line nodeBuiltinImport:off
 import { isAbsolute } from "node:path";
 
 export interface NixUpdaterOptions {
@@ -26,9 +32,11 @@ export class NixManagedUpdater extends EventEmitter {
   private available: string | undefined;
   private prepared: string | undefined;
   private readonly run: NonNullable<NixUpdaterOptions["run"]>;
+  private readonly options: NixUpdaterOptions;
 
-  constructor(private readonly options: NixUpdaterOptions) {
+  constructor(options: NixUpdaterOptions) {
     super();
+    this.options = options;
     if (!isAbsolute(options.command) || !isAbsolute(options.launcher)) {
       throw new Error("Nix updater and stable launcher must be absolute paths");
     }

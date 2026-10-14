@@ -29,6 +29,7 @@ focused_tests=(
   packages/client-runtime/src/rpc/session.test.ts \
   apps/desktop/src/app/DesktopEarlyElectronStartup.test.ts \
   apps/desktop/src/app/DesktopEnvironment.test.ts \
+  apps/desktop/src/app/DesktopWindowsProfileBinding.test.ts \
   apps/desktop/src/app/DesktopAppIdentity.test.ts \
   apps/desktop/src/app/DesktopLinuxUrlHandler.test.ts \
   apps/desktop/src/backend/DesktopBackendConfiguration.test.ts \
@@ -45,6 +46,7 @@ focused_tests=(
   apps/server/src/environment/ServerEnvironment.test.ts
   apps/server/src/cloud/pinnedRuntime.test.ts
   apps/server/src/serviceLauncher.test.ts
+  apps/server/src/voice/VoiceSettings.test.ts
 )
 voice_tests=(
   apps/web/src/voice/useVoiceDictation.test.tsx
