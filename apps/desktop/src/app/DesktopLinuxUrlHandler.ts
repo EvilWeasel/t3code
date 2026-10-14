@@ -93,9 +93,9 @@ export interface UrlHandlerLaunch {
  */
 export function resolveUrlHandlerLaunch(input: {
   readonly defaultExecTarget: string;
-  readonly configuredLauncher?: string;
-  readonly home?: string;
-  readonly profileId?: string;
+  readonly configuredLauncher?: string | undefined;
+  readonly home?: string | undefined;
+  readonly profileId?: string | undefined;
 }): UrlHandlerLaunch {
   const configuredLauncher = input.configuredLauncher?.startsWith("/")
     ? input.configuredLauncher
