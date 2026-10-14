@@ -47,6 +47,8 @@ focused_tests=(
   apps/server/src/cloud/pinnedRuntime.test.ts
   apps/server/src/serviceLauncher.test.ts
   apps/server/src/voice/VoiceSettings.test.ts
+  apps/web/src/voice/VoiceDictationControl.test.tsx
+  apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
 )
 voice_tests=(
   apps/web/src/voice/useVoiceDictation.test.tsx
