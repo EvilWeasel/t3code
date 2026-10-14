@@ -843,6 +843,20 @@ export const ServerConfigStreamSettingsUpdatedEvent = Schema.Struct({
 export type ServerConfigStreamSettingsUpdatedEvent =
   typeof ServerConfigStreamSettingsUpdatedEvent.Type;
 
+export const ServerConfigEnvironmentLabelUpdatedPayload = Schema.Struct({
+  label: TrimmedNonEmptyString,
+});
+export type ServerConfigEnvironmentLabelUpdatedPayload =
+  typeof ServerConfigEnvironmentLabelUpdatedPayload.Type;
+
+export const ServerConfigStreamEnvironmentLabelUpdatedEvent = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("environmentLabelUpdated"),
+  payload: ServerConfigEnvironmentLabelUpdatedPayload,
+});
+export type ServerConfigStreamEnvironmentLabelUpdatedEvent =
+  typeof ServerConfigStreamEnvironmentLabelUpdatedEvent.Type;
+
 export const ServerConfigEnvironmentThemesUpdatedPayload = Schema.Struct({
   /** The full published set; empty once the machine publishes none. */
   themes: Schema.Array(EnvironmentTheme),
@@ -878,6 +892,7 @@ export const ServerConfigStreamEvent = Schema.Union([
   ServerConfigStreamKeybindingsUpdatedEvent,
   ServerConfigStreamProviderStatusesEvent,
   ServerConfigStreamSettingsUpdatedEvent,
+  ServerConfigStreamEnvironmentLabelUpdatedEvent,
   ServerConfigStreamEnvironmentThemesUpdatedEvent,
   ServerConfigStreamUsageLimitSourcesUpdatedEvent,
 ]);

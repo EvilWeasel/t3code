@@ -6,6 +6,7 @@ import {
   OtlpEndpointCheckInput,
   resolveEnvironmentMachineKind,
   ServerConfig,
+  ServerConfigStreamEvent,
   ServerObservability,
   ServerProvider,
   ServerProviders,
@@ -278,5 +279,25 @@ describe("OtlpEndpointCheckInput", () => {
     for (const url of ["data:text/plain,ok", "file:///etc/hosts", "collector:4318/v1/traces"]) {
       expect(() => decode({ signal: "traces", url })).toThrow();
     }
+  });
+});
+
+
+describe("MT environment label stream contract", () => {
+  const decode = Schema.decodeUnknownSync(ServerConfigStreamEvent);
+  const event = { version: 1, type: "environmentLabelUpdated", payload: { label: "MT Code" } };
+
+  it("accepts the strict version 1 MT label event", () => {
+    expect(decode(event)).toEqual(event);
+  });
+
+  it.each([
+    { ...event, version: 2 },
+    { ...event, type: "unknownEvent" },
+    { ...event, payload: {} },
+    { ...event, payload: { label: "   " } },
+    { ...event, payload: { label: 42 } },
+  ])("rejects incompatible versions, event types and labels: %j", (invalid) => {
+    expect(() => decode(invalid)).toThrow();
   });
 });

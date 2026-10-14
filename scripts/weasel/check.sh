@@ -23,6 +23,9 @@ done
 
 vp_cmd run --filter=@t3tools/scripts typecheck
 focused_tests=(
+  packages/contracts/src/server.test.ts \
+  packages/client-runtime/src/state/serverConfigProjection.test.ts \
+  packages/client-runtime/src/rpc/session.test.ts \
   apps/desktop/src/app/DesktopEarlyElectronStartup.test.ts \
   apps/desktop/src/app/DesktopEnvironment.test.ts \
   apps/desktop/src/app/DesktopAppIdentity.test.ts \
