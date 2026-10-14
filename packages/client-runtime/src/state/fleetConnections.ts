@@ -29,7 +29,7 @@ export const requestFleetPairingCredential = (
     group: "auth",
     method: "POST",
     timeoutMs: 15_000,
-    url: (urls) => urls.fleetPairingCredential({ environmentId: input.environmentId }),
+    url: (urls) => urls.fleetPairingCredential({ params: { environmentId: input.environmentId } }),
     request: ({ client, headers }) =>
       client.fleetPairingCredential({ params: { environmentId: input.environmentId }, headers }),
   });
