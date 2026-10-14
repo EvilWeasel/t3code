@@ -1,0 +1,42 @@
+name: Weasel HTML browser fixtures
+
+on:
+  push:
+    branches: [archify/html-fixtures-qualification]
+    paths:
+      - .github/workflows/weasel-html-fixtures.yml
+      - scripts/weasel/qualify-html-browser.ts
+      - apps/server/src/htmlRender/**
+      - apps/server/src/preview/**
+      - apps/server/src/config.ts
+      - apps/server/src/zipArchive.ts
+      - apps/server/package.json
+      - apps/server/src/mcp/toolkits/html/tools.ts
+      - apps/server/src/mcp/toolkits/html/tools.test.ts
+      - packages/shared/src/HostProcess.ts
+      - packages/shared/src/htmlRender.ts
+      - packages/shared/src/themePalettes.ts
+      - package.json
+      - pnpm-lock.yaml
+      - vite.config.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weasel-html-fixtures-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  html-browser-fixtures:
+    runs-on: namespace-profile-ci-builder
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: true
+      - name: Install the pinned preview browser and run HTML fixtures
+        run: node scripts/weasel/qualify-html-browser.ts
