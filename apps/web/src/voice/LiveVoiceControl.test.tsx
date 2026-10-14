@@ -74,7 +74,10 @@ it("keeps unavailable Live quiet until the disabled control is focused", async (
   });
   expect(document.activeElement).toBe(trigger);
   await vi.waitFor(() =>
-    expect(document.querySelector('[role="tooltip"]')?.textContent, document.body.innerHTML).toContain(reason),
+    expect(
+      document.querySelector('[role="tooltip"]')?.textContent,
+      document.body.innerHTML,
+    ).toContain(reason),
   );
   expect(calls.command).not.toHaveBeenCalled();
 });

@@ -1,7 +1,7 @@
 import { AsyncResult } from "effect/reactivity";
 import { MicIcon, MicOffIcon, PhoneOffIcon, Volume2Icon, VolumeXIcon } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import type { LiveVoiceEvent } from "@t3tools/contracts";
 import {
@@ -120,6 +120,7 @@ export function LiveVoiceControl(props: {
   readonly eligible: boolean;
   readonly unavailableReason: string;
 }) {
+  const hintId = useId();
   const prepare = useAtomCommand(liveVoiceEnvironment.prepare, {
     reportFailure: false,
     reportDefect: false,
@@ -277,6 +278,7 @@ export function LiveVoiceControl(props: {
           ) : null}
           <Tooltip>
             <TooltipTrigger
+              aria-describedby={hintId}
               render={<span className="inline-flex" tabIndex={!canStart ? 0 : undefined} />}
             >
               <Button
@@ -291,7 +293,9 @@ export function LiveVoiceControl(props: {
                 <MicIcon />
               </Button>
             </TooltipTrigger>
-            <TooltipPopup>{unavailableNotice ?? "Start Live voice"}</TooltipPopup>
+            <TooltipPopup id={hintId} role="tooltip">
+              {unavailableNotice ?? "Start Live voice"}
+            </TooltipPopup>
           </Tooltip>
         </>
       ) : (
