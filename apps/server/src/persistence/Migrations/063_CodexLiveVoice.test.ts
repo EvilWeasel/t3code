@@ -161,7 +161,7 @@ it.effect("adds Voice 63 to the current main 62 database without replacing main'
     const ledger = yield* sql<{ migration_id: number; name: string }>`
       SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
     `;
-    assert.deepStrictEqual(ledger.map((row) => [row.migration_id, row.name]), migrationManifest);
+    assert.deepStrictEqual(ledger.map((row) => [row.migration_id, row.name] as const), migrationManifest);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
 );
@@ -206,7 +206,7 @@ it.effect("upgrades the qualified Voice 62 ledger atomically while preserving le
     const ledger = yield* sql<{ migration_id: number; name: string }>`
       SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
     `;
-    assert.deepStrictEqual(ledger.map((row) => [row.migration_id, row.name]), migrationManifest);
+    assert.deepStrictEqual(ledger.map((row) => [row.migration_id, row.name] as const), migrationManifest);
     assert.lengthOf(yield* failureIndex, 1);
     assert.deepStrictEqual(yield* runMigrations(), []);
   }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
