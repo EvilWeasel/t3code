@@ -76,7 +76,9 @@ import * as DesktopWindow from "./window/DesktopWindow.ts";
 import * as DesktopWslBackend from "./wsl/DesktopWslBackend.ts";
 import * as DesktopWslEnvironment from "./wsl/DesktopWslEnvironment.ts";
 import * as DesktopWslServerTree from "./wsl/DesktopWslServerTree.ts";
+import { resolveWindowsProfileHome } from "./app/DesktopWindowsProfileBinding.ts";
 
+let packagedWeaselProfile = false;
 if (Electron.app.isPackaged) {
   try {
     const packageMetadata = JSON.parse(
@@ -84,9 +86,7 @@ if (Electron.app.isPackaged) {
     ) as { t3codeProfile?: unknown };
     if (packageMetadata.t3codeProfile === "weasel") {
       process.env.T3CODE_DESKTOP_PROFILE = "weasel";
-      if (!process.env.T3CODE_HOME?.trim()) {
-        process.env.T3CODE_HOME = `${NodeOS.homedir()}/.t3-weasel`;
-      }
+      packagedWeaselProfile = true;
     }
   } catch {
     // Upstream and development packages have no fork profile marker.
@@ -100,6 +100,18 @@ if (process.argv.includes("--version")) {
     if (!(error instanceof Error) || !("code" in error) || error.code !== "EPIPE") throw error;
   }
   Electron.app.exit(0);
+}
+
+if (packagedWeaselProfile) {
+  if (process.platform === "win32") {
+    process.env.T3CODE_HOME = resolveWindowsProfileHome({
+      homeDirectory: NodeOS.homedir(),
+      appDataDirectory: process.env.APPDATA,
+      explicitHome: process.env.T3CODE_HOME,
+    });
+  } else if (!process.env.T3CODE_HOME?.trim()) {
+    process.env.T3CODE_HOME = `${NodeOS.homedir()}/.t3-weasel`;
+  }
 }
 
 const layerDesktopEnvironment = Layer.unwrap(
