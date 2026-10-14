@@ -55,7 +55,7 @@ export class RelayEnvironmentDiscovery extends Context.Service<
   RelayEnvironmentDiscovery,
   {
     readonly state: SubscriptionRef.SubscriptionRef<RelayEnvironmentDiscoveryState>;
-    readonly authenticatedSnapshot: SubscriptionRef.SubscriptionRef<
+    readonly authenticatedSnapshot?: SubscriptionRef.SubscriptionRef<
       Option.Option<AuthenticatedRelayEnvironmentSnapshot>
     >;
     readonly refresh: Effect.Effect<void>;

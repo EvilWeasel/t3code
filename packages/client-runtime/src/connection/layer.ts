@@ -76,13 +76,15 @@ export const watchDiscoveredEnvironments = Effect.fn("connection.watchDiscovered
   function* () {
     const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
     const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
-    yield* SubscriptionRef.changes(discovery.authenticatedSnapshot).pipe(
+    const snapshots = discovery.authenticatedSnapshot;
+    if (snapshots === undefined) return;
+    yield* SubscriptionRef.changes(snapshots).pipe(
       Stream.runForEach(() =>
         Effect.gen(function* () {
-          const snapshot = yield* SubscriptionRef.get(discovery.authenticatedSnapshot);
+          const snapshot = yield* SubscriptionRef.get(snapshots);
           if (Option.isNone(snapshot)) {
             yield* registry.removeRelayEnvironments();
-          } else {
+          } else if (registry.reconcileDiscovered !== undefined) {
             yield* registry.reconcileDiscovered(snapshot.value);
           }
         }).pipe(
@@ -117,24 +119,19 @@ export function layerWithOptions(options: RpcSession.RpcSessionOptions) {
       yield* watchDiscoveredEnvironments().pipe(Effect.forkScoped);
       // Populate linked environments on cold start without waiting for a UI
       // surface to request discovery. The watcher is already subscribed.
-      yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery.pipe(
-        Effect.flatMap((discovery) => discovery.refresh),
-      );
-      yield* Effect.gen(function* () {
-        const snapshot = yield* SubscriptionRef.get(
-          (yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery).authenticatedSnapshot,
-        );
-        if (Option.isSome(snapshot)) {
+      const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
+      yield* discovery.refresh;
+      if (discovery.authenticatedSnapshot !== undefined) {
+        const snapshot = yield* SubscriptionRef.get(discovery.authenticatedSnapshot);
+        if (Option.isSome(snapshot) && registry.reconcileDiscovered !== undefined) {
           yield* registry.reconcileDiscovered(snapshot.value);
-          return;
+        } else if (Option.isNone(snapshot)) {
+          const state = yield* SubscriptionRef.get(discovery.state);
+          if (!state.refreshing && !state.offline && Option.isNone(state.error)) {
+            yield* registry.removeRelayEnvironments();
+          }
         }
-        const state = yield* SubscriptionRef.get(
-          (yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery).state,
-        );
-        if (!state.refreshing && !state.offline && Option.isNone(state.error)) {
-          yield* registry.removeRelayEnvironments();
-        }
-      });
+      }
       yield* platformSource.registrations.pipe(
         Stream.runForEach(registry.reconcilePlatform),
         Effect.forkScoped,

@@ -207,7 +207,7 @@ describe("RelayEnvironmentDiscovery", () => {
           const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
           yield* discovery.refresh;
           const first = Option.getOrThrow(
-            yield* SubscriptionRef.get(discovery.authenticatedSnapshot),
+            yield* SubscriptionRef.get(discovery.authenticatedSnapshot!),
           );
           expect(first.environments.size).toBe(2);
           expect([...first.environments.keys()]).toEqual(
@@ -216,7 +216,7 @@ describe("RelayEnvironmentDiscovery", () => {
 
           yield* discovery.refresh;
           const refreshed = Option.getOrThrow(
-            yield* SubscriptionRef.get(discovery.authenticatedSnapshot),
+            yield* SubscriptionRef.get(discovery.authenticatedSnapshot!),
           );
           expect(refreshed.environments.size).toBe(2);
           expect(refreshed.identity).toEqual(first.identity);
@@ -444,7 +444,7 @@ describe("RelayEnvironmentDiscovery", () => {
         }
         yield* discovery.refresh;
         const firstSnapshot = Option.getOrThrow(
-          yield* SubscriptionRef.get(discovery.authenticatedSnapshot),
+          yield* SubscriptionRef.get(discovery.authenticatedSnapshot!),
         );
         expect(firstSnapshot.identity.accountId).toBe("account-1");
         expect([...firstSnapshot.environments.keys()]).toEqual(
@@ -457,7 +457,7 @@ describe("RelayEnvironmentDiscovery", () => {
 
         const state = yield* SubscriptionRef.get(discovery.state);
         expect(yield* firstSnapshot.isCurrent()).toBe(false);
-        expect(Option.isNone(yield* SubscriptionRef.get(discovery.authenticatedSnapshot))).toBe(
+        expect(Option.isNone(yield* SubscriptionRef.get(discovery.authenticatedSnapshot!))).toBe(
           true,
         );
         expect(state.environments.size).toBe(0);
@@ -481,24 +481,25 @@ describe("RelayEnvironmentDiscovery", () => {
         }
         yield* discovery.refresh;
         const original = Option.getOrThrow(
-          yield* SubscriptionRef.get(discovery.authenticatedSnapshot),
+          yield* SubscriptionRef.get(discovery.authenticatedSnapshot!),
         );
 
         yield* Ref.set(harness.pauseSecondList, true);
         const staleRefresh = yield* Effect.forkChild(discovery.refresh);
         yield* Deferred.await(harness.secondListCall);
         const currentSnapshotFiber = yield* Effect.forkChild(
-          SubscriptionRef.changes(discovery.authenticatedSnapshot).pipe(
+          SubscriptionRef.changes(discovery.authenticatedSnapshot!).pipe(
             Stream.filter(
               (snapshot) =>
                 Option.isSome(snapshot) && snapshot.value.identity.accountId === "account-2",
             ),
             Stream.runHead,
             Effect.map(Option.getOrThrow),
+            Effect.map(Option.getOrThrow),
           ),
         );
         const invalidatedSnapshotFiber = yield* Effect.forkChild(
-          SubscriptionRef.changes(discovery.authenticatedSnapshot).pipe(
+          SubscriptionRef.changes(discovery.authenticatedSnapshot!).pipe(
             Stream.filter(Option.isNone),
             Stream.runHead,
           ),

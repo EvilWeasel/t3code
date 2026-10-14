@@ -518,7 +518,7 @@ function linkedSnapshot(
     generation: 1,
     environments,
     isCurrent,
-  } as RelayEnvironmentDiscovery.AuthenticatedRelayEnvironmentSnapshot;
+  } as unknown as RelayEnvironmentDiscovery.AuthenticatedRelayEnvironmentSnapshot;
 }
 
 function replaceRoutes(
@@ -820,7 +820,7 @@ describe("EnvironmentRegistry", () => {
             { environmentId: blain, label: "Blain" },
             { environmentId: winDev, label: "WinDev" },
           ]);
-          yield* registry.reconcileDiscovered(snapshot);
+          yield* registry.reconcileDiscovered!(snapshot);
           for (const environmentId of [heph, blain]) {
             yield* awaitConnectionState(
               registry,
@@ -846,7 +846,7 @@ describe("EnvironmentRegistry", () => {
             "RelayConnectionTarget",
           ]);
 
-          yield* registry.reconcileDiscovered(snapshot);
+          yield* registry.reconcileDiscovered!(snapshot);
           expect(yield* Ref.get(harness.storedTargets)).toEqual(firstTargets);
           expect((yield* Ref.get(harness.sessions)).length).toBe(firstSessionCount);
           expect(yield* Ref.get(harness.releasedSessions)).toBe(firstReleasedCount);
@@ -876,9 +876,9 @@ describe("EnvironmentRegistry", () => {
           const snapshot = linkedSnapshot(
             ids.map((environmentId, index) => ({ environmentId, label: `discovered-${index}` })),
           );
-          yield* registry.reconcileDiscovered(snapshot);
+          yield* registry.reconcileDiscovered!(snapshot);
           const firstSessionCount = (yield* Ref.get(harness.sessions)).length;
-          yield* registry.reconcileDiscovered(snapshot);
+          yield* registry.reconcileDiscovered!(snapshot);
           expect(yield* Ref.get(harness.storedTargets)).toEqual(targets);
           expect((yield* Ref.get(harness.sessions)).length).toBe(firstSessionCount);
           expect((yield* SubscriptionRef.get(registry.entries)).get(ids[3]!)?.enabled).toBe(false);
@@ -924,7 +924,7 @@ describe("EnvironmentRegistry", () => {
             [{ environmentId: target.environmentId, label: "Stale owner route" }],
             () => Ref.get(isCurrentRef),
           );
-          const reconcileFiber = yield* Effect.forkChild(registry.reconcileDiscovered(snapshot));
+          const reconcileFiber = yield* Effect.forkChild(registry.reconcileDiscovered!(snapshot));
           yield* Deferred.await(enteredRegistration);
           yield* Ref.set(isCurrentRef, false);
           yield* Deferred.succeed(releaseRegistration, undefined);

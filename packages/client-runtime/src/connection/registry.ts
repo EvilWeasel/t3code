@@ -36,7 +36,7 @@ import type {
   PersistedConnectionTarget,
   SupervisorConnectionState,
 } from "./model.ts";
-import { ConnectionBlockedError } from "./model.ts";
+import { ConnectionBlockedError, RelayConnectionTarget } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionDriver from "./driver.ts";
@@ -108,7 +108,7 @@ export class EnvironmentRegistry extends Context.Service<
       registrations: ReadonlyArray<PlatformConnectionRegistration>,
     ) => Effect.Effect<void>;
     /** Reconciles only the owner-authenticated linked-environment snapshot from relay discovery. */
-    readonly reconcileDiscovered: (
+    readonly reconcileDiscovered?: (
       snapshot: AuthenticatedRelayEnvironmentSnapshot,
     ) => Effect.Effect<
       void,

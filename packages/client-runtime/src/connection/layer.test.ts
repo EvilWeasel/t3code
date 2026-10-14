@@ -37,7 +37,7 @@ describe("connection layer enrollment watcher", () => {
             ],
           ]),
           isCurrent: () => Effect.succeed(true),
-        } as RelayEnvironmentDiscovery.AuthenticatedRelayEnvironmentSnapshot;
+        } as unknown as RelayEnvironmentDiscovery.AuthenticatedRelayEnvironmentSnapshot;
         const authenticatedSnapshot = yield* SubscriptionRef.make<
           Option.Option<RelayEnvironmentDiscovery.AuthenticatedRelayEnvironmentSnapshot>
         >(Option.some(snapshot));
@@ -49,7 +49,9 @@ describe("connection layer enrollment watcher", () => {
         const firstReconcile = yield* Deferred.make<void>();
         const removed = yield* Deferred.make<void>();
         const registry = EnvironmentRegistry.EnvironmentRegistry.of({
-          reconcileDiscovered: (current) =>
+          reconcileDiscovered: (
+            current: RelayEnvironmentDiscovery.AuthenticatedRelayEnvironmentSnapshot,
+          ) =>
             Ref.update(reconciled, (calls) => [...calls, [...current.environments.keys()]]).pipe(
               Effect.andThen(Deferred.succeed(firstReconcile, undefined)),
             ),
