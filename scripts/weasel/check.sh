@@ -116,6 +116,7 @@ fi
 focused_tests+=("$transcript_ui_test")
 echo "Including required Transcript UI gate: $transcript_ui_test"
 agent_session_tests=(
+  packages/contracts/src/agentSessions.test.ts
   apps/server/src/project/AgentSessionScanner.test.ts
   apps/server/src/project/AgentSessionImporter.test.ts
 )
