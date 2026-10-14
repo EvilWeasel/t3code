@@ -1,4 +1,4 @@
-import { DEFAULT_SERVER_SETTINGS, type ServerConfig, ServerConfigStreamEvent } from "@t3tools/contracts";
+import { EnvironmentId, DEFAULT_SERVER_SETTINGS, type ServerConfig, ServerConfigStreamEvent } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
@@ -7,7 +7,7 @@ import { applyServerConfigProjection } from "./serverConfigProjection.ts";
 
 const SERVER_CONFIG: ServerConfig = {
   environment: {
-    environmentId: "test-environment",
+    environmentId: EnvironmentId.make("test-environment"),
     label: "Before",
     platform: {
       os: "darwin",
