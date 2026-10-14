@@ -1,0 +1,66 @@
+name: Morrowbyte NixOS release package
+on:
+  push:
+    branches: [deployment/morrowbyte-nixos-20261014]
+    paths: [.github/workflows/morrowbyte-nixos-release.yml]
+permissions:
+  contents: read
+concurrency:
+  group: morrowbyte-nixos-release-20261014
+  cancel-in-progress: false
+jobs:
+  package:
+    runs-on: namespace-profile-ci-builder
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 13570fb8042beeb5c0f0e8cd563041f3aaa11b76
+      - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9
+        with:
+          cache: nix
+      - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = 4
+            cores = 2
+      - name: Bind to the exact qualified published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=v0.0.47-nightly.20261014.14
+          ready=0
+          for attempt in $(seq 1 120); do
+            if gh api repos/morrowbyte/t3code/releases/tags/$tag > release.json 2>/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 15
+          done
+          test "$ready" = 1
+          test "$(jq -r .target_commitish release.json)" = 13570fb8042beeb5c0f0e8cd563041f3aaa11b76
+          jq -er '.assets[] | select(.name == "T3-Code-0.0.47-nightly.20261014.14-x86_64.AppImage") | .digest | select(test("^sha256:[0-9a-f]{64}$"))' release.json > digest
+          jq -er '.assets[] | select(.name == "T3-Code-0.0.47-nightly.20261014.14-x86_64.AppImage") | .browser_download_url' release.json > artifact-url
+      - name: Build and export only the prebuilt release package on Namespace
+        run: |
+          set -euo pipefail
+          export T3_WEASEL_REPOSITORY=morrowbyte/t3code
+          export T3_WEASEL_VERSION=0.0.47-nightly.20261014.14
+          export T3_WEASEL_ARTIFACT_URL="$(cat artifact-url)"
+          export T3_WEASEL_ARTIFACT_SHA256="$(sed 's/^sha256://' digest)"
+          nix build --impure --no-write-lock-file --out-link result path:./packaging/nixos#t3code-weasel
+          out="$(readlink -f result)"
+          mkdir -p transfer
+          printf '%s\n' "$out" > transfer/package-path.txt
+          nix-store --query --requisites "$out" > transfer/closure-paths.txt
+          nix-store --export $(cat transfer/closure-paths.txt) | gzip -1 > transfer/closure.nar.gz
+          sha256sum transfer/closure.nar.gz > transfer/SHA256SUMS
+          jq -n --arg source 13570fb8042beeb5c0f0e8cd563041f3aaa11b76 --arg version "$T3_WEASEL_VERSION" --arg artifactSha256 "$T3_WEASEL_ARTIFACT_SHA256" --arg package "$out" '{source:$source,version:$version,artifactSha256:$artifactSha256,package:$package}' > transfer/receipt.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: morrowbyte-nixos-0.0.47-nightly.20261014.14
+          path: transfer/
+          compression-level: 0
+          retention-days: 7
