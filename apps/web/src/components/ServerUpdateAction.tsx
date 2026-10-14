@@ -65,17 +65,29 @@ type UpdateButtonProps = Pick<ComponentProps<typeof Button>, "variant" | "size" 
   readonly appearance?: "button" | "icon";
 };
 
+export type ServerUpdateResult =
+  | { readonly ok: true; readonly label: string; readonly version: string }
+  | { readonly ok: false; readonly label: string; readonly message: string };
+
 /** Updates one server and waits until it is back on the target version.
     Reports its own success or failure toast; never rejects. */
 export function useServerUpdate() {
   const updateServer = useAtomCommand(serverEnvironment.updateServer, { reportFailure: false });
-  return async (target: ServerUpdateTarget, failureTitle = "Server update failed") => {
+  return async (
+    target: ServerUpdateTarget,
+    failureTitle = "Server update failed",
+  ): Promise<ServerUpdateResult> => {
     const { environmentId, serverLabel, selfUpdate, targetVersion } = target;
     if (
       !canUpdateServer(appAtomRegistry.get(environmentSession.sessionStateAtom(environmentId))) ||
       pendingUpdateEnvironmentIds.has(environmentId)
-    )
-      return;
+    ) {
+      return {
+        ok: false,
+        label: serverLabel,
+        message: "Update permission is missing or another update is running.",
+      };
+    }
     pendingUpdateEnvironmentIds.add(environmentId);
     try {
       const result = await updateServer({
@@ -88,7 +100,9 @@ export function useServerUpdate() {
         },
       });
       if (result._tag === "Failure") {
-        if (isAtomCommandInterrupted(result)) return;
+        if (isAtomCommandInterrupted(result)) {
+          return { ok: false, label: serverLabel, message: "Update was interrupted." };
+        }
         throw squashAtomCommandFailure(result);
       }
       toastManager.add({
@@ -99,12 +113,11 @@ export function useServerUpdate() {
             ? `Desktop app relaunched on ${result.value.targetVersion}.`
             : `Reconnected on t3@${result.value.targetVersion}.`,
       });
+      return { ok: true, label: serverLabel, version: result.value.targetVersion };
     } catch (error) {
-      toastManager.add({
-        type: "error",
-        title: failureTitle,
-        description: updateFailureMessage(error),
-      });
+      const message = updateFailureMessage(error);
+      toastManager.add({ type: "error", title: failureTitle, description: message });
+      return { ok: false, label: serverLabel, message };
     } finally {
       pendingUpdateEnvironmentIds.delete(environmentId);
     }

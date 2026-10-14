@@ -61,6 +61,17 @@ describe("collectServerUpdateTargets", () => {
       ["other-desktop", "0.0.50"],
     ]);
   });
+  it("keeps current and newer nightly hosts out of an update pass", () => {
+    const targets = collectServerUpdateTargets(
+      [
+        machine("older", "0.0.47-nightly.20261014.15", "boot-service"),
+        machine("current", "0.0.47-nightly.20261014.16", "boot-service"),
+        machine("newer", "0.0.47-nightly.20261014.17", "desktop-managed"),
+      ],
+      "0.0.47-nightly.20261014.16",
+    );
+    expect(targets.map((target) => target.serverLabel)).toEqual(["older"]);
+  });
 });
 
 describe("collectRestartingMachines", () => {
@@ -153,6 +164,21 @@ describe("runUpdateEverything", () => {
     });
 
     expect(calls).toEqual(["providers", "servers"]);
+  });
+  it("keeps this app open when a remote host fails so its result remains visible", async () => {
+    const installLocal = async () => {
+      throw new Error("must not restart");
+    };
+    await expect(
+      runUpdateEverything({
+        downloadLocal: async () => true,
+        updateProviders: async () => {},
+        updateServers: async () => [
+          { label: "Hephaestus", message: "Downloaded version did not match" },
+        ],
+        installLocal,
+      }),
+    ).rejects.toThrow("Hephaestus: Downloaded version did not match");
   });
 });
 

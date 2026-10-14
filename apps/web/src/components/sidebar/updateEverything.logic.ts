@@ -118,7 +118,10 @@ export interface UpdateEverythingSteps {
   /** Downloads this app's update. Resolves true when it is ready to install. */
   readonly downloadLocal?: () => Promise<boolean>;
   readonly updateProviders: () => Promise<void>;
-  readonly updateServers: () => Promise<void>;
+  readonly updateServers: () => Promise<void | ReadonlyArray<{
+    readonly label: string;
+    readonly message: string;
+  }>>;
   /** Installs this app's update. The relaunch ends the run. */
   readonly installLocal?: () => Promise<void>;
 }
@@ -130,10 +133,15 @@ export interface UpdateEverythingSteps {
  * failed download skips only that install. Steps report their own results.
  */
 export async function runUpdateEverything(steps: UpdateEverythingSteps): Promise<void> {
-  const [localReady] = await Promise.all([
+  const [localReady, failures] = await Promise.all([
     steps.downloadLocal?.() ?? Promise.resolve(true),
     steps.updateProviders().then(steps.updateServers),
   ]);
+  if (failures && failures.length > 0) {
+    throw new Error(
+      `Some hosts could not update: ${failures.map((failure) => `${failure.label}: ${failure.message}`).join("; ")}. This app has not restarted.`,
+    );
+  }
   if (localReady) await steps.installLocal?.();
 }
 
