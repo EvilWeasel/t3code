@@ -270,6 +270,86 @@ describe("DesktopLinuxUrlHandler", () => {
     });
   });
 
+  it.effect(
+    "keeps cold protocol launches on the configured launcher and explicit home across updates",
+    () => {
+      const firstRegistration = emptyRecording();
+      const secondRegistration = emptyRecording();
+      const launchConfig = {
+        linuxUrlHandlerLauncher: Option.some("/tmp/t3code-fixture/bin/t3code-weasel"),
+        linuxUrlHandlerHome: Option.some("/tmp/t3code-fixture/home/t3code-weasel"),
+        profileId: Option.some("weasel"),
+      };
+
+      return Effect.gen(function* () {
+        yield* runRegister(firstRegistration, {
+          environment: {
+            ...launchConfig,
+            appImagePath: Option.some("/tmp/.mount_first/T3Code.AppImage"),
+          },
+        });
+        const firstEntry = firstRegistration.files[0]?.content;
+        assert.isString(firstEntry);
+        assert.include(
+          firstEntry,
+          [
+            'Exec="/usr/bin/env"',
+            '"T3CODE_DESKTOP_LINUX_URL_HANDLER_LAUNCHER=/tmp/t3code-fixture/bin/t3code-weasel"',
+            '"T3CODE_HOME=/tmp/t3code-fixture/home/t3code-weasel"',
+            '"T3CODE_DESKTOP_PROFILE=weasel"',
+            '"/tmp/t3code-fixture/bin/t3code-weasel" %U',
+          ].join(" "),
+        );
+
+        // The cold launch receives these assignments from Exec. The next app
+        // version presents a different mounted AppImage path but the configured
+        // wrapper remains the entry point and registration reproduces the entry.
+        yield* runRegister(secondRegistration, {
+          environment: {
+            ...launchConfig,
+            appImagePath: Option.some("/tmp/.mount_updated/T3Code.AppImage"),
+          },
+        });
+        assert.equal(secondRegistration.files[0]?.content, firstEntry);
+        assert.include(
+          secondRegistration.files[0]?.content,
+          "T3CODE_HOME=/tmp/t3code-fixture/home/t3code-weasel",
+        );
+        assert.include(
+          secondRegistration.files[0]?.content,
+          '"/tmp/t3code-fixture/bin/t3code-weasel" %U',
+        );
+      });
+    },
+  );
+
+  it("does not treat a relative launcher setting as an executable override", () => {
+    const launch = DesktopLinuxUrlHandler.resolveUrlHandlerLaunch({
+      defaultExecTarget: "/opt/t3/T3Code.AppImage",
+      configuredLauncher: "bin/t3code-wrapper",
+      home: "/home/tester/.t3",
+    });
+    assert.deepEqual(launch, {
+      execTarget: "/opt/t3/T3Code.AppImage",
+      environment: { T3CODE_HOME: "/home/tester/.t3" },
+    });
+  });
+
+  it("escapes configured launcher and home arguments containing spaces, quotes, and field codes", () => {
+    const entry = DesktopLinuxUrlHandler.renderUrlHandlerDesktopEntry({
+      displayName: "T3 Code (Fork)",
+      execTarget: "/tmp/t3 fixture/bin/launch \"quoted\" 50%.sh",
+      environment: {
+        T3CODE_HOME: "/tmp/t3 fixture/home \"profile\" 100%",
+      },
+      scheme: "t3code-weasel",
+    });
+    assert.include(
+      entry,
+      'Exec="/usr/bin/env" "T3CODE_HOME=/tmp/t3 fixture/home \\\\"profile\\\\" 100%%" "/tmp/t3 fixture/bin/launch \\\\"quoted\\\\" 50%%.sh" %U',
+    );
+  });
+
   it.effect("does not rewrite the pre-ready entry while the portal can be reading it", () => {
     const recorded = emptyRecording();
 

@@ -81,19 +81,58 @@ export function escapeDesktopEntryExecArgument(value: string): string {
   return escapeDesktopEntryString(`"${quoted}"`);
 }
 
+export interface UrlHandlerLaunch {
+  readonly execTarget: string;
+  readonly environment: Readonly<Record<string, string>>;
+}
+
+/**
+ * Resolve only explicitly configured launch settings. Desktop entries are
+ * regenerated on every start, so carrying these values in Exec makes the
+ * selected launcher and T3 home survive a cold protocol launch and re-register.
+ */
+export function resolveUrlHandlerLaunch(input: {
+  readonly defaultExecTarget: string;
+  readonly configuredLauncher?: string;
+  readonly home?: string;
+  readonly profileId?: string;
+}): UrlHandlerLaunch {
+  const configuredLauncher = input.configuredLauncher?.startsWith("/")
+    ? input.configuredLauncher
+    : undefined;
+  return {
+    execTarget: configuredLauncher ?? input.defaultExecTarget,
+    environment: {
+      ...(configuredLauncher === undefined
+        ? {}
+        : { T3CODE_DESKTOP_LINUX_URL_HANDLER_LAUNCHER: configuredLauncher }),
+      ...(input.home === undefined ? {} : { T3CODE_HOME: input.home }),
+      ...(input.profileId === undefined ? {} : { T3CODE_DESKTOP_PROFILE: input.profileId }),
+    },
+  };
+}
+
 // The AppImage integration entry owns the window identity. This
 // hidden URL-only entry must not compete with it for StartupWMClass matching.
 export function renderUrlHandlerDesktopEntry(input: {
   readonly displayName: string;
   readonly execTarget: string;
+  readonly environment?: Readonly<Record<string, string>>;
   readonly scheme: string;
   readonly iconPath?: string;
 }): string {
+  const environmentEntries = Object.entries(input.environment ?? {});
+  const execArguments = [
+    ...(environmentEntries.length === 0
+      ? []
+      : ["/usr/bin/env", ...environmentEntries.map(([key, value]) => `${key}=${value}`)]),
+    input.execTarget,
+  ];
   return [
     "[Desktop Entry]",
     "Type=Application",
     `Name=${escapeDesktopEntryString(input.displayName)}`,
-    `Exec=${escapeDesktopEntryExecArgument(input.execTarget)} %U`,
+    `Exec=${execArguments.map(escapeDesktopEntryExecArgument).join(" ")} %U`,
     ...(input.iconPath === undefined ? [] : [`Icon=${escapeDesktopEntryString(input.iconPath)}`]),
     "Terminal=false",
     "NoDisplay=true",
@@ -128,10 +167,16 @@ export const make = Effect.gen(function* () {
   const writeDesktopEntry = Effect.gen(function* () {
     // Inside the mounted AppImage, process.execPath points at a transient
     // /tmp/.mount_* path — the handler must launch the AppImage itself.
-    const execTarget = Option.getOrElse(environment.appImagePath, () => process.execPath);
+    const launch = resolveUrlHandlerLaunch({
+      defaultExecTarget: Option.getOrElse(environment.appImagePath, () => process.execPath),
+      configuredLauncher: Option.getOrUndefined(environment.linuxUrlHandlerLauncher),
+      home: Option.getOrUndefined(environment.linuxUrlHandlerHome),
+      profileId: Option.getOrUndefined(environment.profileId),
+    });
     const content = renderUrlHandlerDesktopEntry({
       displayName: environment.displayName,
-      execTarget,
+      execTarget: launch.execTarget,
+      environment: launch.environment,
       scheme,
       ...(environment.isPackaged ? { iconPath } : {}),
     });
