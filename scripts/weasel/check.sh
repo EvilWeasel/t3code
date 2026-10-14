@@ -115,5 +115,16 @@ if [[ ! -f "$transcript_ui_test" ]]; then
 fi
 focused_tests+=("$transcript_ui_test")
 echo "Including required Transcript UI gate: $transcript_ui_test"
+agent_session_tests=(
+  apps/server/src/project/AgentSessionScanner.test.ts
+  apps/server/src/project/AgentSessionImporter.test.ts
+)
+for agent_session_test in "${agent_session_tests[@]}"; do
+  if [[ ! -f "$agent_session_test" ]]; then
+    echo "Required agent session gate is missing: $agent_session_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$agent_session_test")
+done
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts)
