@@ -60,7 +60,7 @@ vi.mock("../ui/menu", async () => {
       disabled?: boolean;
     }) => {
       const context = React.useContext(Context);
-      return React.cloneElement(render, { disabled, onClick: context.toggle, children });
+      return React.cloneElement(render, { disabled: disabled === true, onClick: context.toggle, children });
     },
     MenuPopup: ({ children }: { children: ReactNode }) =>
       React.useContext(Context).open ? <div role="menu">{children}</div> : null,
