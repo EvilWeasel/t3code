@@ -49,6 +49,7 @@ import {
   connectionRoutes,
   entryWithRoutes,
   findRouteToSameAddress,
+  isLearned,
   mergeLearnedRoutes,
   routesAfterRemoving,
   upsertRoute,
@@ -884,7 +885,8 @@ export const make = Effect.gen(function* () {
 
   /**
    * Saves the direct addresses a connected server reports as learned routes,
-   * replacing learned routes it no longer reports. Routes the user saved are
+   * after they pass an authenticated preflight, replacing unreachable or
+   * unreported learned routes. Routes the user saved are
    * never changed. Learned routes reuse the active route's credential, so they
    * do not revoke GitHub routing trust the way a newly paired address does.
    */
@@ -901,13 +903,40 @@ export const make = Effect.gen(function* () {
         }
         const entry = (yield* SubscriptionRef.get(entries)).get(input.environmentId);
         if (entry === undefined) return Option.none<ConnectionCatalogEntry>();
-        const routes = mergeLearnedRoutes({
+        const merged = mergeLearnedRoutes({
           entry,
           activeRoute: input.activeRoute,
           reported: input.reported,
           allowInsecure: allowInsecureRoutes,
         });
-        if (routes === null) return Option.none<ConnectionCatalogEntry>();
+        const saved = connectionRoutes(entry);
+        // An address advertised by the server may be unreachable from this
+        // client (for example its VPN address behind a routed VM bridge).
+        // Validate learned alternatives before persisting them. The active
+        // route already authenticated and must not be removed by a probe.
+        const checked = yield* Effect.forEach(
+          merged ?? saved,
+          (route) => {
+            if (
+              !isLearned(route) ||
+              connectionRouteId(route.target) === connectionRouteId(input.activeRoute.target)
+            ) {
+              return Effect.succeed(route);
+            }
+            return driver.preflight(entry, route).pipe(
+              Effect.timeoutOption("5 seconds"),
+              Effect.map((result) => (Option.getOrElse(result, () => false) ? route : null)),
+            );
+          },
+          { concurrency: 4 },
+        );
+        const routes = checked.filter((route) => route !== null);
+        if (
+          routes.length === saved.length &&
+          routes.every((route, index) => route === saved[index])
+        ) {
+          return Option.none<ConnectionCatalogEntry>();
+        }
         const next = entryWithRoutes(entry, routes);
         // Save new learned profiles and any whose Tailscale mark changed. A
         // learned route owns its profile; the credential stays with the route
@@ -929,6 +958,13 @@ export const make = Effect.gen(function* () {
           yield* profiles.put(profile);
         }
         yield* registrations.setRoutes(input.environmentId, persistedRoutes(next));
+        const retainedIds = new Set(routes.map((route) => connectionRouteId(route.target)));
+        for (const route of saved) {
+          if (isLearned(route) && !retainedIds.has(connectionRouteId(route.target))) {
+            const profile = Option.getOrNull(route.profile);
+            if (profile !== null) yield* profiles.remove(profile.connectionId);
+          }
+        }
         // Update the lease in place: the live session already works, and
         // `installEntryLocked` would replace it for a route list change.
         const lease = (yield* SubscriptionRef.get(serviceScopes)).get(input.environmentId);

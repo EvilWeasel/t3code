@@ -41,7 +41,7 @@ import * as Connectivity from "./connectivity.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import * as ConnectionDriver from "./driver.ts";
 import type { RouteCheck } from "./driver.ts";
-import { connectionRouteId, connectionRouteKind } from "./routes.ts";
+import { connectionRouteId, connectionRouteKind, routeHttpBaseUrl } from "./routes.ts";
 import {
   ConnectionTransientError,
   ConnectionBlockedError,
@@ -158,6 +158,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       environmentId: EnvironmentId,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
     readonly checkRoute?: (route: ConnectionRoute) => RouteCheck;
+    readonly preflight?: (route: ConnectionRoute) => boolean;
     readonly prepareRoute?: (target: ConnectionTarget) => ConnectionBlockedError | undefined;
     /** Runs before preparing a route; may suspend to hold an attempt in flight. */
     readonly beforePrepareRoute?: (
@@ -438,7 +439,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       ),
     checkRoute: (_entry, route) => checkRoute(route),
     preflight: (_entry, route) =>
-      checkRoute(route).pipe(Effect.map((check) => check === "answered")),
+      checkRoute(route).pipe(
+        Effect.map((check) => options?.preflight?.(route) ?? check === "answered"),
+      ),
   });
 
   const layerCache = Layer.succeed(Persistence.EnvironmentCacheStore, cacheStore);
@@ -2092,6 +2095,7 @@ describe("EnvironmentRegistry routes", () => {
         [LAN_PROFILE, learnedProfile],
         [[LAN_TARGET.connectionId, BEARER_CREDENTIAL]],
         {
+          checkRoute: () => "answered",
           directEndpoints: [
             { kind: "lan", httpBaseUrl: LAN_PROFILE.httpBaseUrl },
             { kind: "tailnet", httpBaseUrl },
@@ -2113,6 +2117,95 @@ describe("EnvironmentRegistry routes", () => {
         });
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
+  );
+
+  it.effect(
+    "keeps the authenticated saved route and only persists usable advertised alternatives",
+    () =>
+      Effect.gen(function* () {
+        const reachable = "http://192.168.10.8:3773/";
+        const unreachable = "http://100.96.62.207:3780/";
+        const rejected = "http://192.168.10.9:3773/";
+        const harness = yield* makeHarness(
+          [LAN_TARGET],
+          [LAN_PROFILE],
+          [[LAN_TARGET.connectionId, BEARER_CREDENTIAL]],
+          {
+            checkRoute: (route) =>
+              routeHttpBaseUrl(route) === unreachable ? "silent" : "answered",
+            preflight: (route) => routeHttpBaseUrl(route) === reachable,
+            directEndpoints: [reachable, unreachable, rejected].map((httpBaseUrl) => ({
+              kind: "lan" as const,
+              httpBaseUrl,
+            })),
+          },
+        );
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.start;
+          yield* SubscriptionRef.changes(registry.entries).pipe(
+            Stream.filter(
+              (entries) => entries.get(LAN_TARGET.environmentId)?.alternateRoutes?.length === 1,
+            ),
+            Stream.runHead,
+          );
+          const profiles = [...(yield* Ref.get(harness.storedProfiles)).values()];
+          expect(profiles.map((profile) => profile.connectionId)).toContain(
+            LAN_PROFILE.connectionId,
+          );
+          expect(
+            profiles
+              .filter((profile) => profile._tag === "BearerConnectionProfile")
+              .map((profile) => profile.httpBaseUrl),
+          ).toEqual([LAN_PROFILE.httpBaseUrl, reachable]);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+  );
+
+  it.effect(
+    "removes an unreachable learned route saved by an earlier version without replacing the live session",
+    () =>
+      Effect.gen(function* () {
+        const httpBaseUrl = "http://100.96.62.207:3780/";
+        const connectionId = `learned:${LAN_TARGET.environmentId}:http://100.96.62.207:3780@${LAN_TARGET.connectionId}`;
+        const learned = new BearerConnectionTarget({ ...LAN_TARGET, connectionId });
+        const learnedProfile = new BearerConnectionProfile({
+          ...LAN_PROFILE,
+          connectionId,
+          httpBaseUrl,
+          wsBaseUrl: "ws://100.96.62.207:3780/",
+          learned: true,
+        });
+        const harness = yield* makeHarness(
+          [LAN_TARGET, learned],
+          [LAN_PROFILE, learnedProfile],
+          [[LAN_TARGET.connectionId, BEARER_CREDENTIAL]],
+          {
+            checkRoute: (route) =>
+              routeHttpBaseUrl(route) === httpBaseUrl ? "silent" : "answered",
+            directEndpoints: [{ kind: "lan", httpBaseUrl }],
+          },
+        );
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.start;
+          yield* SubscriptionRef.changes(registry.entries).pipe(
+            Stream.filter(
+              (entries) =>
+                (entries.get(LAN_TARGET.environmentId)?.alternateRoutes?.length ?? 0) === 0,
+            ),
+            Stream.runHead,
+          );
+          expect(routesOf(yield* Ref.get(harness.storedTargets), LAN_TARGET.environmentId)).toEqual(
+            [LAN_TARGET],
+          );
+          expect((yield* Ref.get(harness.storedProfiles)).has(connectionId)).toBe(false);
+          expect((yield* Ref.get(harness.storedCredentials)).has(LAN_TARGET.connectionId)).toBe(
+            true,
+          );
+          expect(yield* Ref.get(harness.releasedSessions)).toBe(0);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
   );
 
   it.effect("drops a learned route whose profile was not saved instead of duplicating it", () =>
