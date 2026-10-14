@@ -57,6 +57,7 @@ const settings = (model: string): typeof VoiceTranscriptionSettings.Type => ({
   instanceId: null,
   model,
   apiKeyConfigured: false,
+  supportsEncryptedApiKeyStorage: true,
   apiKeySource: "none",
   available: true,
   message: "Configured",
@@ -184,4 +185,39 @@ it("discards an unsaved API key when switching to account transcription", async 
   expect(renderer!.root.findByProps({ "aria-label": "Transcription API key" }).props.value).toBe(
     "",
   );
+});
+
+it.each([undefined, false])(
+  "does not submit a key to an environment without confirmed encrypted storage (%s)",
+  async (support) => {
+    const { supportsEncryptedApiKeyStorage: _support, ...oldSettings } = settings("legacy-model");
+    const legacy =
+      support === undefined
+        ? oldSettings
+        : { ...oldSettings, supportsEncryptedApiKeyStorage: support };
+    state.request.mockResolvedValue(legacy);
+    await act(async () => {
+      renderer = create(<VoiceTranscriptionSettingsPanel />);
+    });
+    const keyInput = renderer!.root.findByProps({ "aria-label": "Transcription API key" });
+    expect(keyInput.props.disabled).toBe(true);
+    // Even a stale input callback cannot send a key after capability changes.
+    act(() => {
+      keyInput.props.onChange({ target: { value: "fixture-key-must-not-upload" } });
+    });
+    await act(async () => renderer!.root.findAllByType("button").at(-1)!.props.onClick());
+    expect(state.request).toHaveBeenCalledOnce();
+    expect(JSON.stringify(renderer!.toJSON())).toContain("Update this environment");
+  },
+);
+
+it("can remove a legacy saved key without re-uploading it", async () => {
+  const { supportsEncryptedApiKeyStorage: _support, ...oldSettings } = settings("legacy-model");
+  const legacy = { ...oldSettings, apiKeyConfigured: true, apiKeySource: "saved" as const };
+  state.request.mockResolvedValue(legacy);
+  await act(async () => {
+    renderer = create(<VoiceTranscriptionSettingsPanel />);
+  });
+  await act(async () => renderer!.root.findAllByType("button")[0]!.props.onClick());
+  expect(state.request.mock.calls[1]?.[1]).toHaveProperty("apiKey", null);
 });

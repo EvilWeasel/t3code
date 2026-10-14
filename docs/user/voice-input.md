@@ -26,7 +26,9 @@ is needed for account mode. A provider can still reject transcription even while
 coding works; the failed recording remains available to retry.
 
 OpenAI API mode uses API billing. Keys entered here go only to the environment's
-private secret store and are never returned in settings. Leave the key blank to
+private secret store and are never returned in settings. The key input remains
+disabled until that environment confirms encrypted storage; update older servers
+before entering a key. Leave the key blank to
 retain it; **Remove saved key** removes the saved override. A key supplied by the
 host's private launch environment remains managed by that host.
 

@@ -752,6 +752,8 @@ export const VoiceTranscriptionSettings = Schema.Struct({
   instanceId: Schema.NullOr(Schema.String),
   model: Schema.String,
   apiKeyConfigured: Schema.Boolean,
+  // Absent on older servers. Clients must require true before sending a key to be saved.
+  supportsEncryptedApiKeyStorage: Schema.optionalKey(Schema.Boolean),
   apiKeySource: Schema.Literals(["saved", "environment", "none"]),
   available: Schema.Boolean,
   message: Schema.String,

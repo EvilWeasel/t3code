@@ -33,6 +33,7 @@ if [[ "$typecheck_failed" != 0 ]]; then
 fi
 focused_tests=(
   packages/contracts/src/server.test.ts \
+  packages/contracts/src/environmentHttp.test.ts \
   packages/client-runtime/src/state/serverConfigProjection.test.ts \
   packages/client-runtime/src/rpc/session.test.ts \
   apps/desktop/src/app/DesktopEarlyElectronStartup.test.ts \

@@ -494,6 +494,7 @@ export const layer = Layer.effect(
         instanceId: config.instanceId,
         model: config.model,
         apiKeyConfigured: Boolean(config.apiKey),
+        supportsEncryptedApiKeyStorage: true,
         apiKeySource: config.apiKeySource,
         available,
         instances,

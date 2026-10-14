@@ -50,6 +50,17 @@ export function VoiceTranscriptionSettingsPanel() {
   }, [environmentId]);
   const save = async (clearKey = false) => {
     if (!environmentId || !editable) return;
+    if (
+      !clearKey &&
+      provider === "openai-api" &&
+      apiKey.trim() &&
+      settings?.supportsEncryptedApiKeyStorage !== true
+    ) {
+      setError(
+        "Update this environment before saving an API key. Encrypted storage is not confirmed.",
+      );
+      return;
+    }
     const generation = generationRef.current;
     setBusy(true);
     setError("");
@@ -130,11 +141,15 @@ export function VoiceTranscriptionSettingsPanel() {
         <SettingsRow
           title="OpenAI API key"
           description={
-            settings?.apiKeySource === "environment"
-              ? "Provided by this host's private launch environment. Leave empty to keep it."
-              : settings?.apiKeyConfigured
-                ? "A key is encrypted in this environment's private secret store and is never returned to the app. Leave empty to keep it. API billing applies."
-                : "Encrypted in this environment's private secret store. API billing applies separately from ChatGPT."
+            !settings
+              ? "Checking whether this environment can save encrypted API keys."
+              : settings.supportsEncryptedApiKeyStorage !== true
+                ? "Update this environment before entering an API key. Encrypted storage is not confirmed; existing saved keys can still be removed."
+                : settings.apiKeySource === "environment"
+                  ? "Provided by this host's private launch environment. Leave empty to keep it."
+                  : settings?.apiKeyConfigured
+                    ? "A key is encrypted in this environment's private secret store and is never returned to the app. Leave empty to keep it. API billing applies."
+                    : "Encrypted in this environment's private secret store. API billing applies separately from ChatGPT."
           }
         >
           <Input
@@ -142,7 +157,7 @@ export function VoiceTranscriptionSettingsPanel() {
             autoComplete="off"
             aria-label="Transcription API key"
             value={apiKey}
-            disabled={!editable || busy}
+            disabled={!editable || busy || settings?.supportsEncryptedApiKeyStorage !== true}
             onChange={(event) => setApiKey(event.target.value)}
           />
         </SettingsRow>

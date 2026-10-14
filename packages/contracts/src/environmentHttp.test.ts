@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
+import * as Schema from "effect/Schema";
 
 import {
   EnvironmentAuthInvalidError,
@@ -7,6 +8,7 @@ import {
   EnvironmentRequestInvalidError,
   EnvironmentResourceNotFoundError,
   EnvironmentScopeRequiredError,
+  VoiceTranscriptionSettings,
 } from "./environmentHttp.ts";
 
 const traceId = "trace-1";
@@ -60,3 +62,25 @@ describe("environment HTTP errors", () => {
     });
   });
 });
+
+it.each([undefined, false, true])(
+  "decodes mixed-version voice settings without inventing encrypted storage (%s)",
+  (support) => {
+    const response = {
+      provider: "openai-api",
+      instanceId: null,
+      model: "gpt-transcribe",
+      apiKeyConfigured: false,
+      apiKeySource: "none",
+      available: false,
+      message: "No key",
+      instances: [],
+      ...(support === undefined ? {} : { supportsEncryptedApiKeyStorage: support }),
+    };
+    const decoded = Schema.decodeUnknownSync(VoiceTranscriptionSettings)(
+      JSON.parse(JSON.stringify(response)),
+    );
+    expect(decoded.supportsEncryptedApiKeyStorage).toBe(support);
+    expect(decoded.supportsEncryptedApiKeyStorage === true).toBe(support === true);
+  },
+);
