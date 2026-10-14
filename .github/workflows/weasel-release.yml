@@ -1,5 +1,5 @@
 name: Weasel desktop nightly
-run-name: Weasel desktop ${{ inputs.build_mode }} ${{ inputs.source_sha }}
+run-name: Weasel desktop ${{ inputs.build_mode }}-${{ inputs.platform }} ${{ inputs.source_sha }}
 
 on:
   workflow_dispatch:
@@ -10,13 +10,19 @@ on:
         default: production
         type: choice
         options: [production, candidate]
+      platform:
+        description: Build both desktop platforms or Linux only
+        required: true
+        default: all
+        type: choice
+        options: [all, linux]
       source_sha:
         description: Immutable commit SHA to build
         required: true
         type: string
 
 concurrency:
-  group: ${{ inputs.build_mode == 'candidate' && format('weasel-desktop-candidate-{0}', inputs.source_sha) || 'weasel-desktop-production' }}
+  group: ${{ inputs.build_mode == 'candidate' && format('weasel-desktop-candidate-{0}-{1}', inputs.platform, inputs.source_sha) || 'weasel-desktop-production' }}
   cancel-in-progress: false
 
 permissions:
@@ -42,9 +48,12 @@ jobs:
       - name: Validate build mode
         env:
           BUILD_MODE: ${{ inputs.build_mode }}
+          BUILD_PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
           [[ "$BUILD_MODE" == production || "$BUILD_MODE" == candidate ]]
+          [[ "$BUILD_PLATFORM" == all || "$BUILD_PLATFORM" == linux ]]
+          [[ "$BUILD_MODE" != production || "$BUILD_PLATFORM" == all ]]
 
       - name: Verify production source is the fork main tip
         if: inputs.build_mode == 'production'
@@ -64,7 +73,7 @@ jobs:
           GH_REPO: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
         run: |
           set -euo pipefail
-          [[ "$SOURCE_SHA" == f1bf0f154d65782dcad4f2ebf01dc258e205bd8d ]]
+          [[ "$SOURCE_SHA" == b99c008e037dbb97fcebb359517ad6f604ae6269 ]]
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$GH_REPO" = "$GITHUB_REPOSITORY"
           test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)" = public
@@ -97,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${{ inputs.build_mode }}" == candidate ]]; then
-            [[ "$SOURCE_SHA" == f1bf0f154d65782dcad4f2ebf01dc258e205bd8d ]]
+            [[ "$SOURCE_SHA" == b99c008e037dbb97fcebb359517ad6f604ae6269 ]]
             desktop_version="$(jq -er '.version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' apps/desktop/package.json)"
             fork_version="${desktop_version}-pr.${SOURCE_SHA:0:12}"
           else
@@ -232,15 +241,15 @@ jobs:
           node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --output-dir release-linux
           if [[ "${{ inputs.build_mode }}" == production ]]; then
             test -s release-linux/nightly-linux.yml
-            shopt -s nullglob
-            stage_roots=(/tmp/t3code-desktop-linux-stage-* "$RUNNER_TEMP"/t3code-desktop-linux-stage-*)
-            test "${#stage_roots[@]}" -gt 0
-            update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
-            test -n "$update_config"
-            IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
-            grep -Fq "owner: $expected_owner" "$update_config"
-            grep -Fq "repo: $expected_repo" "$update_config"
           fi
+          shopt -s nullglob
+          stage_roots=(/tmp/t3code-desktop-linux-stage-* "$RUNNER_TEMP"/t3code-desktop-linux-stage-*)
+          test "${#stage_roots[@]}" -gt 0
+          update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
+          test -n "$update_config"
+          IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
+          grep -Fq "owner: $expected_owner" "$update_config"
+          grep -Fq "repo: $expected_repo" "$update_config"
 
       - name: Prepare NixOS download bundle
         if: inputs.build_mode == 'production'
@@ -289,6 +298,7 @@ jobs:
           retention-days: 1
 
   build_windows:
+    if: inputs.platform == 'all'
     needs: [preflight, build_bundle, build_linux]
     runs-on: nscloud-windows-2022-amd64-8x16
     timeout-minutes: 50
@@ -404,7 +414,7 @@ jobs:
           retention-days: 1
 
   publish:
-    if: inputs.build_mode == 'production'
+    if: inputs.build_mode == 'production' && inputs.platform == 'all'
     needs: [preflight, build_linux, build_windows]
     runs-on: namespace-profile-ci-builder
     timeout-minutes: 15
