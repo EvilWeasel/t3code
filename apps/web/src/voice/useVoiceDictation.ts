@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { acquireMicrophoneOwnership } from "@t3tools/client-runtime/live-voice";
 
 export type VoiceDictationState =
   | { readonly phase: "idle" }
@@ -25,6 +26,8 @@ type ActiveCapture = {
   stream?: MediaStream;
   recorder?: MediaRecorder;
   chunks: Blob[];
+  mediaRequestPending: boolean;
+  releaseMicrophone: () => void;
   timeout?: ReturnType<typeof setTimeout>;
 };
 
@@ -44,6 +47,8 @@ export function useVoiceDictation(input: {
   const releaseCapture = useCallback((capture: ActiveCapture) => {
     if (capture.timeout !== undefined) clearTimeout(capture.timeout);
     for (const track of capture.stream?.getTracks() ?? []) track.stop();
+    // Keep the token through a cancelled, nonabortable permission request.
+    if (!capture.mediaRequestPending) capture.releaseMicrophone();
     if (captureRef.current === capture) captureRef.current = null;
   }, []);
 
@@ -77,17 +82,33 @@ export function useVoiceDictation(input: {
       setState({ phase: "error", message: "Audio recording is not supported in this browser." });
       return;
     }
+    const releaseMicrophone = acquireMicrophoneOwnership();
+    if (!releaseMicrophone) {
+      setState({
+        phase: "error",
+        message: "Another microphone session is active. End it before recording.",
+        ...(audioUrlRef.current ? { audioUrl: audioUrlRef.current } : {}),
+      });
+      return;
+    }
     const generation = ++generationRef.current;
     startingRef.current = true;
-    const capture: ActiveCapture = { generation, chunks: [] };
+    const capture: ActiveCapture = {
+      generation,
+      chunks: [],
+      mediaRequestPending: true,
+      releaseMicrophone,
+    };
     captureRef.current = capture;
     clearAudio();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      capture.mediaRequestPending = false;
       capture.stream = stream;
       startingRef.current = false;
       if (generationRef.current !== generation || captureRef.current !== capture) {
         for (const track of stream.getTracks()) track.stop();
+        capture.releaseMicrophone();
         return;
       }
       const recorder = new MediaRecorder(stream);
@@ -127,8 +148,12 @@ export function useVoiceDictation(input: {
       }, MAX_RECORDING_DURATION_MS);
       setState({ phase: "recording" });
     } catch {
+      capture.mediaRequestPending = false;
       startingRef.current = false;
-      if (generationRef.current !== generation || captureRef.current !== capture) return;
+      if (generationRef.current !== generation || captureRef.current !== capture) {
+        capture.releaseMicrophone();
+        return;
+      }
       releaseCapture(capture);
       setState({
         phase: "error",

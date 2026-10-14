@@ -9,6 +9,7 @@ import {
   type LiveVoiceSubscribeInput,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import { acquireMicrophoneOwnership } from "./microphoneOwnership.ts";
 
 /** Owns one browser WebRTC session; all authenticated lease/signaling work is injected. */
 
@@ -97,6 +98,11 @@ export type LiveVoiceControllerDependencies = {
   readonly onStateChange: (state: LiveVoiceState) => void;
 };
 
+type MicrophoneOwnership = {
+  readonly release: () => void;
+  mediaRequestPending: boolean;
+};
+
 const IDLE_STATE: LiveVoiceState = {
   phase: "idle",
   localMuted: false,
@@ -109,8 +115,6 @@ const IDLE_STATE: LiveVoiceState = {
 const MAX_TRANSCRIPT_ENTRIES = 24;
 const DEFAULT_START_TIMEOUT_MS = 30_000;
 const isLiveVoiceError = Schema.is(LiveVoiceError);
-let microphoneOwner: object | null = null;
-
 function stopTracks(stream: LiveVoiceMediaStream | null): void {
   stream?.getTracks().forEach((track) => track.stop());
 }
@@ -169,7 +173,6 @@ function safeErrorMessage(error: unknown): string {
 }
 
 export class LiveVoiceController {
-  private readonly microphoneOwnerToken = {};
   private readonly dependencies: LiveVoiceControllerDependencies;
   private state: LiveVoiceState = IDLE_STATE;
   private target: LiveVoiceTarget | null = null;
@@ -196,6 +199,7 @@ export class LiveVoiceController {
   private resolveRtcReady: (() => void) | null = null;
   private rejectRtcReady: ((error: Error) => void) | null = null;
   private rtcReady: Promise<void> | null = null;
+  private microphoneOwnership: MicrophoneOwnership | null = null;
   private readonly stopRequestIds = new Map<string, string>();
   private readonly stopRequests = new Map<string, Promise<void>>();
 
@@ -224,7 +228,16 @@ export class LiveVoiceController {
       });
       return;
     }
-    if (microphoneOwner && microphoneOwner !== this.microphoneOwnerToken) {
+    if (this.microphoneOwnership?.mediaRequestPending) {
+      this.setState({
+        ...IDLE_STATE,
+        phase: "error",
+        error: "A microphone permission request is still finishing. Try again shortly.",
+      });
+      return;
+    }
+    const releaseMicrophone = acquireMicrophoneOwnership();
+    if (!releaseMicrophone) {
       this.setState({
         ...IDLE_STATE,
         phase: "error",
@@ -234,10 +247,14 @@ export class LiveVoiceController {
     }
 
     const operation = ++this.operation;
+    const microphoneOwnership: MicrophoneOwnership = {
+      release: releaseMicrophone,
+      mediaRequestPending: false,
+    };
+    this.microphoneOwnership = microphoneOwnership;
     this.target = target;
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
-    microphoneOwner = this.microphoneOwnerToken;
     this.setState({ ...IDLE_STATE, phase: "preparing" });
     this.cancelStartTimer = this.dependencies.scheduleTimeout(() => {
       if (this.identity) {
@@ -251,7 +268,7 @@ export class LiveVoiceController {
         this.abortController?.abort();
         this.unsubscribe?.();
         this.unsubscribe = null;
-        if (microphoneOwner === this.microphoneOwnerToken) microphoneOwner = null;
+        this.releaseMicrophoneIfReady(microphoneOwnership);
         this.target = null;
         this.setState({
           ...this.state,
@@ -327,9 +344,17 @@ export class LiveVoiceController {
         error: null,
       });
 
-      const stream = await this.dependencies.getUserMedia();
+      microphoneOwnership.mediaRequestPending = true;
+      let stream: LiveVoiceMediaStream;
+      try {
+        // getUserMedia cannot be aborted; an End during this await keeps its token reserved.
+        stream = await this.dependencies.getUserMedia();
+      } finally {
+        microphoneOwnership.mediaRequestPending = false;
+      }
       if (!this.isCurrentLease(operation, activeLease)) {
         stopTracks(stream);
+        this.releaseMicrophoneIfReady(microphoneOwnership);
         await this.stopLease(activeLease);
         return;
       }
@@ -411,11 +436,12 @@ export class LiveVoiceController {
         const message = safeErrorMessage(error);
         this.setState({ ...this.state, phase: "error", error: message });
         // Release locally before stop RPC so a slow server cannot retain the mic.
-        await this.release(lease);
+        await this.release(lease, microphoneOwnership);
         if (lease) await this.stopLease(lease);
       } else if (lease) {
         // A stale operation may stop only the lease it captured; global resources
         // may now belong to a newer start on this controller.
+        this.releaseMicrophoneIfReady(microphoneOwnership);
         await this.stopLease(lease);
       }
     }
@@ -457,13 +483,14 @@ export class LiveVoiceController {
   /** Ends only Live/media ownership. It never cancels the durable T3 work run. */
   async end(): Promise<void> {
     const lease = this.identity;
+    const microphoneOwnership = this.microphoneOwnership;
     const operation = ++this.operation;
     this.setState({ ...this.state, phase: "stopping" });
     this.abortController?.abort();
     this.rejectAnswer?.(new Error("Live session ended."));
     this.rejectPrepared?.(new Error("Live session ended."));
     this.rejectSubscriptionReady?.(new Error("Live session ended."));
-    await this.release(lease);
+    await this.release(lease, microphoneOwnership);
     if (lease) await this.stopLease(lease);
     if (operation === this.operation) this.setState({ ...IDLE_STATE, phase: "ended" });
   }
@@ -588,7 +615,7 @@ export class LiveVoiceController {
     this.rejectPrepared?.(error);
     this.rejectSubscriptionReady?.(error);
     this.rejectRtcReady?.(error);
-    await this.release(lease);
+    await this.release(lease, this.microphoneOwnership);
     await this.stopLease(lease);
   }
 
@@ -634,7 +661,10 @@ export class LiveVoiceController {
     await stopping;
   }
 
-  private async release(lease: LiveVoiceLease | null): Promise<void> {
+  private async release(
+    lease: LiveVoiceLease | null,
+    microphoneOwnership: MicrophoneOwnership | null,
+  ): Promise<void> {
     this.clearStartTimer();
     this.abortController?.abort();
     this.unsubscribe?.();
@@ -667,7 +697,7 @@ export class LiveVoiceController {
     this.playbackBlocked = false;
     this.resolveSubscriptionReady = null;
     this.rejectSubscriptionReady = null;
-    if (microphoneOwner === this.microphoneOwnerToken) microphoneOwner = null;
+    this.releaseMicrophoneIfReady(microphoneOwnership);
     if (
       lease &&
       this.identity &&
@@ -688,6 +718,12 @@ export class LiveVoiceController {
   private clearStartTimer(): void {
     this.cancelStartTimer?.();
     this.cancelStartTimer = null;
+  }
+
+  private releaseMicrophoneIfReady(microphoneOwnership: MicrophoneOwnership | null): void {
+    if (!microphoneOwnership || microphoneOwnership.mediaRequestPending) return;
+    microphoneOwnership.release();
+    if (this.microphoneOwnership === microphoneOwnership) this.microphoneOwnership = null;
   }
 
   private setState(state: LiveVoiceState): void {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
+  acquireMicrophoneOwnership,
   isLiveVoiceSupported,
   LiveVoiceController,
   type LiveVoiceControllerDependencies,
@@ -245,6 +246,77 @@ async function connect(harness: ReturnType<typeof createHarness>, starting: Prom
 }
 
 describe("LiveVoiceController", () => {
+  it("does not start Live while dictation owns the renderer microphone", async () => {
+    const releaseDictation = acquireMicrophoneOwnership();
+    expect(releaseDictation).not.toBeNull();
+    const harness = createHarness();
+
+    await harness.controller.start(target);
+
+    expect(harness.controller.currentState).toMatchObject({
+      phase: "error",
+      error: "Another live microphone session is active.",
+    });
+    expect(harness.signaling.prepare).not.toHaveBeenCalled();
+    expect(harness.calls).not.toContain("media-request");
+    expect(acquireMicrophoneOwnership()).toBeNull();
+
+    releaseDictation?.();
+    const starting = harness.controller.start(target);
+    await vi.waitFor(() => expect(harness.calls).toContain("subscribe"));
+    await harness.controller.end();
+    await starting;
+  });
+
+  it("keeps the microphone reserved until an ended permission request settles and late tracks stop", async () => {
+    const permission = deferred<MediaStream>();
+    const harness = createHarness({ media: () => permission.promise });
+    const starting = harness.controller.start(target);
+    await vi.waitFor(() => expect(harness.calls).toContain("subscribe"));
+    harness.emit(statusEvent(lease));
+    await vi.waitFor(() => expect(harness.calls).toContain("media-request"));
+
+    await harness.controller.end();
+    await harness.controller.start(target);
+    expect(harness.calls.filter((call) => call === "media-request")).toHaveLength(1);
+    expect(acquireMicrophoneOwnership()).toBeNull();
+
+    permission.resolve(harness.stream);
+    await starting;
+    expect(harness.stoppedTracks).toBe(1);
+    const releaseNextOwner = acquireMicrophoneOwnership();
+    expect(releaseNextOwner).not.toBeNull();
+    releaseNextOwner?.();
+  });
+
+  it("releases microphone ownership after permission is denied", async () => {
+    const harness = createHarness({ media: () => Promise.reject(new Error("permission denied")) });
+    const starting = harness.controller.start(target);
+    await vi.waitFor(() => expect(harness.calls).toContain("subscribe"));
+    harness.emit(statusEvent(lease));
+    await starting;
+
+    expect(harness.controller.currentState.phase).toBe("error");
+    const releaseNextOwner = acquireMicrophoneOwnership();
+    expect(releaseNextOwner).not.toBeNull();
+    releaseNextOwner?.();
+  });
+
+  it("does not let a stale release closure clear a later microphone owner", () => {
+    const releaseFirst = acquireMicrophoneOwnership();
+    expect(releaseFirst).not.toBeNull();
+    releaseFirst?.();
+    const releaseSecond = acquireMicrophoneOwnership();
+    expect(releaseSecond).not.toBeNull();
+
+    releaseFirst?.();
+    expect(acquireMicrophoneOwnership()).toBeNull();
+    releaseSecond?.();
+    const releaseThird = acquireMicrophoneOwnership();
+    expect(releaseThird).not.toBeNull();
+    releaseThird?.();
+  });
+
   it("prepares the authenticated lease, subscribes before SDP, and waits for all RTC readiness evidence", async () => {
     const harness = createHarness();
     const starting = harness.controller.start(target);
