@@ -243,6 +243,7 @@ jobs:
           fi
 
       - name: Prepare NixOS download bundle
+        if: inputs.build_mode == 'production'
         run: |
           set -euo pipefail
           sed "s|EvilWeasel/t3code|${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}|g" \
