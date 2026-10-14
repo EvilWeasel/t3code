@@ -5,7 +5,9 @@
  * platform key, so a rename here is a release-breaking change.
  */
 
-const CLI_RELEASE_REPOSITORY = "pingdotgg/t3code";
+import { compareSemverVersions } from "./semver.ts";
+
+export const CLI_RELEASE_REPOSITORY = "morrowbyte/t3code";
 export const CLI_RELEASE_CHECKSUMS_FILE = "SHA256SUMS";
 /** Overrides the download origin for mirrors and air-gapped installs. */
 export const CLI_RELEASE_BASE_URL_ENV = "T3CODE_RELEASE_BASE_URL";
@@ -101,24 +103,47 @@ export function cliReleaseIndexPageUrl(page: number): string {
   return `https://api.github.com/repos/${CLI_RELEASE_REPOSITORY}/releases?per_page=100&page=${page}`;
 }
 
+export interface CliRelease {
+  readonly tag_name: string;
+  readonly draft?: boolean | undefined;
+  readonly assets?:
+    | ReadonlyArray<{ readonly name: string; readonly size?: number | undefined }>
+    | undefined;
+}
+
+/** An archive is usable only after its platform artifact and checksums are published. */
+export function cliReleaseHasAssets(
+  release: CliRelease,
+  platformKey: CliArchivePlatformKey,
+): boolean {
+  const version = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(release.tag_name)?.[1];
+  if (release.draft || version === undefined) return false;
+  const names = new Set(
+    (release.assets ?? [])
+      .filter((asset) => asset.size === undefined || asset.size > 0)
+      .map((asset) => asset.name),
+  );
+  return (
+    names.has(CLI_RELEASE_CHECKSUMS_FILE) && names.has(cliArchiveFileName(version, platformKey))
+  );
+}
+
 /**
- * Picks the newest version on a channel from the release index. Tags are
- * `v<version>`; the channel is decided by the same rule the runtime uses, so
- * a preview tag never satisfies a nightly lookup and vice versa. Drafts are
- * skipped because their assets are not downloadable.
+ * Picks the newest version on a channel from the release index. A platform
+ * requires its archive and checksums, so partially published releases stay out.
+ * GitHub orders by publication rather than version; a re-published old release
+ * must not hide a newer nightly.
  */
 export function newestCliReleaseVersion(
-  releases: ReadonlyArray<{
-    readonly tag_name: string;
-    readonly draft?: boolean | undefined;
-  }>,
+  releases: ReadonlyArray<CliRelease>,
   channel: CliReleaseChannel,
+  platformKey?: CliArchivePlatformKey,
 ): string | undefined {
-  for (const release of releases) {
-    if (release.draft) continue;
+  const versions = releases.flatMap((release) => {
+    if (release.draft || (platformKey !== undefined && !cliReleaseHasAssets(release, platformKey)))
+      return [];
     const version = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(release.tag_name)?.[1];
-    if (version === undefined) continue;
-    if (cliReleaseChannelOf(version) === channel) return version;
-  }
-  return undefined;
+    return version !== undefined && cliReleaseChannelOf(version) === channel ? [version] : [];
+  });
+  return versions.sort((a, b) => compareSemverVersions(b, a))[0];
 }

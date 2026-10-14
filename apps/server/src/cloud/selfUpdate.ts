@@ -186,8 +186,10 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
   );
   const inFlight = yield* Ref.make(false);
 
-  const capability: ServerSelfUpdateCapability | null =
-    serverConfig.mode === "desktop" ? "desktop-managed" : launcher.managed ? "boot-service" : null;
+  const capability: ServerSelfUpdateCapability | null = resolveServerSelfUpdateCapability({
+    desktopManaged: desktopAppUpdate.available,
+    launcherManaged: launcher.managed,
+  });
   const failWith = (reason: string, cause?: unknown) =>
     cause === undefined
       ? new ServerSelfUpdateError({ reason })

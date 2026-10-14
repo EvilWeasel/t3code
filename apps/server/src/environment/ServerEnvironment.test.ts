@@ -112,12 +112,8 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
           Effect.provideService(HostProcess.Platform, "linux"),
           Effect.provideService(HostProcess.Environment, {}),
         );
-        expect(descriptor.capabilities.serverInstallation).toEqual(
-          mode === "web" ? { kind: "npm-global", prefix } : undefined,
-        );
-        expect(descriptor.capabilities.serverSelfUpdate).toBe(
-          mode === "web" ? undefined : "desktop-managed",
-        );
+        expect(descriptor.capabilities.serverInstallation).toEqual({ kind: "npm-global", prefix });
+        expect(descriptor.capabilities.serverSelfUpdate).toBe(undefined);
       }
     }),
   );
@@ -304,7 +300,7 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
       expect(withFd.capabilities.serverUpdateThreadContinuation).toBeUndefined();
 
       const withoutFd = yield* describeWith({ mode: "desktop" });
-      expect(withoutFd.capabilities.serverSelfUpdate).toBe("desktop-managed");
+      expect(withoutFd.capabilities.serverSelfUpdate).toBeUndefined();
       expect(withoutFd.capabilities.desktopAppUpdate).toBeUndefined();
       expect(withoutFd.capabilities.serverSelfUpdateProgress).toBeUndefined();
       expect(withoutFd.capabilities.serverUpdateThreadContinuation).toBeUndefined();

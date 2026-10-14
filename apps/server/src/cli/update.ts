@@ -3,6 +3,7 @@ import {
   CLI_RELEASE_BASE_URL_ENV,
   CLI_RELEASE_CHANNELS,
   cliReleaseIndexPageUrl,
+  cliArchivePlatformKey,
   cliReleaseChannelOf,
   newestCliReleaseVersion,
   type CliReleaseChannel,
@@ -45,6 +46,14 @@ const ReleaseIndex = Schema.Array(
   Schema.Struct({
     tag_name: Schema.String,
     draft: Schema.optional(Schema.Boolean),
+    assets: Schema.optional(
+      Schema.Array(
+        Schema.Struct({
+          name: Schema.String,
+          size: Schema.optional(Schema.Number),
+        }),
+      ),
+    ),
   }),
 );
 const decodeReleaseIndex = Schema.decodeUnknownEffect(Schema.fromJsonString(ReleaseIndex));
@@ -55,10 +64,18 @@ const RELEASE_INDEX_TIMEOUT = Duration.seconds(30);
 const RELEASE_INDEX_MAX_PAGES = 10;
 
 /** Asks GitHub for the newest published version on a channel, page by page. */
-const resolveNewestVersion = Effect.fn("cli.update.resolve_newest")(function* (
+export const resolveNewestVersion = Effect.fn("cli.update.resolve_newest")(function* (
   channel: CliReleaseChannel,
 ) {
   const httpClient = yield* HttpClient.HttpClient;
+  const platform = yield* HostProcess.Platform;
+  const arch = yield* HostProcess.Architecture;
+  const platformKey = cliArchivePlatformKey(platform, arch);
+  if (platformKey === undefined) {
+    return yield* new CliUpdateError({
+      reason: `No t3 release archive supports ${platform}-${arch}.`,
+    });
+  }
   for (let page = 1; page <= RELEASE_INDEX_MAX_PAGES; page += 1) {
     const body = yield* httpClient
       .execute(
@@ -81,7 +98,7 @@ const resolveNewestVersion = Effect.fn("cli.update.resolve_newest")(function* (
         () => new CliUpdateError({ reason: "The t3 release index had an unexpected shape." }),
       ),
     );
-    const version = newestCliReleaseVersion(releases, channel);
+    const version = newestCliReleaseVersion(releases, channel, platformKey);
     if (version !== undefined) return version;
     if (releases.length === 0) break;
   }

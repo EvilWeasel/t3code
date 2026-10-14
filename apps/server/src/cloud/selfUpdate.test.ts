@@ -355,17 +355,29 @@ it.layer(NodeServices.layer)("server self update", (it) => {
     }),
   );
 
-  it.effect("rejects invalid versions and desktop-managed servers before staging", () =>
+  it.effect("rejects invalid versions and unmanaged headless servers before staging", () =>
     Effect.gen(function* () {
       const web = yield* makeHarness();
       expect(
         (yield* web.selfUpdate.update({ targetVersion: "latest" }).pipe(Effect.flip)).reason,
       ).toBe("'latest' is not an exact t3 version.");
-      const desktop = yield* makeHarness({ mode: "desktop" });
+      const desktop = yield* makeHarness({ mode: "desktop", managed: false });
       expect(
         (yield* desktop.selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason,
-      ).toContain("desktop app");
+      ).toContain("background service");
       expect([...web.order, ...desktop.order]).toEqual([]);
+    }),
+  );
+
+  it.effect("uses the launcher for headless desktop mode without desktop IPC", () =>
+    Effect.gen(function* () {
+      const { selfUpdate, order } = yield* makeHarness({ mode: "desktop" });
+      expect(yield* selfUpdate.update({ targetVersion: "1.1.0" })).toEqual({
+        targetVersion: "1.1.0",
+        method: "boot-service",
+        updateId: "launcher-id",
+      });
+      expect(order).toEqual(["download", "extract", "preflight", "accept"]);
     }),
   );
 

@@ -194,7 +194,8 @@ export const make = Effect.gen(function* () {
   const machine = yield* detectServerEnvironmentMachineKind();
   const launcher = yield* resolveServiceLauncherMode();
   const serverSelfUpdate = resolveServerSelfUpdateCapability({
-    desktopManaged: serverConfig.mode === "desktop",
+    desktopManaged:
+      serverConfig.mode === "desktop" && serverConfig.desktopTelemetryControlFd !== undefined,
     launcherManaged: launcher.managed,
   });
   const serverInstallation = serverSelfUpdate === null ? yield* resolveServerInstallation : null;

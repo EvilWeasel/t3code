@@ -7,6 +7,7 @@ import {
   cliReleaseDownloadBaseUrl,
   cliReleaseChannelOf,
   cliReleaseIndexPageUrl,
+  cliReleaseHasAssets,
   newestCliReleaseVersion,
   parseChecksums,
 } from "./cliRelease.ts";
@@ -33,7 +34,7 @@ describe("cliRelease", () => {
 
   it("resolves download URLs under the tagged release, honoring a mirror", () => {
     expect(cliReleaseDownloadBaseUrl("1.2.3")).toBe(
-      "https://github.com/pingdotgg/t3code/releases/download/v1.2.3",
+      "https://github.com/morrowbyte/t3code/releases/download/v1.2.3",
     );
     expect(cliReleaseDownloadBaseUrl("1.2.3", "https://mirror.example/t3/")).toBe(
       "https://mirror.example/t3/v1.2.3",
@@ -87,8 +88,45 @@ describe("cliRelease", () => {
 
   it("pages through the release index at the largest page GitHub allows", () => {
     expect(cliReleaseIndexPageUrl(1)).toBe(
-      "https://api.github.com/repos/pingdotgg/t3code/releases?per_page=100&page=1",
+      "https://api.github.com/repos/morrowbyte/t3code/releases?per_page=100&page=1",
     );
     expect(cliReleaseIndexPageUrl(3)).toContain("page=3");
+  });
+  it("selects numeric newest versions even when older releases were republished", () => {
+    expect(
+      newestCliReleaseVersion(
+        [
+          { tag_name: "v0.0.47-nightly.20261014.9" },
+          { tag_name: "v0.0.47-nightly.20261014.15" },
+          { tag_name: "v0.0.47-nightly.20261013.100" },
+        ],
+        "nightly",
+      ),
+    ).toBe("0.0.47-nightly.20261014.15");
+  });
+
+  it("skips a partially published release until its platform archive and checksums exist", () => {
+    const release = {
+      tag_name: "v1.2.3",
+      assets: [{ name: "t3-1.2.3-linux-x64.tar.gz", size: 100 }],
+    };
+    expect(cliReleaseHasAssets(release, "linux-x64")).toBe(false);
+    const complete = { ...release, assets: [...release.assets, { name: "SHA256SUMS", size: 64 }] };
+    expect(cliReleaseHasAssets(complete, "linux-x64")).toBe(true);
+    expect(cliReleaseHasAssets(complete, "win32-x64")).toBe(false);
+    expect(cliReleaseHasAssets({ ...complete, draft: true }, "linux-x64")).toBe(false);
+    expect(
+      cliReleaseHasAssets(
+        { ...complete, assets: complete.assets.map((a) => ({ ...a, size: 0 })) },
+        "linux-x64",
+      ),
+    ).toBe(false);
+    expect(
+      newestCliReleaseVersion(
+        [{ tag_name: "v1.3.0", assets: [{ name: "SHA256SUMS", size: 64 }] }, complete],
+        "stable",
+        "linux-x64",
+      ),
+    ).toBe("1.2.3");
   });
 });

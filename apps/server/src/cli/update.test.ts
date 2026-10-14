@@ -1,12 +1,13 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import { HttpClient, HttpClientResponse } from "effect/http";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
-import { repointLauncher, resolveLauncherPath } from "./update.ts";
+import { repointLauncher, resolveLauncherPath, resolveNewestVersion } from "./update.ts";
 
 it.layer(NodeServices.layer)("t3 update launcher", (it) => {
   it.effect("repoints a symlink that lives in a runtime versions tree", () =>
@@ -102,3 +103,36 @@ it.layer(NodeServices.layer)("t3 update launcher", (it) => {
     }).pipe(Effect.scoped, Effect.provideService(HostProcess.Platform, "linux")),
   );
 });
+
+it.effect("discovers only complete fork archives and keeps paging past partial releases", () =>
+  Effect.gen(function* () {
+    const urls: string[] = [];
+    const client = HttpClient.make((request) => {
+      urls.push(request.url);
+      const releases = request.url.endsWith("page=1")
+        ? [{ tag_name: "v1.2.4", assets: [{ name: "SHA256SUMS", size: 64 }] }]
+        : [
+            {
+              tag_name: "v1.2.3",
+              assets: [
+                { name: "SHA256SUMS", size: 64 },
+                { name: "t3-1.2.3-linux-x64.tar.gz", size: 100 },
+              ],
+            },
+          ];
+      return Effect.succeed(
+        HttpClientResponse.fromWeb(request, new Response(JSON.stringify(releases))),
+      );
+    });
+    const version = yield* resolveNewestVersion("stable").pipe(
+      Effect.provideService(HttpClient.HttpClient, client),
+      Effect.provideService(HostProcess.Platform, "linux"),
+      Effect.provideService(HostProcess.Architecture, "x64"),
+    );
+    assert.equal(version, "1.2.3");
+    assert.deepStrictEqual(urls, [
+      "https://api.github.com/repos/morrowbyte/t3code/releases?per_page=100&page=1",
+      "https://api.github.com/repos/morrowbyte/t3code/releases?per_page=100&page=2",
+    ]);
+  }),
+);
