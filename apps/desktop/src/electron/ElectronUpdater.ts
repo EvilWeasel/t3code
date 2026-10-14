@@ -7,6 +7,7 @@ import * as Scope from "effect/Scope";
 import { autoUpdater as electronAutoUpdater } from "electron-updater";
 import * as Electron from "electron";
 import { NixManagedUpdater } from "./NixManagedUpdater.ts";
+import { quitAndInstallInPlace } from "./quitAndInstallInPlace.ts";
 
 const autoUpdater =
   process.platform === "linux" && process.env.T3CODE_NIX_UPDATER
@@ -162,7 +163,13 @@ export const make = ElectronUpdater.of({
       const channel = autoUpdater.channel;
       return Effect.tryPromise({
         try: async () => {
-          await autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
+          await quitAndInstallInPlace(autoUpdater, {
+            platform: process.platform,
+            isPackaged: Electron.app.isPackaged,
+            executable: process.execPath,
+            isSilent,
+            isForceRunAfter,
+          });
         },
         catch: (cause) =>
           new ElectronUpdaterQuitAndInstallError({
