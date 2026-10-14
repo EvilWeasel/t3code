@@ -62,7 +62,10 @@ const makeHarness = Effect.fn("RelayDiscoveryTest.makeHarness")(function* () {
   const listFailure = yield* Ref.make<ManagedRelay.ManagedRelayClientError | null>(null);
   const secondListCall = yield* Deferred.make<void>();
   const clerkToken = yield* Ref.make<string | null>("clerk-token");
-  const sessionIdentity = { accountId: "account-1" };
+  const sessionIdentity = yield* Ref.make({ accountId: "account-1" });
+  const pauseSecondList = yield* Ref.make(false);
+  const releaseSecondList = yield* Deferred.make<void>();
+  const duplicateFirstListRecord = yield* Ref.make(false);
   const wakeups = yield* SubscriptionRef.make<{
     readonly sequence: number;
     readonly reason: "application-active" | "credentials-changed";
@@ -96,11 +99,16 @@ const makeHarness = Effect.fn("RelayDiscoveryTest.makeHarness")(function* () {
         if (count >= 2) {
           yield* Deferred.succeed(secondListCall, undefined);
         }
+        if (count === 2 && (yield* Ref.get(pauseSecondList))) {
+          yield* Deferred.await(releaseSecondList);
+        }
         const failure = yield* Ref.get(listFailure);
         if (failure) {
           return yield* failure;
         }
-        return environments;
+        return (yield* Ref.get(duplicateFirstListRecord))
+          ? [...environments, environments[0]!]
+          : environments;
       }),
     getEnvironmentStatus: ({ environmentId }) =>
       Ref.get(statusRequests).pipe(
@@ -129,8 +137,10 @@ const makeHarness = Effect.fn("RelayDiscoveryTest.makeHarness")(function* () {
           ClientCapabilities.CloudSession,
           ClientCapabilities.CloudSession.of({
             identity: Ref.get(clerkToken).pipe(
-              Effect.map((token) =>
-                token === null ? Option.none() : Option.some(sessionIdentity),
+              Effect.flatMap((token) =>
+                token === null
+                  ? Effect.succeed(Option.none())
+                  : Ref.get(sessionIdentity).pipe(Effect.map(Option.some)),
               ),
             ),
             clerkToken: Ref.get(clerkToken).pipe(
@@ -166,6 +176,10 @@ const makeHarness = Effect.fn("RelayDiscoveryTest.makeHarness")(function* () {
     clerkToken,
     networkStatus,
     secondListCall,
+    pauseSecondList,
+    releaseSecondList,
+    duplicateFirstListRecord,
+    sessionIdentity,
     statusRequests,
     wake: (reason: "application-active" | "credentials-changed") =>
       SubscriptionRef.update(wakeups, (event) => ({
@@ -176,6 +190,41 @@ const makeHarness = Effect.fn("RelayDiscoveryTest.makeHarness")(function* () {
 });
 
 describe("RelayEnvironmentDiscovery", () => {
+  it.effect(
+    "deduplicates repeated linked-list records while refreshing the authenticated snapshot",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        yield* Ref.set(harness.duplicateFirstListRecord, true);
+        yield* Effect.gen(function* () {
+          const requests = yield* Ref.get(harness.statusRequests);
+          for (const environment of environments) {
+            yield* Deferred.succeed(
+              requests.get(environment.environmentId)!,
+              status(environment, "online"),
+            );
+          }
+          const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
+          yield* discovery.refresh;
+          const first = Option.getOrThrow(
+            yield* SubscriptionRef.get(discovery.authenticatedSnapshot),
+          );
+          expect(first.environments.size).toBe(2);
+          expect([...first.environments.keys()]).toEqual(
+            environments.map((environment) => environment.environmentId),
+          );
+
+          yield* discovery.refresh;
+          const refreshed = Option.getOrThrow(
+            yield* SubscriptionRef.get(discovery.authenticatedSnapshot),
+          );
+          expect(refreshed.environments.size).toBe(2);
+          expect(refreshed.identity).toEqual(first.identity);
+          expect(refreshed.generation).toBeGreaterThan(first.generation);
+        }).pipe(Effect.provide(harness.layer));
+      }),
+  );
+
   it.effect("publishes each environment status as soon as that lookup completes", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
@@ -386,14 +435,86 @@ describe("RelayEnvironmentDiscovery", () => {
       const harness = yield* makeHarness();
       yield* Effect.gen(function* () {
         const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
+        const requests = yield* Ref.get(harness.statusRequests);
+        for (const environment of environments) {
+          yield* Deferred.succeed(
+            requests.get(environment.environmentId)!,
+            status(environment, "online"),
+          );
+        }
+        yield* discovery.refresh;
+        const firstSnapshot = Option.getOrThrow(
+          yield* SubscriptionRef.get(discovery.authenticatedSnapshot),
+        );
+        expect(firstSnapshot.identity.accountId).toBe("account-1");
+        expect([...firstSnapshot.environments.keys()]).toEqual(
+          environments.map((environment) => environment.environmentId),
+        );
+        expect(yield* firstSnapshot.isCurrent()).toBe(true);
+
         yield* Ref.set(harness.clerkToken, null);
         yield* discovery.refresh;
 
         const state = yield* SubscriptionRef.get(discovery.state);
+        expect(yield* firstSnapshot.isCurrent()).toBe(false);
+        expect(Option.isNone(yield* SubscriptionRef.get(discovery.authenticatedSnapshot))).toBe(
+          true,
+        );
         expect(state.environments.size).toBe(0);
         expect(state.refreshing).toBe(false);
         expect(Option.isNone(state.error)).toBe(true);
       }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
+  it.effect("fences an in-flight linked-list result across an authenticated account switch", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Effect.gen(function* () {
+        const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
+        const requests = yield* Ref.get(harness.statusRequests);
+        for (const environment of environments) {
+          yield* Deferred.succeed(
+            requests.get(environment.environmentId)!,
+            status(environment, "online"),
+          );
+        }
+        yield* discovery.refresh;
+        const original = Option.getOrThrow(
+          yield* SubscriptionRef.get(discovery.authenticatedSnapshot),
+        );
+
+        yield* Ref.set(harness.pauseSecondList, true);
+        const staleRefresh = yield* Effect.forkChild(discovery.refresh);
+        yield* Deferred.await(harness.secondListCall);
+        const currentSnapshotFiber = yield* Effect.forkChild(
+          SubscriptionRef.changes(discovery.authenticatedSnapshot).pipe(
+            Stream.filter(
+              (snapshot) =>
+                Option.isSome(snapshot) && snapshot.value.identity.accountId === "account-2",
+            ),
+            Stream.runHead,
+            Effect.map(Option.getOrThrow),
+          ),
+        );
+        const invalidatedSnapshotFiber = yield* Effect.forkChild(
+          SubscriptionRef.changes(discovery.authenticatedSnapshot).pipe(
+            Stream.filter(Option.isNone),
+            Stream.runHead,
+          ),
+        );
+        yield* Ref.set(harness.sessionIdentity, { accountId: "account-2" });
+        yield* Ref.set(harness.clerkToken, "opaque-account-2-token");
+        yield* harness.wake("credentials-changed");
+        yield* Fiber.join(invalidatedSnapshotFiber);
+        yield* Deferred.succeed(harness.releaseSecondList, undefined);
+        yield* Fiber.join(staleRefresh);
+
+        const current = yield* Fiber.join(currentSnapshotFiber);
+        expect(yield* original.isCurrent()).toBe(false);
+        expect(current.identity.accountId).toBe("account-2");
+        expect(yield* Ref.get(harness.listCalls)).toBe(3);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );
 

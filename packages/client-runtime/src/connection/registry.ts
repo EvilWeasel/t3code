@@ -13,6 +13,7 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import * as ClientCapabilities from "../platform/capabilities.ts";
+import type { AuthenticatedRelayEnvironmentSnapshot } from "../relay/discovery.ts";
 import {
   type ConnectionCatalogEntry,
   type ConnectionCredential,
@@ -21,6 +22,7 @@ import {
   type ConnectionRoute,
   type PlatformConnectionRegistration,
   type PrimaryConnectionRegistration,
+  RelayConnectionRegistration,
   SshConnectionProfile,
   connectionRegistrationCatalogEntry,
 } from "./catalog.ts";
@@ -105,6 +107,16 @@ export class EnvironmentRegistry extends Context.Service<
     readonly reconcilePlatform: (
       registrations: ReadonlyArray<PlatformConnectionRegistration>,
     ) => Effect.Effect<void>;
+    /** Reconciles only the owner-authenticated linked-environment snapshot from relay discovery. */
+    readonly reconcileDiscovered: (
+      snapshot: AuthenticatedRelayEnvironmentSnapshot,
+    ) => Effect.Effect<
+      void,
+      | Persistence.ConnectionPersistenceError
+      | ConnectionAttemptError
+      | EnvironmentNotRegisteredError
+      | PlatformEnvironmentRemovalError
+    >;
     readonly remove: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<
@@ -816,6 +828,52 @@ export const make = Effect.gen(function* () {
     yield* Effect.forEach(platformRegistrations, installPlatformRegistration, { discard: true });
   });
 
+  const reconcileDiscovered = Effect.fn("EnvironmentRegistry.reconcileDiscovered")(function* (
+    snapshot: AuthenticatedRelayEnvironmentSnapshot,
+  ) {
+    // Discovery publishes the follow-up current snapshot (or None on sign-out
+    // and account change). A stale pass must not clear routes that a newer
+    // same-account snapshot is about to retain.
+    if (!(yield* snapshot.isCurrent())) return;
+
+    const desiredIds = new Set(snapshot.environments.keys());
+    for (const environment of snapshot.environments.values()) {
+      if (!(yield* snapshot.isCurrent())) return;
+      if ((yield* Ref.get(platformEnvironmentIds)).has(environment.environmentId)) continue;
+      const existing = (yield* SubscriptionRef.get(entries)).get(environment.environmentId);
+      const alreadyRegistered =
+        existing !== undefined &&
+        connectionRoutes(existing).some((route) => route.target._tag === "RelayConnectionTarget");
+      if (!alreadyRegistered) {
+        yield* register(
+          new RelayConnectionRegistration({
+            target: new RelayConnectionTarget({
+              environmentId: environment.environmentId,
+              label: environment.label,
+            }),
+          }),
+        );
+        // Registration writes storage and installs a supervisor. If the
+        // snapshot became stale during that work, the ordered None/current
+        // snapshot update performs cleanup or reconciliation next.
+        if (!(yield* snapshot.isCurrent())) return;
+      }
+    }
+
+    const currentEntries = yield* SubscriptionRef.get(entries);
+    for (const entry of currentEntries.values()) {
+      if (!(yield* snapshot.isCurrent())) return;
+      if (
+        desiredIds.has(entry.target.environmentId) ||
+        !connectionRoutes(entry).some((route) => route.target._tag === "RelayConnectionTarget")
+      ) {
+        continue;
+      }
+      yield* removeRoute(entry.target.environmentId, RELAY_ROUTE_ID);
+      if (!(yield* snapshot.isCurrent())) return;
+    }
+  });
+
   /** Forgets a user-saved environment. Callers hold its lease lock. */
   const removeLocked = Effect.fn("EnvironmentRegistry.removeLocked")(function* (
     environmentId: EnvironmentId,
@@ -1169,6 +1227,7 @@ export const make = Effect.gen(function* () {
     register,
     registerPlatform,
     reconcilePlatform,
+    reconcileDiscovered,
     remove,
     removeRoute,
     reorderRoutes,

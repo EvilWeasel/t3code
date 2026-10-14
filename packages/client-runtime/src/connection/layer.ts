@@ -72,6 +72,29 @@ export const watchDiscoveredCompatibility = Effect.fn("connection.watchDiscovere
   },
 );
 
+export const watchDiscoveredEnvironments = Effect.fn("connection.watchDiscoveredEnvironments")(
+  function* () {
+    const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+    const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
+    yield* SubscriptionRef.changes(discovery.authenticatedSnapshot).pipe(
+      Stream.runForEach(() =>
+        Effect.gen(function* () {
+          const snapshot = yield* SubscriptionRef.get(discovery.authenticatedSnapshot);
+          if (Option.isNone(snapshot)) {
+            yield* registry.removeRelayEnvironments();
+          } else {
+            yield* registry.reconcileDiscovered(snapshot.value);
+          }
+        }).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Could not reconcile linked relay environments.", { error }),
+          ),
+        ),
+      ),
+    );
+  },
+);
+
 export function layerWithOptions(options: RpcSession.RpcSessionOptions) {
   const layerDriver = ConnectionDriver.layer.pipe(
     Layer.provide(Layer.mergeAll(ConnectionResolver.layer, RpcSession.layer(options))),
@@ -91,6 +114,27 @@ export function layerWithOptions(options: RpcSession.RpcSessionOptions) {
       const platformSource = yield* PlatformConnectionSource.PlatformConnectionSource;
       yield* watchDiscoveredCompatibility().pipe(Effect.forkScoped);
       yield* registry.start;
+      yield* watchDiscoveredEnvironments().pipe(Effect.forkScoped);
+      // Populate linked environments on cold start without waiting for a UI
+      // surface to request discovery. The watcher is already subscribed.
+      yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery.pipe(
+        Effect.flatMap((discovery) => discovery.refresh),
+      );
+      yield* Effect.gen(function* () {
+        const snapshot = yield* SubscriptionRef.get(
+          (yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery).authenticatedSnapshot,
+        );
+        if (Option.isSome(snapshot)) {
+          yield* registry.reconcileDiscovered(snapshot.value);
+          return;
+        }
+        const state = yield* SubscriptionRef.get(
+          (yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery).state,
+        );
+        if (!state.refreshing && !state.offline && Option.isNone(state.error)) {
+          yield* registry.removeRelayEnvironments();
+        }
+      });
       yield* platformSource.registrations.pipe(
         Stream.runForEach(registry.reconcilePlatform),
         Effect.forkScoped,

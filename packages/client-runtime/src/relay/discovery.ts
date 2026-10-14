@@ -1,8 +1,8 @@
+import { EnvironmentId } from "@t3tools/contracts";
 import type {
   RelayClientEnvironmentRecord,
   RelayEnvironmentStatusResponse,
 } from "@t3tools/contracts/relay";
-import { decodeRelayJwt } from "@t3tools/shared/relayJwt";
 import {
   RelayEnvironmentConnectScope,
   RelayEnvironmentStatusScope,
@@ -39,10 +39,25 @@ export interface RelayEnvironmentDiscoveryState {
   readonly error: Option.Option<ConnectionAttemptError>;
 }
 
+const authenticatedSnapshotBrand: unique symbol = Symbol("authenticatedRelayEnvironmentSnapshot");
+
+/** A linked-environment list tied to the authenticated Connect session that fetched it. */
+export interface AuthenticatedRelayEnvironmentSnapshot {
+  readonly [authenticatedSnapshotBrand]: true;
+  readonly identity: ClientCapabilities.CloudSessionIdentity;
+  readonly generation: number;
+  readonly environments: ReadonlyMap<EnvironmentId, RelayClientEnvironmentRecord>;
+  /** This closure is created by discovery and fences consumers against stale account state. */
+  readonly isCurrent: () => Effect.Effect<boolean>;
+}
+
 export class RelayEnvironmentDiscovery extends Context.Service<
   RelayEnvironmentDiscovery,
   {
     readonly state: SubscriptionRef.SubscriptionRef<RelayEnvironmentDiscoveryState>;
+    readonly authenticatedSnapshot: SubscriptionRef.SubscriptionRef<
+      Option.Option<AuthenticatedRelayEnvironmentSnapshot>
+    >;
     readonly refresh: Effect.Effect<void>;
   }
 >()("@t3tools/client-runtime/relay/discovery/RelayEnvironmentDiscovery") {}
@@ -92,16 +107,6 @@ function validateStatus(
   return Effect.succeed(status);
 }
 
-function relayAccountId(clerkToken: string): Option.Option<string> {
-  try {
-    return Option.fromNullishOr(decodeRelayJwt(clerkToken).sub).pipe(
-      Option.filter((subject) => subject.length > 0),
-    );
-  } catch {
-    return Option.none();
-  }
-}
-
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
   const relay = yield* ManagedRelay.ManagedRelayClient;
@@ -109,12 +114,28 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
   const connectivity = yield* Connectivity.Connectivity;
   const wakeups = yield* ConnectionWakeups.ConnectionWakeups;
   const state = yield* SubscriptionRef.make(EMPTY_RELAY_ENVIRONMENT_DISCOVERY_STATE);
+  const authenticatedSnapshot = yield* SubscriptionRef.make<
+    Option.Option<AuthenticatedRelayEnvironmentSnapshot>
+  >(Option.none());
   const refreshLock = yield* Semaphore.make(1);
   const hasRefreshed = yield* Ref.make(false);
   const accountGeneration = yield* Ref.make(0);
+  const snapshotGeneration = yield* Ref.make(0);
   const activeAccountId = yield* Ref.make<Option.Option<string>>(Option.none());
   const refreshGeneration = yield* Ref.make(0);
   const offlineReportFingerprints = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+
+  const isSnapshotCurrent = Effect.fn("RelayEnvironmentDiscovery.isSnapshotCurrent")(function* (
+    identity: ClientCapabilities.CloudSessionIdentity,
+    generation: number,
+  ) {
+    if ((yield* Ref.get(snapshotGeneration)) !== generation) return false;
+    const currentIdentity = yield* session.identity;
+    if (Option.isNone(currentIdentity) || currentIdentity.value.accountId !== identity.accountId) {
+      return false;
+    }
+    return true;
+  });
 
   const clearOfflineReport = Effect.fn("RelayEnvironmentDiscovery.clearOfflineReport")(function* (
     environmentId: string,
@@ -235,6 +256,8 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
           if ((yield* Ref.get(accountGeneration)) !== generation) {
             return;
           }
+          yield* SubscriptionRef.set(authenticatedSnapshot, Option.none());
+          yield* Ref.set(activeAccountId, Option.none());
           yield* SubscriptionRef.update(state, (current) => ({
             ...current,
             refreshing: false,
@@ -247,7 +270,15 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
       if ((yield* Ref.get(accountGeneration)) !== generation) {
         return;
       }
-      const accountId = relayAccountId(clerkToken);
+      const sessionIdentity = yield* session.identity;
+      if (Option.isNone(sessionIdentity)) {
+        yield* SubscriptionRef.set(authenticatedSnapshot, Option.none());
+        return yield* new ConnectionBlockedError({
+          reason: "authentication",
+          detail: "The T3 Connect session is unavailable.",
+        });
+      }
+      const accountId = Option.some(sessionIdentity.value.accountId);
       const previousAccountId = yield* Ref.get(activeAccountId);
       if (
         Option.isSome(previousAccountId) &&
@@ -255,15 +286,47 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
       ) {
         generation = yield* Ref.updateAndGet(accountGeneration, (current) => current + 1);
         yield* Ref.set(refreshGeneration, generation);
+        yield* SubscriptionRef.set(authenticatedSnapshot, Option.none());
       }
       yield* Ref.set(activeAccountId, accountId);
 
       const environments = yield* relay
         .listEnvironments({ clerkToken })
         .pipe(Effect.mapError(mapManagedRelayError));
+      const identityAfterListing = yield* session.identity;
+      if (
+        Option.isNone(identityAfterListing) ||
+        identityAfterListing.value.accountId !== sessionIdentity.value.accountId
+      ) {
+        yield* Ref.update(accountGeneration, (current) => current + 1);
+        yield* Ref.update(snapshotGeneration, (current) => current + 1);
+        yield* SubscriptionRef.set(authenticatedSnapshot, Option.none());
+        return;
+      }
       if ((yield* Ref.get(accountGeneration)) !== generation) {
         return;
       }
+      const linkedListGeneration = yield* Ref.updateAndGet(
+        snapshotGeneration,
+        (current) => current + 1,
+      );
+      const linkedEnvironments = new Map<EnvironmentId, RelayClientEnvironmentRecord>();
+      for (const environment of environments) {
+        linkedEnvironments.set(environment.environmentId, environment);
+      }
+      const snapshot = {
+        [authenticatedSnapshotBrand]: true as const,
+        identity: sessionIdentity.value,
+        generation: linkedListGeneration,
+        environments: linkedEnvironments,
+      };
+      yield* SubscriptionRef.set(
+        authenticatedSnapshot,
+        Option.some({
+          ...snapshot,
+          isCurrent: () => isSnapshotCurrent(snapshot.identity, snapshot.generation),
+        }),
+      );
       const next = new Map<string, RelayDiscoveredEnvironment>();
       for (const environment of environments) {
         next.set(environment.environmentId, {
@@ -330,7 +393,21 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
       reason === "credentials-changed"
         ? Effect.gen(function* () {
             yield* Ref.update(accountGeneration, (current) => current + 1);
-            yield* Ref.set(activeAccountId, Option.none());
+            yield* Ref.update(snapshotGeneration, (current) => current + 1);
+            const identity = yield* session.identity;
+            const snapshot = yield* SubscriptionRef.get(authenticatedSnapshot);
+            const identityChanged =
+              Option.isNone(identity) ||
+              (Option.isSome(snapshot) &&
+                Option.isSome(identity) &&
+                snapshot.value.identity.accountId !== identity.value.accountId);
+            if (identityChanged) {
+              yield* SubscriptionRef.set(authenticatedSnapshot, Option.none());
+            }
+            yield* Ref.set(
+              activeAccountId,
+              Option.map(identity, (current) => current.accountId),
+            );
             yield* Ref.set(offlineReportFingerprints, new Map());
             yield* SubscriptionRef.set(state, EMPTY_RELAY_ENVIRONMENT_DISCOVERY_STATE);
             // Refresh proactively — this wakeup fires when a session activates
@@ -344,7 +421,7 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
     Effect.forkScoped,
   );
 
-  return RelayEnvironmentDiscovery.of({ state, refresh });
+  return RelayEnvironmentDiscovery.of({ state, authenticatedSnapshot, refresh });
 });
 
 export const layer = Layer.effect(RelayEnvironmentDiscovery, make());
