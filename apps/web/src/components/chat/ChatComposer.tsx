@@ -1674,7 +1674,7 @@ export interface ChatComposerProps {
     e?: { preventDefault: () => void },
     dispatchMode?: ComposerDispatchMode,
     submissionIntent?: ComposerSubmissionIntent,
-  ) => void;
+  ) => void | Promise<boolean | void>;
   onResume: () => void;
   onInterrupt: () => void;
   onImplementPlanInNewThread: () => void;
@@ -4323,6 +4323,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         });
         return;
       }
+      const sendResult: { completion?: Promise<boolean | void> } = {};
       const submission = submitComposerDraft({
         prompt: promptRef.current,
         submissionTarget: activePendingProgress ? "pending-user-input" : "provider-turn",
@@ -4331,7 +4332,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           // ChatView reports its final composed-input preflight through the
           // composer handle before its first asynchronous send step.
           providerInputRejectedRef.current = false;
-          onSend(
+          const completion = onSend(
             sendEvent,
             dispatchMode ??
               resolveComposerDispatchMode({
@@ -4341,6 +4342,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               }),
             submissionIntent,
           );
+          sendResult.completion = Promise.resolve(completion);
           return !providerInputRejectedRef.current;
         },
       });
@@ -4350,6 +4352,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       if (shouldBlurMobileComposerOnSubmit()) {
         blurMobileComposerAfterSend();
       }
+      return Promise.resolve(sendResult.completion).then((accepted) => accepted === true);
     },
     [
       activeThreadId,
@@ -4366,6 +4369,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       promptRef,
       shouldBlurMobileComposerOnSubmit,
     ],
+  );
+  const sendVoiceTranscript = useCallback(
+    async (targetKey: string) => {
+      if (voiceDraftTargetKeyRef.current !== targetKey) return false;
+      return (await submitComposer()) ?? false;
+    },
+    [submitComposer],
   );
   const handleSubmitMessage = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -7729,10 +7739,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 >
                   {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
                     <VoiceDictationControl
+                      environmentId={environmentId}
                       targetKey={voiceDraftTargetKeyRef.current}
                       currentTargetKey={() => voiceDraftTargetKeyRef.current}
                       transcribe={transcribeVoiceRecording(environmentId)}
                       onTranscript={insertVoiceTranscript}
+                      onSend={sendVoiceTranscript}
                     />
                   ) : null}
                   <LiveVoiceControl

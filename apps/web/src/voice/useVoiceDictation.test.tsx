@@ -33,6 +33,7 @@ class FakeMediaRecorder {
 
 let renderer: ReactTestRenderer | null = null;
 let latest: ReturnType<typeof useVoiceDictation> | null = null;
+let onSend: ReturnType<typeof vi.fn<() => Promise<boolean>>>;
 let onTranscript: ReturnType<typeof vi.fn<(transcript: string) => void>>;
 let trackStop: ReturnType<typeof vi.fn>;
 let revokedUrls: string[];
@@ -44,7 +45,12 @@ function Probe({
   transcribe: VoiceDictationTranscriber | null;
   targetKey?: string | undefined;
 }) {
-  latest = useVoiceDictation({ transcribe, onTranscript, ...(targetKey ? { targetKey } : {}) });
+  latest = useVoiceDictation({
+    transcribe,
+    onTranscript,
+    onSend,
+    ...(targetKey ? { targetKey } : {}),
+  });
   return null;
 }
 
@@ -58,12 +64,13 @@ function render(transcribe: VoiceDictationTranscriber | null, targetKey?: string
 async function startAndStop() {
   await act(async () => latest?.start());
   expect(latest?.state.phase).toBe("recording");
-  act(() => latest?.stop());
+  act(() => latest?.stop("review"));
   expect(latest?.state.phase).toBe("review");
 }
 
 beforeEach(() => {
   onTranscript = vi.fn();
+  onSend = vi.fn(async () => true);
   trackStop = vi.fn();
   revokedUrls = [];
   FakeMediaRecorder.instance = null;
@@ -91,6 +98,107 @@ afterEach(() => {
 });
 
 describe("useVoiceDictation", () => {
+  it("Stop transcribes directly into the prompt without sending", async () => {
+    const transcribe = vi.fn(async () => "  stopped words  ");
+    render(transcribe, "voice-stop:auto");
+    await act(async () => latest?.start());
+    await act(async () => latest?.stop());
+    expect(transcribe).toHaveBeenCalledOnce();
+    expect(onTranscript).toHaveBeenCalledWith("stopped words");
+    expect(onSend).not.toHaveBeenCalled();
+    expect(latest?.state.phase).toBe("idle");
+    expect(await readRecordingDraft("voice-stop:auto")).toBeNull();
+  });
+
+  it("Send retains audio until the message is accepted", async () => {
+    let accept!: (accepted: boolean) => void;
+    onSend.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          accept = resolve;
+        }),
+    );
+    render(async () => "send words", "voice-send:pending");
+    await act(async () => latest?.start());
+    await act(async () => latest?.stop("send"));
+    expect(onTranscript).toHaveBeenCalledWith("send words");
+    expect(latest?.state.phase).toBe("transcribing");
+    expect((await readRecordingDraft("voice-send:pending"))?.audio.size).toBeGreaterThan(0);
+    await act(async () => accept(true));
+    expect(latest?.state.phase).toBe("idle");
+    expect(await readRecordingDraft("voice-send:pending")).toBeNull();
+  });
+
+  it("retries a failed Send after remount without inserting or transcribing twice", async () => {
+    const targetKey = "voice-send:retry";
+    const transcribe = vi.fn(async () => "editable words");
+    onSend.mockResolvedValueOnce(false);
+    render(transcribe, targetKey);
+    await act(async () => latest?.start());
+    await act(async () => latest?.stop("send"));
+    expect(latest?.state.phase).toBe("error");
+    expect((await readRecordingDraft(targetKey))?.transcript).toBe("editable words");
+    act(() => {
+      renderer?.unmount();
+      renderer = null;
+    });
+    await act(async () => render(transcribe, targetKey));
+    await act(async () => latest?.transcribe("send"));
+    expect(transcribe).toHaveBeenCalledOnce();
+    expect(onTranscript).toHaveBeenCalledOnce();
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect(await readRecordingDraft(targetKey)).toBeNull();
+  });
+
+  it("shares a pending Send across remount and removes audio after acceptance", async () => {
+    let accept!: (accepted: boolean) => void;
+    onSend.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          accept = resolve;
+        }),
+    );
+    const targetKey = "voice-send:remount-pending";
+    const transcribe = vi.fn(async () => "send once");
+    render(transcribe, targetKey);
+    await act(async () => latest?.start());
+    await act(async () => latest?.stop("send"));
+    act(() => {
+      renderer?.unmount();
+      renderer = null;
+    });
+    await act(async () => render(transcribe, targetKey));
+    let retry: Promise<void> | undefined;
+    act(() => {
+      retry = latest?.transcribe("send");
+    });
+    expect(onSend).toHaveBeenCalledOnce();
+    await act(async () => {
+      accept(true);
+      await retry;
+    });
+    expect(onTranscript).toHaveBeenCalledOnce();
+    expect(await readRecordingDraft(targetKey)).toBeNull();
+    expect(latest?.state.phase).toBe("idle");
+  });
+
+  it("preserves an active recording during composer remount without delivering it", async () => {
+    const targetKey = "voice-capture:remount";
+    const transcribe = vi.fn(async () => "unused");
+    render(transcribe, targetKey);
+    await act(async () => latest?.start());
+    act(() => {
+      renderer?.unmount();
+      renderer = null;
+    });
+    expect((await readRecordingDraft(targetKey))?.audio.size).toBeGreaterThan(0);
+    expect(trackStop).toHaveBeenCalledOnce();
+    expect(transcribe).not.toHaveBeenCalled();
+    await act(async () => render(transcribe, targetKey));
+    expect(latest?.state.phase).toBe("review");
+    act(() => latest?.cancel());
+  });
+
   it("restores a failed recording after Settings navigation and retries after configuration", async () => {
     const targetKey = "voice-recovery:environment:thread";
     render(async () => {
@@ -382,7 +490,7 @@ describe("useVoiceDictation", () => {
     });
     expect(currentRecorder.state).toBe("recording");
     expect(latest?.state.phase).toBe("recording");
-    act(() => latest?.stop());
+    act(() => latest?.stop("review"));
     expect(latest?.state.phase).toBe("review");
   });
 });

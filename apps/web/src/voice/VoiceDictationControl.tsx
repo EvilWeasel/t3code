@@ -1,4 +1,6 @@
-import { MicIcon, SquareIcon, Trash2Icon } from "lucide-react";
+import { Link } from "@tanstack/react-router";
+import type { EnvironmentId } from "@t3tools/contracts";
+import { MicIcon, SquareIcon, Trash2Icon, SendIcon, Settings2Icon } from "lucide-react";
 import {
   useVoiceDictation,
   VoiceDictationServiceError,
@@ -9,10 +11,12 @@ import { useEffect, useRef } from "react";
 import { useCallback } from "react";
 
 export function VoiceDictationControl(props: {
+  readonly environmentId?: EnvironmentId;
   readonly targetKey: string;
   readonly currentTargetKey: () => string;
   readonly transcribe: VoiceDictationTranscriber | null;
   readonly onTranscript: (text: string, targetKey: string) => boolean;
+  readonly onSend?: (targetKey: string) => Promise<boolean>;
 }) {
   const recordedTargetKey = useRef(props.targetKey);
   const recordingTranscriber = useRef<VoiceDictationTranscriber | null>(props.transcribe);
@@ -35,6 +39,11 @@ export function VoiceDictationControl(props: {
   const dictation = useVoiceDictation({
     targetKey: props.targetKey,
     transcribe: transcribeCapturedRecording,
+    onSend: async () => {
+      const targetKey = recordedTargetKey.current;
+      if (props.currentTargetKey() !== targetKey) return false;
+      return (await props.onSend?.(targetKey)) ?? false;
+    },
     onTranscript: (text) => {
       const targetKey = recordedTargetKey.current;
       if (props.currentTargetKey() !== targetKey) {
@@ -50,6 +59,19 @@ export function VoiceDictationControl(props: {
     },
   });
   const state = dictation.state;
+  const settingsLink = props.environmentId ? (
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      render={
+        <Link to="/settings/integrations" search={{ machine: props.environmentId }} hash="voice" />
+      }
+      aria-label="Voice provider and API key settings"
+      title="Voice provider and API key settings"
+    >
+      <Settings2Icon />
+    </Button>
+  ) : null;
   useEffect(() => {
     if (recordedTargetKey.current !== props.targetKey) {
       recordingTranscriber.current = props.transcribe;
@@ -80,6 +102,7 @@ export function VoiceDictationControl(props: {
         >
           <MicIcon />
         </Button>
+        {settingsLink}
       </div>
     );
   }
@@ -94,11 +117,22 @@ export function VoiceDictationControl(props: {
           type="button"
           variant="ghost"
           size="icon-sm"
-          onClick={dictation.stop}
+          onClick={() => dictation.stop()}
           aria-label="Stop recording"
           title="Stop recording"
         >
           <SquareIcon />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          disabled={!props.onSend}
+          onClick={() => dictation.stop("send")}
+          aria-label="Transcribe and send recording"
+          title="Transcribe and send recording"
+        >
+          <SendIcon />
         </Button>
         <Button
           type="button"
@@ -125,9 +159,10 @@ export function VoiceDictationControl(props: {
         src={audioUrl}
         aria-label="Review recording"
       />
+      {settingsLink}
       {error ? (
         <span role="status" className="max-w-40 text-xs text-destructive">
-          {error} Open Settings → Integrations → Voice transcription to check this environment.
+          {error} Check this environment’s voice settings.
         </span>
       ) : null}
       <Button
@@ -137,7 +172,16 @@ export function VoiceDictationControl(props: {
         disabled={busy || !props.transcribe}
         onClick={() => void dictation.transcribe()}
       >
-        {busy ? "Transcribing…" : "Transcribe"}
+        {busy ? "Transcribing…" : "Insert text"}
+      </Button>
+      <Button
+        type="button"
+        variant="secondary"
+        size="sm"
+        disabled={busy || !props.transcribe || !props.onSend}
+        onClick={() => void dictation.transcribe("send")}
+      >
+        Send
       </Button>
       <Button
         type="button"

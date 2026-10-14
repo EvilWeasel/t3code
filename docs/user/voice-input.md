@@ -1,12 +1,16 @@
 # Voice input in Weasel Nightly
 
-Record a message from the chat composer, stop, and listen before transcribing.
-You can discard the recording or retry transcription. Reviewed recordings stay
-with their draft when you open Settings or switch threads, including after a
-failed request. Return to that draft to listen or retry. A successful insertion
-or **Discard recording** removes the saved audio. The transcript becomes
-editable draft text; sending it remains a separate action. Browser storage must
-remain available to keep audio across an app reload.
+Record a message from the chat composer. **Stop** transcribes it into editable
+prompt text. **Send** transcribes it and sends the prompt directly, including any
+text already in your draft. A failed transcription or send keeps the recording
+for playback and retry. Retrying a failed send uses the editable prompt without
+inserting the same transcript twice.
+
+Recordings stay with their original draft when you open Settings or switch
+threads. Leaving during recording stops capture and keeps the audio for review;
+it does not send a message. Return to that draft to listen, insert text, or send.
+A successful insertion, accepted send, or **Discard recording** removes the saved
+audio. Browser storage must remain available to keep audio across an app reload.
 
 Transcription runs on the environment selected for that composer. A remote
 environment uses its own configured transcription provider and login. Changing

@@ -3,6 +3,8 @@ export const MAX_RECORDING_BYTES = 25 * 1024 * 1024;
 export interface RecordingDraft {
   readonly audio: Blob;
   readonly message?: string;
+  // Already inserted into the prompt; a failed Send retries without duplicating words.
+  readonly transcript?: string | undefined;
 }
 
 // Audio belongs to the draft, not to a mounted composer. The memory copy also

@@ -9262,7 +9262,7 @@ export default function ChatView(props: ChatViewProps) {
       ) {
         handleNewThreadInActiveProject();
       }
-      return;
+      return followUpSent;
     }
     // Providers without the legacy toggle receive their native commands unchanged.
     const standaloneSlashCommand =
@@ -9824,7 +9824,7 @@ export default function ChatView(props: ChatViewProps) {
           resetLocalDispatch();
         }
       }
-      return;
+      return failedSelections.length === 0 && startedCount > 0;
     }
     const optimisticAttachments = composerAttachmentsSnapshot.map((attachment) =>
       attachment.type === "image"
@@ -10214,6 +10214,7 @@ export default function ChatView(props: ChatViewProps) {
       );
       if (!sendQueuesBehindSetup) resetLocalDispatch();
     }
+    return turnStartSucceeded;
   };
 
   const onRespondToApproval = useCallback(
