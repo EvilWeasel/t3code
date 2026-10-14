@@ -66,9 +66,11 @@ describe("connection layer enrollment watcher", () => {
         });
 
         yield* watchDiscoveredEnvironments().pipe(
-          Effect.provide(Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, registry)),
           Effect.provide(
-            Layer.succeed(RelayEnvironmentDiscovery.RelayEnvironmentDiscovery, discovery),
+            Layer.mergeAll(
+              Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, registry),
+              Layer.succeed(RelayEnvironmentDiscovery.RelayEnvironmentDiscovery, discovery),
+            ),
           ),
           Effect.forkScoped,
         );

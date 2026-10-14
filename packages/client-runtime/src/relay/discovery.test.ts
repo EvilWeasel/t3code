@@ -138,9 +138,7 @@ const makeHarness = Effect.fn("RelayDiscoveryTest.makeHarness")(function* () {
           ClientCapabilities.CloudSession.of({
             identity: Ref.get(clerkToken).pipe(
               Effect.flatMap((token) =>
-                token === null
-                  ? Effect.succeed(Option.none())
-                  : Ref.get(sessionIdentity).pipe(Effect.map(Option.some)),
+                token === null ? Effect.succeedNone : Ref.get(sessionIdentity).pipe(Effect.asSome),
               ),
             ),
             clerkToken: Ref.get(clerkToken).pipe(
