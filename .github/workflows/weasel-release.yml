@@ -190,6 +190,16 @@ jobs:
           ref: ${{ needs.preflight.outputs.source_sha }}
           fetch-depth: 1
 
+      - name: Checkout pinned NixOS packaging helper
+        if: inputs.build_mode == 'candidate' && inputs.platform == 'linux'
+        uses: actions/checkout@v4
+        with:
+          repository: morrowbyte/t3code
+          ref: 0a1774af188f2e27c104fd0c9a3de598b559bf07
+          path: nixos-packaging
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
@@ -239,17 +249,86 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --output-dir release-linux
+          [[ "$T3CODE_DESKTOP_UPDATE_REPOSITORY" == "$GITHUB_REPOSITORY" ]]
+          [[ "$T3CODE_DESKTOP_APP_ID" == com.evilweasel.t3code ]]
+          [[ "$T3CODE_DESKTOP_PRODUCT_NAME" == 'T3 Code (Weasel Nightly)' ]]
+          [[ "$T3CODE_DESKTOP_PROFILE" == weasel ]]
           if [[ "${{ inputs.build_mode }}" == production ]]; then
             test -s release-linux/nightly-linux.yml
+            shopt -s nullglob
+            stage_roots=(/tmp/t3code-desktop-linux-stage-* "$RUNNER_TEMP"/t3code-desktop-linux-stage-*)
+            test "${#stage_roots[@]}" -gt 0
+            update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
+            test -n "$update_config"
+            IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
+            grep -Fq "owner: $expected_owner" "$update_config"
+            grep -Fq "repo: $expected_repo" "$update_config"
           fi
-          shopt -s nullglob
-          stage_roots=(/tmp/t3code-desktop-linux-stage-* "$RUNNER_TEMP"/t3code-desktop-linux-stage-*)
-          test "${#stage_roots[@]}" -gt 0
-          update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
-          test -n "$update_config"
-          IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
-          grep -Fq "owner: $expected_owner" "$update_config"
-          grep -Fq "repo: $expected_repo" "$update_config"
+
+      - name: Setup Nix
+        if: inputs.build_mode == 'candidate' && inputs.platform == 'linux'
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Export NixOS package closure and build receipt
+        if: inputs.build_mode == 'candidate' && inputs.platform == 'linux'
+        env:
+          T3_WEASEL_VERSION: ${{ needs.preflight.outputs.version }}
+          T3_WEASEL_REPOSITORY: morrowbyte/t3code
+          WEASEL_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          NIXOS_PACKAGING_SHA: 0a1774af188f2e27c104fd0c9a3de598b559bf07
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test "$(git -C nixos-packaging rev-parse HEAD)" = 0a1774af188f2e27c104fd0c9a3de598b559bf07
+          appimage="$GITHUB_WORKSPACE/release-linux/T3-Code-${T3_WEASEL_VERSION}-x86_64.AppImage"
+          test -s "$appimage"
+          T3_WEASEL_ARTIFACT_PATH="$(realpath "$appimage")"
+          T3_WEASEL_ARTIFACT_SHA256="$(sha256sum "$appimage" | cut -d ' ' -f 1)"
+          export T3_WEASEL_ARTIFACT_PATH T3_WEASEL_ARTIFACT_SHA256
+          build_output="$RUNNER_TEMP/t3code-weasel-nix-build-paths.txt"
+          (cd nixos-packaging/packaging/nixos && \
+            nix build --impure --no-link --print-out-paths .#t3code-weasel) > "$build_output"
+          mapfile -t built_store_paths < "$build_output"
+          test "${#built_store_paths[@]}" -eq 1
+          package_store_path="${built_store_paths[0]}"
+          [[ "$package_store_path" == /nix/store/*-t3code-weasel-"$T3_WEASEL_VERSION" ]]
+          bash nixos-packaging/packaging/nixos/export-closure.sh \
+            "$package_store_path" \
+            "$WEASEL_SOURCE_SHA" \
+            "$T3_WEASEL_ARTIFACT_SHA256" \
+            "$T3_WEASEL_VERSION" \
+            "$RUNNER_TEMP/t3code-weasel-nixos-closure"
+          manifest_sha256="$(sha256sum "$RUNNER_TEMP/t3code-weasel-nixos-closure/manifest.json" | cut -d ' ' -f 1)"
+          closure_sha256="$(sha256sum "$RUNNER_TEMP/t3code-weasel-nixos-closure/store-export.nix.gz" | cut -d ' ' -f 1)"
+          (cd "$RUNNER_TEMP/t3code-weasel-nixos-closure" && sha256sum --check SHA256SUMS)
+          jq -e \
+            --arg sha "$closure_sha256" \
+            --arg source "$WEASEL_SOURCE_SHA" \
+            --arg version "$T3_WEASEL_VERSION" \
+            --arg appimage "$T3_WEASEL_ARTIFACT_SHA256" \
+            '.storeExportSha256 == $sha and .sourceSha == $source and .version == $version and .appImageSha256 == $appimage' \
+            "$RUNNER_TEMP/t3code-weasel-nixos-closure/manifest.json" >/dev/null
+          jq -n \
+            --arg sourceSha "$WEASEL_SOURCE_SHA" \
+            --arg nixosPackagingSha "$NIXOS_PACKAGING_SHA" \
+            --arg workflowSha "$WORKFLOW_SHA" \
+            --arg runId "$RUN_ID" \
+            --arg runAttempt "$RUN_ATTEMPT" \
+            --arg version "$T3_WEASEL_VERSION" \
+            --arg repository "$T3_WEASEL_REPOSITORY" \
+            --arg appImagePath "$appimage" \
+            --arg appImageSha256 "$T3_WEASEL_ARTIFACT_SHA256" \
+            --arg manifestSha256 "$manifest_sha256" \
+            --arg closureSha256 "$closure_sha256" \
+            '{format:"weasel-linux-candidate-receipt-v1",sourceSha:$sourceSha,nixosPackagingSha:$nixosPackagingSha,workflowSha:$workflowSha,runId:$runId,runAttempt:$runAttempt,version:$version,repository:$repository,appImagePath:$appImagePath,appImageSha256:$appImageSha256,nixosManifestSha256:$manifestSha256,nixosClosureSha256:$closureSha256}' \
+            > "$RUNNER_TEMP/t3code-weasel-nixos-closure/build-receipt.json"
+          (cd "$RUNNER_TEMP/t3code-weasel-nixos-closure" && sha256sum build-receipt.json >> SHA256SUMS)
+          (cd "$RUNNER_TEMP/t3code-weasel-nixos-closure" && sha256sum --check SHA256SUMS)
 
       - name: Prepare NixOS download bundle
         if: inputs.build_mode == 'production'
@@ -287,6 +366,16 @@ jobs:
           path: release-cli/*
           if-no-files-found: error
           retention-days: 1
+
+      - name: Upload NixOS closure and build receipt
+        if: inputs.build_mode == 'candidate' && inputs.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-linux-nixos-closure-${{ needs.preflight.outputs.version }}-run-${{ github.run_id }}
+          path: ${{ runner.temp }}/t3code-weasel-nixos-closure/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Preserve built Linux files after a later failure
         if: ${{ failure() && hashFiles('release-linux/*.AppImage') != '' }}
