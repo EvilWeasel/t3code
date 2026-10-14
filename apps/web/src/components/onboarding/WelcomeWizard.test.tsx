@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { EnvironmentId, ProjectId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  ProviderInstanceId,
+  type AgentSessionImportOutcome,
+} from "@t3tools/contracts";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 
 const mocks = vi.hoisted(() => ({
@@ -10,13 +15,14 @@ const mocks = vi.hoisted(() => ({
   complete: vi.fn(),
   refresh: vi.fn(),
   toast: vi.fn(),
+  canOperate: true,
   projects: [] as Array<{ id: string; environmentId: string; workspaceRoot: string }>,
 }));
 vi.mock("../../state/session", () => ({
-  useEnvironmentScope: () => true,
+  useEnvironmentScope: () => mocks.canOperate,
   useEnvironmentsWithScope: (environments: Array<{ environmentId: string }>) =>
-    new Set(environments.map((entry) => entry.environmentId)),
-  readEnvironmentScope: () => true,
+    mocks.canOperate ? new Set(environments.map((entry) => entry.environmentId)) : new Set(),
+  readEnvironmentScope: () => mocks.canOperate,
 }));
 vi.mock("../../state/agentSessions", () => ({ agentSessionImport: "import" }));
 vi.mock("../../state/projects", () => ({ projectEnvironment: { create: "create" } }));
@@ -113,6 +119,7 @@ beforeEach(() => {
     value: () => [],
   });
   mocks.projects = [{ id: "test-project", environmentId: "test-env", workspaceRoot: "/project" }];
+  mocks.canOperate = true;
   mocks.complete.mockResolvedValue(undefined);
   mocks.refresh.mockResolvedValue(undefined);
   mocks.importThreads.mockResolvedValue({
@@ -135,6 +142,25 @@ async function click(label: string) {
   );
   expect(button, `button ${label}`).toBeDefined();
   await act(async () => button!.click());
+}
+
+function importOutcome(overrides: Partial<AgentSessionImportOutcome>): AgentSessionImportOutcome {
+  return {
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    providerSessionId: null,
+    status: "imported",
+    recoverability: "conversation",
+    reason: "imported",
+    nativeContinuationEligible: false,
+    ...overrides,
+  };
+}
+
+async function reachImportStep(onDone = vi.fn()) {
+  await act(async () => root.render(<WelcomeWizard localAvailable onDone={onDone} />));
+  await click("Continue");
+  await click("Continue");
+  return onDone;
 }
 
 it("enters the workspace after a partial import and warns after navigation finishes", async () => {
@@ -197,6 +223,128 @@ it.each([
     }
   },
 );
+
+it("explains preserved opaque encrypted context alongside 55 imported conversations", async () => {
+  const opaqueOutcomes = Array.from({ length: 6 }, (_, index) =>
+    importOutcome({
+      providerSessionId: `opaque-fixture-${index}`,
+      status: "skipped",
+      recoverability: "compaction-context",
+      reason: "opaque-context",
+    }),
+  );
+  const importedOutcomes = Array.from({ length: 55 }, () => importOutcome({}));
+  mocks.importThreads.mockResolvedValue({
+    _tag: "Success",
+    value: {
+      importedCount: 55,
+      skippedCount: 6,
+      outcomes: [...importedOutcomes, ...opaqueOutcomes],
+    },
+  });
+  const onDone = await reachImportStep();
+  await click("Import 1 project");
+
+  expect(onDone).toHaveBeenCalledOnce();
+  expect(mocks.toast).toHaveBeenCalledWith(
+    expect.objectContaining({
+      type: "warning",
+      description:
+        "Imported 55 conversations. 6 native sessions contained opaque encrypted compaction context. Their original session data was preserved; no conversation or runtime session was imported, and native continuation is not verified.",
+    }),
+  );
+  const description = mocks.toast.mock.calls[0]?.[0]?.description as string;
+  expect(description).not.toContain("opaque-fixture");
+  expect(description).not.toContain("could not be imported");
+});
+
+it("keeps detailed skip reasons separate and reports an unclassified remainder", async () => {
+  mocks.importThreads.mockResolvedValue({
+    _tag: "Success",
+    value: {
+      importedCount: 1,
+      skippedCount: 5,
+      outcomes: [
+        importOutcome({
+          status: "skipped",
+          reason: "opaque-context",
+          recoverability: "compaction-context",
+        }),
+        importOutcome({
+          status: "skipped",
+          reason: "missing-session-id",
+          recoverability: "metadata-only",
+        }),
+        importOutcome({
+          status: "skipped",
+          reason: "malformed-compaction",
+          recoverability: "unrecoverable",
+        }),
+        importOutcome({
+          status: "skipped",
+          reason: "budget-exceeded",
+          recoverability: "unrecoverable",
+        }),
+        importOutcome({ status: "duplicate", reason: "duplicate" }),
+      ],
+    },
+  });
+  await reachImportStep();
+  await click("Import 1 project");
+
+  const description = mocks.toast.mock.calls[0]?.[0]?.description as string;
+  expect(description).toContain("Imported 1 conversation.");
+  expect(description).toContain("1 native session contained opaque encrypted compaction context.");
+  expect(description).toContain("1 session lacked a recorded native session ID needed for import.");
+  expect(description).toContain("1 session had malformed compaction data and was not imported.");
+  expect(description).toContain(
+    "1 session was left untouched because the import budget was reached.",
+  );
+  expect(description).toContain(
+    "1 additional session was skipped, but the server did not provide a reason.",
+  );
+  expect(description).not.toContain("duplicate");
+});
+
+it("ignores a late DOM import completion after onboarding leaves the import step", async () => {
+  let resolveImport!: (result: {
+    _tag: "Success";
+    value: { importedCount: number; skippedCount: number };
+  }) => void;
+  mocks.importThreads.mockImplementationOnce(
+    () => new Promise((resolve) => (resolveImport = resolve)),
+  );
+  const onDone = await reachImportStep();
+  await click("Import 1 project");
+  expect(mocks.importThreads).toHaveBeenCalledOnce();
+
+  await act(async () => root.render(null));
+  await act(async () => {
+    resolveImport({ _tag: "Success", value: { importedCount: 1, skippedCount: 1 } });
+  });
+
+  expect(onDone).not.toHaveBeenCalled();
+  expect(mocks.toast).not.toHaveBeenCalled();
+});
+
+it("keeps denied DOM import read-only and still allows setup to finish", async () => {
+  const onDone = await reachImportStep();
+  mocks.canOperate = false;
+  await act(async () => root.render(<WelcomeWizard localAvailable onDone={onDone} />));
+
+  const importButton = [...document.querySelectorAll("button")].find((element) =>
+    element.textContent?.includes("Import 1 project"),
+  );
+  expect(importButton?.disabled).toBe(true);
+  expect(document.body.textContent).toContain(
+    "This connection cannot import projects or thread history.",
+  );
+  await click("Do not import projects");
+
+  expect(mocks.createProject).not.toHaveBeenCalled();
+  expect(mocks.importThreads).not.toHaveBeenCalled();
+  expect(onDone).toHaveBeenCalledOnce();
+});
 
 it("keeps setup open when saving completion fails and preserves the import warning on retry", async () => {
   mocks.complete.mockRejectedValueOnce(new Error("settings unavailable"));

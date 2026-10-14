@@ -2,6 +2,7 @@ import { useAuth } from "@clerk/react";
 import { useAtomValue } from "@effect/atom-react";
 import type {
   AgentSessionProjectCandidate,
+  AgentSessionImportOutcome,
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
@@ -1192,6 +1193,91 @@ function AgentInstallTerminal({
 
 const IMPORT_PERMISSION_MESSAGE = "This connection cannot import projects or thread history.";
 
+function formatImportWarning(
+  importedCount: number,
+  skippedCount: number,
+  outcomes: ReadonlyArray<AgentSessionImportOutcome> | undefined,
+  hasDetailedOutcomes: boolean,
+): string {
+  const imported = importedCount
+    ? `Imported ${importedCount} ${importedCount === 1 ? "conversation" : "conversations"}.`
+    : "";
+  if (!hasDetailedOutcomes || outcomes === undefined) {
+    const legacy =
+      importedCount > 0
+        ? `${importedCount === 1 ? "Imported 1 thread." : `Imported ${importedCount} threads.`} `
+        : "";
+    return skippedCount > 0
+      ? `${legacy}${skippedCount} ${skippedCount === 1 ? "thread could not" : "threads could not"} be imported.`
+      : imported;
+  }
+
+  const skipped = outcomes.filter((outcome) => outcome.status === "skipped");
+  const messages: Array<string> = [];
+  let remaining = skippedCount;
+  const addReason = (
+    predicate: (outcome: AgentSessionImportOutcome) => boolean,
+    describe: (count: number) => string,
+  ) => {
+    const count = Math.min(skipped.filter(predicate).length, remaining);
+    if (count > 0) {
+      messages.push(describe(count));
+      remaining -= count;
+    }
+  };
+  const plural = (count: number, singular: string, pluralForm = `${singular}s`) =>
+    `${count} ${count === 1 ? singular : pluralForm}`;
+  const wasWere = (count: number) => (count === 1 ? "was" : "were");
+
+  addReason(
+    (outcome) =>
+      outcome.reason === "opaque-context" && outcome.recoverability === "compaction-context",
+    (count) =>
+      `${plural(count, "native session")} contained opaque encrypted compaction context. Their original session data was preserved; no conversation or runtime session was imported, and native continuation is not verified.`,
+  );
+  addReason(
+    (outcome) => outcome.reason === "missing-session-id",
+    (count) => `${plural(count, "session")} lacked a recorded native session ID needed for import.`,
+  );
+  addReason(
+    (outcome) => outcome.reason === "no-visible-messages",
+    (count) => `${plural(count, "session")} had no visible conversation messages to import.`,
+  );
+  addReason(
+    (outcome) => outcome.reason === "summary-only",
+    (count) => `${plural(count, "session")} only had summaries, not an importable conversation.`,
+  );
+  addReason(
+    (outcome) => outcome.reason === "malformed-compaction",
+    (count) =>
+      `${plural(count, "session")} had malformed compaction data and ${wasWere(count)} not imported.`,
+  );
+  addReason(
+    (outcome) => outcome.reason === "budget-exceeded",
+    (count) =>
+      `${plural(count, "session")} ${wasWere(count)} left untouched because the import budget was reached.`,
+  );
+  addReason(
+    (outcome) => outcome.reason === "read-failed",
+    (count) => `The app could not read ${plural(count, "session").toLowerCase()}.`,
+  );
+  addReason(
+    (outcome) => outcome.reason === "workspace-mismatch",
+    (count) =>
+      `${plural(count, "session")} did not match this project's workspace and ${wasWere(count)} not imported.`,
+  );
+  addReason(
+    (outcome) => outcome.reason === "import-failed",
+    (count) => `${plural(count, "conversation")} could not be imported.`,
+  );
+  if (remaining > 0) {
+    messages.push(
+      `${plural(remaining, "additional session")} ${wasWere(remaining)} skipped, but the server did not provide a reason.`,
+    );
+  }
+  return [imported, ...messages].filter(Boolean).join(" ");
+}
+
 function ImportStep({
   scans,
   isImporting,
@@ -1330,6 +1416,8 @@ function ImportStep({
         : 0;
     let importedThreadCount = 0;
     let skippedThreadCount = 0;
+    let hasDetailedOutcomes = false;
+    const importOutcomes: Array<AgentSessionImportOutcome> = [];
     const refreshEnvironments = new Set<EnvironmentId>();
     for (const candidate of selection) {
       const { environmentId } = candidate;
@@ -1399,6 +1487,10 @@ function ImportStep({
       if (threadImportResult._tag === "Success") {
         importedThreadCount += threadImportResult.value.importedCount;
         skippedThreadCount += threadImportResult.value.skippedCount;
+        if (threadImportResult.value.outcomes !== undefined) {
+          hasDetailedOutcomes = true;
+          importOutcomes.push(...threadImportResult.value.outcomes);
+        }
         if (threadImportResult.value.importedCount > 0) {
           projectsWithImportedHistoryRef.current.set(
             candidate.key,
@@ -1421,9 +1513,19 @@ function ImportStep({
     importedThreadCountRef.current = importedThreadCount;
     if (importedProjectsCount < selection.length) {
       if (importedThreadCount > 0 && skippedThreadCount > 0) {
-        importWarningRef.current = `Imported ${importedThreadCount} ${importedThreadCount === 1 ? "thread" : "threads"}. ${skippedThreadCount} ${skippedThreadCount === 1 ? "thread" : "threads"} could not be imported.`;
+        importWarningRef.current = formatImportWarning(
+          importedThreadCount,
+          skippedThreadCount,
+          hasDetailedOutcomes ? importOutcomes : undefined,
+          hasDetailedOutcomes,
+        );
       } else if (skippedThreadCount > 0) {
-        importWarningRef.current = `${skippedThreadCount} ${skippedThreadCount === 1 ? "thread could" : "threads could"} not be imported.`;
+        importWarningRef.current = formatImportWarning(
+          importedThreadCount,
+          skippedThreadCount,
+          hasDetailedOutcomes ? importOutcomes : undefined,
+          hasDetailedOutcomes,
+        );
       } else if (importedThreadCount > 0) {
         importWarningRef.current = `Imported ${importedThreadCount} ${importedThreadCount === 1 ? "thread" : "threads"}. Some thread history could not be imported.`;
       } else {
