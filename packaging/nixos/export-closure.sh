@@ -46,16 +46,19 @@ trap 'rm -rf -- "$staging_dir"' EXIT
 
 nix-store --export "${closure_paths[@]}" | gzip -n -9 > "$staging_dir/store-export.nix.gz" \
   || die 'could not export the Nix store closure'
+store_export_sha256="$(sha256sum "$staging_dir/store-export.nix.gz")"
+store_export_sha256="${store_export_sha256%% *}"
 closure_paths_json="$(printf '%s\n' "${closure_paths[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
 jq -n \
   --arg format 't3code-nixos-store-export-v1' \
   --arg version "$version" \
   --arg sourceSha "$source_sha" \
   --arg appImageSha256 "$appimage_sha256" \
+  --arg storeExportSha256 "$store_export_sha256" \
   --arg nixpkgsRevision "$nixpkgs_revision" \
   --arg rootStorePath "$package_path" \
   --argjson closurePaths "$closure_paths_json" \
-  '{format:$format,version:$version,sourceSha:$sourceSha,appImageSha256:$appImageSha256,nixpkgsRevision:$nixpkgsRevision,rootStorePath:$rootStorePath,closurePaths:$closurePaths}' \
+  '{format:$format,version:$version,sourceSha:$sourceSha,appImageSha256:$appImageSha256,storeExportSha256:$storeExportSha256,nixpkgsRevision:$nixpkgsRevision,rootStorePath:$rootStorePath,closurePaths:$closurePaths}' \
   > "$staging_dir/manifest.json"
 (cd "$staging_dir" && sha256sum manifest.json store-export.nix.gz > SHA256SUMS)
 manifest_sha256="$(sha256sum "$staging_dir/manifest.json")"

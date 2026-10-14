@@ -117,8 +117,9 @@ NIXOS_PACKAGE_STORE_PATH="$(nix build --impure --no-link --print-out-paths .#t3c
   "$RUNNER_TEMP/t3code-weasel-nixos-closure"
 ```
 
-Upload that directory as a same-run GitHub Actions artifact and put the
-exporter's printed `Qualified manifest SHA-256` in the trusted run receipt. The
+The manifest includes the SHA-256 of the compressed store export itself. Upload
+that directory as a same-run GitHub Actions artifact and put the exporter's
+printed `Qualified manifest SHA-256` in the trusted run receipt. The
 current release workflow does not yet run these steps. Until it does, this
 closure import path is prepared but not available from a published release.
 
@@ -134,8 +135,9 @@ bash packaging/nixos/import-closure.sh \
 ```
 
 The importer validates the independent manifest digest and bundle checksums,
-imports the existing Nix store export, checks the actual closure, roots the
-version, and then atomically changes `current`. It never evaluates the flake or
+then checks the compressed export against the digest inside that qualified
+manifest before passing any bytes to `nix-store --import`. It then checks the
+actual closure, roots the version, and atomically changes `current`. It never evaluates the flake or
 builds a derivation on the laptop. It preserves existing launcher and desktop
 files, creating them only when absent. The previous version remains available
 for `install.sh --rollback VERSION`; running processes and user data are

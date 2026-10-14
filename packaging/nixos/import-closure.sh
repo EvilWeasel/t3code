@@ -40,18 +40,25 @@ actual_manifest_sha256="${actual_manifest_sha256%% *}"
 [[ "$(jq -er '.format' "$manifest")" == t3code-nixos-store-export-v1 ]] || die 'unsupported closure manifest format'
 source_sha="$(jq -er '.sourceSha' "$manifest")"
 appimage_sha256="$(jq -er '.appImageSha256' "$manifest")"
+store_export_sha256="$(jq -er '.storeExportSha256 | select(type == "string")' "$manifest")" \
+  || die 'manifest is missing the compressed store export digest'
 version="$(jq -er '.version' "$manifest")"
 root_store_path="$(jq -er '.rootStorePath' "$manifest")"
 [[ "$source_sha" == "$expected_source_sha" ]] || die 'bundle source SHA does not match the qualified source'
 [[ "$appimage_sha256" == "$expected_appimage_sha256" ]] || die 'bundle AppImage digest does not match the qualified release'
+[[ "$store_export_sha256" =~ ^[0-9a-f]{64}$ ]] || die 'manifest store export SHA-256 is invalid'
+actual_store_export_sha256="$(sha256sum "$bundle_dir/store-export.nix.gz")"
+actual_store_export_sha256="${actual_store_export_sha256%% *}"
+[[ "$actual_store_export_sha256" == "$store_export_sha256" ]] \
+  || die 'compressed Nix store export does not match the qualified manifest'
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.+_-]*)?$ ]] || die 'bundle version has an unexpected format'
 [[ "$root_store_path" =~ ^/nix/store/[0-9a-z]{32}-t3code-weasel-${version}$ ]] || die 'manifest root path does not match the package version'
 jq -e --arg root "$root_store_path" \
   '(.closurePaths | type == "array" and length > 0) and all(.closurePaths[]; type == "string" and startswith("/nix/store/")) and (.closurePaths | index($root) != null)' \
   "$manifest" >/dev/null || die 'manifest closure paths are invalid'
 
-# The export is accepted only after receipt and source digests match. Import
-# validates each Nix store object; no derivation or package build runs here.
+# The qualified manifest binds the compressed export digest. Verify it before
+# nix-store sees the stream; no derivation or package build runs here.
 gzip -dc "$bundle_dir/store-export.nix.gz" | nix-store --import \
   || die 'Nix store import failed'
 actual_closure="$(nix-store --query --requisites "$root_store_path" | LC_ALL=C sort)" \

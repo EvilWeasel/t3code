@@ -28,15 +28,18 @@ nixpkgs_revision="$(sed -n 's#.*github:NixOS/nixpkgs/\([0-9a-f]\{40\}\).*#\1#p' 
 bundle_dir="$temp_dir/bundle"
 mkdir -p "$bundle_dir"
 printf 'stub-only import stream\n' | gzip -n -9 > "$bundle_dir/store-export.nix.gz"
+store_export_sha256="$(sha256sum "$bundle_dir/store-export.nix.gz")"
+store_export_sha256="${store_export_sha256%% *}"
 jq -n \
   --arg format 't3code-nixos-store-export-v1' \
   --arg version "$version" \
   --arg sourceSha "$source_sha" \
   --arg appImageSha256 "$appimage_sha256" \
+  --arg storeExportSha256 "$store_export_sha256" \
   --arg nixpkgsRevision "$nixpkgs_revision" \
   --arg rootStorePath "$package_path" \
   --argjson closurePaths "$closure_paths_json" \
-  '{format:$format,version:$version,sourceSha:$sourceSha,appImageSha256:$appImageSha256,nixpkgsRevision:$nixpkgsRevision,rootStorePath:$rootStorePath,closurePaths:$closurePaths}' \
+  '{format:$format,version:$version,sourceSha:$sourceSha,appImageSha256:$appImageSha256,storeExportSha256:$storeExportSha256,nixpkgsRevision:$nixpkgsRevision,rootStorePath:$rootStorePath,closurePaths:$closurePaths}' \
   > "$bundle_dir/manifest.json"
 (cd "$bundle_dir" && sha256sum manifest.json store-export.nix.gz > SHA256SUMS)
 manifest_sha256="$(sha256sum "$bundle_dir/manifest.json")"
@@ -45,11 +48,13 @@ manifest_sha256="${manifest_sha256%% *}"
 export TEST_CLOSURE_ROOT="$package_path"
 export TEST_CLOSURE_PATHS="$closure_paths"
 export TEST_IMPORT_CAPTURE="$temp_dir/imported-stream"
+export TEST_IMPORT_CALLED="$temp_dir/import-called"
 cat > "$fake_bin/nix-store" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-} ${2:-}" in
   '--import ')
+    : > "$TEST_IMPORT_CALLED"
     cat > "$TEST_IMPORT_CAPTURE"
     ;;
   '--query --requisites')
@@ -83,6 +88,25 @@ launcher="$bin_dir/t3code-weasel"
 desktop="$share_dir/applications/t3code-weasel.desktop"
 old_version='0.0.46-nightly.20261013.3000'
 old_path="$data_dir/versions/$old_version"
+
+# Alter the compressed NAR and repair the bundle's self-supplied checksums.
+# The independently qualified manifest is unchanged, so rejection must occur
+# before the import stub is called.
+tampered_bundle="$temp_dir/tampered-bundle"
+cp -a "$bundle_dir" "$tampered_bundle"
+printf 'modified export bytes\n' >> "$tampered_bundle/store-export.nix.gz"
+(cd "$tampered_bundle" && sha256sum manifest.json store-export.nix.gz > SHA256SUMS)
+if HOME="$home" XDG_DATA_HOME="$share_dir" XDG_BIN_HOME="$bin_dir" \
+  T3_WEASEL_DATA_DIR="$data_dir" \
+  bash "$script_dir/import-closure.sh" "$tampered_bundle" "$source_sha" "$appimage_sha256" "$manifest_sha256" \
+  >"$temp_dir/tampered-output" 2>&1; then
+  echo 'tampered closure unexpectedly passed import validation' >&2
+  exit 1
+fi
+grep -Fq 'compressed Nix store export does not match the qualified manifest' "$temp_dir/tampered-output"
+[[ ! -e "$TEST_IMPORT_CALLED" ]] || { echo 'tampered closure reached nix-store --import' >&2; exit 1; }
+[[ ! -e "$data_dir" ]] || { echo 'tampered closure changed user-local install state' >&2; exit 1; }
+
 mkdir -p "$data_dir/versions" "$bin_dir" "$share_dir/applications"
 ln -s "$package_path" "$old_path"
 ln -s "$old_path" "$data_dir/current"
@@ -109,6 +133,7 @@ HOME="$home" XDG_DATA_HOME="$share_dir" XDG_BIN_HOME="$bin_dir" \
 [[ "$(sha256sum "$desktop")" == "$desktop_hash_before  $desktop" ]]
 [[ "$(stat -c '%a' "$desktop")" == "$desktop_mode_before" ]]
 [[ "$(gzip -dc "$bundle_dir/store-export.nix.gz")" == "$(cat "$TEST_IMPORT_CAPTURE")" ]]
+[[ -e "$TEST_IMPORT_CALLED" ]]
 [[ ! -e "$data_dir/current.next" && ! -e "$data_dir/previous.next" ]]
 
 HOME="$home" XDG_DATA_HOME="$share_dir" XDG_BIN_HOME="$bin_dir" \
