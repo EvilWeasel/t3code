@@ -318,15 +318,19 @@ it.effect("passes an explicit environment to Codex spawn without extending ambie
 it.effect("reports upstream 403 without retaining the raw response or request", () =>
   Effect.gen(function* () {
     const secret = "sk-fake-voice-secret";
-    const codex = mockCodex({});
+    const refreshArguments: boolean[] = [];
+    const codex = mockCodex({ refreshArguments });
+    let requests = 0;
     const httpClient = {
-      execute: (request: HttpClientRequest.HttpClientRequest) =>
-        Effect.succeed(
+      execute: (request: HttpClientRequest.HttpClientRequest) => {
+        requests++;
+        return Effect.succeed(
           HttpClientResponse.fromWeb(
             request,
             new Response(`forbidden Bearer ${secret}`, { status: 403 }),
           ),
-        ),
+        );
+      },
     } as unknown as HttpClient.HttpClient;
     const result = yield* transcribeCodexAccount(codex, httpClient, {
       bytes: new Uint8Array([1]),
@@ -337,8 +341,12 @@ it.effect("reports upstream 403 without retaining the raw response or request", 
     if (result._tag === "Failure") {
       assert(result.failure instanceof VoiceTranscriptionError);
       assert.strictEqual(result.failure.status, 403);
+      assert.strictEqual(result.failure.reason, "upstream_forbidden");
+      assert.include(result.failure.detail, "does not confirm transcription access");
       assert(!JSON.stringify(result.failure).includes(secret));
     }
+    assert.strictEqual(requests, 1);
+    assert.deepStrictEqual(refreshArguments, [false]);
   }),
 );
 

@@ -1,4 +1,8 @@
 import { VoiceTranscriptionSettingsInput } from "@t3tools/contracts";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Effect's Crypto has no authenticated encryption API.
+import * as NodeCrypto from "node:crypto";
+import * as Crypto from "effect/Crypto";
+import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -14,6 +18,51 @@ const Config = Schema.Struct({
   model: Schema.String,
 });
 const SECRET = "voice-transcription-api-key";
+const WRAPPING_KEY = "voice-transcription-wrapping-key";
+const ENVELOPE = Buffer.from("t3-voice-key:v1\0");
+
+class VoiceSecretEncryptionError extends Data.TaggedError("VoiceSecretEncryptionError")<{}> {
+  override get message() {
+    return "The saved voice key could not be secured. Remove it and save it again.";
+  }
+}
+
+// The wrapping key is private to this environment but shares the secret store.
+// This protects the credential file at rest, not against access to the whole store.
+const encryptKey = (value: string, key: Uint8Array, nonce: Uint8Array) =>
+  Effect.try({
+    try: () => {
+      const cipher = NodeCrypto.createCipheriv("aes-256-gcm", key, nonce);
+      cipher.setAAD(ENVELOPE);
+      const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+      return Buffer.concat([ENVELOPE, nonce, cipher.getAuthTag(), ciphertext]);
+    },
+    catch: () => new VoiceSecretEncryptionError(),
+  });
+
+const decryptKey = (value: Uint8Array, key: Uint8Array) =>
+  Effect.try({
+    try: () => {
+      const bytes = Buffer.from(value);
+      if (
+        bytes.length <= ENVELOPE.length + 28 ||
+        !bytes.subarray(0, ENVELOPE.length).equals(ENVELOPE)
+      )
+        throw new Error("Invalid voice key envelope");
+      const decipher = NodeCrypto.createDecipheriv(
+        "aes-256-gcm",
+        key,
+        bytes.subarray(ENVELOPE.length, ENVELOPE.length + 12),
+      );
+      decipher.setAAD(ENVELOPE);
+      decipher.setAuthTag(bytes.subarray(ENVELOPE.length + 12, ENVELOPE.length + 28));
+      return Buffer.concat([
+        decipher.update(bytes.subarray(ENVELOPE.length + 28)),
+        decipher.final(),
+      ]).toString("utf8");
+    },
+    catch: () => new VoiceSecretEncryptionError(),
+  });
 
 /** Non-secret preferences are independent of provider coding credentials. */
 export const makeVoiceSettings = Effect.gen(function* () {
@@ -21,6 +70,7 @@ export const makeVoiceSettings = Effect.gen(function* () {
   const path = yield* Path.Path;
   const server = yield* ServerConfig.ServerConfig;
   const secrets = yield* ServerSecretStore.ServerSecretStore;
+  const crypto = yield* Crypto.Crypto;
   const lock = yield* Semaphore.make(1);
   const filename = path.join(server.stateDir, "voice-transcription.json");
   const read = Effect.gen(function* () {
@@ -38,22 +88,30 @@ export const makeVoiceSettings = Effect.gen(function* () {
           model: process.env.T3CODE_TRANSCRIPTION_MODEL || "gpt-transcribe",
         };
     const stored = yield* secrets.get(SECRET);
-    const apiKey = Option.isSome(stored)
-      ? new TextDecoder().decode(stored.value)
-      : process.env.T3CODE_TRANSCRIPTION_API_KEY;
+    let apiKey = process.env.T3CODE_TRANSCRIPTION_API_KEY;
+    if (Option.isSome(stored)) {
+      const key = yield* secrets.get(WRAPPING_KEY);
+      if (Option.isNone(key)) return yield* Effect.fail(new VoiceSecretEncryptionError());
+      // Reads never migrate plaintext or recreate a missing wrapping key.
+      apiKey = yield* decryptKey(stored.value, key.value);
+    }
     const apiKeySource = Option.isSome(stored)
       ? ("saved" as const)
       : apiKey
         ? ("environment" as const)
         : ("none" as const);
     return { ...config, apiKey, apiKeySource };
-  });
+  }).pipe(Effect.withTracerEnabled(false));
   const write = (input: typeof VoiceTranscriptionSettingsInput.Type) =>
     lock.withPermits(1)(
       Effect.gen(function* () {
         if (input.apiKey === null) yield* secrets.remove(SECRET);
-        if (input.apiKey?.trim())
-          yield* secrets.set(SECRET, new TextEncoder().encode(input.apiKey.trim()));
+        if (input.apiKey?.trim()) {
+          const key = yield* secrets.getOrCreateRandom(WRAPPING_KEY, 32);
+          const nonce = yield* crypto.randomBytes(12);
+          const encrypted = yield* encryptKey(input.apiKey.trim(), key, nonce);
+          yield* secrets.set(SECRET, encrypted);
+        }
         const config = {
           provider: input.provider,
           instanceId: input.instanceId || null,

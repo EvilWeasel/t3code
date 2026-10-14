@@ -307,6 +307,16 @@ export const transcribeCodexAccount = Effect.fn("voice.transcribeCodexAccount")(
     }
     return firstResult.success;
   }
+  if (firstResult.failure.status === 403) {
+    return yield* Effect.fail(
+      new VoiceTranscriptionError({
+        reason: "upstream_forbidden",
+        detail:
+          "Codex account transcription was denied (HTTP 403). Signing in does not confirm transcription access.",
+        status: 403,
+      }),
+    );
+  }
   if (firstResult.failure.status !== 401) return yield* Effect.fail(firstResult.failure);
   const refreshed = yield* readTrustedAccountContext(client, true);
   if (!samePrincipal(refreshed, initial)) {
@@ -493,7 +503,7 @@ export const layer = Layer.effect(
               ? "OpenAI API key configured on this environment."
               : "Add an OpenAI API key on this environment."
             : selected?.authenticated
-              ? "Uses the selected Codex ChatGPT account; no API key required."
+              ? "Codex is signed in. Account transcription access is checked when you transcribe."
               : "Sign in to an enabled Codex provider on this environment.",
       };
     }).pipe(

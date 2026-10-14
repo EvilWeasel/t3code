@@ -53,7 +53,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 const settings = (model: string): typeof VoiceTranscriptionSettings.Type => ({
-  provider: "codex-account",
+  provider: "openai-api",
   instanceId: null,
   model,
   apiKeyConfigured: false,
@@ -125,4 +125,63 @@ it("ignores a saved response from a host after the settings target changes", asy
       .find((input) => input.props["aria-label"] === "Transcription model")?.props.value,
   ).toBe("environment-b");
   expect(renderer!.root.findByType("button").props.disabled).toBe(false);
+});
+
+it("saves a write-only key, clears the input and preserves it on later settings saves", async () => {
+  state.request.mockImplementation((_environmentId: string, update: unknown) =>
+    Promise.resolve({
+      ...settings("gpt-transcribe"),
+      apiKeyConfigured: Boolean(update),
+      apiKeySource: update ? "saved" : "none",
+    }),
+  );
+  await act(async () => {
+    renderer = create(<VoiceTranscriptionSettingsPanel />);
+  });
+  act(() => {
+    renderer!.root.findByProps({ "aria-label": "Transcription API key" }).props.onChange({
+      target: { value: "fixture-write-only-key" },
+    });
+  });
+  const saveButton = () => renderer!.root.findAllByType("button").at(-1)!;
+  await act(async () => saveButton().props.onClick());
+  expect(state.request.mock.calls[1]?.[1]).toMatchObject({
+    provider: "openai-api",
+    apiKey: "fixture-write-only-key",
+  });
+  expect(renderer!.root.findByProps({ "aria-label": "Transcription API key" }).props.value).toBe(
+    "",
+  );
+  expect(JSON.stringify(renderer!.toJSON())).not.toContain("fixture-write-only-key");
+  await act(async () => saveButton().props.onClick());
+  expect(state.request.mock.calls[2]?.[1]).not.toHaveProperty("apiKey");
+  await act(async () => renderer!.root.findAllByType("button")[0]!.props.onClick());
+  expect(state.request.mock.calls[3]?.[1]).toHaveProperty("apiKey", null);
+});
+
+it("discards an unsaved API key when switching to account transcription", async () => {
+  state.request.mockResolvedValue(settings("gpt-transcribe"));
+  await act(async () => {
+    renderer = create(<VoiceTranscriptionSettingsPanel />);
+  });
+  act(() => {
+    renderer!.root.findByProps({ "aria-label": "Transcription API key" }).props.onChange({
+      target: { value: "fixture-unsaved-key" },
+    });
+    renderer!.root.findByProps({ "aria-label": "Voice transcription provider" }).props.onChange({
+      target: { value: "codex-account" },
+    });
+  });
+  expect(renderer!.root.findAllByProps({ "aria-label": "Transcription model" })).toHaveLength(0);
+  await act(async () => renderer!.root.findByType("button").props.onClick());
+  expect(state.request.mock.calls[1]?.[1]).toMatchObject({ provider: "codex-account" });
+  expect(state.request.mock.calls[1]?.[1]).not.toHaveProperty("apiKey");
+  act(() => {
+    renderer!.root.findByProps({ "aria-label": "Voice transcription provider" }).props.onChange({
+      target: { value: "openai-api" },
+    });
+  });
+  expect(renderer!.root.findByProps({ "aria-label": "Transcription API key" }).props.value).toBe(
+    "",
+  );
 });

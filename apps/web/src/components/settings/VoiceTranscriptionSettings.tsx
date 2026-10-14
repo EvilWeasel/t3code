@@ -58,7 +58,11 @@ export function VoiceTranscriptionSettingsPanel() {
         provider,
         instanceId: instanceId || null,
         model,
-        ...(clearKey ? { apiKey: null } : apiKey.trim() ? { apiKey } : {}),
+        ...(clearKey
+          ? { apiKey: null }
+          : provider === "openai-api" && apiKey.trim()
+            ? { apiKey }
+            : {}),
       });
       if (generationRef.current !== generation) return;
       setApiKey("");
@@ -93,7 +97,10 @@ export function VoiceTranscriptionSettingsPanel() {
           aria-label="Voice transcription provider"
           value={provider}
           disabled={!settings || !editable || busy}
-          onChange={(event) => setProvider(event.target.value as "codex-account" | "openai-api")}
+          onChange={(event) => {
+            setProvider(event.target.value as "codex-account" | "openai-api");
+            setApiKey("");
+          }}
         >
           <option value="codex-account">Codex / ChatGPT account</option>
           <option value="openai-api">OpenAI API key</option>
@@ -102,7 +109,7 @@ export function VoiceTranscriptionSettingsPanel() {
       {provider === "codex-account" ? (
         <SettingsRow
           title="Codex account"
-          description="Uses the enabled Codex instance and its existing sign-in. No API key is needed. If authorization is rejected, check Providers settings."
+          description="Uses the enabled Codex instance and its existing sign-in. Transcription access depends on the account service; signing in does not confirm access. If it returns HTTP 403, you can explicitly choose OpenAI API key instead."
         >
           <select
             aria-label="Transcription Codex account"
@@ -126,8 +133,8 @@ export function VoiceTranscriptionSettingsPanel() {
             settings?.apiKeySource === "environment"
               ? "Provided by this host's private launch environment. Leave empty to keep it."
               : settings?.apiKeyConfigured
-                ? "A key is saved in this environment's private secret store. Leave empty to keep it."
-                : "Stored only in this environment's private secret store. API billing applies."
+                ? "A key is encrypted in this environment's private secret store and is never returned to the app. Leave empty to keep it. API billing applies."
+                : "Encrypted in this environment's private secret store. API billing applies separately from ChatGPT."
           }
         >
           <Input
@@ -140,17 +147,16 @@ export function VoiceTranscriptionSettingsPanel() {
           />
         </SettingsRow>
       )}
-      <SettingsRow
-        title="Transcription model"
-        description="Used for OpenAI API and managed Codex account transcription."
-      >
-        <Input
-          aria-label="Transcription model"
-          value={model}
-          disabled={!editable || busy}
-          onChange={(event) => setModel(event.target.value)}
-        />
-      </SettingsRow>
+      {provider === "openai-api" ? (
+        <SettingsRow title="Transcription model" description="Used for OpenAI API transcription.">
+          <Input
+            aria-label="Transcription model"
+            value={model}
+            disabled={!editable || busy}
+            onChange={(event) => setModel(event.target.value)}
+          />
+        </SettingsRow>
+      ) : null}
       <SettingsRow
         title="Provider status"
         description={
