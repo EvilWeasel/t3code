@@ -77,5 +77,43 @@ for live_test in "${live_tests[@]}"; do
   fi
   focused_tests+=("$live_test")
 done
+pair_test=apps/server/src/cli/pair.test.ts
+if [[ ! -f "$pair_test" ]]; then
+  echo "Required pairing gate is missing: $pair_test" >&2
+  exit 1
+fi
+focused_tests+=("$pair_test")
+echo "Including required pairing gate: $pair_test"
+
+connection_tests=(
+  packages/client-runtime/src/relay/discovery.test.ts
+  packages/client-runtime/src/connection/registry.test.ts
+)
+for connection_test in "${connection_tests[@]}"; do
+  if [[ ! -f "$connection_test" ]]; then
+    echo "Required connection gate is missing: $connection_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$connection_test")
+  echo "Including required connection gate: $connection_test"
+done
+connection_layer_test=packages/client-runtime/src/connection/layer.test.ts
+if [[ -f "$connection_layer_test" ]]; then
+  focused_tests+=("$connection_layer_test")
+  echo "Including connection layer gate: $connection_layer_test"
+else
+  echo "Connection layer gate not present in this source; NOT EXECUTED: $connection_layer_test"
+fi
+
+transcript_ui_test=apps/web/src/voice/LiveVoiceTranscript.test.tsx
+if [[ -f "$transcript_ui_test" ]]; then
+  focused_tests+=("$transcript_ui_test")
+  echo "Including Transcript UI gate: $transcript_ui_test"
+elif [[ -f apps/web/src/voice/LiveVoiceTranscript.tsx ]]; then
+  echo "Required Transcript UI gate is missing: $transcript_ui_test" >&2
+  exit 1
+else
+  echo "Transcript UI gate not present in this source; NOT EXECUTED: $transcript_ui_test"
+fi
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts)
