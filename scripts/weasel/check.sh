@@ -2,6 +2,7 @@
 set -euo pipefail
 
 bash scripts/weasel/test.sh
+python3 packaging/nixos/test-updater.py
 
 vp_cmd() {
   if command -v vp >/dev/null 2>&1; then
@@ -32,6 +33,18 @@ focused_tests=(
   apps/desktop/src/app/DesktopLinuxUrlHandler.test.ts \
   apps/desktop/src/backend/DesktopBackendConfiguration.test.ts \
   apps/desktop/src/wsl/DesktopWslBackend.test.ts
+  apps/desktop/src/updates/DesktopUpdates.test.ts
+  apps/desktop/src/updates/remoteUpdateFlow.test.ts
+  apps/desktop/src/updates/updateMachine.test.ts
+  apps/desktop/src/electron/ElectronUpdater.test.ts
+  apps/desktop/src/electron/NixManagedUpdater.test.ts
+  apps/web/src/components/sidebar/updateEverything.logic.test.ts
+  packages/shared/src/cliRelease.test.ts
+  apps/server/src/cli/update.test.ts
+  apps/server/src/cloud/selfUpdate.test.ts
+  apps/server/src/environment/ServerEnvironment.test.ts
+  apps/server/src/cloud/pinnedRuntime.test.ts
+  apps/server/src/serviceLauncher.test.ts
 )
 voice_tests=(
   apps/web/src/voice/useVoiceDictation.test.tsx

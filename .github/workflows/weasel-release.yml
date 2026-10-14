@@ -255,6 +255,32 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  build_nixos:
+    needs: [preflight, build_linux]
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.source_sha }}
+      - uses: cachix/install-nix-action@3c6342b75005b9cc7c7d4069c3e9179247c89012 # v31
+      - name: Install closure packaging tools
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - uses: actions/download-artifact@v4
+        with:
+          name: weasel-release-linux
+          path: release-linux
+      - name: Build immutable NixOS closure on Namespace
+        env:
+          T3_WEASEL_REPOSITORY: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
+        run: bash scripts/weasel/build-nixos-closure.sh "${{ needs.preflight.outputs.version }}" "release-linux/T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage" release-nixos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weasel-release-nixos
+          path: release-nixos/*
+          if-no-files-found: error
+          retention-days: 1
+
   build_windows:
     needs: [preflight, build_bundle, build_linux]
     runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'nscloud-windows-2022-amd64-8x16' }}
@@ -366,7 +392,7 @@ jobs:
           retention-days: 1
 
   publish:
-    needs: [preflight, build_linux, build_windows]
+    needs: [preflight, build_linux, build_nixos, build_windows]
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
     timeout-minutes: 15
     permissions:
@@ -393,6 +419,9 @@ jobs:
           test -s release-assets/weasel-linux-x64.tar.gz
           test -s "release-assets/T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage"
           test -s release-assets/install-linux.sh
+          test -s "release-assets/T3-Code-${{ needs.preflight.outputs.version }}-x86_64-linux-nix-closure.nar.zst"
+          test -s "release-assets/T3-Code-${{ needs.preflight.outputs.version }}-x86_64-linux-nix-closure.json"
+          bash scripts/weasel/verify-nixos-closure.sh "${{ needs.preflight.outputs.version }}" release-assets
           test -n "$(find release-assets -maxdepth 1 -name 't3-*-linux-x64.tar.gz' -print -quit)"
           test -n "$(find release-assets -maxdepth 1 -name 't3-*-win32-x64.zip' -print -quit)"
           ! find release-assets -maxdepth 1 -type f \( -name '*apk' -o -name '*aab' -o -name '*ipa' \) | grep -q .

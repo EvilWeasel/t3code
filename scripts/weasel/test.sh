@@ -21,3 +21,4 @@ fi
 
 bash scripts/weasel/verify-published-release.test.sh
 bash scripts/weasel/read-draft-release-assets.test.sh
+bash scripts/weasel/verify-nixos-closure.test.sh

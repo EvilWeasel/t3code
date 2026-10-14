@@ -42,6 +42,8 @@ for required in \
   nightly.yml \
   weasel-linux-x64.tar.gz \
   "T3-Code-$version-x86_64.AppImage" \
+  "T3-Code-$version-x86_64-linux-nix-closure.nar.zst" \
+  "T3-Code-$version-x86_64-linux-nix-closure.json" \
   install-linux.sh \
   "t3-$version-linux-x64.tar.gz" \
   "t3-$version-win32-x64.zip" \
