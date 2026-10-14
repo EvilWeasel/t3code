@@ -30,5 +30,10 @@ private secret store and are never returned in settings. Leave the key blank to
 retain it; **Remove saved key** removes the saved override. A key supplied by the
 host's private launch environment remains managed by that host.
 
-This feature records messages. Continuous GPT Live conversation and spoken
-work results are a separate integration still in development.
+The separate phone control starts a voice call for an eligible managed Codex
+thread. It needs microphone permission and WebRTC in a secure browser context.
+Call availability also depends on the configured account. During a call you can
+mute the microphone or speaker and end the call. Ending releases the microphone
+and leaves the call transcript available to view or copy while you remain in
+that composer. Starting another call replaces that transcript. Leaving the
+thread ends its call; already submitted agent work continues independently.

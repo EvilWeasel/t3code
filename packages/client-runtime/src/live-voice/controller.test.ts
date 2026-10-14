@@ -636,6 +636,43 @@ describe("LiveVoiceController", () => {
     expect(harness.signaling.stop).toHaveBeenCalledOnce();
   });
 
+  it("keeps the ended call transcript available while releasing all media", async () => {
+    const harness = createHarness();
+    await connect(harness, harness.controller.start(target));
+    harness.emit({
+      type: "transcript",
+      leaseId: lease.leaseId,
+      generation: lease.generation,
+      role: "user",
+      text: "Keep this call transcript",
+    });
+    harness.emit({
+      type: "transcript",
+      leaseId: lease.leaseId,
+      generation: lease.generation,
+      role: "assistant",
+      text: "The call has a useful answer",
+    });
+    await harness.controller.end();
+    expect(harness.controller.currentState.phase).toBe("ended");
+    expect(harness.controller.currentState.transcript.map((entry) => entry.text)).toEqual([
+      "Keep this call transcript",
+      "The call has a useful answer",
+    ]);
+    expect(harness.controller.currentState.lease?.threadId).toBe(target.threadId);
+    expect(harness.stoppedTracks).toBe(1);
+    expect(harness.audio.srcObject).toBeNull();
+    expect(harness.calls).toContain("peer-close");
+    harness.emit({
+      type: "transcript",
+      leaseId: lease.leaseId,
+      generation: lease.generation,
+      role: "assistant",
+      text: "Late speech must be ignored",
+    });
+    expect(harness.controller.currentState.transcript).toHaveLength(2);
+  });
+
   it("unsubscribes a late subscription without replacing a newer call's listener", async () => {
     const harness = createHarness();
     const subscription = deferred<() => void>();

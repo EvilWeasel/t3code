@@ -489,6 +489,7 @@ export class LiveVoiceController {
   /** Ends only Live/media ownership. It never cancels the durable T3 work run. */
   async end(): Promise<void> {
     const lease = this.identity;
+    const transcript = this.state.transcript;
     const microphoneOwnership = this.microphoneOwnership;
     const operation = ++this.operation;
     this.setState({ ...this.state, phase: "stopping" });
@@ -499,7 +500,8 @@ export class LiveVoiceController {
     this.rejectRtcReady?.(new Error("Live session ended."));
     await this.release(lease, microphoneOwnership);
     if (lease) await this.stopLease(lease);
-    if (operation === this.operation) this.setState({ ...IDLE_STATE, phase: "ended" });
+    if (operation === this.operation)
+      this.setState({ ...IDLE_STATE, phase: "ended", lease, transcript });
   }
 
   private onSignal(operation: number, event: LiveVoiceSignalEvent): void {

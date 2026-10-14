@@ -61,7 +61,7 @@ it("keeps unavailable Live quiet until the disabled control is focused", async (
   );
   expect(container.textContent).not.toContain(reason);
   const button = container.querySelector<HTMLButtonElement>(
-    'button[aria-label="Start Live voice"]',
+    'button[aria-label="Start voice call"]',
   )!;
   expect(button.disabled).toBe(true);
   await act(async () => button.click());

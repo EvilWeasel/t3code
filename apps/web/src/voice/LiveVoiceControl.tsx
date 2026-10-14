@@ -1,5 +1,12 @@
 import { AsyncResult } from "effect/reactivity";
-import { MicIcon, MicOffIcon, PhoneOffIcon, Volume2Icon, VolumeXIcon } from "lucide-react";
+import {
+  MicIcon,
+  MicOffIcon,
+  PhoneOffIcon,
+  PhoneCallIcon,
+  Volume2Icon,
+  VolumeXIcon,
+} from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
@@ -223,7 +230,7 @@ export function LiveVoiceControl(props: {
   const unavailableNotice = !supported
     ? "Live voice needs browser WebRTC and microphone access."
     : !target
-      ? "Open a thread for Live"
+      ? "Open a thread for a voice call"
       : !props.eligible
         ? props.unavailableReason
         : null;
@@ -282,13 +289,13 @@ export function LiveVoiceControl(props: {
                 disabled={!canStart}
                 onPointerDown={(event) => event.preventDefault()}
                 onClick={onStart}
-                aria-label="Start Live voice"
+                aria-label="Start voice call"
               >
-                <MicIcon />
+                <PhoneCallIcon />
               </Button>
             </TooltipTrigger>
             <TooltipPopup id={hintId} role="tooltip">
-              {unavailableNotice ?? "Start Live voice"}
+              {unavailableNotice ?? "Start voice call"}
             </TooltipPopup>
           </Tooltip>
         </>
