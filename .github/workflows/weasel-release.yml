@@ -190,15 +190,23 @@ jobs:
           ref: ${{ needs.preflight.outputs.source_sha }}
           fetch-depth: 1
 
-      - name: Checkout pinned NixOS packaging helper
+      - name: Fetch pinned NixOS packaging helper files
         if: inputs.build_mode == 'candidate' && inputs.platform == 'linux'
-        uses: actions/checkout@v4
-        with:
-          repository: morrowbyte/t3code
-          ref: 0a1774af188f2e27c104fd0c9a3de598b559bf07
-          path: nixos-packaging
-          fetch-depth: 1
-          persist-credentials: false
+        env:
+          NIXOS_PACKAGING_SHA: 0a1774af188f2e27c104fd0c9a3de598b559bf07
+        run: |
+          set -euo pipefail
+          tool_repo="$RUNNER_TEMP/nixos-tool-repo"
+          git init --bare --quiet "$tool_repo"
+          git -C "$tool_repo" fetch --no-tags --no-recurse-submodules --depth=1 \
+            https://github.com/morrowbyte/t3code.git "$NIXOS_PACKAGING_SHA"
+          fetched_sha="$(git -C "$tool_repo" rev-parse FETCH_HEAD)"
+          test "$fetched_sha" = "$NIXOS_PACKAGING_SHA"
+          mkdir -p "$GITHUB_WORKSPACE/nixos-packaging"
+          git -C "$tool_repo" archive --format=tar "$fetched_sha" packaging/nixos \
+            | tar -xf - -C "$GITHUB_WORKSPACE/nixos-packaging"
+          test -s "$GITHUB_WORKSPACE/nixos-packaging/packaging/nixos/flake.nix"
+          test -s "$GITHUB_WORKSPACE/nixos-packaging/packaging/nixos/export-closure.sh"
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
@@ -284,7 +292,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          test "$(git -C nixos-packaging rev-parse HEAD)" = 0a1774af188f2e27c104fd0c9a3de598b559bf07
+          test "$(git -C "$RUNNER_TEMP/nixos-tool-repo" rev-parse FETCH_HEAD)" = 0a1774af188f2e27c104fd0c9a3de598b559bf07
           appimage="$GITHUB_WORKSPACE/release-linux/T3-Code-${T3_WEASEL_VERSION}-x86_64.AppImage"
           test -s "$appimage"
           T3_WEASEL_ARTIFACT_PATH="$(realpath "$appimage")"
