@@ -1,66 +1,165 @@
 name: Morrowbyte NixOS release package
+
 on:
   push:
     branches: [deployment/morrowbyte-nixos-20261014]
     paths: [.github/workflows/morrowbyte-nixos-release.yml]
+
 permissions:
   contents: read
+
 concurrency:
-  group: morrowbyte-nixos-release-20261014
+  group: morrowbyte-nixos-release-20261014-15
   cancel-in-progress: false
+
 jobs:
   package:
     runs-on: namespace-profile-ci-builder
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Check out the exact released source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 13570fb8042beeb5c0f0e8cd563041f3aaa11b76
+          repository: morrowbyte/t3code
+          ref: 20adb02f5848cef0f202f4fea6e67f519d70eaa9
+          sparse-checkout: packaging/nixos
+          sparse-checkout-cone-mode: true
+
       - uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9
         with:
           cache: nix
+
       - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
             max-jobs = 4
             cores = 2
-      - name: Bind to the exact qualified published release
+
+      - name: Verify the published source, AppImage, and release receipt
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag=v0.0.47-nightly.20261014.14
-          ready=0
-          for attempt in $(seq 1 120); do
-            if gh api repos/morrowbyte/t3code/releases/tags/$tag > release.json 2>/dev/null; then
-              ready=1
-              break
-            fi
-            sleep 15
-          done
-          test "$ready" = 1
-          test "$(jq -r .target_commitish release.json)" = 13570fb8042beeb5c0f0e8cd563041f3aaa11b76
-          jq -er '.assets[] | select(.name == "T3-Code-0.0.47-nightly.20261014.14-x86_64.AppImage") | .digest | select(test("^sha256:[0-9a-f]{64}$"))' release.json > digest
-          jq -er '.assets[] | select(.name == "T3-Code-0.0.47-nightly.20261014.14-x86_64.AppImage") | .browser_download_url' release.json > artifact-url
-      - name: Build and export only the prebuilt release package on Namespace
+          readonly repository=morrowbyte/t3code
+          readonly version=0.0.47-nightly.20261014.15
+          readonly tag="v$version"
+          readonly source_sha=20adb02f5848cef0f202f4fea6e67f519d70eaa9
+          readonly appimage="T3-Code-$version-x86_64.AppImage"
+          readonly appimage_sha256=90a0d8d70ae6c99c08fbc4072df0898f5e232ccc446e42025f7eda9ec13c4f24
+          readonly receipt_sha256=f377df8498c5cdfd193b55c09c50403942757e804f63da2bba9f6d0dfa0b6f14
+          readonly sums_sha256=d92ff143646df34afbcfe9e733758deb5e856c9403012290fb0cf294fd81dc5d
+          readonly release_url="https://github.com/$repository/releases/download/$tag/$appimage"
+
+          gh api "repos/$repository/releases/tags/$tag" > "$RUNNER_TEMP/release.json"
+          jq -e --arg tag "$tag" --arg source "$source_sha" '
+            .tag_name == $tag and
+            .draft == false and
+            .prerelease == true and
+            .target_commitish == $source
+          ' "$RUNNER_TEMP/release.json" >/dev/null
+
+          test "$(jq --arg name "$appimage" '[.assets[] | select(.name == $name)] | length' "$RUNNER_TEMP/release.json")" = 1
+          test "$(jq -er --arg name "$appimage" '.assets[] | select(.name == $name) | .digest' "$RUNNER_TEMP/release.json")" = "sha256:$appimage_sha256"
+          test "$(jq -er --arg name "$appimage" '.assets[] | select(.name == $name) | .browser_download_url' "$RUNNER_TEMP/release.json")" = "$release_url"
+
+          receipt_id="$(jq -er '.assets[] | select(.name == "RELEASE-RECEIPT.txt") | .id' "$RUNNER_TEMP/release.json")"
+          test "$(jq --arg name RELEASE-RECEIPT.txt '[.assets[] | select(.name == $name)] | length' "$RUNNER_TEMP/release.json")" = 1
+          test "$(jq -er '.assets[] | select(.name == "RELEASE-RECEIPT.txt") | .digest' "$RUNNER_TEMP/release.json")" = "sha256:$receipt_sha256"
+          gh api "repos/$repository/releases/assets/$receipt_id" \
+            -H 'Accept: application/octet-stream' > "$RUNNER_TEMP/RELEASE-RECEIPT.txt"
+          printf '%s  %s\n' "$receipt_sha256" "$RUNNER_TEMP/RELEASE-RECEIPT.txt" | sha256sum --check --status
+          grep -Fxq "fork_release=$tag" "$RUNNER_TEMP/RELEASE-RECEIPT.txt"
+          grep -Fxq "source_sha=$source_sha" "$RUNNER_TEMP/RELEASE-RECEIPT.txt"
+          test "$(sed -n 's/^github_asset_digests=//p' "$RUNNER_TEMP/RELEASE-RECEIPT.txt" | wc -l)" = 1
+          sed -n 's/^github_asset_digests=//p' "$RUNNER_TEMP/RELEASE-RECEIPT.txt" > "$RUNNER_TEMP/release-asset-digests.json"
+          jq -e --arg name "$appimage" --arg digest "sha256:$appimage_sha256" \
+            'any(.[]; .name == $name and .digest == $digest)' \
+            "$RUNNER_TEMP/release-asset-digests.json" >/dev/null
+          grep -Fxq "$appimage_sha256  ./$appimage" "$RUNNER_TEMP/RELEASE-RECEIPT.txt"
+
+          sums_id="$(jq -er '.assets[] | select(.name == "SHA256SUMS") | .id' "$RUNNER_TEMP/release.json")"
+          test "$(jq -er '.assets[] | select(.name == "SHA256SUMS") | .digest' "$RUNNER_TEMP/release.json")" = "sha256:$sums_sha256"
+          gh api "repos/$repository/releases/assets/$sums_id" \
+            -H 'Accept: application/octet-stream' > "$RUNNER_TEMP/SHA256SUMS"
+          printf '%s  %s\n' "$sums_sha256" "$RUNNER_TEMP/SHA256SUMS" | sha256sum --check --status
+          grep -Fxq "$appimage_sha256  ./$appimage" "$RUNNER_TEMP/SHA256SUMS"
+
+          printf 'Qualified release: %s\nSource: %s\nAppImage SHA-256: %s\n' \
+            "$tag" "$source_sha" "$appimage_sha256"
+          {
+            printf 'T3_WEASEL_REPOSITORY=%s\n' "$repository"
+            printf 'T3_WEASEL_VERSION=%s\n' "$version"
+            printf 'T3_WEASEL_SOURCE_SHA=%s\n' "$source_sha"
+            printf 'T3_WEASEL_ARTIFACT_URL=%s\n' "$release_url"
+            printf 'T3_WEASEL_ARTIFACT_SHA256=%s\n' "$appimage_sha256"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and export the exact-source NixOS closure
         run: |
           set -euo pipefail
-          export T3_WEASEL_REPOSITORY=morrowbyte/t3code
-          export T3_WEASEL_VERSION=0.0.47-nightly.20261014.14
-          export T3_WEASEL_ARTIFACT_URL="$(cat artifact-url)"
-          export T3_WEASEL_ARTIFACT_SHA256="$(sed 's/^sha256://' digest)"
-          nix build --impure --no-write-lock-file --out-link result path:./packaging/nixos#t3code-weasel
-          out="$(readlink -f result)"
-          mkdir -p transfer
-          printf '%s\n' "$out" > transfer/package-path.txt
-          nix-store --query --requisites "$out" > transfer/closure-paths.txt
-          nix-store --export $(cat transfer/closure-paths.txt) | gzip -1 > transfer/closure.nar.gz
-          sha256sum transfer/closure.nar.gz > transfer/SHA256SUMS
-          jq -n --arg source 13570fb8042beeb5c0f0e8cd563041f3aaa11b76 --arg version "$T3_WEASEL_VERSION" --arg artifactSha256 "$T3_WEASEL_ARTIFACT_SHA256" --arg package "$out" '{source:$source,version:$version,artifactSha256:$artifactSha256,package:$package}' > transfer/receipt.json
+          readonly helper_sha=0a1774af188f2e27c104fd0c9a3de598b559bf07
+          readonly helper_repository=https://github.com/morrowbyte/t3code.git
+          readonly helper_git="$RUNNER_TEMP/nixos-helper.git"
+          readonly helper_dir="$RUNNER_TEMP/nixos-helper"
+          readonly transfer_dir="$RUNNER_TEMP/morrowbyte-nixos-transfer"
+          readonly output_link="$RUNNER_TEMP/t3code-weasel-result"
+
+          test "$(git rev-parse HEAD)" = "$T3_WEASEL_SOURCE_SHA"
+          test -f "$GITHUB_WORKSPACE/packaging/nixos/flake.nix"
+          git init --bare "$helper_git"
+          git -C "$helper_git" fetch --depth=1 "$helper_repository" "$helper_sha"
+          test "$(git -C "$helper_git" rev-parse FETCH_HEAD)" = "$helper_sha"
+          git -C "$helper_git" cat-file -e "$helper_sha^{commit}"
+
+          mkdir -p "$helper_dir"
+          git -C "$helper_git" show "$helper_sha:packaging/nixos/export-closure.sh" > "$helper_dir/export-closure.sh"
+          chmod 0755 "$helper_dir/export-closure.sh"
+          # The pinned exporter reads nixpkgs metadata from its adjacent flake; use SOURCE20's exact tracked flake.
+          cp "$GITHUB_WORKSPACE/packaging/nixos/flake.nix" "$helper_dir/flake.nix"
+
+          flake_ref="path:$GITHUB_WORKSPACE/packaging/nixos#t3code-weasel"
+          nix build --impure --no-write-lock-file --out-link "$output_link" "$flake_ref"
+          package_path="$(readlink -f "$output_link")"
+          "$helper_dir/export-closure.sh" \
+            "$package_path" \
+            "$T3_WEASEL_SOURCE_SHA" \
+            "$T3_WEASEL_ARTIFACT_SHA256" \
+            "$T3_WEASEL_VERSION" \
+            "$transfer_dir" | tee "$RUNNER_TEMP/export-closure.log"
+
+          manifest_sha256="$(sha256sum "$transfer_dir/manifest.json" | cut -d ' ' -f 1)"
+          store_export_sha256="$(sha256sum "$transfer_dir/store-export.nix.gz" | cut -d ' ' -f 1)"
+          test "$(jq -er '.format' "$transfer_dir/manifest.json")" = t3code-nixos-store-export-v1
+          test "$(jq -er '.sourceSha' "$transfer_dir/manifest.json")" = "$T3_WEASEL_SOURCE_SHA"
+          test "$(jq -er '.version' "$transfer_dir/manifest.json")" = "$T3_WEASEL_VERSION"
+          test "$(jq -er '.appImageSha256' "$transfer_dir/manifest.json")" = "$T3_WEASEL_ARTIFACT_SHA256"
+          test "$(jq -er '.storeExportSha256' "$transfer_dir/manifest.json")" = "$store_export_sha256"
+          test "$(wc -l < "$transfer_dir/SHA256SUMS")" = 2
+          (cd "$transfer_dir" && sha256sum --check --strict SHA256SUMS)
+
+          jq -n \
+            --arg repository morrowbyte/t3code \
+            --arg version "$T3_WEASEL_VERSION" \
+            --arg sourceSha "$T3_WEASEL_SOURCE_SHA" \
+            --arg appImageUrl "$T3_WEASEL_ARTIFACT_URL" \
+            --arg appImageSha256 "$T3_WEASEL_ARTIFACT_SHA256" \
+            --arg helperSha "$helper_sha" \
+            --arg workflowSha "$GITHUB_SHA" \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg manifestSha256 "$manifest_sha256" \
+            --arg storeExportSha256 "$store_export_sha256" \
+            '{format:"t3code-nixos-build-receipt-v1",repository:$repository,version:$version,sourceSha:$sourceSha,appImageUrl:$appImageUrl,appImageSha256:$appImageSha256,helperSha:$helperSha,workflowSha:$workflowSha,runId:$runId,manifestSha256:$manifestSha256,storeExportSha256:$storeExportSha256}' \
+            > "$transfer_dir/build-receipt.json"
+
+          printf 'Qualified manifest SHA-256: %s\n' "$manifest_sha256"
+          printf 'Qualified compressed store export SHA-256: %s\n' "$store_export_sha256"
+          printf 'Bound source: %s\nVersion: %s\nAppImage SHA-256: %s\nHelper pin: %s\n' \
+            "$T3_WEASEL_SOURCE_SHA" "$T3_WEASEL_VERSION" "$T3_WEASEL_ARTIFACT_SHA256" "$helper_sha"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: morrowbyte-nixos-0.0.47-nightly.20261014.14
-          path: transfer/
+          name: morrowbyte-nixos-0.0.47-nightly.20261014.15-source-20adb02
+          path: ${{ runner.temp }}/morrowbyte-nixos-transfer/
           compression-level: 0
-          retention-days: 7
+          retention-days: 30
