@@ -4,6 +4,8 @@ import {
   AuthSessionId,
   ProviderInstanceId,
   ProviderSessionId,
+  type OrchestrationV2StoredEvent,
+  type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import type { LiveVoiceEvent } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -15,6 +17,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SessionStore from "../auth/SessionStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -44,6 +47,33 @@ it.effect(
         | undefined;
       let sends = 0;
       let stops = 0;
+      const spoken: Array<{ plannerNativeThreadId: string; text: string }> = [];
+      let appendAttempts = 0;
+      let appendSpeechFails = false;
+      let resolveAppendAttempt: (() => void) | undefined;
+      let appendAttemptObserved = new Promise<void>((resolve) => {
+        resolveAppendAttempt = resolve;
+      });
+      let resolveSpeech: (() => void) | undefined;
+      let speechObserved = new Promise<void>((resolve) => {
+        resolveSpeech = resolve;
+      });
+      let gateReadResolvers: Array<() => void> = [];
+      let durableProjection = {
+        ...projection,
+        runs: [],
+        attempts: [],
+        nodes: [],
+        subagents: [],
+        checkpoints: [],
+        messages: [],
+      } as unknown as OrchestrationV2ThreadProjection;
+      const t3EventQueues = new Map([
+        ["run.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
+        ["subagent.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
+        ["checkpoint.captured", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
+        ["message.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
+      ]);
       let plannerCalls = 0;
       const runtime = {
         instanceId: ProviderInstanceId.make("codex-test"),
@@ -77,7 +107,15 @@ it.effect(
             Effect.sync(() => {
               stops += 1;
             }),
-          appendSpeech: () => Effect.void,
+          appendSpeech: (input: { plannerNativeThreadId: string; text: string }) =>
+            Effect.gen(function* () {
+              appendAttempts += 1;
+              resolveAppendAttempt?.();
+              if (appendSpeechFails)
+                return yield* Effect.fail(new Error("ambiguous native acknowledgement"));
+              spoken.push(input);
+              resolveSpeech?.();
+            }),
         },
       } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
       const sessionId = AuthSessionId.make("live-test-principal");
@@ -138,12 +176,20 @@ it.effect(
           get: () => Effect.succeed(Option.some(runtime)),
         } as unknown as ProviderSessionManager.ProviderSessionManagerV2Shape),
         Layer.succeed(ThreadManagementService.ThreadManagementService, {
-          getThreadProjection: () => Effect.succeed(projection),
-          getProjectThread: () => Effect.succeed(projection),
+          getThreadProjection: () => Effect.succeed(durableProjection),
+          getProjectThread: () =>
+            Effect.sync(() => {
+              const resolve = gateReadResolvers.shift();
+              resolve?.();
+              return durableProjection;
+            }),
+          getThreadEventSequence: () => Effect.succeed(0),
+          streamStoredEventsFrom: (input: { eventType?: string }) =>
+            Stream.fromQueue(t3EventQueues.get(input.eventType ?? "")!),
           sendToThread: () =>
             Effect.sync(() => {
               sends += 1;
-              return { delivery: "queued", run: { id: "durable-run-1" } };
+              return { delivery: "queued", run: { id: `durable-run-${sends}` } };
             }),
         } as unknown as ThreadManagementService.ThreadManagementServiceShape),
         Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
@@ -152,6 +198,7 @@ it.effect(
       );
       const program = Effect.gen(function* () {
         yield* runMigrations();
+        const sql = yield* SqlClient.SqlClient;
         const service = yield* CodexLiveSessionService.CodexLiveSessionService;
         const prepared = yield* service.prepare(session, {
           threadId,
@@ -241,14 +288,286 @@ it.effect(
         const duplicateReceipt = yield* invoke("call-2", "Implement the requested change");
         assert.equal(firstReceipt, duplicateReceipt);
         assert.equal(sends, 1);
+
+        const makeRunProjection = (runId: string, childStatus: "running" | "completed") =>
+          ({
+            ...projection,
+            runs: [
+              {
+                id: runId,
+                threadId,
+                ordinal: runId.endsWith("1") ? 1 : 2,
+                providerInstanceId,
+                modelSelection,
+                providerThreadId: null,
+                userMessageId: `user-${runId}`,
+                rootNodeId: `root-${runId}`,
+                activeAttemptId: `attempt-${runId}`,
+                status: "completed",
+                requestedAt: "2026-10-14T00:00:00.000Z",
+                startedAt: "2026-10-14T00:00:01.000Z",
+                completedAt: "2026-10-14T00:00:03.000Z",
+                checkpointId: `checkpoint-${runId}`,
+              },
+            ],
+            nodes: [
+              {
+                id: `assistant-${runId}`,
+                threadId,
+                runId,
+                parentNodeId: `root-${runId}`,
+                rootNodeId: `root-${runId}`,
+                kind: "assistant_message",
+                status: "completed",
+                countsForRun: false,
+                providerThreadId: "provider-thread-test",
+                providerTurnId: "provider-turn-test",
+                nativeItemRef: null,
+                runtimeRequestId: null,
+                checkpointScopeId: null,
+                startedAt: "2026-10-14T00:00:02.000Z",
+                completedAt: "2026-10-14T00:00:03.000Z",
+              },
+            ],
+            attempts: [
+              {
+                id: `attempt-${runId}`,
+                runId,
+                attemptOrdinal: 1,
+                rootNodeId: `root-${runId}`,
+                providerInstanceId,
+                providerThreadId: "provider-thread-test",
+                providerTurnId: "provider-turn-test",
+                reason: "initial",
+                status: "completed",
+                startedAt: "2026-10-14T00:00:01.000Z",
+                completedAt: "2026-10-14T00:00:03.000Z",
+              },
+            ],
+            subagents: [
+              {
+                id: `child-${runId}`,
+                threadId,
+                runId,
+                parentNodeId: `root-${runId}`,
+                origin: "app_owned",
+                createdBy: "assistant",
+                driver: "codex",
+                providerInstanceId,
+                providerThreadId: null,
+                childThreadId: null,
+                nativeTaskRef: null,
+                prompt: "required child work",
+                title: null,
+                model: null,
+                status: childStatus,
+                result: null,
+                startedAt: "2026-10-14T00:00:01.000Z",
+                completedAt: childStatus === "completed" ? "2026-10-14T00:00:03.000Z" : null,
+                updatedAt: "2026-10-14T00:00:03.000Z",
+              },
+            ],
+            messages: [
+              {
+                id: `final-${runId}`,
+                threadId,
+                runId,
+                nodeId: `assistant-${runId}`,
+                role: "assistant",
+                text: `durable answer for ${runId}`,
+                streaming: false,
+                attachments: [],
+                createdAt: "2026-10-14T00:00:02.000Z",
+                updatedAt: "2026-10-14T00:00:03.000Z",
+              },
+            ],
+            checkpoints: [],
+          }) as unknown as OrchestrationV2ThreadProjection;
+        const eventFor = (event: OrchestrationV2StoredEvent["event"]) =>
+          ({
+            sequence: 1,
+            commandId: null,
+            event,
+          }) as OrchestrationV2StoredEvent;
+        const waitForGateRead = () =>
+          Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                gateReadResolvers.push(resolve);
+              }),
+          );
+
+        durableProjection = makeRunProjection("durable-run-1", "running");
+        const firstGateRead = waitForGateRead();
+        yield* Queue.offer(
+          t3EventQueues.get("run.updated")!,
+          eventFor({
+            type: "run.updated",
+            id: "event-run-1",
+            threadId,
+            runId: "durable-run-1",
+            nodeId: "root-durable-run-1",
+            providerInstanceId,
+            occurredAt: "2026-10-14T00:00:03.000Z",
+            payload: durableProjection.runs[0] as never,
+          } as never),
+        );
+        yield* firstGateRead;
+        assert.equal(spoken.length, 0, "a still-running required child blocks speech");
+
+        durableProjection = {
+          ...durableProjection,
+          subagents: [{ ...durableProjection.subagents[0]!, status: "completed" }],
+        };
+        const childGateRead = waitForGateRead();
+        yield* Queue.offer(
+          t3EventQueues.get("subagent.updated")!,
+          eventFor({
+            type: "subagent.updated",
+            id: "event-child-1",
+            threadId,
+            runId: "durable-run-1",
+            nodeId: "child-durable-run-1",
+            providerInstanceId,
+            occurredAt: "2026-10-14T00:00:04.000Z",
+            payload: durableProjection.subagents[0] as never,
+          } as never),
+        );
+        yield* childGateRead;
+        assert.equal(spoken.length, 0, "speech waits for the matching checkpoint");
+
+        durableProjection = {
+          ...durableProjection,
+          checkpoints: [
+            {
+              id: "checkpoint-durable-run-1",
+              threadId,
+              scopeId: "scope-root-1",
+              runId: "durable-run-1",
+              nodeId: "root-durable-run-1",
+              parentCheckpointId: null,
+              ordinalWithinScope: 1,
+              appRunOrdinal: 1,
+              ref: "checkpoint-ref-1",
+              status: "ready",
+              files: [],
+              capturedAt: "2026-10-14T00:00:03.000Z",
+            },
+          ],
+        };
+        const checkpointGateRead = waitForGateRead();
+        yield* Queue.offer(
+          t3EventQueues.get("checkpoint.captured")!,
+          eventFor({
+            type: "checkpoint.captured",
+            id: "event-checkpoint-1",
+            threadId,
+            runId: "durable-run-1",
+            nodeId: "root-durable-run-1",
+            providerInstanceId,
+            occurredAt: "2026-10-14T00:00:03.000Z",
+            payload: durableProjection.checkpoints[0] as never,
+          } as never),
+        );
+        yield* checkpointGateRead;
+        yield* Effect.promise(() => speechObserved);
+        assert.deepEqual(spoken, [
+          {
+            plannerNativeThreadId: "planner-native-1",
+            text: "durable answer for durable-run-1",
+          },
+        ]);
+        const sentReceipt = yield* sql<{ receipt_json: string }>`
+          SELECT receipt_json FROM codex_live_voice_intents
+          WHERE lease_id = ${prepared.leaseId} AND generation = ${prepared.generation}
+            AND planner_turn_id = ${"planner-turn-1"}
+        `;
+        assert.equal(JSON.parse(sentReceipt[0]!.receipt_json).readback.state, "sent");
+        speechObserved = new Promise<void>((resolve) => {
+          resolveSpeech = resolve;
+        });
+        appendSpeechFails = true;
+        yield* invoke("call-next", "Queue follow-up work", "planner-turn-2");
+        assert.equal(sends, 2);
+        durableProjection = {
+          ...makeRunProjection("durable-run-2", "completed"),
+          checkpoints: [
+            {
+              id: "checkpoint-durable-run-2",
+              threadId,
+              scopeId: "scope-root-2",
+              runId: "durable-run-2",
+              nodeId: "root-durable-run-2",
+              parentCheckpointId: null,
+              ordinalWithinScope: 1,
+              appRunOrdinal: 2,
+              ref: "checkpoint-ref-2",
+              status: "ready",
+              files: [],
+              capturedAt: "2026-10-14T00:00:03.000Z",
+            },
+          ],
+        };
+        const ambiguousGateRead = waitForGateRead();
+        yield* Queue.offer(
+          t3EventQueues.get("run.updated")!,
+          eventFor({
+            type: "run.updated",
+            id: "event-run-2",
+            threadId,
+            runId: "durable-run-2",
+            nodeId: "root-durable-run-2",
+            providerInstanceId,
+            occurredAt: "2026-10-14T00:00:03.000Z",
+            payload: durableProjection.runs[0] as never,
+          } as never),
+        );
+        yield* ambiguousGateRead;
+        yield* Effect.promise(() => appendAttemptObserved);
+        assert.equal(appendAttempts, 2);
+        assert.equal(
+          spoken.length,
+          1,
+          "ambiguous append acknowledgement is not treated as delivery",
+        );
+        const unknownReceipt = yield* sql<{ receipt_json: string }>`
+          SELECT receipt_json FROM codex_live_voice_intents
+          WHERE lease_id = ${prepared.leaseId} AND generation = ${prepared.generation}
+            AND planner_turn_id = ${"planner-turn-2"}
+        `;
+        assert.equal(JSON.parse(unknownReceipt[0]!.receipt_json).readback.state, "unknown");
+        appendAttemptObserved = new Promise<void>((resolve) => {
+          resolveAppendAttempt = resolve;
+        });
+        const duplicateReadback = yield* invoke(
+          "call-next-retry",
+          "Queue follow-up work",
+          "planner-turn-2",
+        );
+        assert.equal(
+          duplicateReadback,
+          yield* invoke("call-next-again", "Queue follow-up work", "planner-turn-2"),
+        );
+        assert.equal(appendAttempts, 2, "a claimed readback is never blindly retried");
+
+        appendSpeechFails = false;
+        yield* invoke("call-after-stop", "Queue work that must outlive Live", "planner-turn-3");
+        assert.equal(sends, 3);
+        const staleGeneration = yield* Effect.exit(
+          service.status(session, {
+            leaseId: prepared.leaseId,
+            generation: prepared.generation + 1,
+          }),
+        );
+        assert.isTrue(Exit.isFailure(staleGeneration));
         const staleReplay = yield* Effect.exit(
           invoke("call-stale-retry", "A request captured under old settings", "planner-turn-stale"),
         );
         assert.isTrue(Exit.isFailure(staleReplay));
-        assert.equal(sends, 1);
+        assert.equal(sends, 3);
         const changedIntent = yield* Effect.exit(invoke("call-3", "Submit a different request"));
         assert.isTrue(Exit.isFailure(changedIntent));
-        assert.equal(sends, 1);
+        assert.equal(sends, 3);
 
         const wrongSubject = {
           ...session,
@@ -269,14 +588,34 @@ it.effect(
         });
         assert.equal(stopped.status, "stopping");
         assert.equal(stops, 1);
-        assert.equal(sends, 1);
+        assert.equal(sends, 3);
+        durableProjection = makeRunProjection("durable-run-3", "completed");
+        yield* Queue.offer(
+          t3EventQueues.get("run.updated")!,
+          eventFor({
+            type: "run.updated",
+            id: "event-run-2",
+            threadId,
+            runId: "durable-run-3",
+            nodeId: "root-durable-run-3",
+            providerInstanceId,
+            occurredAt: "2026-10-14T00:00:03.000Z",
+            payload: durableProjection.runs[0] as never,
+          } as never),
+        );
+        yield* Effect.yieldNow;
+        assert.equal(
+          appendAttempts,
+          2,
+          "Stop Live suppresses readback without cancelling queued work",
+        );
         const acceptedWorkAfterStop = yield* invoke("call-5", "Implement the requested change");
         assert.equal(acceptedWorkAfterStop, firstReceipt);
         const afterStop = yield* Effect.exit(
           invoke("call-4", "A request after stopping is refused"),
         );
         assert.isTrue(Exit.isFailure(afterStop));
-        assert.equal(sends, 1);
+        assert.equal(sends, 3);
       });
       yield* program.pipe(
         Effect.provide(Layer.provideMerge(CodexLiveSessionService.layer, dependencies)),
