@@ -70,9 +70,9 @@ export const readFleetConnections = Effect.gen(function* () {
   const store = yield* ServerSecretStore.ServerSecretStore;
   const value = yield* store.get(FLEET_CONNECTIONS_SECRET).pipe(Effect.mapError(unavailable));
   if (Option.isNone(value)) return [];
-  const catalog = yield* Schema.decodeEffect(Schema.fromJsonString(PrivateCatalog))(
-    new TextDecoder().decode(value.value),
-  ).pipe(Effect.mapError(unavailable));
+  const catalog = yield* Schema.decodeEffect(
+    Schema.fromJsonString(Schema.toCodecJson(PrivateCatalog)),
+  )(new TextDecoder().decode(value.value)).pipe(Effect.mapError(unavailable));
   return yield* Effect.try({
     try: () => {
       const ids = new Set<string>();
@@ -162,9 +162,9 @@ export const issueFleetPairing = Effect.fn("auth.issueFleetPairing")(function* (
   }
   if (!response.ok) return yield* unavailable();
   const grantText = yield* Effect.tryPromise({ try: () => response.text(), catch: unavailable });
-  const grant = yield* Schema.decodeEffect(Schema.fromJsonString(AuthPairingCredentialResult))(
-    grantText,
-  ).pipe(Effect.mapError(unavailable));
+  const grant = yield* Schema.decodeEffect(
+    Schema.fromJsonString(Schema.toCodecJson(AuthPairingCredentialResult)),
+  )(grantText).pipe(Effect.mapError(unavailable));
   const now = yield* DateTime.now;
   const remaining = DateTime.toEpochMillis(grant.expiresAt) - DateTime.toEpochMillis(now);
   if (remaining <= 0 || remaining > 5 * 60_000 + 5000) return yield* unavailable();
