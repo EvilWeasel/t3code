@@ -13,6 +13,7 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import * as ClientCapabilities from "../platform/capabilities.ts";
+import type { AuthenticatedRelayEnvironmentSnapshot } from "../relay/discovery.ts";
 import {
   type ConnectionCatalogEntry,
   type ConnectionCredential,
@@ -21,6 +22,7 @@ import {
   type ConnectionRoute,
   type PlatformConnectionRegistration,
   type PrimaryConnectionRegistration,
+  RelayConnectionRegistration,
   SshConnectionProfile,
   connectionRegistrationCatalogEntry,
 } from "./catalog.ts";
@@ -34,7 +36,7 @@ import type {
   PersistedConnectionTarget,
   SupervisorConnectionState,
 } from "./model.ts";
-import { ConnectionBlockedError } from "./model.ts";
+import { ConnectionBlockedError, RelayConnectionTarget } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionDriver from "./driver.ts";
@@ -105,6 +107,16 @@ export class EnvironmentRegistry extends Context.Service<
     readonly reconcilePlatform: (
       registrations: ReadonlyArray<PlatformConnectionRegistration>,
     ) => Effect.Effect<void>;
+    /** Reconciles only the owner-authenticated linked-environment snapshot from relay discovery. */
+    readonly reconcileDiscovered?: (
+      snapshot: AuthenticatedRelayEnvironmentSnapshot,
+    ) => Effect.Effect<
+      void,
+      | Persistence.ConnectionPersistenceError
+      | ConnectionAttemptError
+      | EnvironmentNotRegisteredError
+      | PlatformEnvironmentRemovalError
+    >;
     readonly remove: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<
@@ -552,44 +564,76 @@ export const make = Effect.gen(function* () {
     return { entry: rest, addressesChanged: true };
   };
 
-  const register = Effect.fn("EnvironmentRegistry.register")(function* (
+  const registerLocked = Effect.fn("EnvironmentRegistry.registerLocked")(function* (
     registration: ConnectionRegistration,
+    isCurrent?: () => Effect.Effect<boolean>,
   ) {
     const registered = connectionRegistrationCatalogEntry(registration);
     const environmentId = registered.target.environmentId;
-    yield* withLeaseLock(
-      environmentId,
-      Effect.gen(function* () {
-        if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) {
-          return;
-        }
-        // A new route joins the environment's saved routes. Registering one it
-        // already has (the same id, or a pairing to the same address) replaces
-        // it in place. Editing keeps the disabled state.
-        const previous = (yield* SubscriptionRef.get(entries)).get(environmentId);
-        let entry = registered;
-        if (previous !== undefined) {
-          const route: ConnectionRoute = { target: registered.target, profile: registered.profile };
-          const existing = connectionRoutes(previous);
-          const sameAddress = findRouteToSameAddress(existing, route);
-          const routes = existing.filter(
-            (existing) =>
-              existing !== sameAddress ||
-              connectionRouteId(existing.target) === connectionRouteId(route.target),
-          );
-          const next = withRoutes(previous, upsertRoute(routes, route));
-          if (next.addressesChanged) {
-            yield* forgetRoutingTrust(environmentId, "register-connection");
-          }
-          entry = next.entry;
-        }
-        yield* registrations.register(registration, persistedRoutes(entry));
+    if ((yield* Ref.get(platformEnvironmentIds)).has(environmentId)) return;
+    if (isCurrent !== undefined && !(yield* isCurrent())) return;
+
+    // A new route joins the environment's saved routes. Registering one it
+    // already has replaces it in place. Editing keeps the disabled state.
+    const previous = (yield* SubscriptionRef.get(entries)).get(environmentId);
+    let entry = registered;
+    if (previous !== undefined) {
+      const route: ConnectionRoute = { target: registered.target, profile: registered.profile };
+      const existing = connectionRoutes(previous);
+      const sameAddress = findRouteToSameAddress(existing, route);
+      const routes = existing.filter(
+        (existing) =>
+          existing !== sameAddress ||
+          connectionRouteId(existing.target) === connectionRouteId(route.target),
+      );
+      const next = withRoutes(previous, upsertRoute(routes, route));
+      if (next.addressesChanged) {
+        yield* forgetRoutingTrust(environmentId, "register-connection");
+      }
+      entry = next.entry;
+    }
+    if (isCurrent !== undefined && !(yield* isCurrent())) return;
+    yield* registrations.register(registration, persistedRoutes(entry));
+
+    const restorePrevious = Effect.gen(function* () {
+      if (previous === undefined) {
+        yield* registrations.remove(environmentId);
+        yield* Ref.update(persistedEnvironmentIds, (current) => {
+          const next = new Set(current);
+          next.delete(environmentId);
+          return next;
+        });
+        yield* closeServiceScope(environmentId);
+        yield* SubscriptionRef.update(entries, (current) => {
+          const next = new Map(current);
+          next.delete(environmentId);
+          return next;
+        });
+      } else {
+        yield* registrations.setRoutes(environmentId, persistedRoutes(previous));
         yield* Ref.update(persistedEnvironmentIds, (current) =>
           new Set(current).add(environmentId),
         );
-        yield* installEntryLocked(entry);
-      }),
-    );
+        yield* installEntryLocked(previous);
+      }
+    });
+
+    if (isCurrent !== undefined && !(yield* isCurrent())) {
+      yield* restorePrevious;
+      return;
+    }
+    yield* Ref.update(persistedEnvironmentIds, (current) => new Set(current).add(environmentId));
+    yield* installEntryLocked(entry);
+    // Sign-out can land while persistence or scope installation is suspended.
+    // Roll back under the same environment lease; the cleanup pass may already
+    // have enumerated entries before this route was visible.
+    if (isCurrent !== undefined && !(yield* isCurrent())) yield* restorePrevious;
+  });
+
+  const register = Effect.fn("EnvironmentRegistry.register")(function* (
+    registration: ConnectionRegistration,
+  ) {
+    return yield* withLeaseLock(registration.target.environmentId, registerLocked(registration));
   });
 
   /** Writes a new route list for a user-saved environment and restarts its connection. */
@@ -816,6 +860,59 @@ export const make = Effect.gen(function* () {
     yield* Effect.forEach(platformRegistrations, installPlatformRegistration, { discard: true });
   });
 
+  const reconcileDiscovered = Effect.fn("EnvironmentRegistry.reconcileDiscovered")(function* (
+    snapshot: AuthenticatedRelayEnvironmentSnapshot,
+  ) {
+    const desiredIds = new Set(snapshot.environments.keys());
+    for (const environment of snapshot.environments.values()) {
+      yield* withLeaseLock(
+        environment.environmentId,
+        Effect.gen(function* () {
+          if (!(yield* snapshot.isCurrent())) return;
+          if ((yield* Ref.get(platformEnvironmentIds)).has(environment.environmentId)) return;
+          const existing = (yield* SubscriptionRef.get(entries)).get(environment.environmentId);
+          const alreadyRegistered =
+            existing !== undefined &&
+            connectionRoutes(existing).some(
+              (route) => route.target._tag === "RelayConnectionTarget",
+            );
+          if (!alreadyRegistered) {
+            yield* registerLocked(
+              new RelayConnectionRegistration({
+                target: new RelayConnectionTarget({
+                  environmentId: environment.environmentId,
+                  label: environment.label,
+                }),
+              }),
+              snapshot.isCurrent,
+            );
+          }
+        }),
+      );
+    }
+
+    const currentEntries = yield* SubscriptionRef.get(entries);
+    for (const entry of currentEntries.values()) {
+      const environmentId = entry.target.environmentId;
+      if (desiredIds.has(environmentId)) continue;
+      yield* withLeaseLock(
+        environmentId,
+        Effect.gen(function* () {
+          if (!(yield* snapshot.isCurrent())) return;
+          const current = (yield* SubscriptionRef.get(entries)).get(environmentId);
+          if (
+            current === undefined ||
+            !connectionRoutes(current).some(
+              (route) => route.target._tag === "RelayConnectionTarget",
+            )
+          )
+            return;
+          yield* removeRouteLocked(environmentId, RELAY_ROUTE_ID);
+        }),
+      );
+    }
+  });
+
   /** Forgets a user-saved environment. Callers hold its lease lock. */
   const removeLocked = Effect.fn("EnvironmentRegistry.removeLocked")(function* (
     environmentId: EnvironmentId,
@@ -952,28 +1049,30 @@ export const make = Effect.gen(function* () {
     );
   });
 
+  const removeRouteLocked = Effect.fn("EnvironmentRegistry.removeRouteLocked")(function* (
+    environmentId: EnvironmentId,
+    routeId: string,
+  ) {
+    const entry = yield* userEntry(environmentId);
+    const routes = connectionRoutes(entry);
+    const route = routes.find((candidate) => connectionRouteId(candidate.target) === routeId);
+    if (route === undefined) return;
+    const remaining = routesAfterRemoving(routes, routeId);
+    if (remaining.length === 0) return yield* removeLocked(environmentId);
+    yield* replaceRoutesLocked(entry, remaining);
+    const profile = Option.getOrNull(route.profile);
+    if (profile !== null && isSshConnectionProfile(profile)) {
+      yield* disconnectSsh(environmentId, profile);
+    }
+  });
+
   const removeRoute = Effect.fn("EnvironmentRegistry.removeRoute")(function* (
     environmentId: EnvironmentId,
     routeId: string,
   ) {
-    // One lock for the whole decision: a route registered between "this was
-    // the last route" and the removal must not be deleted with it.
-    yield* withLeaseLock(
-      environmentId,
-      Effect.gen(function* () {
-        const entry = yield* userEntry(environmentId);
-        const routes = connectionRoutes(entry);
-        const route = routes.find((candidate) => connectionRouteId(candidate.target) === routeId);
-        if (route === undefined) return;
-        const remaining = routesAfterRemoving(routes, routeId);
-        if (remaining.length === 0) return yield* removeLocked(environmentId);
-        yield* replaceRoutesLocked(entry, remaining);
-        const profile = Option.getOrNull(route.profile);
-        if (profile !== null && isSshConnectionProfile(profile)) {
-          yield* disconnectSsh(environmentId, profile);
-        }
-      }),
-    );
+    // Keep the route decision and persistence under one lease so a concurrent
+    // registration cannot be deleted with the route being removed.
+    yield* withLeaseLock(environmentId, removeRouteLocked(environmentId, routeId));
   });
 
   const reorderRoutes = Effect.fn("EnvironmentRegistry.reorderRoutes")(function* (
@@ -1010,7 +1109,7 @@ export const make = Effect.gen(function* () {
       yield* Effect.forEach(
         relayEnvironmentIds,
         (environmentId) =>
-          removeRoute(environmentId, RELAY_ROUTE_ID).pipe(
+          withLeaseLock(environmentId, removeRouteLocked(environmentId, RELAY_ROUTE_ID)).pipe(
             Effect.catchTags({ EnvironmentNotRegisteredError: () => Effect.void }),
           ),
         {
@@ -1169,6 +1268,7 @@ export const make = Effect.gen(function* () {
     register,
     registerPlatform,
     reconcilePlatform,
+    reconcileDiscovered,
     remove,
     removeRoute,
     reorderRoutes,

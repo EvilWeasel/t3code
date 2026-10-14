@@ -7,6 +7,7 @@ import {
   type ServerConfig,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import type { RelayClientEnvironmentRecord } from "@t3tools/contracts/relay";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -41,10 +42,16 @@ import * as Connectivity from "./connectivity.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import * as ConnectionDriver from "./driver.ts";
 import type { RouteCheck } from "./driver.ts";
-import { connectionRouteId, connectionRouteKind } from "./routes.ts";
+import {
+  connectionRouteId,
+  connectionRouteKind,
+  connectionRoutes,
+  mergeLearnedRoutes,
+} from "./routes.ts";
 import {
   ConnectionTransientError,
   ConnectionBlockedError,
+  type ConnectionAttemptError,
   BearerConnectionTarget,
   PrimaryConnectionTarget,
   RelayConnectionTarget,
@@ -64,7 +71,7 @@ import {
 import * as RpcSession from "../rpc/session.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
-import { watchDiscoveredCompatibility } from "./layer.ts";
+import { watchDiscoveredCompatibility, watchDiscoveredEnvironments } from "./layer.ts";
 import * as RelayEnvironmentDiscovery from "../relay/discovery.ts";
 import type { RelayEnvironmentStatusResponse } from "@t3tools/contracts/relay";
 import { runDesktopCommitWithReconnectObserver } from "../state/server.ts";
@@ -158,7 +165,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       environmentId: EnvironmentId,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
     readonly checkRoute?: (route: ConnectionRoute) => RouteCheck;
-    readonly prepareRoute?: (target: ConnectionTarget) => ConnectionBlockedError | undefined;
+    readonly prepareRoute?: (target: ConnectionTarget) => ConnectionAttemptError | undefined;
     /** Runs before preparing a route; may suspend to hold an attempt in flight. */
     readonly beforePrepareRoute?: (
       target: ConnectionTarget,
@@ -490,6 +497,30 @@ function hasRoutes(targets: ReadonlyArray<ConnectionTarget>, environmentId: Envi
   return routesOf(targets, environmentId).length > 0;
 }
 
+function linkedSnapshot(
+  records: ReadonlyArray<{ readonly environmentId: EnvironmentId; readonly label: string }>,
+  isCurrent: () => Effect.Effect<boolean> = () => Effect.succeed(true),
+): RelayEnvironmentDiscovery.AuthenticatedRelayEnvironmentSnapshot {
+  const environments = new Map<EnvironmentId, RelayClientEnvironmentRecord>();
+  for (const record of records) {
+    environments.set(record.environmentId, {
+      ...record,
+      endpoint: {
+        httpBaseUrl: "https://relay.example.test",
+        wsBaseUrl: "wss://relay.example.test",
+        providerKind: "manual" as const,
+      },
+      linkedAt: "2026-10-14T00:00:00.000Z",
+    });
+  }
+  return {
+    identity: { accountId: "same-owner" },
+    generation: 1,
+    environments,
+    isCurrent,
+  } as unknown as RelayEnvironmentDiscovery.AuthenticatedRelayEnvironmentSnapshot;
+}
+
 function replaceRoutes(
   current: ReadonlyArray<ConnectionTarget>,
   environmentId: EnvironmentId,
@@ -746,6 +777,239 @@ describe("EnvironmentRegistry", () => {
         expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
       }).pipe(Effect.provide(harness.layer));
     }),
+  );
+
+  it.effect(
+    "reconciles four linked environments once and preserves local and disabled entries",
+    () =>
+      Effect.gen(function* () {
+        const heph = EnvironmentId.make("dd33bc2a-a8bd-43f5-a885-581f57c62d5c");
+        const nixy = EnvironmentId.make("b3095cde-76bd-4092-a4c1-42527ad4db63");
+        const blain = EnvironmentId.make("95672cd5-e1c9-4428-91c8-547ab462abba");
+        const winDev = EnvironmentId.make("03dae822-670f-48da-9b08-8e91e69ff7cf");
+        const directHeph = new PrimaryConnectionTarget({
+          environmentId: heph,
+          label: "Heph local direct",
+          httpBaseUrl: "https://heph.example.test",
+          wsBaseUrl: "wss://heph.example.test",
+        });
+        const existingNixyRelay = new RelayConnectionTarget({
+          environmentId: nixy,
+          label: "Existing Nixy link",
+        });
+        const harness = yield* makeHarness([directHeph, existingNixyRelay], [], [], {
+          initialDisabled: [nixy],
+          prepareRoute: (target) =>
+            target.environmentId === winDev ||
+            (target.environmentId === heph && target._tag === "PrimaryConnectionTarget")
+              ? new ConnectionTransientError({
+                  reason: "endpoint-unavailable",
+                  detail:
+                    target.environmentId === winDev
+                      ? "WinDev is offline."
+                      : "Heph direct route is offline.",
+                })
+              : undefined,
+        });
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.start;
+          const snapshot = linkedSnapshot([
+            { environmentId: heph, label: "MorrowCode" },
+            { environmentId: nixy, label: "MorrowCode" },
+            { environmentId: blain, label: "Blain" },
+            { environmentId: winDev, label: "WinDev" },
+          ]);
+          yield* registry.reconcileDiscovered!(snapshot);
+          for (const environmentId of [heph, blain]) {
+            yield* awaitConnectionState(
+              registry,
+              environmentId,
+              (state) => state.phase === "connected",
+            );
+          }
+          const offline = yield* awaitConnectionState(
+            registry,
+            winDev,
+            (state) => state.phase === "backoff",
+          );
+          expect(offline.lastFailure?._tag).toBe("ConnectionTransientError");
+          expect(yield* Ref.get(harness.connectedRoutes)).toContain("relay");
+          const firstTargets = yield* Ref.get(harness.storedTargets);
+          const firstSessionCount = (yield* Ref.get(harness.sessions)).length;
+          const firstReleasedCount = yield* Ref.get(harness.releasedSessions);
+          const entries = yield* SubscriptionRef.get(registry.entries);
+          expect(entries.size).toBe(4);
+          expect(entries.get(nixy)?.enabled).toBe(false);
+          expect(routesOf(firstTargets, heph).map((target) => target._tag)).toEqual([
+            "PrimaryConnectionTarget",
+            "RelayConnectionTarget",
+          ]);
+
+          yield* registry.reconcileDiscovered!(snapshot);
+          expect(yield* Ref.get(harness.storedTargets)).toEqual(firstTargets);
+          expect((yield* Ref.get(harness.sessions)).length).toBe(firstSessionCount);
+          expect(yield* Ref.get(harness.releasedSessions)).toBe(firstReleasedCount);
+          expect((yield* SubscriptionRef.get(registry.entries)).get(nixy)?.enabled).toBe(false);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+  );
+
+  it.effect(
+    "reconciles a cold-start persisted four-host catalog without duplication or re-enabling",
+    () =>
+      Effect.gen(function* () {
+        const ids = [
+          EnvironmentId.make("dd33bc2a-a8bd-43f5-a885-581f57c62d5c"),
+          EnvironmentId.make("b3095cde-76bd-4092-a4c1-42527ad4db63"),
+          EnvironmentId.make("95672cd5-e1c9-4428-91c8-547ab462abba"),
+          EnvironmentId.make("03dae822-670f-48da-9b08-8e91e69ff7cf"),
+        ];
+        const targets = ids.map(
+          (environmentId, index) =>
+            new RelayConnectionTarget({ environmentId, label: `saved-${index}` }),
+        );
+        const harness = yield* makeHarness(targets, [], [], { initialDisabled: [ids[3]!] });
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.start;
+          const snapshot = linkedSnapshot(
+            ids.map((environmentId, index) => ({ environmentId, label: `discovered-${index}` })),
+          );
+          yield* registry.reconcileDiscovered!(snapshot);
+          const firstSessionCount = (yield* Ref.get(harness.sessions)).length;
+          yield* registry.reconcileDiscovered!(snapshot);
+          expect(yield* Ref.get(harness.storedTargets)).toEqual(targets);
+          expect((yield* Ref.get(harness.sessions)).length).toBe(firstSessionCount);
+          expect((yield* SubscriptionRef.get(registry.entries)).get(ids[3]!)?.enabled).toBe(false);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+  );
+
+  it.effect(
+    "keeps persisted disabled relay and independent routes until authenticated discovery settles",
+    () =>
+      Effect.gen(function* () {
+        const disabledId = EnvironmentId.make("persisted-disabled-relay");
+        const disabledRelay = new RelayConnectionTarget({
+          environmentId: disabledId,
+          label: "Disabled linked host",
+        });
+        const manualId = TARGET.environmentId;
+        const harness = yield* makeHarness([disabledRelay, TARGET], [], [], {
+          initialDisabled: [disabledId],
+        });
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.start;
+          const authenticatedSnapshot = yield* SubscriptionRef.make<
+            Option.Option<RelayEnvironmentDiscovery.AuthenticatedRelayEnvironmentSnapshot>
+          >(Option.none());
+          const relayCleanupAuthorized = yield* SubscriptionRef.make(false);
+          const state = yield* SubscriptionRef.make({
+            ...RelayEnvironmentDiscovery.EMPTY_RELAY_ENVIRONMENT_DISCOVERY_STATE,
+            refreshing: true,
+            offline: true,
+          });
+          const discovery = RelayEnvironmentDiscovery.RelayEnvironmentDiscovery.of({
+            state,
+            authenticatedSnapshot,
+            relayCleanupAuthorized,
+            refresh: Effect.void,
+          });
+          yield* watchDiscoveredEnvironments().pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, registry),
+                Layer.succeed(RelayEnvironmentDiscovery.RelayEnvironmentDiscovery, discovery),
+              ),
+            ),
+            Effect.forkScoped,
+          );
+
+          // The first authenticated list includes the disabled existing link
+          // and a new linked environment. It must leave the former disabled.
+          const addedId = EnvironmentId.make("new-linked-host");
+          yield* SubscriptionRef.set(
+            authenticatedSnapshot,
+            Option.some(
+              linkedSnapshot([
+                { environmentId: disabledId, label: "Disabled linked host" },
+                { environmentId: addedId, label: "New linked host" },
+              ]),
+            ),
+          );
+          yield* awaitConnectionState(
+            registry,
+            addedId,
+            (current) => current.phase === "connected",
+          );
+          const entries = yield* SubscriptionRef.get(registry.entries);
+          expect(entries.get(disabledId)?.enabled).toBe(false);
+          expect(entries.has(manualId)).toBe(true);
+          expect(entries.has(addedId)).toBe(true);
+          expect(yield* Ref.get(harness.storedTargets)).toContain(disabledRelay);
+          expect(yield* Ref.get(harness.storedTargets)).toContain(TARGET);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
+  );
+
+  it("does not add insecure NetBird-style HTTP routes to a secure browser connection", () => {
+    const entry: ConnectionCatalogEntry = {
+      target: RELAY_TARGET,
+      profile: Option.none(),
+      enabled: true,
+    };
+    const routes = mergeLearnedRoutes({
+      entry,
+      activeRoute: connectionRoutes(entry)[0]!,
+      reported: [{ httpBaseUrl: "http://100.96.19.71:3773/" }],
+      allowInsecure: false,
+    });
+    expect(routes).toBeNull();
+  });
+
+  it.effect(
+    "does not resurrect an authenticated relay route after persistence crosses an account change",
+    () =>
+      Effect.gen(function* () {
+        const enteredRegistration = yield* Deferred.make<void>();
+        const releaseRegistration = yield* Deferred.make<void>();
+        const isCurrentRef = yield* Ref.make(true);
+        const target = new RelayConnectionTarget({
+          environmentId: EnvironmentId.make("late-account-route"),
+          label: "Stale owner route",
+        });
+        const harness = yield* makeHarness([], [], [], {
+          beforeRegistrationRegister: (registration) =>
+            registration._tag === "RelayConnectionRegistration"
+              ? Deferred.succeed(enteredRegistration, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseRegistration)),
+                )
+              : Effect.void,
+        });
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+          yield* registry.start;
+          const snapshot = linkedSnapshot(
+            [{ environmentId: target.environmentId, label: "Stale owner route" }],
+            () => Ref.get(isCurrentRef),
+          );
+          const reconcileFiber = yield* Effect.forkChild(registry.reconcileDiscovered!(snapshot));
+          yield* Deferred.await(enteredRegistration);
+          yield* Ref.set(isCurrentRef, false);
+          // Cleanup enumerates before the in-flight persistence becomes visible.
+          // The enrollment's lease and generation recheck must still prevent a
+          // stale route from appearing after this sign-out cleanup completes.
+          yield* registry.removeRelayEnvironments();
+          yield* Deferred.succeed(releaseRegistration, undefined);
+          yield* Fiber.join(reconcileFiber);
+          const entry = (yield* SubscriptionRef.get(registry.entries)).get(target.environmentId);
+          expect(entry).toBeUndefined();
+          expect(routesOf(yield* Ref.get(harness.storedTargets), target.environmentId)).toEqual([]);
+          expect(yield* Ref.get(harness.sessions)).toHaveLength(0);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
   );
 
   it.effect("only a fresh health check for the rejected environment unlocks it", () =>

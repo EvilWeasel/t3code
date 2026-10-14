@@ -72,6 +72,45 @@ export const watchDiscoveredCompatibility = Effect.fn("connection.watchDiscovere
   },
 );
 
+export const watchDiscoveredEnvironments = Effect.fn("connection.watchDiscoveredEnvironments")(
+  function* () {
+    const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+    const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
+    const snapshots = discovery.authenticatedSnapshot;
+    if (snapshots === undefined) return;
+    const cleanupAuthorized = discovery.relayCleanupAuthorized;
+    yield* Stream.concat(
+      Stream.succeed(undefined),
+      Stream.merge(
+        SubscriptionRef.changes(snapshots).pipe(Stream.as(undefined)),
+        cleanupAuthorized === undefined
+          ? Stream.empty
+          : SubscriptionRef.changes(cleanupAuthorized).pipe(Stream.as(undefined)),
+      ),
+    ).pipe(
+      Stream.runForEach(() =>
+        Effect.gen(function* () {
+          const snapshot = yield* SubscriptionRef.get(snapshots);
+          if (Option.isNone(snapshot)) {
+            if (
+              cleanupAuthorized !== undefined &&
+              (yield* SubscriptionRef.get(cleanupAuthorized))
+            ) {
+              yield* registry.removeRelayEnvironments();
+            }
+          } else if (registry.reconcileDiscovered !== undefined) {
+            yield* registry.reconcileDiscovered(snapshot.value);
+          }
+        }).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Could not reconcile linked relay environments.", { error }),
+          ),
+        ),
+      ),
+    );
+  },
+);
+
 export function layerWithOptions(options: RpcSession.RpcSessionOptions) {
   const layerDriver = ConnectionDriver.layer.pipe(
     Layer.provide(Layer.mergeAll(ConnectionResolver.layer, RpcSession.layer(options))),
@@ -91,6 +130,11 @@ export function layerWithOptions(options: RpcSession.RpcSessionOptions) {
       const platformSource = yield* PlatformConnectionSource.PlatformConnectionSource;
       yield* watchDiscoveredCompatibility().pipe(Effect.forkScoped);
       yield* registry.start;
+      yield* watchDiscoveredEnvironments().pipe(Effect.forkScoped);
+      // Populate linked environments on cold start without waiting for a UI
+      // surface to request discovery. The watcher is already subscribed.
+      const discovery = yield* RelayEnvironmentDiscovery.RelayEnvironmentDiscovery;
+      yield* discovery.refresh;
       yield* platformSource.registrations.pipe(
         Stream.runForEach(registry.reconcilePlatform),
         Effect.forkScoped,
