@@ -407,6 +407,7 @@ export const layer: Layer.Layer<
             row.planner_native_thread_id !== input.plannerNativeThreadId ||
             (row.status !== "active" && row.status !== "starting") ||
             lease?.plannerNativeThreadId !== input.plannerNativeThreadId ||
+            lease.runtime.liveVoice === undefined ||
             lease.runtime.driver !== "codex" ||
             lease.runtime.instanceId !== row.provider_instance_id ||
             lease.runtime.providerSessionId !== row.provider_session_id
@@ -471,10 +472,10 @@ export const layer: Layer.Layer<
           `;
           if (afterClaim[0]?.receipt_json !== claimed) return;
           const state = yield* Effect.exit(
-            lease.runtime.liveVoice?.appendSpeech({
+            lease.runtime.liveVoice.appendSpeech({
               plannerNativeThreadId: input.plannerNativeThreadId,
               text: input.text.slice(0, 3_800),
-            }) ?? Effect.fail(liveError("runtime_unavailable")),
+            }),
           );
           // appendSpeech has no idempotency key: any outcome after claim is terminal.
           const settled = encodeReceipt({
