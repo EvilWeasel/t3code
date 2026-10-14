@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import {
   AuthOrchestrationOperateScope,
   AuthSessionId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
   type OrchestrationV2StoredEvent,
@@ -17,6 +18,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SessionStore from "../auth/SessionStore.ts";
@@ -27,6 +29,15 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as CodexLiveSessionService from "./CodexLiveSessionService.ts";
+
+const decodeJson = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
+const readbackState = (json: string) => {
+  const decoded = decodeJson(json);
+  if (typeof decoded !== "object" || decoded === null) return undefined;
+  const readback = (decoded as Record<string, unknown>).readback;
+  if (typeof readback !== "object" || readback === null) return undefined;
+  return (readback as Record<string, unknown>).state;
+};
 
 it.effect(
   "uses the native planner, gates active on both notifications, and queues one durable work intent",
@@ -59,15 +70,7 @@ it.effect(
         resolveSpeech = resolve;
       });
       let gateReadResolvers: Array<() => void> = [];
-      let durableProjection = {
-        ...projection,
-        runs: [],
-        attempts: [],
-        nodes: [],
-        subagents: [],
-        checkpoints: [],
-        messages: [],
-      } as unknown as OrchestrationV2ThreadProjection;
+      let durableProjection: OrchestrationV2ThreadProjection;
       const t3EventQueues = new Map([
         ["run.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
         ["subagent.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
@@ -112,7 +115,12 @@ it.effect(
               appendAttempts += 1;
               resolveAppendAttempt?.();
               if (appendSpeechFails)
-                return yield* Effect.fail(new Error("ambiguous native acknowledgement"));
+                return yield* Effect.fail(
+                  new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: ProviderDriverKind.make("codex"),
+                    detail: "Ambiguous native append acknowledgement.",
+                  }),
+                );
               spoken.push(input);
               resolveSpeech?.();
             }),
@@ -153,6 +161,15 @@ it.effect(
           { id: ProviderSessionId.make("provider-session-test"), providerInstanceId },
         ],
       };
+      durableProjection = {
+        ...projection,
+        runs: [],
+        attempts: [],
+        nodes: [],
+        subagents: [],
+        checkpoints: [],
+        messages: [],
+      } as unknown as OrchestrationV2ThreadProjection;
       const policy = {
         runtimeMode: "approval-required",
         interactionMode: "default",
@@ -418,7 +435,7 @@ it.effect(
         durableProjection = {
           ...durableProjection,
           subagents: [{ ...durableProjection.subagents[0]!, status: "completed" }],
-        };
+        } as unknown as OrchestrationV2ThreadProjection;
         const childGateRead = waitForGateRead();
         yield* Queue.offer(
           t3EventQueues.get("subagent.updated")!,
@@ -454,7 +471,7 @@ it.effect(
               capturedAt: "2026-10-14T00:00:03.000Z",
             },
           ],
-        };
+        } as unknown as OrchestrationV2ThreadProjection;
         const checkpointGateRead = waitForGateRead();
         yield* Queue.offer(
           t3EventQueues.get("checkpoint.captured")!,
@@ -482,7 +499,7 @@ it.effect(
           WHERE lease_id = ${prepared.leaseId} AND generation = ${prepared.generation}
             AND planner_turn_id = ${"planner-turn-1"}
         `;
-        assert.equal(JSON.parse(sentReceipt[0]!.receipt_json).readback.state, "sent");
+        assert.equal(readbackState(sentReceipt[0]!.receipt_json), "sent");
         speechObserved = new Promise<void>((resolve) => {
           resolveSpeech = resolve;
         });
@@ -507,7 +524,7 @@ it.effect(
               capturedAt: "2026-10-14T00:00:03.000Z",
             },
           ],
-        };
+        } as unknown as OrchestrationV2ThreadProjection;
         const ambiguousGateRead = waitForGateRead();
         yield* Queue.offer(
           t3EventQueues.get("run.updated")!,
@@ -535,7 +552,7 @@ it.effect(
           WHERE lease_id = ${prepared.leaseId} AND generation = ${prepared.generation}
             AND planner_turn_id = ${"planner-turn-2"}
         `;
-        assert.equal(JSON.parse(unknownReceipt[0]!.receipt_json).readback.state, "unknown");
+        assert.equal(readbackState(unknownReceipt[0]!.receipt_json), "unknown");
         appendAttemptObserved = new Promise<void>((resolve) => {
           resolveAppendAttempt = resolve;
         });

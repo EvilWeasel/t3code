@@ -18,7 +18,7 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as Either from "effect/Either";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -66,6 +66,7 @@ const encodeRuntimePolicy = Schema.encodeSync(
   Schema.fromJsonString(ProviderAdapter.ProviderAdapterV2RuntimePolicy),
 );
 const encodeReceipt = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeReceipt = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
 const sessionFromRow = (row: LeaseRow): LiveVoiceSession => ({
   leaseId: row.lease_id,
   generation: row.generation,
@@ -443,7 +444,7 @@ export const layer: Layer.Layer<
           `;
           const stored = intents[0]?.receipt_json;
           if (stored === undefined || stored === null) return;
-          const receipt = JSON.parse(stored) as Record<string, unknown>;
+          const receipt = decodeReceipt(stored) as Record<string, unknown>;
           if (receipt.runId !== input.runId || receipt.readback !== undefined) return;
           const claimed = encodeReceipt({
             ...receipt,
@@ -469,7 +470,7 @@ export const layer: Layer.Layer<
               AND planner_turn_id = ${input.plannerTurnId} AND dispatch_state = 'admitted'
           `;
           if (afterClaim[0]?.receipt_json !== claimed) return;
-          const state = yield* Effect.either(
+          const state = yield* Effect.exit(
             lease.runtime.liveVoice?.appendSpeech({
               plannerNativeThreadId: input.plannerNativeThreadId,
               text: input.text.slice(0, 3_800),
@@ -479,7 +480,7 @@ export const layer: Layer.Layer<
           const settled = encodeReceipt({
             ...receipt,
             readback: {
-              state: Either.isRight(state) ? "sent" : "unknown",
+              state: Exit.isSuccess(state) ? "sent" : "unknown",
               runId: input.runId,
               attemptId: input.attemptId,
               finalMessageId: input.finalMessageId,
@@ -938,7 +939,7 @@ export const layer: Layer.Layer<
             return yield* liveError("dispatch_conflict");
           }
           if (intent.dispatch_state === "admitted" && intent.receipt_json !== null) {
-            const priorReceipt = JSON.parse(intent.receipt_json) as Record<string, unknown>;
+            const priorReceipt = decodeReceipt(intent.receipt_json) as Record<string, unknown>;
             return encodeReceipt({
               accepted: priorReceipt.accepted,
               delivery: priorReceipt.delivery,
