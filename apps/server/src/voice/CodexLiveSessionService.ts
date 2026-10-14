@@ -12,11 +12,14 @@ import {
   type LiveVoiceStartInput,
   type LiveVoiceStopInput,
   type LiveVoiceSubscribeInput,
+  type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -63,6 +66,7 @@ const encodeRuntimePolicy = Schema.encodeSync(
   Schema.fromJsonString(ProviderAdapter.ProviderAdapterV2RuntimePolicy),
 );
 const encodeReceipt = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeReceipt = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
 const sessionFromRow = (row: LeaseRow): LiveVoiceSession => ({
   leaseId: row.lease_id,
   generation: row.generation,
@@ -127,6 +131,7 @@ export const layer: Layer.Layer<
     const crypto = yield* Crypto.Crypto;
     const serviceScope = yield* Effect.scope;
     const leaseLocks = yield* KeyedLock.make<string>();
+    const readbackWorkers = new Map<string, Fiber.Fiber<void, never>>();
     const active = new Map<
       string,
       {
@@ -195,6 +200,301 @@ export const layer: Layer.Layer<
         yield* eventHub.publish({ type: "status", session });
         return { row: next, session };
       });
+
+    const readbackWorkerKey = (leaseId: string, generation: number, plannerTurnId: string) =>
+      `${leaseId}:${generation}:${plannerTurnId}`;
+
+    const readbackResult = (projection: OrchestrationV2ThreadProjection, runId: string) => {
+      const run = projection.runs.find((candidate) => candidate.id === runId);
+      if (
+        run === undefined ||
+        run.status !== "completed" ||
+        run.rootNodeId === null ||
+        run.checkpointId === null
+      )
+        return undefined;
+      const attempts = projection.attempts.filter(
+        (attempt) => attempt.runId === runId && attempt.status === "completed",
+      );
+      if (
+        attempts.length !== 1 ||
+        run.activeAttemptId !== attempts[0]!.id ||
+        attempts[0]!.providerTurnId === null
+      )
+        return undefined;
+      const resultNodeIds = new Set(
+        projection.nodes
+          .filter(
+            (node) =>
+              node.rootNodeId === run.rootNodeId &&
+              node.providerTurnId === attempts[0]!.providerTurnId &&
+              node.kind === "assistant_message" &&
+              node.status === "completed",
+          )
+          .map((node) => node.id),
+      );
+      const finalMessages = projection.messages.filter(
+        (message) =>
+          message.runId === runId &&
+          message.role === "assistant" &&
+          message.nodeId !== null &&
+          resultNodeIds.has(message.nodeId) &&
+          !message.streaming &&
+          message.text.trim().length > 0,
+      );
+      if (finalMessages.length !== 1) return undefined;
+      const checkpoint = projection.checkpoints.find(
+        (candidate) => candidate.id === run.checkpointId && candidate.runId === runId,
+      );
+      if (checkpoint?.status !== "ready") return undefined;
+      if (
+        projection.subagents.some((child) => child.runId === runId && child.status !== "completed")
+      )
+        return undefined;
+      return {
+        attemptId: attempts[0]!.id,
+        finalMessageId: finalMessages[0]!.id,
+        text: finalMessages[0]!.text.trim(),
+      };
+    };
+
+    const inspectReadback = (projection: OrchestrationV2ThreadProjection, runId: string) => {
+      const run = projection.runs.find((candidate) => candidate.id === runId);
+      if (
+        run === undefined ||
+        ["preparing", "queued", "starting", "running", "waiting"].includes(run.status)
+      )
+        return { type: "pending" } as const;
+      if (run.status !== "completed" || run.rootNodeId === null || run.checkpointId === null) {
+        return { type: "blocked" } as const;
+      }
+      const children = projection.subagents.filter((child) => child.runId === runId);
+      if (children.some((child) => child.status !== "completed")) {
+        return children.some((child) =>
+          ["idle", "pending", "running", "waiting"].includes(child.status),
+        )
+          ? ({ type: "pending" } as const)
+          : ({ type: "blocked" } as const);
+      }
+      const checkpoint = projection.checkpoints.find(
+        (candidate) => candidate.id === run.checkpointId && candidate.runId === runId,
+      );
+      if (checkpoint === undefined) return { type: "pending" } as const;
+      if (checkpoint.status !== "ready") return { type: "blocked" } as const;
+      const result = readbackResult(projection, runId);
+      if (result === undefined) return { type: "blocked" } as const;
+      return { type: "ready", ...result } as const;
+    };
+
+    function startReadbackWorker(input: {
+      readonly leaseId: string;
+      readonly generation: number;
+      readonly threadId: LiveVoiceSession["threadId"];
+      readonly projectId: OrchestrationV2ThreadProjection["thread"]["projectId"];
+      readonly plannerNativeThreadId: string;
+      readonly plannerTurnId: string;
+      readonly runId: string;
+    }): Effect.Effect<void> {
+      return Effect.gen(function* () {
+        const key = readbackWorkerKey(input.leaseId, input.generation, input.plannerTurnId);
+        if (readbackWorkers.has(key)) return;
+        const worker = Effect.gen(function* () {
+          const afterSequence = yield* threads.getThreadEventSequence(input.threadId);
+          const readProjection = () =>
+            threads.getProjectThread({ projectId: input.projectId, threadId: input.threadId });
+          const first = inspectReadback(yield* readProjection(), input.runId);
+          if (first.type === "ready") {
+            yield* appendDurableFinal({
+              ...input,
+              attemptId: first.attemptId,
+              finalMessageId: first.finalMessageId,
+              text: first.text,
+            });
+            return;
+          }
+          if (first.type === "blocked") return;
+          const eventTypes = [
+            "run.updated",
+            "subagent.updated",
+            "checkpoint.captured",
+            "message.updated",
+          ] as const;
+          const result = yield* Stream.mergeAll(
+            eventTypes.map((eventType) =>
+              threads.streamStoredEventsFrom({
+                threadId: input.threadId,
+                afterSequence,
+                eventType,
+              }),
+            ),
+            { concurrency: "unbounded" },
+          ).pipe(
+            Stream.filter((stored) => {
+              const event = stored.event;
+              switch (event.type) {
+                case "run.updated":
+                  return event.payload.id === input.runId;
+                case "checkpoint.captured":
+                case "message.updated":
+                case "subagent.updated":
+                  return event.payload.runId === input.runId;
+                default:
+                  return false;
+              }
+            }),
+            Stream.mapEffect(() =>
+              readProjection().pipe(
+                Effect.map((projection) => inspectReadback(projection, input.runId)),
+              ),
+            ),
+            Stream.filter((gate) => gate.type !== "pending"),
+            Stream.runHead,
+          );
+          if (Option.isNone(result) || result.value.type !== "ready") return;
+          yield* appendDurableFinal({
+            ...input,
+            attemptId: result.value.attemptId,
+            finalMessageId: result.value.finalMessageId,
+            text: result.value.text,
+          });
+        }).pipe(Effect.catchCause(() => Effect.void));
+        const fiber = yield* Effect.forkIn(worker, serviceScope);
+        readbackWorkers.set(key, fiber);
+        yield* Effect.forkIn(
+          Fiber.await(fiber).pipe(
+            Effect.tap(() =>
+              Effect.sync(() => {
+                if (readbackWorkers.get(key) === fiber) readbackWorkers.delete(key);
+              }),
+            ),
+          ),
+          serviceScope,
+        );
+      });
+    }
+
+    const stopReadbackWorkers = (leaseId: string, generation: number) =>
+      Effect.forEach(
+        [...readbackWorkers.entries()].filter(([key]) =>
+          key.startsWith(`${leaseId}:${generation}:`),
+        ),
+        ([key, fiber]) =>
+          Fiber.interrupt(fiber).pipe(
+            Effect.tap(() => Effect.sync(() => readbackWorkers.delete(key))),
+          ),
+        { discard: true },
+      );
+
+    const appendDurableFinal = (input: {
+      readonly leaseId: string;
+      readonly generation: number;
+      readonly threadId: LiveVoiceSession["threadId"];
+      readonly projectId: OrchestrationV2ThreadProjection["thread"]["projectId"];
+      readonly plannerNativeThreadId: string;
+      readonly plannerTurnId: string;
+      readonly runId: string;
+      readonly attemptId: string;
+      readonly finalMessageId: string;
+      readonly text: string;
+    }) =>
+      leaseLocks.withLock(
+        leaseKey(input.leaseId, input.generation),
+        Effect.gen(function* () {
+          const row = yield* getLease(input.leaseId, input.generation);
+          const lease = active.get(leaseKey(input.leaseId, input.generation));
+          if (
+            row === undefined ||
+            row.planner_native_thread_id !== input.plannerNativeThreadId ||
+            (row.status !== "active" && row.status !== "starting") ||
+            lease?.plannerNativeThreadId !== input.plannerNativeThreadId ||
+            lease.runtime.liveVoice === undefined ||
+            lease.runtime.driver !== "codex" ||
+            lease.runtime.instanceId !== row.provider_instance_id ||
+            lease.runtime.providerSessionId !== row.provider_session_id
+          )
+            return;
+          const activePrincipals = yield* authSessions
+            .listActive()
+            .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
+          if (
+            !activePrincipals.some(
+              (principal) =>
+                principal.sessionId === row.principal_session_id &&
+                principal.subject === row.principal_subject &&
+                principal.scopes.includes(AuthOrchestrationOperateScope),
+            )
+          )
+            return;
+          const latestProjection = yield* threads.getProjectThread({
+            projectId: input.projectId,
+            threadId: input.threadId,
+          });
+          const latestFinal = readbackResult(latestProjection, input.runId);
+          if (
+            latestFinal === undefined ||
+            latestFinal.attemptId !== input.attemptId ||
+            latestFinal.finalMessageId !== input.finalMessageId ||
+            latestFinal.text !== input.text
+          )
+            return;
+          const intents = yield* sql<{ receipt_json: string | null }>`
+            SELECT receipt_json FROM codex_live_voice_intents
+            WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
+              AND planner_native_thread_id = ${input.plannerNativeThreadId}
+              AND planner_turn_id = ${input.plannerTurnId} AND dispatch_state = 'admitted'
+          `;
+          const stored = intents[0]?.receipt_json;
+          if (stored === undefined || stored === null) return;
+          const receipt = decodeReceipt(stored) as Record<string, unknown>;
+          if (receipt.runId !== input.runId || receipt.readback !== undefined) return;
+          const claimed = encodeReceipt({
+            ...receipt,
+            readback: {
+              state: "claimed",
+              runId: input.runId,
+              attemptId: input.attemptId,
+              finalMessageId: input.finalMessageId,
+            },
+          });
+          const now = DateTime.formatIso(yield* DateTime.now);
+          yield* sql`
+            UPDATE codex_live_voice_intents SET receipt_json = ${claimed}, updated_at = ${now}
+            WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
+              AND planner_native_thread_id = ${input.plannerNativeThreadId}
+              AND planner_turn_id = ${input.plannerTurnId} AND dispatch_state = 'admitted'
+              AND receipt_json = ${stored}
+          `;
+          const afterClaim = yield* sql<{ receipt_json: string | null }>`
+            SELECT receipt_json FROM codex_live_voice_intents
+            WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
+              AND planner_native_thread_id = ${input.plannerNativeThreadId}
+              AND planner_turn_id = ${input.plannerTurnId} AND dispatch_state = 'admitted'
+          `;
+          if (afterClaim[0]?.receipt_json !== claimed) return;
+          const state = yield* Effect.exit(
+            lease.runtime.liveVoice.appendSpeech({
+              plannerNativeThreadId: input.plannerNativeThreadId,
+              text: input.text.slice(0, 3_800),
+            }),
+          );
+          // appendSpeech has no idempotency key: any outcome after claim is terminal.
+          const settled = encodeReceipt({
+            ...receipt,
+            readback: {
+              state: Exit.isSuccess(state) ? "sent" : "unknown",
+              runId: input.runId,
+              attemptId: input.attemptId,
+              finalMessageId: input.finalMessageId,
+            },
+          });
+          yield* sql`
+            UPDATE codex_live_voice_intents SET receipt_json = ${settled}, updated_at = ${now}
+            WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
+              AND planner_native_thread_id = ${input.plannerNativeThreadId}
+              AND planner_turn_id = ${input.plannerTurnId} AND receipt_json = ${claimed}
+          `;
+        }),
+      );
 
     const markUnknown = (leaseId: string, generation: number) =>
       Effect.gen(function* () {
@@ -504,6 +804,7 @@ export const layer: Layer.Layer<
             WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
           `,
             );
+            yield* stopReadbackWorkers(input.leaseId, input.generation);
             const lease = active.get(leaseKey(input.leaseId, input.generation));
             const runtime =
               lease?.runtime ??
@@ -639,7 +940,12 @@ export const layer: Layer.Layer<
             return yield* liveError("dispatch_conflict");
           }
           if (intent.dispatch_state === "admitted" && intent.receipt_json !== null) {
-            return intent.receipt_json;
+            const priorReceipt = decodeReceipt(intent.receipt_json) as Record<string, unknown>;
+            return encodeReceipt({
+              accepted: priorReceipt.accepted,
+              delivery: priorReceipt.delivery,
+              runId: priorReceipt.runId,
+            });
           }
           const projection = yield* threads
             .getProjectThread({
@@ -701,6 +1007,15 @@ export const layer: Layer.Layer<
             AND planner_native_thread_id = ${input.plannerNativeThreadId}
             AND planner_turn_id = ${input.plannerTurnId} AND submit_slot = 0
         `;
+          yield* startReadbackWorker({
+            leaseId: input.leaseId,
+            generation: input.generation,
+            threadId: currentRow.thread_id as LiveVoiceSession["threadId"],
+            projectId: projection.thread.projectId,
+            plannerNativeThreadId: input.plannerNativeThreadId,
+            plannerTurnId: input.plannerTurnId,
+            runId: result.run.id,
+          });
           return receipt;
         }),
       );
@@ -766,6 +1081,7 @@ export const layer: Layer.Layer<
             return;
           case "closed":
             yield* updateStatus(row, "closed");
+            yield* stopReadbackWorkers(leaseId, generation);
             active.delete(leaseKey(leaseId, generation));
             return;
           case "transcript":
