@@ -9,8 +9,13 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 
 export function VoiceTranscriptionSettingsPanel() {
-  const { target } = useSettingsScope();
-  const environmentId = target?.environmentId;
+  const { target, scope } = useSettingsScope();
+  // A representative target in global/project scope is not authorization to
+  // choose a host for account credentials. Require one explicit environment.
+  const environmentId =
+    scope.kind === "environment" && target?.environmentId === scope.environmentId
+      ? scope.environmentId
+      : undefined;
   const [settings, setSettings] = useState<typeof VoiceTranscriptionSettings.Type | null>(null);
   const [provider, setProvider] = useState<"codex-account" | "openai-api">("codex-account");
   const [instanceId, setInstanceId] = useState("");
@@ -67,12 +72,22 @@ export function VoiceTranscriptionSettingsPanel() {
       if (generationRef.current === generation) setBusy(false);
     }
   };
+  if (scope.kind !== "environment") {
+    return (
+      <SettingsSection id="voice" title="Voice transcription">
+        <p role="status">
+          Select one environment in the settings header to configure its voice provider and
+          credentials.
+        </p>
+      </SettingsSection>
+    );
+  }
   return (
     <SettingsSection id="voice" title="Voice transcription">
       <SettingsRow
         {...searchableSetting("voice-transcription")}
         title="Transcription provider"
-        description="Applies to the selected environment. Reviewed recordings stay in their original draft while you change settings."
+        description={`Applies to ${scope.label}. Reviewed recordings stay in their original draft while you change settings.`}
       >
         <select
           aria-label="Voice transcription provider"

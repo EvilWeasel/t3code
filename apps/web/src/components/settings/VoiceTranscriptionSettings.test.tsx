@@ -1,12 +1,23 @@
 import { act, type ReactNode } from "react";
 import { create, type ReactTestRenderer } from "react-test-renderer";
-import { afterEach, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import type { VoiceTranscriptionSettings } from "@t3tools/contracts";
 
-const state = vi.hoisted(() => ({ environmentId: "environment-a", request: vi.fn() }));
+const state = vi.hoisted(() => ({
+  environmentId: "environment-a",
+  scopeKind: "environment" as "environment" | "all" | "project" | "checkout",
+  request: vi.fn(),
+}));
 vi.mock("../../voice/voiceSettingsClient", () => ({ voiceSettingsRequest: state.request }));
 vi.mock("./SettingsScopeContext", () => ({
-  useSettingsScope: () => ({ target: { environmentId: state.environmentId } }),
+  useSettingsScope: () => ({
+    target: { environmentId: state.environmentId },
+    scope: {
+      kind: state.scopeKind,
+      environmentId: state.environmentId,
+      label: `Host ${state.environmentId}`,
+    },
+  }),
 }));
 vi.mock("../../state/session", () => ({ readEnvironmentScope: () => true }));
 vi.mock("./settingsSearch", () => ({ searchableSetting: () => ({}) }));
@@ -30,6 +41,12 @@ vi.mock("../ui/input", async () => {
 import { VoiceTranscriptionSettingsPanel } from "./VoiceTranscriptionSettings";
 
 let renderer: ReactTestRenderer | undefined;
+beforeEach(() => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  state.environmentId = "environment-a";
+  state.scopeKind = "environment";
+  state.request.mockReset();
+});
 afterEach(() => {
   act(() => renderer?.unmount());
   renderer = undefined;
@@ -44,6 +61,36 @@ const settings = (model: string): typeof VoiceTranscriptionSettings.Type => ({
   available: true,
   message: "Configured",
   instances: [],
+});
+
+it.each(["all", "project", "checkout"] as const)(
+  "does not read or write a representative host in %s scope",
+  async (kind) => {
+    state.scopeKind = kind;
+    await act(async () => {
+      renderer = create(<VoiceTranscriptionSettingsPanel />);
+    });
+    expect(state.request).not.toHaveBeenCalled();
+    expect(renderer!.root.findAllByType("button")).toHaveLength(0);
+    expect(renderer!.root.findByProps({ role: "status" }).children.join("")).toContain(
+      "Select one environment",
+    );
+  },
+);
+
+it("names the explicit host and sends reads and changes only to that host", async () => {
+  state.request.mockResolvedValue(settings("model-a"));
+  await act(async () => {
+    renderer = create(<VoiceTranscriptionSettingsPanel />);
+  });
+  expect(JSON.stringify(renderer!.toJSON())).toContain("Host environment-a");
+  await act(async () => {
+    renderer!.root.findByType("button").props.onClick();
+  });
+  expect(state.request.mock.calls.map((call) => call[0])).toEqual([
+    "environment-a",
+    "environment-a",
+  ]);
 });
 
 it("ignores a saved response from a host after the settings target changes", async () => {
