@@ -25,7 +25,14 @@ export async function readFleetConnections(environmentId: EnvironmentId) {
         prepared: prepared.value,
         signer,
         remoteAuthorization,
-      });
+      }).pipe(
+        Effect.catch((error) =>
+          error._tag === "EnvironmentResourceNotFoundError" ||
+          (error._tag === "RemoteEnvironmentAuthUndeclaredStatusError" && error.status === 404)
+            ? Effect.succeed({ connections: [] })
+            : Effect.fail(error),
+        ),
+      );
     }).pipe(Effect.withTracerEnabled(false)),
   );
   appAtomRegistry.set(request, undefined);

@@ -56,7 +56,9 @@ function connectFleet(primary: EnvironmentId) {
         if (grant.environmentId !== peer.environmentId || grant.httpBaseUrl !== peer.httpBaseUrl) {
           throw new Error("Fleet pairing target changed.");
         }
-        if (appAtomRegistry.get(environmentCatalog.catalogValueAtom).entries.has(peer.environmentId)) {
+        if (
+          appAtomRegistry.get(environmentCatalog.catalogValueAtom).entries.has(peer.environmentId)
+        ) {
           acknowledged.remember(peer.environmentId);
           return;
         }
@@ -92,8 +94,9 @@ export function FleetConnectionBootstrap() {
         }
       })
       .catch(() => {
-        // Older servers have no fleet endpoint; ordinary manual connections still work.
         attempts.delete(primary);
+        if (active)
+          toastManager.add({ type: "error", title: "Could not load configured environments" });
       });
     return () => {
       active = false;

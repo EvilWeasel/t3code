@@ -115,9 +115,24 @@ it("rejects a changed grant target without redeeming its code", async () => {
 it("lets a saved disabled connection created during the grant request win", async () => {
   state.grant.mockImplementation(async () => {
     state.catalog.entries.set("nixy", { enabled: false });
-    return { environmentId: "nixy", httpBaseUrl: "https://nixy.example.test/", credential: "unused" };
+    return {
+      environmentId: "nixy",
+      httpBaseUrl: "https://nixy.example.test/",
+      credential: "unused",
+    };
   });
   await mount();
   expect(state.connect).not.toHaveBeenCalled();
   expect(state.toast).not.toHaveBeenCalled();
+});
+
+it("shows manifest failures without rendering private service errors", async () => {
+  state.read.mockRejectedValue(new Error("private-catalog-material"));
+  await mount();
+  expect(state.connect).not.toHaveBeenCalled();
+  expect(state.toast).toHaveBeenCalledWith({
+    type: "error",
+    title: "Could not load configured environments",
+  });
+  expect(JSON.stringify(state.toast.mock.calls)).not.toContain("private-catalog-material");
 });
