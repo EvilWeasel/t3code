@@ -1,9 +1,9 @@
-import * as NodeCrypto from "node:crypto";
 import {
   AuthOrchestrationOperateScope,
   CommandId,
   LiveVoiceError,
   MessageId,
+  ModelSelection,
   ProviderSessionId,
   type LiveVoiceEvent,
   type LiveVoicePrepareInput,
@@ -13,9 +13,13 @@ import {
   type LiveVoiceSubscribeInput,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import * as SqlError from "effect/sql/SqlError";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
@@ -53,6 +57,11 @@ type LeaseRow = {
 };
 
 const leaseKey = (leaseId: string, generation: number) => `${leaseId}:${generation}`;
+const encodeModelSelection = Schema.encodeSync(Schema.fromJsonString(ModelSelection));
+const encodeRuntimePolicy = Schema.encodeSync(
+  Schema.fromJsonString(ProviderAdapter.ProviderAdapterV2RuntimePolicy),
+);
+const encodeReceipt = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const sessionFromRow = (row: LeaseRow): LiveVoiceSession => ({
   leaseId: row.lease_id,
   generation: row.generation,
@@ -102,7 +111,8 @@ export const layer: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | ThreadManagementService.ThreadManagementService
   | ProviderInstanceRegistry.ProviderInstanceRegistry
-> = Layer.effect(
+  | Crypto.Crypto
+> = Layer.scoped(
   CodexLiveSessionService,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -113,6 +123,8 @@ export const layer: Layer.Layer<
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
     const eventHub = yield* CodexLiveEventHub.CodexLiveEventHub;
+    const crypto = yield* Crypto.Crypto;
+    const serviceScope = yield* Effect.scope;
     const leaseLocks = yield* KeyedLock.make<string>();
     const active = new Map<
       string,
@@ -163,10 +175,10 @@ export const layer: Layer.Layer<
     const updateStatus = (
       row: LeaseRow,
       status: LiveVoiceSession["status"],
-      additionalSql?: (now: string) => Effect.Effect<unknown>,
+      additionalSql?: (now: string) => Effect.Effect<unknown, SqlError.SqlError>,
     ) =>
       Effect.gen(function* () {
-        const now = new Date().toISOString();
+        const now = DateTime.formatIso(yield* DateTime.now);
         const next = yield* sql.withTransaction(
           Effect.gen(function* () {
             yield* sql`
@@ -189,62 +201,68 @@ export const layer: Layer.Layer<
         if (row !== undefined) yield* updateStatus(row, "unknown");
       });
 
+    const toLiveError = (error: unknown) =>
+      Schema.is(LiveVoiceError)(error) ? error : liveError("runtime_unavailable");
+
     const prepare: CodexLiveSessionService["Service"]["prepare"] = (session, input) =>
-      leaseLocks.withLock(
-        `request:${session.sessionId}:${input.clientRequestId}`,
-        Effect.gen(function* () {
-          yield* ensurePrincipal(session);
-          const environmentId = yield* environment.getEnvironmentId;
-          const existing = yield* sql<LeaseRow>`
+      leaseLocks
+        .withLock(
+          `request:${session.sessionId}:${input.clientRequestId}`,
+          Effect.gen(function* () {
+            yield* ensurePrincipal(session);
+            const environmentId = yield* environment.getEnvironmentId;
+            const existing = yield* sql<LeaseRow>`
           SELECT * FROM codex_live_voice_leases
           WHERE environment_id = ${environmentId}
             AND principal_session_id = ${session.sessionId}
             AND client_request_id = ${input.clientRequestId}
         `.pipe(Effect.map((rows) => rows[0]));
-          if (existing !== undefined) {
-            if (existing.thread_id !== input.threadId) {
-              return yield* liveError("dispatch_conflict");
+            if (existing !== undefined) {
+              if (existing.thread_id !== input.threadId) {
+                return yield* liveError("dispatch_conflict");
+              }
+              yield* recoverPendingIntents(existing.lease_id, existing.generation);
+              const key = leaseKey(existing.lease_id, existing.generation);
+              if (
+                !active.has(key) &&
+                ["preparing", "prepared", "starting", "active", "stopping"].includes(
+                  existing.status,
+                )
+              ) {
+                const reconciled = yield* updateStatus(existing, "unknown");
+                return reconciled.session;
+              }
+              return sessionFromRow(existing);
             }
-            yield* recoverPendingIntents(existing.lease_id, existing.generation);
-            const key = leaseKey(existing.lease_id, existing.generation);
-            if (
-              !active.has(key) &&
-              ["preparing", "prepared", "starting", "active", "stopping"].includes(existing.status)
-            ) {
-              const reconciled = yield* updateStatus(existing, "unknown");
-              return reconciled.session;
-            }
-            return sessionFromRow(existing);
-          }
 
-          const projection = yield* threads
-            .getThreadProjection(input.threadId)
-            .pipe(Effect.mapError(() => liveError("session_not_found")));
-          if (projection.thread.archivedAt !== null) return yield* liveError("session_not_found");
-          const providerInstance = yield* providerInstances.getInstance(
-            projection.thread.providerInstanceId,
-          );
-          if (providerInstance?.driverKind !== "codex") {
-            return yield* liveError("unsupported_provider");
-          }
-          const runtimePolicy = yield* runtimePolicies
-            .resolve({
-              thread: projection.thread,
-              modelSelection: projection.thread.modelSelection,
-            })
-            .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
-          const previousLease = yield* sql<LeaseRow>`
+            const projection = yield* threads
+              .getThreadProjection(input.threadId)
+              .pipe(Effect.mapError(() => liveError("session_not_found")));
+            if (projection.thread.archivedAt !== null) return yield* liveError("session_not_found");
+            const providerInstance = yield* providerInstances.getInstance(
+              projection.thread.providerInstanceId,
+            );
+            if (providerInstance?.driverKind !== "codex") {
+              return yield* liveError("unsupported_provider");
+            }
+            const runtimePolicy = yield* runtimePolicies
+              .resolve({
+                thread: projection.thread,
+                modelSelection: projection.thread.modelSelection,
+              })
+              .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
+            const previousLease = yield* sql<LeaseRow>`
           SELECT * FROM codex_live_voice_leases
           WHERE thread_id = ${input.threadId}
             AND status IN ('preparing', 'prepared', 'starting', 'active', 'stopping', 'unknown')
           ORDER BY updated_at DESC LIMIT 1
         `.pipe(Effect.map((rows) => rows[0]));
-          if (previousLease !== undefined) return yield* liveError("dispatch_conflict");
+            if (previousLease !== undefined) return yield* liveError("dispatch_conflict");
 
-          const leaseId = NodeCrypto.randomUUID();
-          const generation = 1;
-          const now = new Date().toISOString();
-          yield* sql`
+            const leaseId = yield* crypto.randomUUIDv4;
+            const generation = 1;
+            const now = DateTime.formatIso(yield* DateTime.now);
+            yield* sql`
           INSERT INTO codex_live_voice_leases (
             lease_id, generation, environment_id, thread_id, provider_instance_id,
             model_selection_json, runtime_policy_json,
@@ -252,250 +270,268 @@ export const layer: Layer.Layer<
             client_request_id, status, updated_at
           ) VALUES (
             ${leaseId}, ${generation}, ${environmentId}, ${input.threadId},
-            ${projection.thread.providerInstanceId}, ${JSON.stringify(projection.thread.modelSelection)},
-            ${JSON.stringify(runtimePolicy)}, NULL, NULL, ${session.sessionId}, ${session.subject},
+            ${projection.thread.providerInstanceId}, ${encodeModelSelection(projection.thread.modelSelection)},
+            ${encodeRuntimePolicy(runtimePolicy)}, NULL, NULL, ${session.sessionId}, ${session.subject},
             ${input.clientRequestId}, 'preparing', ${now}
           )
         `.pipe(Effect.catch(() => Effect.fail(liveError("dispatch_conflict"))));
-          const initial: LiveVoiceSession = {
-            leaseId,
-            generation,
-            environmentId,
-            threadId: input.threadId,
-            providerInstanceId: projection.thread.providerInstanceId,
-            providerSessionId: null,
-            plannerNativeThreadId: null,
-            status: "preparing",
-          };
-          yield* eventHub.register(initial);
+            const initial: LiveVoiceSession = {
+              leaseId,
+              generation,
+              environmentId,
+              threadId: input.threadId,
+              providerInstanceId: projection.thread.providerInstanceId,
+              providerSessionId: null,
+              plannerNativeThreadId: null,
+              status: "preparing",
+            };
+            yield* eventHub.register(initial);
 
-          const providerThread = projection.providerThreads.find(
-            (candidate) => candidate.id === projection.thread.activeProviderThreadId,
-          );
-          const providerSession = projection.providerSessions.find(
-            (candidate) => candidate.providerInstanceId === projection.thread.providerInstanceId,
-          );
-          const providerSessionId =
-            providerSession?.id ??
-            ProviderSessionId.make(`provider-session-live-${NodeCrypto.randomUUID()}`);
-          const runtimeOption = yield* providerSessions
-            .get(providerSessionId)
-            .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
-          const runtime = Option.isSome(runtimeOption)
-            ? runtimeOption.value
-            : yield* providerSessions
-                .open({
-                  threadId: input.threadId,
-                  providerSessionId,
-                  modelSelection: projection.thread.modelSelection,
-                  runtimePolicy,
-                  ...(providerSession === undefined ? {} : { resumeFromSession: providerSession }),
-                  ...(providerThread?.nativeThreadRef?.nativeId === undefined
-                    ? {}
-                    : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
-                })
-                .pipe(
-                  Effect.mapError(() => liveError("runtime_unavailable")),
-                  Effect.catch((error) =>
-                    markUnknown(leaseId, generation).pipe(Effect.andThen(Effect.fail(error))),
-                  ),
-                );
-          yield* sql`
+            const providerThread = projection.providerThreads.find(
+              (candidate) => candidate.id === projection.thread.activeProviderThreadId,
+            );
+            const providerSession = projection.providerSessions.find(
+              (candidate) => candidate.providerInstanceId === projection.thread.providerInstanceId,
+            );
+            const providerSessionId =
+              providerSession?.id ??
+              ProviderSessionId.make(`provider-session-live-${yield* crypto.randomUUIDv4}`);
+            const runtimeOption = yield* providerSessions
+              .get(providerSessionId)
+              .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
+            const runtime = Option.isSome(runtimeOption)
+              ? runtimeOption.value
+              : yield* providerSessions
+                  .open({
+                    threadId: input.threadId,
+                    providerSessionId,
+                    modelSelection: projection.thread.modelSelection,
+                    runtimePolicy,
+                    ...(providerSession === undefined
+                      ? {}
+                      : { resumeFromSession: providerSession }),
+                    ...(providerThread?.nativeThreadRef?.nativeId === undefined
+                      ? {}
+                      : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
+                  })
+                  .pipe(
+                    Effect.mapError(() => liveError("runtime_unavailable")),
+                    Effect.catch((error) =>
+                      markUnknown(leaseId, generation).pipe(Effect.andThen(Effect.fail(error))),
+                    ),
+                  );
+            yield* sql`
           UPDATE codex_live_voice_leases SET provider_session_id = ${providerSessionId},
-            updated_at = ${new Date().toISOString()}
+            updated_at = ${DateTime.formatIso(yield* DateTime.now)}
           WHERE lease_id = ${leaseId} AND generation = ${generation}
         `;
-          if (
-            runtime.instanceId !== projection.thread.providerInstanceId ||
-            runtime.providerSessionId !== providerSessionId ||
-            runtime.driver !== "codex"
-          ) {
-            const lease = yield* getLease(leaseId, generation);
-            if (lease !== undefined) yield* updateStatus(lease, "failed");
-            return yield* liveError("unsupported_provider");
-          }
-          if (runtime.liveVoice === undefined) {
-            const lease = yield* getLease(leaseId, generation);
-            if (lease !== undefined) yield* updateStatus(lease, "failed");
-            return yield* liveError("unsupported_provider");
-          }
+            if (
+              runtime.instanceId !== projection.thread.providerInstanceId ||
+              runtime.providerSessionId !== providerSessionId ||
+              runtime.driver !== "codex"
+            ) {
+              const lease = yield* getLease(leaseId, generation);
+              if (lease !== undefined) yield* updateStatus(lease, "failed");
+              return yield* liveError("unsupported_provider");
+            }
+            if (runtime.liveVoice === undefined) {
+              const lease = yield* getLease(leaseId, generation);
+              if (lease !== undefined) yield* updateStatus(lease, "failed");
+              return yield* liveError("unsupported_provider");
+            }
 
-          const prepared = yield* runtime.liveVoice
-            .preparePlanner({
-              modelSelection: projection.thread.modelSelection,
-              ...(getCodexServiceTierOptionValue(projection.thread.modelSelection) === undefined
-                ? {}
-                : {
-                    serviceTier: getCodexServiceTierOptionValue(projection.thread.modelSelection),
-                  }),
-              ...(getModelSelectionStringOptionValue(
-                projection.thread.modelSelection,
-                "reasoningEffort",
-              ) === undefined
-                ? {}
-                : {
-                    reasoningEffort: getModelSelectionStringOptionValue(
-                      projection.thread.modelSelection,
-                      "reasoningEffort",
+            const prepared = yield* runtime.liveVoice
+              .preparePlanner({
+                modelSelection: projection.thread.modelSelection,
+                ...(getCodexServiceTierOptionValue(projection.thread.modelSelection) === undefined
+                  ? {}
+                  : {
+                      serviceTier: getCodexServiceTierOptionValue(projection.thread.modelSelection),
+                    }),
+                ...(getModelSelectionStringOptionValue(
+                  projection.thread.modelSelection,
+                  "reasoningEffort",
+                ) === undefined
+                  ? {}
+                  : {
+                      reasoningEffort: getModelSelectionStringOptionValue(
+                        projection.thread.modelSelection,
+                        "reasoningEffort",
+                      ),
+                    }),
+                onSubmitWork: ({ plannerNativeThreadId, plannerTurnId, callId, message }) =>
+                  submitWork({
+                    principalSessionId: session.sessionId,
+                    leaseId,
+                    generation,
+                    plannerNativeThreadId,
+                    plannerTurnId,
+                    callId,
+                    message,
+                  }).pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new ProviderAdapter.ProviderAdapterProtocolError({
+                          driver: "codex",
+                          detail: "Live work could not be submitted.",
+                          cause,
+                        }),
                     ),
-                  }),
-              onSubmitWork: ({ plannerNativeThreadId, plannerTurnId, callId, message }) =>
-                submitWork({
-                  principalSessionId: session.sessionId,
-                  leaseId,
-                  generation,
-                  plannerNativeThreadId,
-                  plannerTurnId,
-                  callId,
-                  message,
-                }),
-            })
-            .pipe(
-              Effect.mapError((error) =>
-                error instanceof ProviderAdapter.ProviderAdapterProtocolError &&
-                error.detail === "Managed ChatGPT account is required for Codex Live."
-                  ? liveError("managed_account_required")
-                  : liveError("planner_restriction_failed"),
-              ),
-              Effect.catch((error) =>
-                markUnknown(leaseId, generation).pipe(Effect.andThen(Effect.fail(error))),
-              ),
-            );
-          const row = yield* getLease(leaseId, generation);
-          if (row === undefined) return yield* liveError("session_not_found");
-          yield* sql`
+                  ),
+              })
+              .pipe(
+                Effect.mapError((error) =>
+                  Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(error) &&
+                  error.detail === "Managed ChatGPT account is required for Codex Live."
+                    ? liveError("managed_account_required")
+                    : liveError("planner_restriction_failed"),
+                ),
+                Effect.catch((error) =>
+                  markUnknown(leaseId, generation).pipe(Effect.andThen(Effect.fail(error))),
+                ),
+              );
+            const row = yield* getLease(leaseId, generation);
+            if (row === undefined) return yield* liveError("session_not_found");
+            yield* sql`
           UPDATE codex_live_voice_leases SET provider_session_id = ${providerSessionId},
             planner_native_thread_id = ${prepared.plannerNativeThreadId}, status = 'prepared',
-            updated_at = ${new Date().toISOString()}
+            updated_at = ${DateTime.formatIso(yield* DateTime.now)}
           WHERE lease_id = ${leaseId} AND generation = ${generation}
         `;
-          const ready = yield* getLease(leaseId, generation);
-          if (ready === undefined) return yield* liveError("session_not_found");
-          active.set(leaseKey(leaseId, generation), {
-            runtime,
-            plannerNativeThreadId: prepared.plannerNativeThreadId,
-          });
-          yield* eventHub.publish({ type: "status", session: sessionFromRow(ready) });
-          yield* Effect.forkScoped(
-            runtime.liveVoice.events.pipe(
-              Stream.runForEach((event) => handleNativeEvent(leaseId, generation, event)),
-            ),
-          );
-          return sessionFromRow(ready);
-        }),
-      );
+            const ready = yield* getLease(leaseId, generation);
+            if (ready === undefined) return yield* liveError("session_not_found");
+            active.set(leaseKey(leaseId, generation), {
+              runtime,
+              plannerNativeThreadId: prepared.plannerNativeThreadId,
+            });
+            yield* eventHub.publish({ type: "status", session: sessionFromRow(ready) });
+            yield* Effect.forkIn(
+              runtime.liveVoice.events.pipe(
+                Stream.runForEach((event) => handleNativeEvent(leaseId, generation, event)),
+              ),
+              serviceScope,
+            );
+            return sessionFromRow(ready);
+          }),
+        )
+        .pipe(Effect.mapError(toLiveError));
 
     const start: CodexLiveSessionService["Service"]["start"] = (session, input) =>
-      leaseLocks.withLock(
-        leaseKey(input.leaseId, input.generation),
-        Effect.gen(function* () {
-          yield* ensurePrincipal(session);
-          let row = yield* getOwnedLease(session.sessionId, input.leaseId, input.generation);
-          if (row.start_client_request_id === input.clientRequestId) return sessionFromRow(row);
-          if (row.status !== "prepared" || row.planner_native_thread_id === null) {
-            return yield* liveError("invalid_state");
-          }
-          const projection = yield* threads
-            .getThreadProjection(row.thread_id as LiveVoiceSession["threadId"])
-            .pipe(Effect.mapError(() => liveError("session_not_found")));
-          const providerInstance = yield* providerInstances.getInstance(
-            projection.thread.providerInstanceId,
-          );
-          const runtimePolicy = yield* runtimePolicies
-            .resolve({
-              thread: projection.thread,
-              modelSelection: projection.thread.modelSelection,
-            })
-            .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
-          if (
-            projection.thread.archivedAt !== null ||
-            projection.thread.providerInstanceId !== row.provider_instance_id ||
-            providerInstance?.driverKind !== "codex" ||
-            JSON.stringify(projection.thread.modelSelection) !== row.model_selection_json ||
-            JSON.stringify(runtimePolicy) !== row.runtime_policy_json
-          ) {
-            yield* updateStatus(row, "failed");
-            return yield* liveError("stale_lease");
-          }
-          const next = yield* updateStatus(
-            row,
-            "starting",
-            (now) =>
-              sql`
+      leaseLocks
+        .withLock(
+          leaseKey(input.leaseId, input.generation),
+          Effect.gen(function* () {
+            yield* ensurePrincipal(session);
+            let row = yield* getOwnedLease(session.sessionId, input.leaseId, input.generation);
+            if (row.start_client_request_id === input.clientRequestId) return sessionFromRow(row);
+            const plannerNativeThreadId = row.planner_native_thread_id;
+            if (row.status !== "prepared" || plannerNativeThreadId === null) {
+              return yield* liveError("invalid_state");
+            }
+            const projection = yield* threads
+              .getThreadProjection(row.thread_id as LiveVoiceSession["threadId"])
+              .pipe(Effect.mapError(() => liveError("session_not_found")));
+            const providerInstance = yield* providerInstances.getInstance(
+              projection.thread.providerInstanceId,
+            );
+            const runtimePolicy = yield* runtimePolicies
+              .resolve({
+                thread: projection.thread,
+                modelSelection: projection.thread.modelSelection,
+              })
+              .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
+            if (
+              projection.thread.archivedAt !== null ||
+              projection.thread.providerInstanceId !== row.provider_instance_id ||
+              providerInstance?.driverKind !== "codex" ||
+              encodeModelSelection(projection.thread.modelSelection) !== row.model_selection_json ||
+              encodeRuntimePolicy(runtimePolicy) !== row.runtime_policy_json
+            ) {
+              yield* updateStatus(row, "failed");
+              return yield* liveError("stale_lease");
+            }
+            const next = yield* updateStatus(
+              row,
+              "starting",
+              (now) =>
+                sql`
             UPDATE codex_live_voice_leases SET start_client_request_id = ${input.clientRequestId},
               native_started = 0, native_sdp_received = 0, updated_at = ${now}
             WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
           `,
-          );
-          row = next.row;
-          const lease = active.get(leaseKey(input.leaseId, input.generation));
-          if (lease === undefined) {
-            yield* updateStatus(row, "unknown");
-            return sessionFromRow(yield* getLease(input.leaseId, input.generation) ?? row);
-          }
-          yield* lease.runtime
-            .liveVoice!.start({
-              plannerNativeThreadId: row.planner_native_thread_id,
-              realtimeSessionId: `${input.leaseId}:${input.generation}`,
-              offerSdp: input.offerSdp,
-            })
-            .pipe(
-              Effect.mapError(() => liveError("runtime_unavailable")),
-              Effect.catch((error) =>
-                updateStatus(row, "unknown").pipe(Effect.andThen(Effect.fail(error))),
-              ),
             );
-          return sessionFromRow((yield* getLease(input.leaseId, input.generation)) ?? row);
-        }),
-      );
+            row = next.row;
+            const lease = active.get(leaseKey(input.leaseId, input.generation));
+            if (lease === undefined) {
+              yield* updateStatus(row, "unknown");
+              return sessionFromRow(yield* getLease(input.leaseId, input.generation) ?? row);
+            }
+            yield* lease.runtime
+              .liveVoice!.start({
+                plannerNativeThreadId,
+                realtimeSessionId: `${input.leaseId}:${input.generation}`,
+                offerSdp: input.offerSdp,
+              })
+              .pipe(
+                Effect.mapError(() => liveError("runtime_unavailable")),
+                Effect.catch((error) =>
+                  updateStatus(row, "unknown").pipe(Effect.andThen(Effect.fail(error))),
+                ),
+              );
+            return sessionFromRow((yield* getLease(input.leaseId, input.generation)) ?? row);
+          }),
+        )
+        .pipe(Effect.mapError(toLiveError));
 
     const stop: CodexLiveSessionService["Service"]["stop"] = (session, input) =>
-      leaseLocks.withLock(
-        leaseKey(input.leaseId, input.generation),
-        Effect.gen(function* () {
-          yield* ensurePrincipal(session);
-          const row = yield* getOwnedLease(session.sessionId, input.leaseId, input.generation);
-          if (
-            row.stop_client_request_id === input.clientRequestId ||
-            row.status === "closed" ||
-            row.status === "stopping"
-          ) {
-            return sessionFromRow(row);
-          }
-          if (row.status === "failed") return sessionFromRow(row);
-          if (row.planner_native_thread_id === null || row.provider_session_id === null) {
-            if (row.status === "unknown") return sessionFromRow(row);
-            return yield* liveError("invalid_state");
-          }
-          const next = yield* updateStatus(
-            row,
-            "stopping",
-            (now) =>
-              sql`
+      leaseLocks
+        .withLock(
+          leaseKey(input.leaseId, input.generation),
+          Effect.gen(function* () {
+            yield* ensurePrincipal(session);
+            const row = yield* getOwnedLease(session.sessionId, input.leaseId, input.generation);
+            if (
+              row.stop_client_request_id === input.clientRequestId ||
+              row.status === "closed" ||
+              row.status === "stopping"
+            ) {
+              return sessionFromRow(row);
+            }
+            if (row.status === "failed") return sessionFromRow(row);
+            if (row.planner_native_thread_id === null || row.provider_session_id === null) {
+              if (row.status === "unknown") return sessionFromRow(row);
+              return yield* liveError("invalid_state");
+            }
+            const next = yield* updateStatus(
+              row,
+              "stopping",
+              (now) =>
+                sql`
             UPDATE codex_live_voice_leases SET stop_client_request_id = ${input.clientRequestId},
               updated_at = ${now}
             WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
           `,
-          );
-          const lease = active.get(leaseKey(input.leaseId, input.generation));
-          const runtime =
-            lease?.runtime ??
-            Option.getOrUndefined(
-              yield* providerSessions.get(ProviderSessionId.make(row.provider_session_id)),
             );
-          if (runtime?.liveVoice === undefined) {
-            yield* updateStatus(next.row, "unknown");
+            const lease = active.get(leaseKey(input.leaseId, input.generation));
+            const runtime =
+              lease?.runtime ??
+              Option.getOrUndefined(
+                yield* providerSessions.get(ProviderSessionId.make(row.provider_session_id)),
+              );
+            if (runtime?.liveVoice === undefined) {
+              yield* updateStatus(next.row, "unknown");
+              return sessionFromRow((yield* getLease(input.leaseId, input.generation)) ?? next.row);
+            }
+            yield* runtime.liveVoice.stop(row.planner_native_thread_id).pipe(
+              Effect.mapError(() => liveError("runtime_unavailable")),
+              Effect.catch((error) =>
+                updateStatus(next.row, "unknown").pipe(Effect.andThen(Effect.fail(error))),
+              ),
+            );
             return sessionFromRow((yield* getLease(input.leaseId, input.generation)) ?? next.row);
-          }
-          yield* runtime.liveVoice.stop(row.planner_native_thread_id).pipe(
-            Effect.mapError(() => liveError("runtime_unavailable")),
-            Effect.catch((error) =>
-              updateStatus(next.row, "unknown").pipe(Effect.andThen(Effect.fail(error))),
-            ),
-          );
-          return sessionFromRow((yield* getLease(input.leaseId, input.generation)) ?? next.row);
-        }),
-      );
+          }),
+        )
+        .pipe(Effect.mapError(toLiveError));
 
     const status: CodexLiveSessionService["Service"]["status"] = (session, input) =>
       Effect.gen(function* () {
@@ -510,7 +546,7 @@ export const layer: Layer.Layer<
           return (yield* updateStatus(row, "unknown")).session;
         }
         return sessionFromRow(row);
-      });
+      }).pipe(Effect.mapError(toLiveError));
 
     const subscribe: CodexLiveSessionService["Service"]["subscribe"] = (session, input) =>
       Stream.unwrap(
@@ -522,7 +558,7 @@ export const layer: Layer.Layer<
           yield* eventHub.register(sessionFromRow(row));
           return eventHub.subscribe(input);
         }),
-      );
+      ).pipe(Stream.mapError(toLiveError));
 
     function submitWork(input: {
       readonly principalSessionId: string;
@@ -563,7 +599,7 @@ export const layer: Layer.Layer<
           const messageId = MessageId.make(
             `message:live-voice:${encodeURIComponent(input.leaseId)}:${input.generation}:${encodeURIComponent(input.plannerTurnId)}:submit-0`,
           );
-          const now = new Date().toISOString();
+          const now = DateTime.formatIso(yield* DateTime.now);
           const priorIntents = yield* sql<{
             dispatch_state: "reserved" | "admitted" | "conflict";
           }>`
@@ -634,12 +670,13 @@ export const layer: Layer.Layer<
             projection.thread.providerInstanceId !== currentRow.provider_instance_id ||
             providerInstance?.driverKind !== "codex" ||
             projection.thread.archivedAt !== null ||
-            JSON.stringify(projection.thread.modelSelection) !== currentRow.model_selection_json ||
-            JSON.stringify(currentRuntimePolicy) !== currentRow.runtime_policy_json
+            encodeModelSelection(projection.thread.modelSelection) !==
+              currentRow.model_selection_json ||
+            encodeRuntimePolicy(currentRuntimePolicy) !== currentRow.runtime_policy_json
           ) {
             yield* sql`
               UPDATE codex_live_voice_intents SET dispatch_state = 'conflict',
-                updated_at = ${new Date().toISOString()}
+                updated_at = ${DateTime.formatIso(yield* DateTime.now)}
               WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
                 AND planner_native_thread_id = ${input.plannerNativeThreadId}
                 AND planner_turn_id = ${input.plannerTurnId} AND submit_slot = 0
@@ -660,14 +697,14 @@ export const layer: Layer.Layer<
               creationSource: "voice",
             })
             .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
-          const receipt = JSON.stringify({
+          const receipt = encodeReceipt({
             accepted: true,
             delivery: result.delivery,
             runId: result.run.id,
           });
           yield* sql`
           UPDATE codex_live_voice_intents SET dispatch_state = 'admitted', receipt_json = ${receipt},
-            updated_at = ${new Date().toISOString()}
+            updated_at = ${DateTime.formatIso(yield* DateTime.now)}
           WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
             AND planner_native_thread_id = ${input.plannerNativeThreadId}
             AND planner_turn_id = ${input.plannerTurnId} AND submit_slot = 0

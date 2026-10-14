@@ -716,7 +716,11 @@ const layerMakeRoutes = Layer.mergeAll(
     DeviceHubProxy.layer,
     ServerBrowserStream.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
-    Ws.layer.pipe(Layer.provide(CodexLiveSessionService.layer)),
+    Ws.layer.pipe(
+      Layer.provide(
+        CodexLiveSessionService.layer.pipe(Layer.provide(RuntimeLayer.layerRuntimePolicyProvided)),
+      ),
+    ),
   ),
   // The MCP session registry is provided globally (shared with V2 provider
   // sessions) rather than inline here. The orchestrator toolkit resolves

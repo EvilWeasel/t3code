@@ -6522,7 +6522,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           new ProviderAdapter.ProviderAdapterProtocolError({
             driver: CODEX_PROVIDER,
             detail:
-              cause instanceof ProviderAdapter.ProviderAdapterProtocolError &&
+              Schema.is(ProviderAdapter.ProviderAdapterProtocolError)(cause) &&
               cause.detail === "Managed ChatGPT account is required for Codex Live."
                 ? cause.detail
                 : `Codex Live ${operation} failed.`,

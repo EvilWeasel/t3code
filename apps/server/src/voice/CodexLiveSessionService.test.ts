@@ -7,6 +7,7 @@ import {
 } from "@t3tools/contracts";
 import type { LiveVoiceEvent } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -36,7 +37,7 @@ it.effect(
             plannerTurnId: string;
             callId: string;
             message: string;
-          }) => Effect.Effect<string>)
+          }) => Effect.Effect<string, ProviderAdapter.ProviderAdapterV2Error>)
         | undefined;
       let plannerOptions:
         | { serviceTier?: string | null; reasoningEffort?: string | null }
@@ -64,8 +65,10 @@ it.effect(
               plannerCalls += 1;
               submitWork = input.onSubmitWork;
               plannerOptions = {
-                serviceTier: input.serviceTier,
-                reasoningEffort: input.reasoningEffort,
+                ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
+                ...(input.reasoningEffort === undefined
+                  ? {}
+                  : { reasoningEffort: input.reasoningEffort }),
               };
               return { plannerNativeThreadId: "planner-native-1" };
             }),
@@ -117,9 +120,10 @@ it.effect(
         interactionMode: "default",
         cwd: "/private/test-worktree",
       } as never;
-      let currentPolicy = policy;
+      let currentPolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy = policy;
       const dependencies = Layer.mergeAll(
         NodeSqliteClient.layer({ filename: ":memory:" }),
+        NodeCrypto.layer,
         Layer.succeed(SessionStore.SessionStore, {
           listActive: () =>
             Effect.succeed([{ sessionId, subject: session.subject, scopes: session.scopes }]),
@@ -226,7 +230,7 @@ it.effect(
             callId,
             message,
           });
-        currentPolicy = { ...policy, cwd: "/changed-worktree" } as never;
+        currentPolicy = { ...currentPolicy, cwd: "/changed-worktree" };
         const policyChanged = yield* Effect.exit(
           invoke("call-stale", "A request captured under old settings", "planner-turn-stale"),
         );

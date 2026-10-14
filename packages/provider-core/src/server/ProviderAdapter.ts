@@ -665,7 +665,7 @@ export interface ProviderAdapterV2LiveVoiceRuntime {
       readonly plannerTurnId: string;
       readonly callId: string;
       readonly message: string;
-    }) => Effect.Effect<string>;
+    }) => Effect.Effect<string, ProviderAdapterV2Error>;
   }) => Effect.Effect<{ readonly plannerNativeThreadId: string }, ProviderAdapterV2Error>;
   readonly start: (input: {
     readonly plannerNativeThreadId: string;
