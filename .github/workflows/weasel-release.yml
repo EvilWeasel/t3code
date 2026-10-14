@@ -327,7 +327,6 @@ jobs:
             --arg closureSha256 "$closure_sha256" \
             '{format:"weasel-linux-candidate-receipt-v1",sourceSha:$sourceSha,nixosPackagingSha:$nixosPackagingSha,workflowSha:$workflowSha,runId:$runId,runAttempt:$runAttempt,version:$version,repository:$repository,appImagePath:$appImagePath,appImageSha256:$appImageSha256,nixosManifestSha256:$manifestSha256,nixosClosureSha256:$closureSha256}' \
             > "$RUNNER_TEMP/t3code-weasel-nixos-closure/build-receipt.json"
-          (cd "$RUNNER_TEMP/t3code-weasel-nixos-closure" && sha256sum build-receipt.json >> SHA256SUMS)
           (cd "$RUNNER_TEMP/t3code-weasel-nixos-closure" && sha256sum --check SHA256SUMS)
 
       - name: Prepare NixOS download bundle
