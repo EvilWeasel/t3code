@@ -933,11 +933,14 @@ it.effect(
             event.session.status === "failed",
         );
         principalGate.release();
-        const failedBeforeSpeech = yield* service.status(session, {
-          leaseId: secondPrepared.leaseId,
-          generation: secondPrepared.generation,
-        });
-        assert.equal(failedBeforeSpeech.status, "failed");
+        const duplicateRaceReceipt = yield* invokeWithPlanner(
+          "planner-native-2",
+          "call-native-error-race",
+          "Queue readback before a native failure",
+          "planner-turn-native-error-race",
+        );
+        assert.equal(duplicateRaceReceipt, raceReceipt);
+        assert.equal(sends, 5);
         assert.equal(
           appendAttempts,
           2,
