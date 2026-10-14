@@ -42,7 +42,7 @@ function Probe({
   targetKey,
 }: {
   transcribe: VoiceDictationTranscriber | null;
-  targetKey?: string;
+  targetKey?: string | undefined;
 }) {
   latest = useVoiceDictation({ transcribe, onTranscript, ...(targetKey ? { targetKey } : {}) });
   return null;

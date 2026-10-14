@@ -4,6 +4,7 @@ import type {
   VoiceTranscriptionSettingsInput,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Data from "effect/Data";
 import * as Option from "effect/Option";
 import { AtomRegistry } from "effect/reactivity";
 import { RemoteEnvironmentAuthorization } from "@t3tools/client-runtime/authorization/service";
@@ -13,6 +14,10 @@ import { connectionAtomRuntime } from "../connection/runtime";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentSession } from "../state/session";
 
+class VoiceSettingsUnavailable extends Data.TaggedError("VoiceSettingsUnavailable")<{
+  readonly message: string;
+}> {}
+
 export async function voiceSettingsRequest(
   environmentId: EnvironmentId,
   update?: typeof VoiceTranscriptionSettingsInput.Type,
@@ -21,7 +26,9 @@ export async function voiceSettingsRequest(
     Effect.gen(function* () {
       const prepared = get(environmentSession.preparedConnectionValueAtom(environmentId));
       if (Option.isNone(prepared))
-        return yield* Effect.fail(new Error("Environment disconnected."));
+        return yield* Effect.fail(
+          new VoiceSettingsUnavailable({ message: "Environment disconnected." }),
+        );
       const signer = yield* Effect.serviceOption(ManagedRelay.ManagedRelayDpopSigner);
       const remoteAuthorization = yield* Effect.serviceOption(RemoteEnvironmentAuthorization);
       return yield* requestEnvironmentVoiceSettings({
