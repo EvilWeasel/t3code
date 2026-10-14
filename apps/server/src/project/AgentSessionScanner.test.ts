@@ -3219,7 +3219,7 @@ const scanRecoveryFixture = (contents: string, duplicate = false) =>
     const codexHomePath = yield* makeTempDir("t3code-recovery-codex-");
     const workspace = yield* makeTempDir("t3code-recovery-workspace-");
     const fixture = opaqueFixtureAtWorkspace(contents, workspace);
-    const filePath = path.join(codexHomePath, "sessions", "2026", "10", "14", "rollout.jsonl");
+    const filePath = path.join(codexHomePath, "sessions", "2026", "10", "14", "rollout-fixture.jsonl");
     yield* writeTranscript({ filePath, contents: fixture.contents, mtimeMs: nowMs });
     if (duplicate) {
       yield* writeTranscript({
