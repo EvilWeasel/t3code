@@ -13,6 +13,7 @@ import {
   type LiveVoiceStopInput,
   type LiveVoiceSubscribeInput,
   type OrchestrationV2ThreadProjection,
+  type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -234,7 +235,7 @@ export const layer: Layer.Layer<
           .map((node) => node.id),
       );
       const finalItems = projection.turnItems.filter(
-        (item) =>
+        (item): item is Extract<OrchestrationV2TurnItem, { readonly type: "assistant_message" }> =>
           item.type === "assistant_message" &&
           item.runId === runId &&
           item.nodeId !== null &&
