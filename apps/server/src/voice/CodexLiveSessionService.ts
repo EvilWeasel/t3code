@@ -341,25 +341,16 @@ export const layer: Layer.Layer<
               return yield* liveError("unsupported_provider");
             }
 
+            const serviceTier = getCodexServiceTierOptionValue(projection.thread.modelSelection);
+            const reasoningEffort = getModelSelectionStringOptionValue(
+              projection.thread.modelSelection,
+              "reasoningEffort",
+            );
             const prepared = yield* runtime.liveVoice
               .preparePlanner({
                 modelSelection: projection.thread.modelSelection,
-                ...(getCodexServiceTierOptionValue(projection.thread.modelSelection) == null
-                  ? {}
-                  : {
-                      serviceTier: getCodexServiceTierOptionValue(projection.thread.modelSelection),
-                    }),
-                ...(getModelSelectionStringOptionValue(
-                  projection.thread.modelSelection,
-                  "reasoningEffort",
-                ) == null
-                  ? {}
-                  : {
-                      reasoningEffort: getModelSelectionStringOptionValue(
-                        projection.thread.modelSelection,
-                        "reasoningEffort",
-                      ),
-                    }),
+                ...(serviceTier == null ? {} : { serviceTier }),
+                ...(reasoningEffort == null ? {} : { reasoningEffort }),
                 onSubmitWork: ({ plannerNativeThreadId, plannerTurnId, callId, message }) =>
                   submitWork({
                     principalSessionId: session.sessionId,

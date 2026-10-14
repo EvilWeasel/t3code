@@ -716,11 +716,7 @@ const layerMakeRoutes = Layer.mergeAll(
     DeviceHubProxy.layer,
     ServerBrowserStream.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
-    Ws.layer.pipe(
-      Layer.provide(
-        CodexLiveSessionService.layer.pipe(Layer.provide(RuntimeLayer.layerRuntimePolicyProvided)),
-      ),
-    ),
+    Ws.layer,
   ),
   // The MCP session registry is provided globally (shared with V2 provider
   // sessions) rather than inline here. The orchestrator toolkit resolves
@@ -1109,6 +1105,9 @@ const layerMakeServer = Layer.unwrap(
     return layerServerApplication.pipe(
       // The connect routes and the startup/shutdown link work share one instance.
       Layer.provide(CloudLink.layer),
+      Layer.provideMerge(
+        CodexLiveSessionService.layer.pipe(Layer.provide(RuntimeLayer.layerRuntimePolicyProvided)),
+      ),
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(
