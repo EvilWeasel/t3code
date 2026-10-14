@@ -106,7 +106,7 @@ describe("LiveVoiceTranscript", () => {
     expect(document.querySelector('[role="alert"]')?.textContent).toContain(
       "Couldn’t copy transcript. Try again.",
     );
-    expect(document.querySelector('[role="status"]')?.textContent).not.toContain("copied");
+    expect(document.querySelector('[role="status"]')).toBeNull();
 
     await click("Copy transcript");
     expect(document.querySelector('[role="status"]')?.textContent).toContain("Transcript copied.");
