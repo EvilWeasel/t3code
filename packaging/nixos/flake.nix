@@ -72,7 +72,7 @@
               --set T3_WEASEL_REPOSITORY ${lib.escapeShellArg repository} \
               --set T3_WEASEL_MANAGED 1 \
               --prefix PATH : ${lib.makeBinPath [ pkgs.coreutils pkgs.curl pkgs.jq pkgs.nix pkgs.util-linux pkgs.zstd ]}
-            makeWrapper "$out/lib/t3code-weasel/t3code" "$out/bin/t3code-weasel" \
+            makeShellWrapper "$out/lib/t3code-weasel/t3code" "$out/bin/t3code-weasel" \
               "''${gappsWrapperArgs[@]}" \
               --prefix PATH : ${lib.makeBinPath [ pkgs.xdg-utils ]} \
               --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath (with pkgs; [
