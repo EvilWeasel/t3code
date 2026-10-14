@@ -39,6 +39,7 @@ focused_tests=(
   apps/desktop/src/updates/updateMachine.test.ts
   apps/desktop/src/electron/ElectronUpdater.test.ts
   apps/desktop/src/electron/NixManagedUpdater.test.ts
+  apps/desktop/src/electron/quitAndInstallInPlace.test.ts
   apps/web/src/components/sidebar/updateEverything.logic.test.ts
   packages/shared/src/cliRelease.test.ts
   apps/server/src/cli/update.test.ts
@@ -48,6 +49,7 @@ focused_tests=(
   apps/server/src/serviceLauncher.test.ts
   apps/server/src/voice/VoiceSettings.test.ts
   apps/web/src/voice/VoiceDictationControl.test.tsx
+  apps/web/src/voice/LiveVoiceControl.test.tsx
   apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
 )
 voice_tests=(

@@ -59,7 +59,8 @@ export const makeVoiceSettings = Effect.gen(function* () {
           instanceId: input.instanceId || null,
           model: input.model.trim() || "gpt-transcribe",
         };
-        yield* fs.writeFileString(`${filename}.tmp`, JSON.stringify(config), { mode: 0o600 });
+        const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Config))(config);
+        yield* fs.writeFileString(`${filename}.tmp`, encoded, { mode: 0o600 });
         yield* fs.rename(`${filename}.tmp`, filename);
       }).pipe(Effect.withTracerEnabled(false)),
     );

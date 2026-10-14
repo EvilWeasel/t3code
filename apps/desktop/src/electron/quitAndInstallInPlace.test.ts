@@ -4,7 +4,8 @@ import { quitAndInstallInPlace } from "./quitAndInstallInPlace.ts";
 const input = {
   platform: "win32" as const,
   isPackaged: true,
-  executable: "C:\\Users\\User\\AppData\\Local\\Programs\\morrowbyte-t3-release15\\T3 Code (Weasel Nightly).exe",
+  executable:
+    "C:\\Users\\User\\AppData\\Local\\Programs\\morrowbyte-t3-release15\\T3 Code (Weasel Nightly).exe",
   isSilent: true,
   isForceRunAfter: true,
 };
@@ -14,7 +15,9 @@ describe("native installer destination", () => {
     let observed: string | undefined;
     const updater = {
       installDirectory: "C:\\wrong-default",
-      quitAndInstall: vi.fn(async () => { observed = updater.installDirectory; }),
+      quitAndInstall: vi.fn(async () => {
+        observed = updater.installDirectory;
+      }),
     };
     await quitAndInstallInPlace(updater, input);
     expect(observed).toBe("C:\\Users\\User\\AppData\\Local\\Programs\\morrowbyte-t3-release15");
@@ -43,12 +46,18 @@ describe("native installer destination", () => {
 
   it("rejects an invalid Windows executable before dispatching the installer", () => {
     const updater = { quitAndInstall: vi.fn() };
-    expect(() => quitAndInstallInPlace(updater, { ...input, executable: "relative.exe" })).toThrow("installation directory");
+    expect(() => quitAndInstallInPlace(updater, { ...input, executable: "relative.exe" })).toThrow(
+      "installation directory",
+    );
     expect(updater.quitAndInstall).not.toHaveBeenCalled();
   });
 
   it("preserves asynchronous installer failures for the typed updater error boundary", async () => {
-    const updater = { quitAndInstall: vi.fn(async () => { throw new Error("install failed"); }) };
+    const updater = {
+      quitAndInstall: vi.fn(async () => {
+        throw new Error("install failed");
+      }),
+    };
     await expect(quitAndInstallInPlace(updater, input)).rejects.toThrow("install failed");
   });
 });

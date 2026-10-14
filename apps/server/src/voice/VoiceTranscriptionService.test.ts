@@ -5,6 +5,7 @@ import {
   AuthSessionId,
   EnvironmentAuthenticatedPrincipal,
   CodexSettings,
+  ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
@@ -49,8 +50,9 @@ const routeContext = {
 
 it("uses the registry's implicit default Codex when persisted providerInstances is empty", () => {
   const hydrated = deriveProviderInstanceConfigMap(DEFAULT_SERVER_SETTINGS);
-  assert.strictEqual(hydrated.codex?.driver, "codex");
-  const live = [{ instanceId: "codex", driverKind: hydrated.codex!.driver, enabled: true }];
+  const codexId = Schema.decodeSync(ProviderInstanceId)("codex");
+  assert.strictEqual(hydrated[codexId]?.driver, "codex");
+  const live = [{ instanceId: codexId, driverKind: hydrated[codexId]!.driver, enabled: true }];
   const selected = selectCodexTranscriptionInstance(
     liveCodexTranscriptionConfigs({}, live),
     undefined,

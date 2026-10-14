@@ -33,7 +33,8 @@ function isAbsoluteWindowsHome(value: unknown): value is string {
 function readHome(bindingPath: string): string | undefined {
   let raw: string;
   try {
-    if (Fs.statSync(bindingPath).size > 16_384) throw new Error("Saved desktop profile is too large");
+    if (Fs.statSync(bindingPath).size > 16_384)
+      throw new Error("Saved desktop profile is too large");
     raw = Fs.readFileSync(bindingPath, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -43,7 +44,9 @@ function readHome(bindingPath: string): string | undefined {
   try {
     value = JSON.parse(raw);
   } catch {
-    throw new Error("Saved Windows desktop profile is invalid; use an explicit T3CODE_HOME to recover");
+    throw new Error(
+      "Saved Windows desktop profile is invalid; use an explicit T3CODE_HOME to recover",
+    );
   }
   if (
     !value ||
@@ -55,7 +58,9 @@ function readHome(bindingPath: string): string | undefined {
     !("t3Home" in value) ||
     !isAbsoluteWindowsHome(value.t3Home)
   ) {
-    throw new Error("Saved Windows desktop profile is invalid; use an explicit T3CODE_HOME to recover");
+    throw new Error(
+      "Saved Windows desktop profile is invalid; use an explicit T3CODE_HOME to recover",
+    );
   }
   return value.t3Home;
 }
