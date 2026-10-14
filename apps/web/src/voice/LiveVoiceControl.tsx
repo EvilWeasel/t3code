@@ -13,6 +13,7 @@ import {
   type LiveVoiceSignalEvent,
   type LiveVoiceSignalingAdapter,
   type LiveVoiceState,
+  type LiveVoiceTranscript as LiveVoiceTranscriptEntry,
   type LiveVoiceTarget,
 } from "@t3tools/client-runtime/live-voice";
 
@@ -20,6 +21,7 @@ import { liveVoiceEnvironment } from "../state/liveVoice";
 import { useAtomCommand } from "../state/use-atom-command";
 import { Button } from "~/components/ui/button";
 import { randomUUID } from "~/lib/utils";
+import { LiveVoiceTranscript } from "./LiveVoiceTranscript";
 
 type VoiceEventBridge = {
   readonly subscribe: LiveVoiceSignalingAdapter["subscribe"];
@@ -189,6 +191,16 @@ export function LiveVoiceControl(props: {
   );
   const controller = useMemo(() => new LiveVoiceController(dependencies), [dependencies]);
 
+  const transcriptLease = state.lease;
+  const transcriptMatchesTarget =
+    transcriptLease !== null &&
+    transcriptLease.environmentId === props.environmentId &&
+    transcriptLease.threadId === props.threadId &&
+    transcriptLease.providerInstanceId === props.providerInstanceId;
+  const currentTranscript: ReadonlyArray<LiveVoiceTranscriptEntry> = transcriptMatchesTarget
+    ? state.transcript
+    : [];
+
   useEffect(
     () => () => {
       void controller.end();
@@ -333,12 +345,14 @@ export function LiveVoiceControl(props: {
           </Button>
         </>
       )}
-      {state.transcript.length > 0 ? (
-        <span className="max-w-48 truncate text-xs text-muted-foreground" aria-live="polite">
-          {state.transcript.at(-1)?.speaker === "user" ? "You said: " : "Live said: "}
-          {state.transcript.at(-1)?.text.slice(0, 500)}
-        </span>
-      ) : null}
+      <LiveVoiceTranscript
+        key={
+          transcriptMatchesTarget && transcriptLease
+            ? `${transcriptLease.environmentId}:${transcriptLease.threadId}:${transcriptLease.providerInstanceId}:${transcriptLease.leaseId}:${transcriptLease.generation}`
+            : "no-live-transcript"
+        }
+        transcript={currentTranscript}
+      />
     </div>
   );
 }
