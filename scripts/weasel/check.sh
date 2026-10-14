@@ -106,14 +106,11 @@ else
 fi
 
 transcript_ui_test=apps/web/src/voice/LiveVoiceTranscript.test.tsx
-if [[ -f "$transcript_ui_test" ]]; then
-  focused_tests+=("$transcript_ui_test")
-  echo "Including Transcript UI gate: $transcript_ui_test"
-elif [[ -f apps/web/src/voice/LiveVoiceTranscript.tsx ]]; then
+if [[ ! -f "$transcript_ui_test" ]]; then
   echo "Required Transcript UI gate is missing: $transcript_ui_test" >&2
   exit 1
-else
-  echo "Transcript UI gate not present in this source; NOT EXECUTED: $transcript_ui_test"
 fi
+focused_tests+=("$transcript_ui_test")
+echo "Including required Transcript UI gate: $transcript_ui_test"
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts)
