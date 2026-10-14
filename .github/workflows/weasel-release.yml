@@ -300,7 +300,7 @@ jobs:
           export T3_WEASEL_ARTIFACT_PATH T3_WEASEL_ARTIFACT_SHA256
           build_output="$RUNNER_TEMP/t3code-weasel-nix-build-paths.txt"
           (cd nixos-packaging/packaging/nixos && \
-            nix build --impure --no-link --print-out-paths .#t3code-weasel) > "$build_output"
+            nix build --impure --no-link --print-out-paths "path:$PWD#t3code-weasel") > "$build_output"
           mapfile -t built_store_paths < "$build_output"
           test "${#built_store_paths[@]}" -eq 1
           package_store_path="${built_store_paths[0]}"
