@@ -306,8 +306,14 @@ it.effect(
         assert.equal(firstReceipt, duplicateReceipt);
         assert.equal(sends, 1);
 
-        const makeRunProjection = (runId: string, childStatus: "running" | "completed") =>
-          ({
+        const makeRunProjection = (runId: string, childStatus: "running" | "completed") => {
+          const commentaryText = `commentary for ${runId}`;
+          const finalText = `  ${`durable answer for ${runId} `.repeat(400)}\n  `;
+          const commentaryNodeId = `commentary-${runId}`;
+          const finalNodeId = `assistant-${runId}`;
+          const commentaryMessageId = `commentary-message-${runId}`;
+          const finalMessageId = `final-${runId}`;
+          return {
             ...projection,
             runs: [
               {
@@ -329,7 +335,24 @@ it.effect(
             ],
             nodes: [
               {
-                id: `assistant-${runId}`,
+                id: commentaryNodeId,
+                threadId,
+                runId,
+                parentNodeId: `root-${runId}`,
+                rootNodeId: `root-${runId}`,
+                kind: "assistant_message",
+                status: "completed",
+                countsForRun: false,
+                providerThreadId: "provider-thread-test",
+                providerTurnId: "provider-turn-test",
+                nativeItemRef: null,
+                runtimeRequestId: null,
+                checkpointScopeId: null,
+                startedAt: "2026-10-14T00:00:02.000Z",
+                completedAt: "2026-10-14T00:00:03.000Z",
+              },
+              {
+                id: finalNodeId,
                 threadId,
                 runId,
                 parentNodeId: `root-${runId}`,
@@ -386,20 +409,75 @@ it.effect(
             ],
             messages: [
               {
-                id: `final-${runId}`,
+                id: commentaryMessageId,
                 threadId,
                 runId,
-                nodeId: `assistant-${runId}`,
+                nodeId: commentaryNodeId,
                 role: "assistant",
-                text: `durable answer for ${runId}`,
+                text: commentaryText,
+                streaming: false,
+                attachments: [],
+                createdAt: "2026-10-14T00:00:02.000Z",
+                updatedAt: "2026-10-14T00:00:03.000Z",
+              },
+              {
+                id: finalMessageId,
+                threadId,
+                runId,
+                nodeId: finalNodeId,
+                role: "assistant",
+                text: finalText,
                 streaming: false,
                 attachments: [],
                 createdAt: "2026-10-14T00:00:02.000Z",
                 updatedAt: "2026-10-14T00:00:03.000Z",
               },
             ],
+            turnItems: [
+              {
+                id: `commentary-item-${runId}`,
+                threadId,
+                runId,
+                nodeId: commentaryNodeId,
+                providerThreadId: "provider-thread-test",
+                providerTurnId: "provider-turn-test",
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 1,
+                status: "completed",
+                title: null,
+                startedAt: "2026-10-14T00:00:02.000Z",
+                completedAt: "2026-10-14T00:00:03.000Z",
+                updatedAt: "2026-10-14T00:00:03.000Z",
+                type: "assistant_message",
+                messageId: commentaryMessageId,
+                text: commentaryText,
+                streaming: false,
+              },
+              {
+                id: `final-item-${runId}`,
+                threadId,
+                runId,
+                nodeId: finalNodeId,
+                providerThreadId: "provider-thread-test",
+                providerTurnId: "provider-turn-test",
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 2,
+                status: "completed",
+                title: null,
+                startedAt: "2026-10-14T00:00:02.000Z",
+                completedAt: "2026-10-14T00:00:03.000Z",
+                updatedAt: "2026-10-14T00:00:03.000Z",
+                type: "assistant_message",
+                messageId: finalMessageId,
+                text: finalText,
+                streaming: false,
+              },
+            ],
             checkpoints: [],
-          }) as unknown as OrchestrationV2ThreadProjection;
+          } as unknown as OrchestrationV2ThreadProjection;
+        };
         const eventFor = (event: OrchestrationV2StoredEvent["event"]) =>
           ({
             sequence: 1,
@@ -491,7 +569,7 @@ it.effect(
         assert.deepEqual(spoken, [
           {
             plannerNativeThreadId: "planner-native-1",
-            text: "durable answer for durable-run-1",
+            text: `  ${`durable answer for durable-run-1 `.repeat(400)}\n  `,
           },
         ]);
         const sentReceipt = yield* sql<{ receipt_json: string }>`
@@ -570,6 +648,25 @@ it.effect(
         appendSpeechFails = false;
         yield* invoke("call-after-stop", "Queue work that must outlive Live", "planner-turn-3");
         assert.equal(sends, 3);
+        durableProjection = {
+          ...makeRunProjection("durable-run-3", "completed"),
+          checkpoints: [
+            {
+              id: "checkpoint-durable-run-3",
+              threadId,
+              scopeId: "scope-root-3",
+              runId: "durable-run-3",
+              nodeId: "root-durable-run-3",
+              parentCheckpointId: null,
+              ordinalWithinScope: 1,
+              appRunOrdinal: 3,
+              ref: "checkpoint-ref-3",
+              status: "ready",
+              files: [],
+              capturedAt: "2026-10-14T00:00:03.000Z",
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
         const staleGeneration = yield* Effect.exit(
           service.status(session, {
             leaseId: prepared.leaseId,
@@ -606,7 +703,6 @@ it.effect(
         assert.equal(stopped.status, "stopping");
         assert.equal(stops, 1);
         assert.equal(sends, 3);
-        durableProjection = makeRunProjection("durable-run-3", "completed");
         yield* Queue.offer(
           t3EventQueues.get("run.updated")!,
           eventFor({

@@ -7420,7 +7420,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               client.raw
                 .request("thread/realtime/appendSpeech", {
                   threadId: input.plannerNativeThreadId,
-                  text: input.text.slice(0, 3_800),
+                  text: input.text,
                 })
                 .pipe(Effect.asVoid, Effect.mapError(liveVoiceFailure("speech output"))),
           },

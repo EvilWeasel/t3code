@@ -233,14 +233,30 @@ export const layer: Layer.Layer<
           )
           .map((node) => node.id),
       );
+      const finalItems = projection.turnItems.filter(
+        (item) =>
+          item.type === "assistant_message" &&
+          item.runId === runId &&
+          item.nodeId !== null &&
+          resultNodeIds.has(item.nodeId) &&
+          item.providerTurnId === attempts[0]!.providerTurnId &&
+          item.status === "completed" &&
+          !item.streaming &&
+          item.text.trim().length > 0,
+      );
+      if (finalItems.length === 0) return undefined;
+      const terminalOrdinal = Math.max(...finalItems.map((item) => item.ordinal));
+      const terminalItems = finalItems.filter((item) => item.ordinal === terminalOrdinal);
+      if (terminalItems.length !== 1) return undefined;
+      const finalItem = terminalItems[0]!;
       const finalMessages = projection.messages.filter(
         (message) =>
+          message.id === finalItem.messageId &&
           message.runId === runId &&
           message.role === "assistant" &&
-          message.nodeId !== null &&
-          resultNodeIds.has(message.nodeId) &&
+          message.nodeId === finalItem.nodeId &&
           !message.streaming &&
-          message.text.trim().length > 0,
+          message.text === finalItem.text,
       );
       if (finalMessages.length !== 1) return undefined;
       const checkpoint = projection.checkpoints.find(
@@ -254,7 +270,7 @@ export const layer: Layer.Layer<
       return {
         attemptId: attempts[0]!.id,
         finalMessageId: finalMessages[0]!.id,
-        text: finalMessages[0]!.text.trim(),
+        text: finalMessages[0]!.text,
       };
     };
 
@@ -447,6 +463,19 @@ export const layer: Layer.Layer<
           if (stored === undefined || stored === null) return;
           const receipt = decodeReceipt(stored) as Record<string, unknown>;
           if (receipt.runId !== input.runId || receipt.readback !== undefined) return;
+          const beforeClaim = yield* getLease(input.leaseId, input.generation);
+          const leaseBeforeClaim = active.get(leaseKey(input.leaseId, input.generation));
+          if (
+            beforeClaim === undefined ||
+            beforeClaim.status !== "active" ||
+            beforeClaim.planner_native_thread_id !== input.plannerNativeThreadId ||
+            leaseBeforeClaim?.plannerNativeThreadId !== input.plannerNativeThreadId ||
+            leaseBeforeClaim.runtime.liveVoice === undefined ||
+            leaseBeforeClaim.runtime.driver !== "codex" ||
+            leaseBeforeClaim.runtime.instanceId !== beforeClaim.provider_instance_id ||
+            leaseBeforeClaim.runtime.providerSessionId !== beforeClaim.provider_session_id
+          )
+            return;
           const claimed = encodeReceipt({
             ...receipt,
             readback: {
@@ -471,10 +500,48 @@ export const layer: Layer.Layer<
               AND planner_turn_id = ${input.plannerTurnId} AND dispatch_state = 'admitted'
           `;
           if (afterClaim[0]?.receipt_json !== claimed) return;
+          const beforeDispatch = yield* getLease(input.leaseId, input.generation);
+          const currentLease = active.get(leaseKey(input.leaseId, input.generation));
+          const dispatchPrincipals = yield* authSessions
+            .listActive()
+            .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
+          if (
+            beforeDispatch === undefined ||
+            beforeDispatch.status !== "active" ||
+            beforeDispatch.planner_native_thread_id !== input.plannerNativeThreadId ||
+            currentLease?.plannerNativeThreadId !== input.plannerNativeThreadId ||
+            currentLease.runtime.liveVoice === undefined ||
+            currentLease.runtime.driver !== "codex" ||
+            currentLease.runtime.instanceId !== beforeDispatch.provider_instance_id ||
+            currentLease.runtime.providerSessionId !== beforeDispatch.provider_session_id ||
+            !dispatchPrincipals.some(
+              (principal) =>
+                principal.sessionId === beforeDispatch.principal_session_id &&
+                principal.subject === beforeDispatch.principal_subject &&
+                principal.scopes.includes(AuthOrchestrationOperateScope),
+            )
+          ) {
+            const refused = encodeReceipt({
+              ...receipt,
+              readback: {
+                state: "refused",
+                runId: input.runId,
+                attemptId: input.attemptId,
+                finalMessageId: input.finalMessageId,
+              },
+            });
+            yield* sql`
+              UPDATE codex_live_voice_intents SET receipt_json = ${refused}, updated_at = ${now}
+              WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
+                AND planner_native_thread_id = ${input.plannerNativeThreadId}
+                AND planner_turn_id = ${input.plannerTurnId} AND receipt_json = ${claimed}
+            `;
+            return;
+          }
           const state = yield* Effect.exit(
-            lease.runtime.liveVoice.appendSpeech({
+            currentLease.runtime.liveVoice.appendSpeech({
               plannerNativeThreadId: input.plannerNativeThreadId,
-              text: input.text.slice(0, 3_800),
+              text: input.text,
             }),
           );
           // appendSpeech has no idempotency key: any outcome after claim is terminal.
