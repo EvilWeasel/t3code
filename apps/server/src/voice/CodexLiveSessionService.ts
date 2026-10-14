@@ -133,9 +133,12 @@ export const layer: Layer.Layer<
     const serviceScope = yield* Effect.scope;
     const leaseLocks = yield* KeyedLock.make<string>();
     const readbackWorkers = new Map<string, Fiber.Fiber<void, never>>();
+    const nativeEventRuntimes = new Set<ProviderAdapter.ProviderAdapterV2SessionRuntime>();
     const active = new Map<
       string,
       {
+        readonly leaseId: string;
+        readonly generation: number;
         readonly runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
         readonly plannerNativeThreadId: string;
       }
@@ -763,16 +766,36 @@ export const layer: Layer.Layer<
             const ready = yield* getLease(leaseId, generation);
             if (ready === undefined) return yield* liveError("session_not_found");
             active.set(leaseKey(leaseId, generation), {
+              leaseId,
+              generation,
               runtime,
               plannerNativeThreadId: prepared.plannerNativeThreadId,
             });
             yield* eventHub.publish({ type: "status", session: sessionFromRow(ready) });
-            yield* Effect.forkIn(
-              runtime.liveVoice.events.pipe(
-                Stream.runForEach((event) => handleNativeEvent(leaseId, generation, event)),
-              ),
-              serviceScope,
-            );
+            // The adapter exposes one consuming queue per runtime. A worker per
+            // lease would let an ended call steal a later call's notifications.
+            if (!nativeEventRuntimes.has(runtime)) {
+              nativeEventRuntimes.add(runtime);
+              yield* Effect.forkIn(
+                runtime.liveVoice.events.pipe(
+                  Stream.runForEach((event) => {
+                    const entry = [...active.values()].find(
+                      (candidate) =>
+                        candidate.runtime === runtime &&
+                        candidate.plannerNativeThreadId === event.plannerNativeThreadId,
+                    );
+                    if (entry === undefined) return Effect.void;
+                    const handling = handleNativeEvent(entry.leaseId, entry.generation, event);
+                    // Readiness cannot race Stop; failures must still invalidate
+                    // readback while its principal lookup is in flight.
+                    return event.type === "started" || event.type === "sdp"
+                      ? leaseLocks.withLock(leaseKey(entry.leaseId, entry.generation), handling)
+                      : handling;
+                  }),
+                ),
+                serviceScope,
+              );
+            }
             return sessionFromRow(ready);
           }),
         )
@@ -1106,6 +1129,7 @@ export const layer: Layer.Layer<
           return;
         switch (event.type) {
           case "started": {
+            if (row.status !== "starting" && row.status !== "active") return;
             if (
               event.realtimeSessionId != null &&
               event.realtimeSessionId !== `${leaseId}:${generation}`
@@ -1124,6 +1148,7 @@ export const layer: Layer.Layer<
             return;
           }
           case "sdp": {
+            if (row.status !== "starting" && row.status !== "active") return;
             yield* updateStatus(
               row,
               row.native_started === 1 ? "active" : "starting",

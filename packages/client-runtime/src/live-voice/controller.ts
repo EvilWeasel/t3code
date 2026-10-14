@@ -310,12 +310,16 @@ export class LiveVoiceController {
       // End/timeout can reject this barrier before subscribe() settles, so attach
       // a handler now while still awaiting the original promise below.
       void subscriptionReady.catch(() => undefined);
-      this.unsubscribe = await this.dependencies.signaling.subscribe(
+      const unsubscribe = await this.dependencies.signaling.subscribe(
         lease,
         (event) => this.onSignal(operation, event),
         signal,
       );
-      if (!this.isCurrentLease(operation, lease)) return;
+      if (!this.isCurrentLease(operation, lease)) {
+        unsubscribe();
+        return;
+      }
+      this.unsubscribe = unsubscribe;
       await subscriptionReady;
       if (!this.isCurrentLease(operation, lease)) return;
       let prepared = lease;
@@ -324,6 +328,7 @@ export class LiveVoiceController {
           this.resolvePrepared = resolve;
           this.rejectPrepared = reject;
         });
+        void ready.catch(() => undefined);
         const current = await this.dependencies.signaling.status({
           leaseId: lease.leaseId,
           generation: lease.generation,
@@ -409,6 +414,7 @@ export class LiveVoiceController {
 
       // Server events are already subscribed; RPC acceptance alone never changes the UI to live.
       const answerPromise = this.waitForAnswer(operation, activeLease);
+      void answerPromise.catch(() => undefined);
       const starting = await this.dependencies.signaling.start(
         {
           leaseId: activeLease.leaseId,
@@ -490,6 +496,7 @@ export class LiveVoiceController {
     this.rejectAnswer?.(new Error("Live session ended."));
     this.rejectPrepared?.(new Error("Live session ended."));
     this.rejectSubscriptionReady?.(new Error("Live session ended."));
+    this.rejectRtcReady?.(new Error("Live session ended."));
     await this.release(lease, microphoneOwnership);
     if (lease) await this.stopLease(lease);
     if (operation === this.operation) this.setState({ ...IDLE_STATE, phase: "ended" });
@@ -556,7 +563,7 @@ export class LiveVoiceController {
     }
   }
 
-  private async waitForAnswer(operation: number, lease: LiveVoiceLease): Promise<string> {
+  private waitForAnswer(operation: number, lease: LiveVoiceLease): Promise<string> {
     return new Promise<string>((resolve, reject) => {
       if (!this.isCurrentLease(operation, lease))
         return reject(new Error("Live session changed during startup."));
@@ -675,7 +682,11 @@ export class LiveVoiceController {
     this.rejectPrepared = null;
     this.resolveRtcReady = null;
     this.rejectRtcReady = null;
-    this.channel?.close();
+    if (this.channel) {
+      this.channel.onopen = null;
+      this.channel.onclose = null;
+      this.channel.close();
+    }
     this.channel = null;
     if (this.peer) {
       this.peer.ontrack = null;

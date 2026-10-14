@@ -39,15 +39,18 @@ const readbackState = (json: string) => {
   return (readback as Record<string, unknown>).state;
 };
 
-it.effect(
-  "uses the native planner, gates active on both notifications, and queues one durable work intent",
-  () =>
+it.effect.each([false, true])(
+  "uses the native planner, gates active, and queues durable work (reuse runtime: %s)",
+  (reuseRuntime) =>
     Effect.gen(function* () {
       const nativeEvents =
         yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2LiveVoiceEvent>();
-      const secondNativeEvents =
-        yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2LiveVoiceEvent>();
-      const secondProviderSessionId = ProviderSessionId.make("provider-session-test-2");
+      const secondNativeEvents = reuseRuntime
+        ? nativeEvents
+        : yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2LiveVoiceEvent>();
+      const secondProviderSessionId = ProviderSessionId.make(
+        reuseRuntime ? "provider-session-test" : "provider-session-test-2",
+      );
       let submitWork:
         | ((input: {
             plannerNativeThreadId: string;
@@ -243,7 +246,11 @@ it.effect(
         Layer.succeed(ProviderSessionManager.ProviderSessionManagerV2, {
           get: (providerSessionId: ProviderSessionId) =>
             Effect.succeed(
-              Option.some(providerSessionId === secondProviderSessionId ? secondRuntime : runtime),
+              Option.some(
+                !reuseRuntime && providerSessionId === secondProviderSessionId
+                  ? secondRuntime
+                  : runtime,
+              ),
             ),
         } as unknown as ProviderSessionManager.ProviderSessionManagerV2Shape),
         Layer.succeed(ThreadManagementService.ThreadManagementService, {
@@ -287,13 +294,18 @@ it.effect(
         assert.equal(plannerCalls, 1);
 
         const delivered = yield* Queue.unbounded<LiveVoiceEvent>();
+        const observedStatuses: string[] = [];
         yield* service
           .subscribe(session, {
             leaseId: prepared.leaseId,
             generation: prepared.generation,
           })
           .pipe(
-            Stream.runForEach((event) => Queue.offer(delivered, event)),
+            Stream.runForEach((event) =>
+              Effect.sync(() => {
+                if (event.type === "status") observedStatuses.push(event.session.status);
+              }).pipe(Effect.andThen(Queue.offer(delivered, event))),
+            ),
             Effect.forkChild({ startImmediately: true }),
           );
         const waitForEvent = (predicate: (event: LiveVoiceEvent) => boolean) =>
@@ -826,6 +838,17 @@ it.effect(
         );
         assert.isTrue(Exit.isFailure(afterStop));
         assert.equal(sends, 4);
+        const statusesBeforeLateReadiness = observedStatuses.length;
+        yield* Queue.offer(nativeEvents, {
+          type: "started",
+          plannerNativeThreadId: "planner-native-1",
+          realtimeSessionId: `${prepared.leaseId}:${prepared.generation}`,
+        });
+        yield* Queue.offer(nativeEvents, {
+          type: "sdp",
+          plannerNativeThreadId: "planner-native-1",
+          sdp: "late-answer-after-stop",
+        });
         yield* Queue.offer(nativeEvents, {
           type: "closed",
           plannerNativeThreadId: "planner-native-1",
@@ -836,6 +859,11 @@ it.effect(
             event.session.leaseId === prepared.leaseId &&
             event.session.generation === prepared.generation &&
             event.session.status === "closed",
+        );
+
+        assert.isFalse(
+          observedStatuses.slice(statusesBeforeLateReadiness).includes("active"),
+          "late readiness must not resurrect a stopping call",
         );
 
         durableProjection = {
@@ -878,6 +906,11 @@ it.effect(
           clientRequestId: "start-2",
         });
         yield* Queue.offer(secondNativeEvents, {
+          type: "started",
+          plannerNativeThreadId: "planner-native-1",
+          realtimeSessionId: `${prepared.leaseId}:${prepared.generation}`,
+        });
+        yield* Queue.offer(secondNativeEvents, {
           type: "sdp",
           plannerNativeThreadId: "planner-native-2",
           sdp: "v=0\\r\\nanswer",
@@ -893,6 +926,15 @@ it.effect(
             event.session.leaseId === secondPrepared.leaseId &&
             event.session.generation === secondPrepared.generation &&
             event.session.status === "active",
+        );
+
+        assert.equal(
+          (yield* service.status(session, {
+            leaseId: prepared.leaseId,
+            generation: prepared.generation,
+          })).status,
+          "closed",
+          "an old planner notification cannot resurrect the ended call",
         );
 
         const raceReceipt = yield* invokeWithPlanner(

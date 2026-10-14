@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vite-plus/test";
+import { LiveVoiceError } from "@t3tools/contracts";
 
 import {
   isLiveVoiceSupported,
@@ -573,5 +574,94 @@ describe("LiveVoiceController", () => {
     expect(harness.signaling.stop).toHaveBeenCalledOnce();
     expect(harness.stoppedTracks).toBe(0);
     expect(harness.calls).not.toContain("media-request");
+  });
+
+  it("settles startup when End Live interrupts RTC readiness after SDP", async () => {
+    const harness = createHarness();
+    const starting = harness.controller.start(target);
+    await vi.waitFor(() => expect(harness.calls).toContain("subscribe"));
+    harness.emit(statusEvent(lease));
+    await vi.waitFor(() => expect(harness.calls).toContain("signaling-start"));
+    harness.emit(answerEvent);
+    await vi.waitFor(() => expect(harness.calls).toContain("remote:answer-sdp"));
+
+    await harness.controller.end();
+    await starting;
+
+    expect(harness.controller.currentState.phase).toBe("ended");
+    expect(harness.stoppedTracks).toBe(1);
+    expect(harness.channel.onopen).toBeNull();
+    expect(harness.channel.onclose).toBeNull();
+    expect(harness.signaling.stop).toHaveBeenCalledOnce();
+  });
+
+  it("cleans up an unanswered SDP wait when start RPC fails with a public voice category", async () => {
+    const harness = createHarness();
+    vi.mocked(harness.signaling.start).mockRejectedValueOnce(
+      new LiveVoiceError({ code: "managed_account_required" }),
+    );
+    const starting = harness.controller.start(target);
+    await vi.waitFor(() => expect(harness.calls).toContain("subscribe"));
+    harness.emit(statusEvent(lease));
+    await starting;
+    expect(harness.controller.currentState).toMatchObject({
+      phase: "error",
+      error: "Sign in to a supported ChatGPT account to use Live voice.",
+    });
+    expect(harness.stoppedTracks).toBe(1);
+    expect(harness.signaling.stop).toHaveBeenCalledOnce();
+  });
+
+  it("settles an ended preparation when the status RPC rejects late", async () => {
+    const recovery = deferred<LiveVoiceLease>();
+    const unresolved = {
+      ...lease,
+      providerSessionId: null,
+      plannerNativeThreadId: null,
+      status: "preparing",
+    } as LiveVoiceLease;
+    const harness = createHarness({
+      preparedLease: unresolved,
+      status: () => recovery.promise,
+    });
+    const starting = harness.controller.start(target);
+    await vi.waitFor(() => expect(harness.calls).toContain("subscribe"));
+    harness.emit(statusEvent(unresolved));
+    await vi.waitFor(() => expect(harness.signaling.status).toHaveBeenCalledOnce());
+    await harness.controller.end();
+    recovery.reject(new Error("private late status failure"));
+    await starting;
+    expect(harness.controller.currentState.phase).toBe("ended");
+    expect(harness.calls).not.toContain("media-request");
+    expect(harness.signaling.stop).toHaveBeenCalledOnce();
+  });
+
+  it("unsubscribes a late subscription without replacing a newer call's listener", async () => {
+    const harness = createHarness();
+    const subscription = deferred<() => void>();
+    const unsubscribeLate = vi.fn();
+    vi.mocked(harness.signaling.subscribe).mockImplementationOnce(() => subscription.promise);
+    const firstStart = harness.controller.start(target);
+    await vi.waitFor(() => expect(harness.signaling.subscribe).toHaveBeenCalledOnce());
+    await harness.controller.end();
+
+    const secondStart = harness.controller.start(target);
+    await connect(harness, secondStart);
+    subscription.resolve(unsubscribeLate);
+    await firstStart;
+    expect(unsubscribeLate).toHaveBeenCalledOnce();
+
+    harness.emit({
+      type: "transcript",
+      leaseId: lease.leaseId,
+      generation: lease.generation,
+      role: "assistant",
+      text: "The new call still receives events",
+    });
+    expect(harness.controller.currentState.transcript.at(-1)?.text).toBe(
+      "The new call still receives events",
+    );
+    await harness.controller.end();
+    expect(harness.calls.filter((call) => call === "unsubscribe")).toHaveLength(1);
   });
 });

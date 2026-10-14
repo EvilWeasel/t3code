@@ -22,6 +22,7 @@ import { Button } from "~/components/ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { randomUUID } from "~/lib/utils";
 import { LiveVoiceTranscript } from "./LiveVoiceTranscript";
+import { unwrapLiveVoiceCommand } from "./LiveVoiceCommands";
 
 type VoiceEventBridge = {
   readonly subscribe: LiveVoiceSignalingAdapter["subscribe"];
@@ -106,13 +107,6 @@ function LiveVoiceEventFeed(props: {
   return null;
 }
 
-function unwrapCommand<A>(
-  result: { readonly _tag: "Success"; readonly value: A } | { readonly _tag: "Failure" },
-): A {
-  if (result._tag === "Success") return result.value;
-  throw new Error("Live voice request failed.");
-}
-
 export function LiveVoiceControl(props: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId | null;
@@ -160,13 +154,13 @@ export function LiveVoiceControl(props: {
     () => ({
       subscribe: bridge.subscribe,
       prepare: async (input) =>
-        unwrapCommand(await prepare({ environmentId: props.environmentId, input })),
+        unwrapLiveVoiceCommand(await prepare({ environmentId: props.environmentId, input })),
       start: async (input) =>
-        unwrapCommand(await startRpc({ environmentId: props.environmentId, input })),
+        unwrapLiveVoiceCommand(await startRpc({ environmentId: props.environmentId, input })),
       stop: async (input) =>
-        unwrapCommand(await stopRpc({ environmentId: props.environmentId, input })),
+        unwrapLiveVoiceCommand(await stopRpc({ environmentId: props.environmentId, input })),
       status: async (input) =>
-        unwrapCommand(await statusRpc({ environmentId: props.environmentId, input })),
+        unwrapLiveVoiceCommand(await statusRpc({ environmentId: props.environmentId, input })),
     }),
     [bridge, prepare, props.environmentId, startRpc, statusRpc, stopRpc],
   );
