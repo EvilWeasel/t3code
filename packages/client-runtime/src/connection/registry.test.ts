@@ -939,6 +939,10 @@ describe("EnvironmentRegistry", () => {
               ]),
             ),
           );
+          yield* SubscriptionRef.changes(registry.entries).pipe(
+            Stream.filter((current) => current.has(addedId)),
+            Stream.runHead,
+          );
           yield* awaitConnectionState(
             registry,
             addedId,

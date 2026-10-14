@@ -255,6 +255,9 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
       // Bind the credential lookup to the identity that requested it. The
       // token provider can suspend while the active Connect account changes.
       const sessionIdentity = yield* session.identity;
+      if (Option.isSome(sessionIdentity)) {
+        yield* Ref.set(activeAccountId, Option.some(sessionIdentity.value.accountId));
+      }
       const tokenResult = yield* Effect.result(session.clerkToken);
       if (tokenResult._tag === "Failure") {
         const failure = tokenResult.failure;
@@ -277,14 +280,14 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
       }
       const clerkToken = tokenResult.success;
       const identityAfterToken = yield* session.identity;
-      if (
-        (yield* Ref.get(accountGeneration)) !== generation ||
+      const generationChanged = (yield* Ref.get(accountGeneration)) !== generation;
+      const identityChanged =
         Option.isNone(sessionIdentity) ||
         Option.isNone(identityAfterToken) ||
-        identityAfterToken.value.accountId !== sessionIdentity.value.accountId
-      ) {
-        if ((yield* Ref.get(accountGeneration)) === generation) {
-          yield* Ref.update(accountGeneration, (current) => current + 1);
+        identityAfterToken.value.accountId !== sessionIdentity.value.accountId;
+      if (generationChanged || identityChanged) {
+        if (identityChanged) {
+          if (!generationChanged) yield* Ref.update(accountGeneration, (current) => current + 1);
           yield* Ref.update(snapshotGeneration, (current) => current + 1);
           yield* SubscriptionRef.set(authenticatedSnapshot, Option.none());
           yield* SubscriptionRef.set(relayCleanupAuthorized, true);
@@ -292,8 +295,8 @@ export const make = Effect.fn("RelayEnvironmentDiscovery.make")(function* () {
             activeAccountId,
             Option.map(identityAfterToken, (current) => current.accountId),
           );
-          yield* SubscriptionRef.update(state, (current) => ({ ...current, refreshing: false }));
         }
+        yield* SubscriptionRef.update(state, (current) => ({ ...current, refreshing: false }));
         return;
       }
       const accountId = Option.some(sessionIdentity.value.accountId);

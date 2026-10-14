@@ -80,17 +80,11 @@ export const watchDiscoveredEnvironments = Effect.fn("connection.watchDiscovered
     if (snapshots === undefined) return;
     const cleanupAuthorized = discovery.relayCleanupAuthorized;
     yield* Stream.concat(
-      Stream.succeed(undefined),
-      Stream.merge(
-        SubscriptionRef.changes(snapshots).pipe(Stream.as(undefined)),
-        cleanupAuthorized === undefined
-          ? Stream.empty
-          : SubscriptionRef.changes(cleanupAuthorized).pipe(Stream.as(undefined)),
-      ),
+      Stream.fromEffect(SubscriptionRef.get(snapshots)),
+      SubscriptionRef.changes(snapshots),
     ).pipe(
-      Stream.runForEach(() =>
+      Stream.runForEach((snapshot) =>
         Effect.gen(function* () {
-          const snapshot = yield* SubscriptionRef.get(snapshots);
           if (Option.isNone(snapshot)) {
             if (
               cleanupAuthorized !== undefined &&
