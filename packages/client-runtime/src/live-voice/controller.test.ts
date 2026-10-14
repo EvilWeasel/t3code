@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
-  acquireMicrophoneOwnership,
   isLiveVoiceSupported,
   LiveVoiceController,
   type LiveVoiceControllerDependencies,
@@ -11,6 +10,7 @@ import {
   type LiveVoiceSignalEvent,
   type LiveVoiceSignalingAdapter,
 } from "./controller.ts";
+import { acquireMicrophoneOwnership } from "./microphoneOwnership.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
