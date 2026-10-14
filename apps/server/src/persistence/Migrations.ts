@@ -76,6 +76,7 @@ import Migration0059 from "./Migrations/059_McpAppModelContext.ts";
 import Migration0060 from "./Migrations/060_ThreadSnapshotWindowIndexes.ts";
 import Migration0061 from "./Migrations/061_PullRequestReviewGuides.ts";
 import Migration0062 from "./Migrations/062_ThreadFailureLookupIndex.ts";
+import Migration0063 from "./Migrations/063_CodexLiveVoice.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -152,6 +153,7 @@ export const migrationEntries = [
   [60, "ThreadSnapshotWindowIndexes", Migration0060],
   [61, "PullRequestReviewGuides", Migration0061],
   [62, "ThreadFailureLookupIndex", Migration0062],
+  [63, "CodexLiveVoice", Migration0063],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
@@ -208,6 +210,55 @@ const assertV2MigrationsCanRun = Effect.fn("assertV2MigrationsCanRun")(function*
 });
 
 /**
+ * The qualified Voice fork used 62 before main allocated it to the failure index.
+ * Move only that known ledger entry to 63, preserving its timestamp and data,
+ * and apply main's 62 in the same transaction before the V2 history guard runs.
+ */
+const reconcileLegacyCodexLiveVoiceMigration = Effect.fn("reconcileLegacyCodexLiveVoiceMigration")(
+  function* (throughId?: number) {
+    if (throughId !== undefined && throughId < 63) return [];
+    const sql = yield* SqlClient.SqlClient;
+    const tables = yield* sql`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'
+    `;
+    if (tables.length === 0) return [];
+    const latest = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+      SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id DESC LIMIT 1
+    `;
+    if (latest[0]?.migration_id !== 62 || latest[0].name !== "CodexLiveVoice") return [];
+    yield* assertV2MigrationsCanRun(61);
+    return yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const voiceTables = yield* sql`
+          SELECT name FROM sqlite_master WHERE type = 'table'
+            AND name IN ('codex_live_voice_leases', 'codex_live_voice_intents')
+        `;
+        if (voiceTables.length !== 2) {
+          return yield* new Migrator.MigrationError({
+            kind: "BadState",
+            message: "Recorded CodexLiveVoice migration 62 is missing its qualified Voice tables.",
+          });
+        }
+        yield* Migration0062;
+        yield* Migration0063;
+        yield* sql`
+          UPDATE effect_sql_migrations SET migration_id = 63
+          WHERE migration_id = 62 AND name = 'CodexLiveVoice'
+        `;
+        yield* sql`
+          INSERT INTO effect_sql_migrations (migration_id, name)
+          VALUES (62, 'ThreadFailureLookupIndex')
+        `;
+        return [
+          [62, "ThreadFailureLookupIndex"],
+          [63, "CodexLiveVoice"],
+        ] as const;
+      }),
+    );
+  },
+);
+
+/**
  * Migrator run function - no schema dumping needed
  * Uses the base Migrator.make without platform dependencies
  */
@@ -233,11 +284,15 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
   const includesV2 =
     toMigrationInclusive === undefined || toMigrationInclusive >= FIRST_V2_MIGRATION_ID;
   const previewMigrations = includesV2 ? yield* reconcileV2PreviewMigration() : [];
+  const legacyVoiceMigrations = includesV2
+    ? yield* reconcileLegacyCodexLiveVoiceMigration(toMigrationInclusive)
+    : [];
   if (includesV2) {
     yield* assertV2MigrationsCanRun(toMigrationInclusive);
   }
   const executedMigrations = [
     ...previewMigrations,
+    ...legacyVoiceMigrations,
     ...(yield* run({ loader: makeMigrationLoader(toMigrationInclusive) })),
   ];
   const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);

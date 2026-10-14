@@ -134,6 +134,28 @@ describe("DesktopEnvironment", () => {
     }),
   );
 
+  it.effect("accepts an explicit absolute Linux URL handler launcher with an explicit T3 home", () =>
+    Effect.gen(function* () {
+      const environment = yield* makeEnvironment(
+        { platform: "linux", isPackaged: true },
+        {
+          T3CODE_DESKTOP_PROFILE: "weasel",
+          T3CODE_HOME: "/tmp/t3code-fixture/home/t3code-weasel",
+          T3CODE_DESKTOP_LINUX_URL_HANDLER_LAUNCHER:
+            "/tmp/t3code-fixture/bin/t3code-weasel",
+        },
+      );
+      assert.deepEqual(
+        environment.linuxUrlHandlerLauncher,
+        Option.some("/tmp/t3code-fixture/bin/t3code-weasel"),
+      );
+      assert.deepEqual(
+        environment.linuxUrlHandlerHome,
+        Option.some("/tmp/t3code-fixture/home/t3code-weasel"),
+      );
+    }),
+  );
+
   it.effect("uses the packaged Windows server sidecar as the backend root", () =>
     Effect.gen(function* () {
       const environment = yield* makeEnvironment({

@@ -115,6 +115,10 @@
       "types": "./src/voice-input/index.ts",
       "default": "./src/voice-input/index.ts"
     },
+    "./live-voice": {
+      "types": "./src/live-voice/index.ts",
+      "default": "./src/live-voice/index.ts"
+    },
     "./t3ToolSummary": {
       "types": "./src/t3ToolSummary.ts",
       "default": "./src/t3ToolSummary.ts"
@@ -214,6 +218,10 @@
     "./state/voice-transcription": {
       "types": "./src/state/voiceTranscriptionHttp.ts",
       "default": "./src/state/voiceTranscriptionHttp.ts"
+    },
+    "./state/live-voice": {
+      "types": "./src/state/liveVoice.ts",
+      "default": "./src/state/liveVoice.ts"
     },
     "./state/project-grouping": {
       "types": "./src/state/projectGrouping.ts",

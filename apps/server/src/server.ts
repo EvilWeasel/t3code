@@ -31,6 +31,7 @@ import * as ServerHttp from "./http.ts";
 import { guardHttpResponseWriteErrors } from "./httpResponseErrorGuard.ts";
 import { fixPath } from "./os-jank.ts";
 import * as Ws from "./ws.ts";
+import * as CodexLiveSessionService from "./voice/CodexLiveSessionService.ts";
 import * as AgentScopeLive from "./process/agentScope.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as NodePtyAdapter from "./terminal/NodePtyAdapter.ts";
@@ -398,7 +399,7 @@ const layerVcs = Layer.empty.pipe(
       // Auto-pull reads the project row. The orchestration runtime also
       // consumes the broadcaster (run finalization), so the policy cannot read
       // the store from the runtime's output.
-      Layer.provide(
+      Layer.provideMerge(
         VcsStatusBroadcaster.layerAutoPullPolicy.pipe(Layer.provide(ProjectStore.layer)),
       ),
     ),
@@ -1104,6 +1105,9 @@ const layerMakeServer = Layer.unwrap(
     return layerServerApplication.pipe(
       // The connect routes and the startup/shutdown link work share one instance.
       Layer.provide(CloudLink.layer),
+      Layer.provideMerge(
+        CodexLiveSessionService.layer.pipe(Layer.provide(RuntimeLayer.layerRuntimePolicyProvided)),
+      ),
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(

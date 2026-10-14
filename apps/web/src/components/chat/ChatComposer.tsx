@@ -272,7 +272,9 @@ import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerImageThumbnail } from "./ComposerImageThumbnail";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { VoiceDictationControl } from "../../voice/VoiceDictationControl";
+import { LiveVoiceControl } from "../../voice/LiveVoiceControl";
 import { transcribeVoiceRecording } from "../../voice/transcriptionClient";
+import { readCodexSetupMode } from "../settings/CodexSetupSection.logic";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
@@ -1730,7 +1732,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     supportsMultipleModels,
     onMultipleModelSelectionsChange: setMultipleModelSelections,
     activeThreadId,
-    activeThreadEnvironmentId: _activeThreadEnvironmentId,
+    activeThreadEnvironmentId,
     activeThread,
     promptHistoryMessages,
     isServerThread: _isServerThread,
@@ -2202,6 +2204,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // disabled.
   const selectedProvider: ProviderDriverKind =
     selectedProviderEntry?.driverKind ?? requestedDriverKind;
+  const selectedCodexConfig = selectedProviderEntry
+    ? settings.providerInstances[selectedProviderEntry.instanceId]?.config
+    : null;
+  const liveVoiceProviderEligible =
+    selectedProviderEntry?.driverKind === "codex" &&
+    readCodexSetupMode(selectedCodexConfig) === "managed";
+  const liveVoiceUnavailableReason = !activeThreadId
+    ? "Open an existing thread to start Live voice."
+    : !canOperateThread
+      ? "You need permission to operate this thread."
+      : "Live voice is available only for a managed Codex thread.";
   const supportedRuntimeModes = selectedProviderEntry?.snapshot.supportedRuntimeModes;
   const compatibleRuntimeModeOptions =
     supportedRuntimeModes && supportedRuntimeModes.length > 0
@@ -7721,6 +7734,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       onTranscript={insertVoiceTranscript}
                     />
                   ) : null}
+                  <LiveVoiceControl
+                    environmentId={activeThreadEnvironmentId ?? environmentId}
+                    threadId={activeThreadId}
+                    providerInstanceId={selectedProviderEntry?.instanceId ?? null}
+                    eligible={liveVoiceProviderEligible && canOperateThread}
+                    unavailableReason={liveVoiceUnavailableReason}
+                  />
                   {showComposerAttachAction ? (
                     <>
                       <input

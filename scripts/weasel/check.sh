@@ -14,6 +14,7 @@ vp_cmd() {
 for package in \
   @t3tools/contracts \
   @t3tools/client-runtime \
+  @t3tools/provider-core \
   t3 \
   @t3tools/web \
   @t3tools/desktop; do
@@ -55,5 +56,26 @@ if [[ ! -f "$server_http_test" ]]; then
   exit 1
 fi
 focused_tests+=("$server_http_test")
+live_tests=(
+  packages/client-runtime/src/live-voice/controller.test.ts
+  packages/client-runtime/src/state/commandPermissions.test.ts
+  packages/contracts/src/liveVoice.test.ts
+  packages/provider-core/src/server/codexRealtimeAdoption.test.ts
+  packages/provider-core/src/server/codexRealtimeLease.test.ts
+  apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
+  apps/server/src/orchestration-v2/RunExecutionService.test.ts
+  apps/server/src/persistence/Migrations.test.ts
+  apps/server/src/persistence/Migrations/063_CodexLiveVoice.test.ts
+  apps/server/src/voice/CodexLiveEventHub.test.ts
+  apps/server/src/voice/CodexLiveSessionService.test.ts
+  apps/server/src/observability/RpcInstrumentation.test.ts
+)
+for live_test in "${live_tests[@]}"; do
+  if [[ ! -f "$live_test" ]]; then
+    echo "Required Live voice gate is missing: $live_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$live_test")
+done
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts)

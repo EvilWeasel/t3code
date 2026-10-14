@@ -368,6 +368,15 @@ import {
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
 import { Project, ProjectMutation, ProjectMutationError } from "./project.ts";
+import {
+  LiveVoiceError,
+  LiveVoiceEvent,
+  LiveVoicePrepareInput,
+  LiveVoiceSession,
+  LiveVoiceStartInput,
+  LiveVoiceStopInput,
+  LiveVoiceSubscribeInput,
+} from "./liveVoice.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -419,6 +428,13 @@ export const WS_METHODS = {
   providerInstallCancel: "provider.install.cancel",
   providerInstallSubscribe: "provider.install.subscribe",
   providerInstallRemove: "provider.install.remove",
+
+  // Subscription-backed Codex Live voice.
+  liveVoicePrepare: "liveVoice.prepare",
+  liveVoiceStart: "liveVoice.start",
+  liveVoiceStop: "liveVoice.stop",
+  liveVoiceStatus: "liveVoice.status",
+  liveVoiceSubscribe: "liveVoice.subscribe",
 
   // VCS methods
   vcsPull: "vcs.pull",
@@ -1865,6 +1881,34 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
   stream: true,
 });
 
+const liveVoiceRpcError = Schema.Union([LiveVoiceError, EnvironmentAuthorizationError]);
+const WsLiveVoicePrepareRpc = Rpc.make(WS_METHODS.liveVoicePrepare, {
+  payload: LiveVoicePrepareInput,
+  success: LiveVoiceSession,
+  error: liveVoiceRpcError,
+});
+const WsLiveVoiceStartRpc = Rpc.make(WS_METHODS.liveVoiceStart, {
+  payload: LiveVoiceStartInput,
+  success: LiveVoiceSession,
+  error: liveVoiceRpcError,
+});
+const WsLiveVoiceStopRpc = Rpc.make(WS_METHODS.liveVoiceStop, {
+  payload: LiveVoiceStopInput,
+  success: LiveVoiceSession,
+  error: liveVoiceRpcError,
+});
+const WsLiveVoiceStatusRpc = Rpc.make(WS_METHODS.liveVoiceStatus, {
+  payload: LiveVoiceSubscribeInput,
+  success: LiveVoiceSession,
+  error: liveVoiceRpcError,
+});
+const WsLiveVoiceSubscribeRpc = Rpc.make(WS_METHODS.liveVoiceSubscribe, {
+  payload: LiveVoiceSubscribeInput,
+  success: LiveVoiceEvent,
+  error: liveVoiceRpcError,
+  stream: true,
+});
+
 /**
  * Checks the connection's scopes against the scope each RPC declares, before
  * the handler runs. Every RPC in `WsRpcGroup` carries it, so a handler cannot
@@ -1876,6 +1920,11 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 ) {}
 
 export const WsRpcGroup = RpcGroup.make(
+  WsLiveVoicePrepareRpc,
+  WsLiveVoiceStartRpc,
+  WsLiveVoiceStopRpc,
+  WsLiveVoiceStatusRpc,
+  WsLiveVoiceSubscribeRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

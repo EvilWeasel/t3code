@@ -11,7 +11,10 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as DesktopEarlyElectronStartup from "./DesktopEarlyElectronStartup.ts";
 import { resolveDesktopAppBranding } from "./DesktopEnvironment.ts";
-import { renderUrlHandlerDesktopEntry } from "./DesktopLinuxUrlHandler.ts";
+import {
+  renderUrlHandlerDesktopEntry,
+  resolveUrlHandlerLaunch,
+} from "./DesktopLinuxUrlHandler.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 
 export interface DesktopPreReadyCommandLineReader {
@@ -93,6 +96,12 @@ export const make = Effect.gen(function* () {
             // Icon installation is optional; registration retries after readiness.
           }
         }
+        const launch = resolveUrlHandlerLaunch({
+          defaultExecTarget: process.env.APPIMAGE?.trim() || process.execPath,
+          configuredLauncher: process.env.T3CODE_DESKTOP_LINUX_URL_HANDLER_LAUNCHER?.trim(),
+          home: process.env.T3CODE_HOME?.trim(),
+          profileId: process.env.T3CODE_DESKTOP_PROFILE?.trim(),
+        });
         NodeFS.writeFileSync(
           NodePath.posix.join(applicationsDir, linux.linuxDesktopEntryName),
           renderUrlHandlerDesktopEntry({
@@ -103,7 +112,8 @@ export const make = Effect.gen(function* () {
                 ? {}
                 : { profileId: process.env.T3CODE_DESKTOP_PROFILE }),
             }).displayName,
-            execTarget: process.env.APPIMAGE?.trim() || process.execPath,
+            execTarget: launch.execTarget,
+            environment: launch.environment,
             scheme: ElectronProtocol.getDesktopScheme(linux.isDevelopment),
             ...(iconPath === undefined ? {} : { iconPath }),
           }),
