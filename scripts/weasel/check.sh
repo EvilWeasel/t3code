@@ -19,7 +19,8 @@ for package in \
   @t3tools/provider-core \
   t3 \
   @t3tools/web \
-  @t3tools/desktop; do
+  @t3tools/desktop \
+  @t3tools/mobile; do
   if ! vp_cmd run --filter="$package" typecheck; then
     typecheck_failed=1
   fi
@@ -67,6 +68,19 @@ focused_tests=(
   apps/web/src/voice/LiveVoiceCommands.test.ts
   apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
 )
+approval_tests=(
+  apps/web/src/components/chat/ComposerPendingApprovalPanel.test.tsx
+  apps/web/src/components/chat/ComposerPendingApprovalActions.test.tsx
+  apps/web/src/components/chat/ApprovalActionSummary.test.tsx
+  apps/mobile/src/features/threads/PendingApprovalCard.test.tsx
+)
+for approval_test in "${approval_tests[@]}"; do
+  if [[ ! -f "$approval_test" ]]; then
+    echo "Required approval gate is missing: $approval_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$approval_test")
+done
 voice_tests=(
   apps/web/src/voice/useVoiceDictation.test.tsx
   packages/client-runtime/src/state/voiceTranscriptionHttp.test.ts

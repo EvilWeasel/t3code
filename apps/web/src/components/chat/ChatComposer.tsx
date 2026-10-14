@@ -6895,6 +6895,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       <ComposerPendingApprovalPanel
                         approval={activePendingApproval}
                         pendingCount={pendingApprovals.length}
+                        environmentId={activeThreadEnvironmentId}
+                        runtimeMode={activeThread?.runtimeMode}
                       />
                     </ComposerBanner.Content>
                     <ComposerBanner.Actions>

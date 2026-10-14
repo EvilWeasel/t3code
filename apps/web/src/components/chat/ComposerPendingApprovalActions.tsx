@@ -3,7 +3,7 @@ import {
   type ProviderApprovalOption,
   type RuntimeRequestId,
 } from "@t3tools/contracts";
-import { memo } from "react";
+import { memo, useRef, useState } from "react";
 import { EllipsisIcon, TriangleAlertIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
@@ -37,6 +37,58 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
   options = DEFAULT_APPROVAL_OPTIONS,
   onRespondToApproval,
 }: ComposerPendingApprovalActionsProps) {
+  const latest = useRef({
+    requestId,
+    disabled,
+    isResponding,
+    canRespond,
+    options,
+    onRespondToApproval,
+  });
+  latest.current = { requestId, disabled, isResponding, canRespond, options, onRespondToApproval };
+  const inFlight = useRef(new Map<RuntimeRequestId, Set<typeof onRespondToApproval>>());
+  const [, refreshResponses] = useState(0);
+  const [failedRequest, setFailedRequest] = useState<{
+    requestId: RuntimeRequestId;
+    responder: typeof onRespondToApproval;
+  } | null>(null);
+  const responseDisabled =
+    disabled ||
+    isResponding ||
+    !canRespond ||
+    inFlight.current.get(requestId)?.has(onRespondToApproval) === true;
+  const respond = async (decision: ProviderApprovalDecision) => {
+    const current = latest.current;
+    if (
+      current.requestId !== requestId ||
+      current.onRespondToApproval !== onRespondToApproval ||
+      current.disabled ||
+      current.isResponding ||
+      !current.canRespond ||
+      !current.options.some((option) => option.decision === decision) ||
+      inFlight.current.get(requestId)?.has(onRespondToApproval) === true
+    )
+      return;
+    let requests = inFlight.current.get(requestId);
+    if (!requests) inFlight.current.set(requestId, (requests = new Set()));
+    requests.add(onRespondToApproval);
+    refreshResponses((value) => value + 1);
+    setFailedRequest(null);
+    try {
+      await onRespondToApproval(requestId, decision);
+    } catch {
+      if (
+        latest.current.requestId === requestId &&
+        latest.current.onRespondToApproval === onRespondToApproval
+      )
+        setFailedRequest({ requestId, responder: onRespondToApproval });
+    } finally {
+      const requests = inFlight.current.get(requestId);
+      requests?.delete(onRespondToApproval);
+      if (requests?.size === 0) inFlight.current.delete(requestId);
+      refreshResponses((value) => value + 1);
+    }
+  };
   const primaryOptions = options.filter(
     (option) => option.decision === "decline" || option.decision === "accept",
   );
@@ -52,16 +104,14 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
             key={option.decision}
             size="xs"
             variant={option.decision === "accept" ? "default" : "outline"}
-            disabled={disabled || isResponding || !canRespond}
+            disabled={responseDisabled}
             aria-description={option.warning}
             onClick={() => {
-              if (!disabled && !isResponding) {
-                void onRespondToApproval(requestId, option.decision);
-              }
+              void respond(option.decision);
             }}
           >
             {option.warning ? <TriangleAlertIcon className="size-3 shrink-0" /> : null}
-            <span className="max-w-40 truncate">{option.label}</span>
+            <span className="max-w-40 whitespace-normal wrap-break-word">{option.label}</span>
           </Button>
         );
         return option.warning ? (
@@ -76,7 +126,7 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
       {moreOptions.length > 0 ? (
         <Menu>
           <MenuTrigger
-            disabled={disabled || isResponding}
+            disabled={responseDisabled}
             render={<Button size="icon-xs" variant="outline" aria-label="More approval options" />}
           >
             <EllipsisIcon />
@@ -86,11 +136,10 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
               const item = (
                 <MenuItem
                   key={option.decision}
-                  disabled={disabled || isResponding}
+                  disabled={responseDisabled}
                   aria-description={option.warning}
                   onClick={() => {
-                    if (!disabled && !isResponding)
-                      void onRespondToApproval(requestId, option.decision);
+                    void respond(option.decision);
                   }}
                   variant="ghost"
                   className="mb-1 last:mb-0"
@@ -110,6 +159,11 @@ export const ComposerPendingApprovalActions = memo(function ComposerPendingAppro
             })}
           </MenuPopup>
         </Menu>
+      ) : null}
+      {failedRequest?.requestId === requestId && failedRequest.responder === onRespondToApproval ? (
+        <span role="status" className="text-xs text-destructive">
+          Could not send this decision. The request is still pending.
+        </span>
       ) : null}
     </>
   );

@@ -1361,6 +1361,9 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                         <PendingApprovalCard
                           canOperateThread={props.canOperateThread}
                           approval={props.activePendingApproval}
+                          environmentId={props.environmentId}
+                          environmentLabel={props.environmentLabel}
+                          runtimeMode={props.selectedThread.runtimeMode}
                           respondingApprovalId={props.respondingApprovalId}
                           onRespond={props.onRespondToApproval}
                         />
