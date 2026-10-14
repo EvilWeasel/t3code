@@ -2973,7 +2973,11 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     buildConfig.nsis = {
       differentialPackage: true,
       ...(profile === "weasel"
-        ? { shortcutName: "Morrowbyte", uninstallDisplayName: "Morrowbyte" }
+        ? {
+            shortcutName: "Morrowbyte",
+            uninstallDisplayName: "Morrowbyte",
+            include: "morrowbyte-installer.nsh",
+          }
         : {}),
     };
     const winConfig: Record<string, unknown> = {

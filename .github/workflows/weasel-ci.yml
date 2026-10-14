@@ -35,3 +35,12 @@ jobs:
         run: vp install --frozen-lockfile
       - name: Run focused source gates
         run: bash scripts/weasel/check.sh
+  windows_installer_guard:
+    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Windows installer process isolation
+        shell: powershell
+        run: ./apps/desktop/resources/test-morrowbyte-installer-guard.ps1

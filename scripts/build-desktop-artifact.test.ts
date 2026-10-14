@@ -817,6 +817,7 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         );
         assert.equal((linux.linux as Record<string, unknown>).executableName, "t3code");
         assert.equal((win.nsis as Record<string, unknown>).shortcutName, "Morrowbyte");
+        assert.equal((win.nsis as Record<string, unknown>).include, "morrowbyte-installer.nsh");
         assert.equal(win.artifactName, "T3-Code-${version}-${arch}.${ext}");
         assert.equal(linux.artifactName, "T3-Code-${version}-x86_64.${ext}");
         assert.equal(win.appId, "com.evilweasel.t3code");
