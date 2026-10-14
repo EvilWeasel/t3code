@@ -7,6 +7,7 @@ interface WindowsProfileInput {
   readonly homeDirectory: string;
   readonly appDataDirectory?: string | undefined;
   readonly explicitHome?: string | undefined;
+  readonly explicitBackendPort?: string | undefined;
 }
 
 /** Outside the installation and Electron's version/profile-specific userData.
@@ -30,7 +31,16 @@ function isAbsoluteWindowsHome(value: unknown): value is string {
   );
 }
 
-function readHome(bindingPath: string): string | undefined {
+interface WindowsProfileBinding {
+  readonly t3Home: string;
+  readonly backendPort?: number | undefined;
+}
+
+function validPort(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 && value <= 65535;
+}
+
+function readBinding(bindingPath: string): (WindowsProfileBinding & { readonly serialized: string }) | undefined {
   let raw: string;
   try {
     if (Fs.statSync(bindingPath).size > 16_384)
@@ -56,46 +66,90 @@ function readHome(bindingPath: string): string | undefined {
     !("profile" in value) ||
     value.profile !== "weasel" ||
     !("t3Home" in value) ||
-    !isAbsoluteWindowsHome(value.t3Home)
+    !isAbsoluteWindowsHome(value.t3Home) ||
+    ("backendPort" in value && !validPort(value.backendPort))
   ) {
     throw new Error(
       "Saved Windows desktop profile is invalid; use an explicit T3CODE_HOME to recover",
     );
   }
-  return value.t3Home;
+  return {
+    serialized: raw,
+    t3Home: value.t3Home,
+    backendPort: "backendPort" in value ? (value.backendPort as number) : undefined,
+  };
 }
 
 /** Called only by the packaged Windows fork, before auth/database bootstrap.
  * Explicit launch configuration wins, but never silently changes an existing
  * default binding belonging to a different profile. No global environment is set. */
-export function resolveWindowsProfileHome(input: WindowsProfileInput): string {
+export function resolveWindowsProfileBinding(input: WindowsProfileInput): WindowsProfileBinding {
   const bindingPath = windowsProfileBindingPath(input);
-  const explicitHome = input.explicitHome?.trim();
-  if (!explicitHome) {
-    // A corrupt binding fails closed instead of opening a new, empty profile.
-    return readHome(bindingPath) ?? Path.win32.join(input.homeDirectory, ".t3-weasel");
+  const explicitHome = input.explicitHome?.trim() || undefined;
+  const portText = input.explicitBackendPort?.trim();
+  const explicitPort = portText ? Number(portText) : undefined;
+  if (portText && (!/^\d+$/.test(portText) || !validPort(explicitPort))) {
+    throw new Error("Windows T3CODE_PORT must be a valid TCP port");
   }
-  if (!isAbsoluteWindowsHome(explicitHome)) {
+  if (explicitHome && !isAbsoluteWindowsHome(explicitHome)) {
     throw new Error("Windows T3CODE_HOME must be an absolute path");
   }
-  if (Fs.existsSync(bindingPath)) return explicitHome;
 
-  Fs.mkdirSync(Path.dirname(bindingPath), { recursive: true, mode: 0o700 });
-  const temporary = `${bindingPath}.${process.pid}.${randomUUID()}.tmp`;
+  let saved: ReturnType<typeof readBinding>;
   try {
-    Fs.writeFileSync(
-      temporary,
-      JSON.stringify({ schemaVersion: 1, profile: "weasel", t3Home: explicitHome }) + "\n",
-      { flag: "wx", mode: 0o600 },
-    );
-    try {
-      // Atomic, create-only publication. A concurrent first launch keeps its binding.
-      Fs.linkSync(temporary, bindingPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    }
-  } finally {
-    Fs.rmSync(temporary, { force: true });
+    saved = readBinding(bindingPath);
+  } catch (error) {
+    // An explicit recovery launch must not destroy the invalid original record.
+    if (!explicitHome) throw error;
+    return { t3Home: explicitHome, backendPort: explicitPort };
   }
-  return explicitHome;
+  const sameHome = saved && (!explicitHome ||
+    Path.win32.normalize(saved.t3Home).toLowerCase() ===
+      Path.win32.normalize(explicitHome).toLowerCase());
+  const selected = {
+    t3Home: explicitHome ?? saved?.t3Home ?? Path.win32.join(input.homeDirectory, ".t3-weasel"),
+    backendPort: explicitPort ?? (sameHome ? saved?.backendPort : undefined),
+  };
+  const addPort = sameHome && saved.backendPort === undefined && explicitPort !== undefined;
+  if ((!saved && explicitHome) || addPort) {
+    Fs.mkdirSync(Path.dirname(bindingPath), { recursive: true, mode: 0o700 });
+    const lockPath = `${bindingPath}.lock`;
+    let lock: number | undefined;
+    if (addPort) {
+      try {
+        lock = Fs.openSync(lockPath, "wx", 0o600);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") return selected;
+        throw error;
+      }
+    }
+    const temporary = `${bindingPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      Fs.writeFileSync(temporary, JSON.stringify({
+        schemaVersion: 1, profile: "weasel", t3Home: saved?.t3Home ?? selected.t3Home,
+        ...(selected.backendPort === undefined ? {} : { backendPort: selected.backendPort }),
+      }) + "\n", { flag: "wx", mode: 0o600 });
+      if (addPort) {
+        // Upgrade only the unchanged matching-home record; retain concurrent choices.
+        if (Fs.readFileSync(bindingPath, "utf8") === saved?.serialized) Fs.renameSync(temporary, bindingPath);
+      } else {
+        try {
+          Fs.linkSync(temporary, bindingPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+      }
+    } finally {
+      Fs.rmSync(temporary, { force: true });
+      if (lock !== undefined) {
+        Fs.closeSync(lock);
+        Fs.rmSync(lockPath, { force: true });
+      }
+    }
+  }
+  return selected;
+}
+
+export function resolveWindowsProfileHome(input: WindowsProfileInput): string {
+  return resolveWindowsProfileBinding(input).t3Home;
 }

@@ -76,7 +76,7 @@ import * as DesktopWindow from "./window/DesktopWindow.ts";
 import * as DesktopWslBackend from "./wsl/DesktopWslBackend.ts";
 import * as DesktopWslEnvironment from "./wsl/DesktopWslEnvironment.ts";
 import * as DesktopWslServerTree from "./wsl/DesktopWslServerTree.ts";
-import { resolveWindowsProfileHome } from "./app/DesktopWindowsProfileBinding.ts";
+import { resolveWindowsProfileBinding } from "./app/DesktopWindowsProfileBinding.ts";
 
 let packagedWeaselProfile = false;
 if (Electron.app.isPackaged) {
@@ -104,11 +104,14 @@ if (process.argv.includes("--version")) {
 
 if (packagedWeaselProfile) {
   if (process.platform === "win32") {
-    process.env.T3CODE_HOME = resolveWindowsProfileHome({
+    const binding = resolveWindowsProfileBinding({
       homeDirectory: NodeOS.homedir(),
       appDataDirectory: process.env.APPDATA,
       explicitHome: process.env.T3CODE_HOME,
+      explicitBackendPort: process.env.T3CODE_PORT,
     });
+    process.env.T3CODE_HOME = binding.t3Home;
+    if (binding.backendPort !== undefined) process.env.T3CODE_PORT = String(binding.backendPort);
   } else if (!process.env.T3CODE_HOME?.trim()) {
     process.env.T3CODE_HOME = `${NodeOS.homedir()}/.t3-weasel`;
   }
