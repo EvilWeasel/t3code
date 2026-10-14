@@ -127,33 +127,35 @@ describe("DesktopEnvironment", () => {
         { T3CODE_DESKTOP_PROFILE: "weasel", T3CODE_HOME: "/custom/t3" },
       );
       assert.equal(fork.baseDir, "/Users/alice/.t3-weasel");
-      assert.equal(fork.displayName, "T3 Code (Weasel Nightly)");
+      assert.equal(fork.displayName, "Morrowbyte");
+      assert.equal(fork.branding.baseName, "Morrowbyte");
       assert.equal(fork.appUserModelId, "com.evilweasel.t3code");
       assert.equal(fork.linuxDesktopEntryName, "com.evilweasel.T3Code.desktop");
       assert.equal(explicit.baseDir, "/custom/t3");
     }),
   );
 
-  it.effect("accepts an explicit absolute Linux URL handler launcher with an explicit T3 home", () =>
-    Effect.gen(function* () {
-      const environment = yield* makeEnvironment(
-        { platform: "linux", isPackaged: true },
-        {
-          T3CODE_DESKTOP_PROFILE: "weasel",
-          T3CODE_HOME: "/tmp/t3code-fixture/home/t3code-weasel",
-          T3CODE_DESKTOP_LINUX_URL_HANDLER_LAUNCHER:
-            "/tmp/t3code-fixture/bin/t3code-weasel",
-        },
-      );
-      assert.deepEqual(
-        environment.linuxUrlHandlerLauncher,
-        Option.some("/tmp/t3code-fixture/bin/t3code-weasel"),
-      );
-      assert.deepEqual(
-        environment.linuxUrlHandlerHome,
-        Option.some("/tmp/t3code-fixture/home/t3code-weasel"),
-      );
-    }),
+  it.effect(
+    "accepts an explicit absolute Linux URL handler launcher with an explicit T3 home",
+    () =>
+      Effect.gen(function* () {
+        const environment = yield* makeEnvironment(
+          { platform: "linux", isPackaged: true },
+          {
+            T3CODE_DESKTOP_PROFILE: "weasel",
+            T3CODE_HOME: "/tmp/t3code-fixture/home/t3code-weasel",
+            T3CODE_DESKTOP_LINUX_URL_HANDLER_LAUNCHER: "/tmp/t3code-fixture/bin/t3code-weasel",
+          },
+        );
+        assert.deepEqual(
+          environment.linuxUrlHandlerLauncher,
+          Option.some("/tmp/t3code-fixture/bin/t3code-weasel"),
+        );
+        assert.deepEqual(
+          environment.linuxUrlHandlerHome,
+          Option.some("/tmp/t3code-fixture/home/t3code-weasel"),
+        );
+      }),
   );
 
   it.effect("uses the packaged Windows server sidecar as the backend root", () =>

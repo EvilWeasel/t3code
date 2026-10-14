@@ -29,7 +29,7 @@ install -m 0755 "$source_image" "$install_dir/T3-Code-Weasel.AppImage"
 cat > "$applications_dir/com.evilweasel.T3Code.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=T3 Code (Weasel Nightly)
+Name=Morrowbyte
 Comment=Desktop GUI for coding agents
 Exec=$install_dir/T3-Code-Weasel.AppImage %U
 Icon=applications-development

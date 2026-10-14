@@ -781,6 +781,62 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     );
   });
 
+  it.effect(
+    "brands Weasel installers without renaming the Windows executable or release assets",
+    () => {
+      const previousProfile = process.env.T3CODE_DESKTOP_PROFILE;
+      const previousName = process.env.T3CODE_DESKTOP_PRODUCT_NAME;
+      const previousAppId = process.env.T3CODE_DESKTOP_APP_ID;
+      process.env.T3CODE_DESKTOP_PROFILE = "weasel";
+      process.env.T3CODE_DESKTOP_APP_ID = "com.evilweasel.t3code";
+      process.env.T3CODE_DESKTOP_PRODUCT_NAME = "T3 Code (Weasel Nightly)";
+      return Effect.gen(function* () {
+        const win = yield* createBuildConfig(
+          "win",
+          "nsis",
+          "1.2.3-nightly.20261014.1",
+          false,
+          false,
+          undefined,
+          undefined,
+        );
+        const linux = yield* createBuildConfig(
+          "linux",
+          "AppImage",
+          "1.2.3-nightly.20261014.1",
+          false,
+          false,
+          undefined,
+          undefined,
+        );
+        assert.equal(win.productName, "Morrowbyte");
+        assert.equal(linux.productName, "Morrowbyte");
+        assert.equal(
+          (win.win as Record<string, unknown>).executableName,
+          "T3 Code (Weasel Nightly)",
+        );
+        assert.equal((linux.linux as Record<string, unknown>).executableName, "t3code");
+        assert.equal((win.nsis as Record<string, unknown>).shortcutName, "Morrowbyte");
+        assert.equal(win.artifactName, "T3-Code-${version}-${arch}.${ext}");
+        assert.equal(linux.artifactName, "T3-Code-${version}-x86_64.${ext}");
+        assert.equal(win.appId, "com.evilweasel.t3code");
+        assert.deepStrictEqual(win.extraMetadata, { t3codeProfile: "weasel" });
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (previousProfile === undefined) delete process.env.T3CODE_DESKTOP_PROFILE;
+            else process.env.T3CODE_DESKTOP_PROFILE = previousProfile;
+            if (previousName === undefined) delete process.env.T3CODE_DESKTOP_PRODUCT_NAME;
+            else process.env.T3CODE_DESKTOP_PRODUCT_NAME = previousName;
+            if (previousAppId === undefined) delete process.env.T3CODE_DESKTOP_APP_ID;
+            else process.env.T3CODE_DESKTOP_APP_ID = previousAppId;
+          }),
+        ),
+        Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
+      );
+    },
+  );
+
   it("excludes foreign node-pty prebuilds from macOS and Linux packages", () => {
     assert.deepStrictEqual(MAC_FILE_EXCLUSIONS, [
       "!**/node_modules/node-pty/prebuilds/win32-*/**/*",

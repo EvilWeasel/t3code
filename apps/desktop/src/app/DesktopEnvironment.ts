@@ -116,12 +116,9 @@ export function resolveDesktopAppBranding(input: {
 }): DesktopAppBranding {
   const stageLabel = resolveDesktopAppStageLabel(input);
   return {
-    baseName: APP_BASE_NAME,
+    baseName: input.profileId === "weasel" ? "Morrowbyte" : APP_BASE_NAME,
     stageLabel,
-    displayName:
-      input.profileId === "weasel"
-        ? "T3 Code (Weasel Nightly)"
-        : `${APP_BASE_NAME} (${stageLabel})`,
+    displayName: input.profileId === "weasel" ? "Morrowbyte" : `${APP_BASE_NAME} (${stageLabel})`,
   };
 }
 

@@ -138,7 +138,7 @@ if [[ "$managed" != 1 ]]; then
   if [[ ! -e "$desktop_dir/t3code-weasel.desktop" ]]; then
     cat >"$work_dir/desktop" <<DESKTOP
 [Desktop Entry]
-Name=T3 Code (Weasel Nightly)
+Name=Morrowbyte
 Comment=AI coding assistant desktop app
 Exec="$launcher_dir/t3code-weasel" %U
 Icon=applications-development

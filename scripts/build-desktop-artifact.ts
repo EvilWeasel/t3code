@@ -2783,7 +2783,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   const profile = process.env.T3CODE_DESKTOP_PROFILE?.trim();
   const buildConfig: Record<string, unknown> = {
     appId,
-    productName: resolveDesktopProductName(version),
+    productName: profile === "weasel" ? "Morrowbyte" : resolveDesktopProductName(version),
     ...(profile ? { extraMetadata: { t3codeProfile: profile } } : {}),
     artifactName:
       profile === "weasel" && platform === "linux"
@@ -2970,9 +2970,16 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     // Keep blockmap-based differential downloads enabled while changing the
     // installed file topology. The optimization is in the payload shape, not
     // in trading update bandwidth for install speed.
-    buildConfig.nsis = { differentialPackage: true };
+    buildConfig.nsis = {
+      differentialPackage: true,
+      ...(profile === "weasel"
+        ? { shortcutName: "Morrowbyte", uninstallDisplayName: "Morrowbyte" }
+        : {}),
+    };
     const winConfig: Record<string, unknown> = {
       target: [target],
+      // Keep existing shortcuts, protocol handlers and rollout launchers working.
+      ...(profile === "weasel" ? { executableName: "T3 Code (Weasel Nightly)" } : {}),
       icon: "icon.ico",
       // Smart App Control validates unpacked native addons independently from
       // the signed desktop executable. Extend release signing to every native

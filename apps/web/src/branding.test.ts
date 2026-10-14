@@ -47,7 +47,7 @@ describe("branding", () => {
     expect(branding.HOSTED_APP_CHANNEL).toBe("nightly");
     expect(branding.HOSTED_APP_CHANNEL_LABEL).toBe("Nightly");
     expect(branding.APP_STAGE_LABEL).toBe("Nightly");
-    expect(branding.APP_DISPLAY_NAME).toBe("T3 Code (Nightly)");
+    expect(branding.APP_DISPLAY_NAME).toBe("Morrowbyte");
   });
 
   it("does not label the latest hosted app channel", async () => {
@@ -58,7 +58,7 @@ describe("branding", () => {
     expect(branding.HOSTED_APP_CHANNEL).toBe("latest");
     expect(branding.HOSTED_APP_CHANNEL_LABEL).toBe("Latest");
     expect(branding.APP_STAGE_LABEL).toBe("Latest");
-    expect(branding.APP_DISPLAY_NAME).toBe("T3 Code");
+    expect(branding.APP_DISPLAY_NAME).toBe("Morrowbyte");
   });
 
   it("ignores unknown hosted app channels", async () => {
@@ -72,6 +72,17 @@ describe("branding", () => {
 });
 
 describe("branding logic", () => {
+  it("keeps the installed Morrowbyte label stable when a nightly server connects", () => {
+    expect(
+      resolveServerBackedAppDisplayName({
+        baseName: "Morrowbyte",
+        fallbackDisplayName: "Morrowbyte",
+        fallbackStageLabel: "Alpha",
+        primaryServerVersion: "0.0.47-nightly.20261014.15",
+      }),
+    ).toBe("Morrowbyte");
+  });
+
   it("returns Nightly for nightly primary server versions", () => {
     expect(
       resolveServerBackedAppStageLabel({

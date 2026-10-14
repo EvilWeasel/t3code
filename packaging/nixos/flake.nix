@@ -28,10 +28,10 @@
           };
           desktopFile = pkgs.writeText "t3code-weasel.desktop" ''
             [Desktop Entry]
-            Name=T3 Code (Weasel Nightly)
+            Name=Morrowbyte
             Comment=AI coding assistant desktop app
             Exec=t3code-weasel %U
-            Icon=applications-development
+            Icon=t3code
             Terminal=false
             Type=Application
             Categories=Development;IDE;

@@ -172,6 +172,26 @@ describe("DesktopAppIdentity", () => {
     ),
   );
 
+  it.effect(
+    "shows Morrowbyte while preserving existing Weasel runtime and user-data identities",
+    () => {
+      const calls: ElectronAppCalls = { setAboutPanelOptions: [], setDockIcon: [], setName: [] };
+      return withIdentity(
+        Effect.gen(function* () {
+          const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+          yield* identity.configure;
+          assert.deepEqual(calls.setName, ["T3 Code Weasel Nightly"]);
+          assert.equal(calls.setAboutPanelOptions[0]?.applicationName, "Morrowbyte");
+          assert.equal(
+            yield* identity.resolveUserDataPath,
+            "/Users/alice/Library/Application Support/t3code-weasel",
+          );
+        }),
+        { calls, environment: { env: { T3CODE_DESKTOP_PROFILE: "weasel" } } },
+      );
+    },
+  );
+
   it.effect("keeps using the legacy development profile", () =>
     withIdentity(
       Effect.gen(function* () {
