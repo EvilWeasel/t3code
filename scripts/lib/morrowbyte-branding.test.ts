@@ -1,3 +1,4 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off - This build fixture checks packaged files and PNG headers synchronously.
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vite-plus/test";
 
