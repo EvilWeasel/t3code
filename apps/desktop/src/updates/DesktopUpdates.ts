@@ -309,6 +309,7 @@ function getAutoUpdateDisabledReason(args: {
   platform: NodeJS.Platform;
   appImage?: string | undefined;
   isDebPackage: boolean;
+  isNixPackage: boolean;
   disabledByEnv: boolean;
   hasUpdateFeedConfig: boolean;
 }): string | null {
@@ -321,8 +322,8 @@ function getAutoUpdateDisabledReason(args: {
   if (args.disabledByEnv) {
     return "Automatic updates are disabled by the T3CODE_DISABLE_AUTO_UPDATE setting.";
   }
-  if (args.platform === "linux" && !args.appImage && !args.isDebPackage) {
-    return "Automatic updates on Linux require the AppImage or the .deb package.";
+  if (args.platform === "linux" && !args.appImage && !args.isDebPackage && !args.isNixPackage) {
+    return "Automatic updates on Linux require an AppImage, .deb, or managed Nix package.";
   }
   return null;
 }
@@ -403,8 +404,12 @@ export const make = Effect.gen(function* () {
           )
       : false;
 
+  const isNixPackage = environment.platform === "linux" && Option.isSome(config.nixUpdaterPath);
+
   const hasUpdateFeedConfig = Ref.get(appUpdateYmlConfigRef).pipe(
-    Effect.map((appUpdateYmlConfig) => Option.isSome(appUpdateYmlConfig) || config.mockUpdates),
+    Effect.map(
+      (appUpdateYmlConfig) => Option.isSome(appUpdateYmlConfig) || config.mockUpdates || isNixPackage,
+    ),
   );
 
   const resolveDisabledReason = Effect.gen(function* () {
@@ -416,6 +421,7 @@ export const make = Effect.gen(function* () {
         platform: environment.platform,
         appImage: Option.getOrUndefined(config.appImagePath),
         isDebPackage,
+        isNixPackage,
         disabledByEnv: config.disableAutoUpdate,
         hasUpdateFeedConfig: hasFeedConfig,
       }),

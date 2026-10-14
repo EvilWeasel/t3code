@@ -4,9 +4,24 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 
-import { autoUpdater } from "electron-updater";
+import { autoUpdater as electronAutoUpdater } from "electron-updater";
+import { app, autoUpdater as nativeAutoUpdater } from "electron";
+import { NixManagedUpdater } from "./NixManagedUpdater.ts";
 
-type AutoUpdater = typeof autoUpdater;
+const autoUpdater = process.platform === "linux" && process.env.T3CODE_NIX_UPDATER
+  ? new NixManagedUpdater({
+      command: process.env.T3CODE_NIX_UPDATER,
+      launcher: process.env.T3CODE_NIX_LAUNCHER ?? "",
+      currentVersion: app.getVersion(),
+      relaunch: (launcher) => {
+        app.relaunch({ execPath: launcher, args: process.argv.slice(1) });
+        nativeAutoUpdater.emit("before-quit-for-update");
+        app.quit();
+      },
+    })
+  : electronAutoUpdater;
+
+type AutoUpdater = typeof electronAutoUpdater;
 
 export type ElectronUpdaterFeedUrl = Parameters<AutoUpdater["setFeedURL"]>[0];
 
@@ -140,8 +155,10 @@ export const make = ElectronUpdater.of({
   quitAndInstall: ({ isSilent, isForceRunAfter }) =>
     Effect.suspend(() => {
       const channel = autoUpdater.channel;
-      return Effect.try({
-        try: () => autoUpdater.quitAndInstall(isSilent, isForceRunAfter),
+      return Effect.tryPromise({
+        try: async () => {
+          await autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
+        },
         catch: (cause) =>
           new ElectronUpdaterQuitAndInstallError({
             channel,

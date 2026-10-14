@@ -106,6 +106,25 @@ describe("DesktopUpdates", () => {
     }),
   );
 
+  it.effect("uses the managed Nix updater without an AppImage or electron feed", () => {
+    const harness = makeHarness({
+      platform: "linux",
+      env: {
+        T3CODE_DESKTOP_MOCK_UPDATES: "false",
+        T3CODE_NIX_UPDATER: "/nix/store/package/libexec/t3code-weasel-update",
+      },
+    });
+    return Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      assert.equal((yield* updates.getState).enabled, true);
+      assert.deepEqual(harness.feedUrls(), []);
+      assert.equal(harness.listenerCount(), 6);
+      yield* updates.check("managed-nix-test");
+      assert.equal(harness.checkCount(), 1);
+    })).pipe(Effect.provide(harness.layer));
+  });
+
   it.effect("subscribe delivers the latest state plus subsequent changes", () => {
     const harness = makeHarness();
 

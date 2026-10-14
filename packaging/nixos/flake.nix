@@ -57,7 +57,8 @@
 
           installPhase = ''
             runHook preInstall
-            mkdir -p "$out/lib/t3code-weasel" "$out/share"
+            mkdir -p "$out/lib/t3code-weasel" "$out/share" "$out/libexec"
+            install -m755 ${./install.sh} "$out/libexec/t3code-weasel-update.sh"
             cp -a "$src"/. "$out/lib/t3code-weasel/"
             chmod -R u+w "$out/lib/t3code-weasel"
             cp -a "$src/usr/share/icons" "$out/share/"
@@ -66,6 +67,11 @@
           '';
 
           postFixup = ''
+            makeWrapper ${pkgs.bash}/bin/bash "$out/libexec/t3code-weasel-update" \
+              --add-flags "$out/libexec/t3code-weasel-update.sh" \
+              --set T3_WEASEL_REPOSITORY ${lib.escapeShellArg repository} \
+              --set T3_WEASEL_MANAGED 1 \
+              --prefix PATH : ${lib.makeBinPath [ pkgs.coreutils pkgs.curl pkgs.jq pkgs.nix pkgs.util-linux pkgs.zstd ]}
             makeWrapper "$out/lib/t3code-weasel/t3code" "$out/bin/t3code-weasel" \
               "''${gappsWrapperArgs[@]}" \
               --prefix PATH : ${lib.makeBinPath [ pkgs.xdg-utils ]} \
@@ -76,7 +82,9 @@
               ])} \
               --unset NO_AT_BRIDGE \
               --add-flags "--force-renderer-accessibility" \
-              --set T3CODE_DISABLE_AUTO_UPDATE true
+              --set-default T3CODE_DISABLE_AUTO_UPDATE false \
+              --set T3CODE_NIX_UPDATER "$out/libexec/t3code-weasel-update" \
+              --run 'export T3CODE_NIX_LAUNCHER="''${T3CODE_NIX_LAUNCHER:-''${T3CODE_DESKTOP_LINUX_URL_HANDLER_LAUNCHER:-$HOME/.local/bin/t3code-weasel}}"'
           '';
 
           meta = {
