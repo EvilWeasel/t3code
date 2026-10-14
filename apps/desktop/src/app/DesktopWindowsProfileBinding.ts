@@ -110,7 +110,7 @@ export function resolveWindowsProfileBinding(input: WindowsProfileInput): Window
     t3Home: explicitHome ?? saved?.t3Home ?? Path.win32.join(input.homeDirectory, ".t3-weasel"),
     backendPort: explicitPort ?? (sameHome ? saved?.backendPort : undefined),
   };
-  const addPort = sameHome && saved.backendPort === undefined && explicitPort !== undefined;
+  const addPort = sameHome && saved?.backendPort === undefined && explicitPort !== undefined;
   if ((!saved && explicitHome) || addPort) {
     Fs.mkdirSync(Path.dirname(bindingPath), { recursive: true, mode: 0o700 });
     const lockPath = `${bindingPath}.lock`;
