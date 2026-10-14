@@ -45,6 +45,9 @@ it.effect(
     Effect.gen(function* () {
       const nativeEvents =
         yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2LiveVoiceEvent>();
+      const secondNativeEvents =
+        yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2LiveVoiceEvent>();
+      const secondProviderSessionId = ProviderSessionId.make("provider-session-test-2");
       let submitWork:
         | ((input: {
             plannerNativeThreadId: string;
@@ -71,6 +74,34 @@ it.effect(
       });
       let gateReadResolvers: Array<() => void> = [];
       let durableProjection: OrchestrationV2ThreadProjection;
+      let activePrincipalLookups = 0;
+      let principalLookupGate:
+        | {
+            readonly callNumber: number;
+            readonly started: Promise<void>;
+            readonly release: () => void;
+            readonly wait: Promise<void>;
+            readonly markStarted: () => void;
+          }
+        | undefined;
+      const holdDispatchPrincipalLookup = () => {
+        let markStarted!: () => void;
+        let release!: () => void;
+        const started = new Promise<void>((resolve) => {
+          markStarted = resolve;
+        });
+        const wait = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        principalLookupGate = {
+          callNumber: activePrincipalLookups + 2,
+          started,
+          release,
+          wait,
+          markStarted,
+        };
+        return principalLookupGate;
+      };
       const t3EventQueues = new Map([
         ["run.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
         ["subagent.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
@@ -103,7 +134,7 @@ it.effect(
                   ? {}
                   : { reasoningEffort: input.reasoningEffort }),
               };
-              return { plannerNativeThreadId: "planner-native-1" };
+              return { plannerNativeThreadId: `planner-native-${plannerCalls}` };
             }),
           start: () => Effect.void,
           stop: () =>
@@ -124,6 +155,14 @@ it.effect(
               spoken.push(input);
               resolveSpeech?.();
             }),
+        },
+      } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+      const secondRuntime = {
+        ...runtime,
+        providerSessionId: secondProviderSessionId,
+        liveVoice: {
+          ...runtime.liveVoice,
+          events: Stream.fromQueue(secondNativeEvents),
         },
       } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
       const sessionId = AuthSessionId.make("live-test-principal");
@@ -180,8 +219,20 @@ it.effect(
         NodeSqliteClient.layer({ filename: ":memory:" }),
         NodeCrypto.layer,
         Layer.succeed(SessionStore.SessionStore, {
-          listActive: () =>
-            Effect.succeed([{ sessionId, subject: session.subject, scopes: session.scopes }]),
+          listActive: () => {
+            activePrincipalLookups += 1;
+            const gate = principalLookupGate;
+            if (gate?.callNumber === activePrincipalLookups) {
+              principalLookupGate = undefined;
+              gate.markStarted();
+              return Effect.promise(() => gate.wait).pipe(
+                Effect.as([{ sessionId, subject: session.subject, scopes: session.scopes }]),
+              );
+            }
+            return Effect.succeed([
+              { sessionId, subject: session.subject, scopes: session.scopes },
+            ]);
+          },
         } as unknown as SessionStore.SessionStore["Service"]),
         Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
           getEnvironmentId: Effect.succeed("env-live-test" as never),
@@ -190,7 +241,10 @@ it.effect(
           resolve: () => Effect.succeed(currentPolicy),
         }),
         Layer.succeed(ProviderSessionManager.ProviderSessionManagerV2, {
-          get: () => Effect.succeed(Option.some(runtime)),
+          get: (providerSessionId: ProviderSessionId) =>
+            Effect.succeed(
+              Option.some(providerSessionId === secondProviderSessionId ? secondRuntime : runtime),
+            ),
         } as unknown as ProviderSessionManager.ProviderSessionManagerV2Shape),
         Layer.succeed(ThreadManagementService.ThreadManagementService, {
           getThreadProjection: () => Effect.succeed(durableProjection),
@@ -287,13 +341,20 @@ it.effect(
         assert.equal(activeEvent.type, "status");
 
         assert.isTrue(typeof submitWork === "function");
-        const invoke = (callId: string, message: string, plannerTurnId = "planner-turn-1") =>
+        const invokeWithPlanner = (
+          plannerNativeThreadId: string,
+          callId: string,
+          message: string,
+          plannerTurnId: string,
+        ) =>
           submitWork!({
-            plannerNativeThreadId: "planner-native-1",
+            plannerNativeThreadId,
             plannerTurnId,
             callId,
             message,
           });
+        const invoke = (callId: string, message: string, plannerTurnId = "planner-turn-1") =>
+          invokeWithPlanner("planner-native-1", callId, message, plannerTurnId);
         currentPolicy = { ...currentPolicy, cwd: "/changed-worktree" };
         const policyChanged = yield* Effect.exit(
           invoke("call-stale", "A request captured under old settings", "planner-turn-stale"),
@@ -306,9 +367,12 @@ it.effect(
         assert.equal(firstReceipt, duplicateReceipt);
         assert.equal(sends, 1);
 
-        const makeRunProjection = (runId: string, childStatus: "running" | "completed") => {
+        const makeRunProjection = (
+          runId: string,
+          childStatus: "running" | "completed",
+          finalText = `  ${`durable answer for ${runId} `.repeat(400)}\n  `,
+        ) => {
           const commentaryText = `commentary for ${runId}`;
-          const finalText = `  ${`durable answer for ${runId} `.repeat(400)}\n  `;
           const commentaryNodeId = `commentary-${runId}`;
           const finalNodeId = `assistant-${runId}`;
           const commentaryMessageId = `commentary-message-${runId}`;
@@ -478,6 +542,26 @@ it.effect(
             checkpoints: [],
           } as unknown as OrchestrationV2ThreadProjection;
         };
+        const makeReadyProjection = (runId: string, ordinal: number, finalText?: string) =>
+          ({
+            ...makeRunProjection(runId, "completed", finalText),
+            checkpoints: [
+              {
+                id: `checkpoint-${runId}`,
+                threadId,
+                scopeId: `scope-root-${ordinal}`,
+                runId,
+                nodeId: `root-${runId}`,
+                parentCheckpointId: null,
+                ordinalWithinScope: 1,
+                appRunOrdinal: ordinal,
+                ref: `checkpoint-ref-${ordinal}`,
+                status: "ready",
+                files: [],
+                capturedAt: "2026-10-14T00:00:03.000Z",
+              },
+            ],
+          }) as unknown as OrchestrationV2ThreadProjection;
         const eventFor = (event: OrchestrationV2StoredEvent["event"]) =>
           ({
             sequence: 1,
@@ -646,27 +730,29 @@ it.effect(
         assert.equal(appendAttempts, 2, "a claimed readback is never blindly retried");
 
         appendSpeechFails = false;
-        yield* invoke("call-after-stop", "Queue work that must outlive Live", "planner-turn-3");
+        yield* invoke("call-empty-final", "Queue commentary and an empty final", "planner-turn-3");
         assert.equal(sends, 3);
-        durableProjection = {
-          ...makeRunProjection("durable-run-3", "completed"),
-          checkpoints: [
-            {
-              id: "checkpoint-durable-run-3",
-              threadId,
-              scopeId: "scope-root-3",
-              runId: "durable-run-3",
-              nodeId: "root-durable-run-3",
-              parentCheckpointId: null,
-              ordinalWithinScope: 1,
-              appRunOrdinal: 3,
-              ref: "checkpoint-ref-3",
-              status: "ready",
-              files: [],
-              capturedAt: "2026-10-14T00:00:03.000Z",
-            },
-          ],
-        } as unknown as OrchestrationV2ThreadProjection;
+        durableProjection = makeReadyProjection("durable-run-3", 3, " \t\n");
+        const emptyFinalGateRead = waitForGateRead();
+        yield* Queue.offer(
+          t3EventQueues.get("run.updated")!,
+          eventFor({
+            type: "run.updated",
+            id: "event-run-3",
+            threadId,
+            runId: "durable-run-3",
+            nodeId: "root-durable-run-3",
+            providerInstanceId,
+            occurredAt: "2026-10-14T00:00:03.000Z",
+            payload: durableProjection.runs[0] as never,
+          } as never),
+        );
+        yield* emptyFinalGateRead;
+        assert.equal(
+          appendAttempts,
+          2,
+          "an empty terminal final item cannot fall back to earlier commentary",
+        );
         const staleGeneration = yield* Effect.exit(
           service.status(session, {
             leaseId: prepared.leaseId,
@@ -695,6 +781,13 @@ it.effect(
         );
         assert.isTrue(Exit.isFailure(unauthorized));
 
+        const workReceiptBeforeStop = yield* invoke(
+          "call-before-stop",
+          "Queue work that must outlive Live",
+          "planner-turn-4",
+        );
+        assert.equal(sends, 4);
+        durableProjection = makeReadyProjection("durable-run-4", 4);
         const stopped = yield* service.stop(session, {
           leaseId: prepared.leaseId,
           generation: prepared.generation,
@@ -702,15 +795,15 @@ it.effect(
         });
         assert.equal(stopped.status, "stopping");
         assert.equal(stops, 1);
-        assert.equal(sends, 3);
+        assert.equal(sends, 4);
         yield* Queue.offer(
           t3EventQueues.get("run.updated")!,
           eventFor({
             type: "run.updated",
-            id: "event-run-2",
+            id: "event-run-4",
             threadId,
-            runId: "durable-run-3",
-            nodeId: "root-durable-run-3",
+            runId: "durable-run-4",
+            nodeId: "root-durable-run-4",
             providerInstanceId,
             occurredAt: "2026-10-14T00:00:03.000Z",
             payload: durableProjection.runs[0] as never,
@@ -722,13 +815,145 @@ it.effect(
           2,
           "Stop Live suppresses readback without cancelling queued work",
         );
-        const acceptedWorkAfterStop = yield* invoke("call-5", "Implement the requested change");
-        assert.equal(acceptedWorkAfterStop, firstReceipt);
+        const acceptedWorkAfterStop = yield* invoke(
+          "call-5",
+          "Queue work that must outlive Live",
+          "planner-turn-4",
+        );
+        assert.equal(acceptedWorkAfterStop, workReceiptBeforeStop);
         const afterStop = yield* Effect.exit(
-          invoke("call-4", "A request after stopping is refused"),
+          invoke("call-6", "A request after stopping is refused", "planner-turn-5"),
         );
         assert.isTrue(Exit.isFailure(afterStop));
-        assert.equal(sends, 3);
+        assert.equal(sends, 4);
+        yield* Queue.offer(nativeEvents, {
+          type: "closed",
+          plannerNativeThreadId: "planner-native-1",
+        });
+        yield* waitForEvent(
+          (event) =>
+            event.type === "status" &&
+            event.session.leaseId === prepared.leaseId &&
+            event.session.generation === prepared.generation &&
+            event.session.status === "closed",
+        );
+
+        durableProjection = {
+          ...projection,
+          providerSessions: [{ id: secondProviderSessionId, providerInstanceId }],
+          runs: [],
+          attempts: [],
+          nodes: [],
+          subagents: [],
+          checkpoints: [],
+          messages: [],
+          turnItems: [],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const secondPrepared = yield* service.prepare(session, {
+          threadId,
+          clientRequestId: "prepare-2",
+        });
+        assert.equal(secondPrepared.providerSessionId, secondProviderSessionId);
+        assert.equal(secondPrepared.plannerNativeThreadId, "planner-native-2");
+        yield* service
+          .subscribe(session, {
+            leaseId: secondPrepared.leaseId,
+            generation: secondPrepared.generation,
+          })
+          .pipe(
+            Stream.runForEach((event) => Queue.offer(delivered, event)),
+            Effect.forkChild({ startImmediately: true }),
+          );
+        yield* waitForEvent(
+          (event) =>
+            event.type === "status" &&
+            event.session.leaseId === secondPrepared.leaseId &&
+            event.session.generation === secondPrepared.generation &&
+            event.session.status === "prepared",
+        );
+        yield* service.start(session, {
+          leaseId: secondPrepared.leaseId,
+          generation: secondPrepared.generation,
+          offerSdp: "v=0\\r\\n",
+          clientRequestId: "start-2",
+        });
+        yield* Queue.offer(secondNativeEvents, {
+          type: "sdp",
+          plannerNativeThreadId: "planner-native-2",
+          sdp: "v=0\\r\\nanswer",
+        });
+        yield* Queue.offer(secondNativeEvents, {
+          type: "started",
+          plannerNativeThreadId: "planner-native-2",
+          realtimeSessionId: `${secondPrepared.leaseId}:${secondPrepared.generation}`,
+        });
+        yield* waitForEvent(
+          (event) =>
+            event.type === "status" &&
+            event.session.leaseId === secondPrepared.leaseId &&
+            event.session.generation === secondPrepared.generation &&
+            event.session.status === "active",
+        );
+
+        const raceReceipt = yield* invokeWithPlanner(
+          "planner-native-2",
+          "call-native-error-race",
+          "Queue readback before a native failure",
+          "planner-turn-native-error-race",
+        );
+        assert.equal(sends, 5);
+        const raceRunId = `durable-run-${sends}`;
+        durableProjection = makeReadyProjection(raceRunId, 5);
+        const principalGate = holdDispatchPrincipalLookup();
+        const raceGateRead = waitForGateRead();
+        yield* Queue.offer(
+          t3EventQueues.get("run.updated")!,
+          eventFor({
+            type: "run.updated",
+            id: "event-run-native-error-race",
+            threadId,
+            runId: raceRunId,
+            nodeId: `root-${raceRunId}`,
+            providerInstanceId,
+            occurredAt: "2026-10-14T00:00:03.000Z",
+            payload: durableProjection.runs[0] as never,
+          } as never),
+        );
+        yield* raceGateRead;
+        yield* Effect.promise(() => principalGate.started);
+        yield* Queue.offer(secondNativeEvents, {
+          type: "error",
+          plannerNativeThreadId: "planner-native-2",
+        });
+        yield* waitForEvent(
+          (event) =>
+            event.type === "status" &&
+            event.session.leaseId === secondPrepared.leaseId &&
+            event.session.generation === secondPrepared.generation &&
+            event.session.status === "failed",
+        );
+        principalGate.release();
+        const duplicateRaceReceipt = yield* invokeWithPlanner(
+          "planner-native-2",
+          "call-native-error-race",
+          "Queue readback before a native failure",
+          "planner-turn-native-error-race",
+        );
+        assert.equal(duplicateRaceReceipt, raceReceipt);
+        assert.equal(sends, 5);
+        assert.equal(
+          appendAttempts,
+          2,
+          "a native failure committed during principal lookup prevents appendSpeech",
+        );
+        const refusedReceipt = yield* sql<{ receipt_json: string }>`
+          SELECT receipt_json FROM codex_live_voice_intents
+          WHERE lease_id = ${secondPrepared.leaseId}
+            AND generation = ${secondPrepared.generation}
+            AND planner_turn_id = ${"planner-turn-native-error-race"}
+        `;
+        assert.equal(readbackState(refusedReceipt[0]!.receipt_json), "refused");
+        assert.isString(raceReceipt);
       });
       yield* program.pipe(
         Effect.provide(Layer.provideMerge(CodexLiveSessionService.layer, dependencies)),

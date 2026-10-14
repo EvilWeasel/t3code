@@ -242,8 +242,7 @@ export const layer: Layer.Layer<
           resultNodeIds.has(item.nodeId) &&
           item.providerTurnId === attempts[0]!.providerTurnId &&
           item.status === "completed" &&
-          !item.streaming &&
-          item.text.trim().length > 0,
+          !item.streaming,
       );
       if (finalItems.length === 0) return undefined;
       const terminalOrdinal = Math.max(...finalItems.map((item) => item.ordinal));
@@ -260,6 +259,7 @@ export const layer: Layer.Layer<
           message.text === finalItem.text,
       );
       if (finalMessages.length !== 1) return undefined;
+      if (finalMessages[0]!.text.trim().length === 0) return undefined;
       const checkpoint = projection.checkpoints.find(
         (candidate) => candidate.id === run.checkpointId && candidate.runId === runId,
       );
@@ -501,11 +501,13 @@ export const layer: Layer.Layer<
               AND planner_turn_id = ${input.plannerTurnId} AND dispatch_state = 'admitted'
           `;
           if (afterClaim[0]?.receipt_json !== claimed) return;
-          const beforeDispatch = yield* getLease(input.leaseId, input.generation);
-          const currentLease = active.get(leaseKey(input.leaseId, input.generation));
           const dispatchPrincipals = yield* authSessions
             .listActive()
             .pipe(Effect.mapError(() => liveError("runtime_unavailable")));
+          // Refresh after the principal lookup: native error/closed events can
+          // commit while that lookup is suspended, without taking this lease lock.
+          const beforeDispatch = yield* getLease(input.leaseId, input.generation);
+          const currentLease = active.get(leaseKey(input.leaseId, input.generation));
           if (
             beforeDispatch === undefined ||
             beforeDispatch.status !== "active" ||
