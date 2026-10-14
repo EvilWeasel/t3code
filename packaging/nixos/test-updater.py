@@ -108,6 +108,39 @@ if not os.path.lexists(root): os.symlink(os.environ['TEST_PACKAGE'],root)
         self.assertEqual(r.returncode,0,r.stderr)
         self.assertEqual(os.readlink(self.data/'current'),old)
 
+    def test_existing_private_launcher_is_preserved_through_update_and_rollback(self):
+        old=self.previous()
+        launcher_dir=self.root/'private-bin'; launcher_dir.mkdir()
+        desktop_dir=self.root/'private-data/applications'; desktop_dir.mkdir(parents=True)
+        launcher=launcher_dir/'t3code-weasel'
+        desktop=desktop_dir/'t3code-weasel.desktop'
+        launcher_bytes=b'#!/bin/sh\n# credential-aware private launcher sentinel\nexit 91\n'
+        desktop_bytes=b'[Desktop Entry]\n# user-owned desktop sentinel\n'
+        launcher.write_bytes(launcher_bytes); launcher.chmod(0o710)
+        desktop.write_bytes(desktop_bytes); desktop.chmod(0o600)
+        launcher_before=hashlib.sha256(launcher_bytes).hexdigest()
+        desktop_before=hashlib.sha256(desktop_bytes).hexdigest()
+        launcher_mode=launcher.stat().st_mode & 0o777
+        desktop_mode=desktop.stat().st_mode & 0o777
+        self.env.update({'T3_WEASEL_MANAGED':'0','XDG_BIN_HOME':str(launcher_dir),
+                         'XDG_DATA_HOME':str(self.root/'private-data')})
+
+        r=self.run_update('--update')
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(hashlib.sha256(launcher.read_bytes()).hexdigest(),launcher_before)
+        self.assertEqual(launcher.stat().st_mode & 0o777,launcher_mode)
+        self.assertEqual(hashlib.sha256(desktop.read_bytes()).hexdigest(),desktop_before)
+        self.assertEqual(desktop.stat().st_mode & 0o777,desktop_mode)
+        self.assertEqual(os.readlink(self.data/'current'),str(self.data/'versions'/VERSION))
+        self.assertEqual(os.readlink(self.data/'previous'),old)
+        self.assertTrue((self.data/'.gcroots'/Path(self.package).name).is_symlink())
+
+        r=self.run_update('--rollback','0.0.47-nightly.20261013.3')
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(os.readlink(self.data/'current'),old)
+        self.assertEqual(hashlib.sha256(launcher.read_bytes()).hexdigest(),launcher_before)
+        self.assertEqual(launcher.stat().st_mode & 0o777,launcher_mode)
+
     def test_stable_does_not_fall_back_to_nightly(self):
         self.env['T3_WEASEL_CHANNEL']='stable'
         r=self.run_update('--check'); self.assertNotEqual(r.returncode,0)

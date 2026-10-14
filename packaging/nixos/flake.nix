@@ -13,15 +13,25 @@
       validRepository = builtins.match "[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" repository != null;
       version = builtins.getEnv "T3_WEASEL_VERSION";
       artifactUrl = builtins.getEnv "T3_WEASEL_ARTIFACT_URL";
+      artifactPath = builtins.getEnv "T3_WEASEL_ARTIFACT_PATH";
       artifactHash = builtins.getEnv "T3_WEASEL_ARTIFACT_SHA256";
       validVersion = builtins.match "[0-9A-Za-z][0-9A-Za-z.+_-]*" version != null;
       validHash = builtins.match "[0-9a-f]{64}" artifactHash != null;
       validUrl = lib.hasPrefix "https://github.com/${repository}/releases/download/v${version}/" artifactUrl;
-      package = if !(validRepository && validVersion && validHash && validUrl) then
-        throw "Set T3_WEASEL_VERSION, T3_WEASEL_ARTIFACT_URL and T3_WEASEL_ARTIFACT_SHA256 to verified release values"
+      validLocalArtifact = artifactPath != "" && validHash
+        && builtins.hashFile "sha256" artifactPath == artifactHash;
+      validRemoteArtifact = artifactPath == "" && validUrl && validHash;
+      package = if !(validRepository && validVersion && (validLocalArtifact || validRemoteArtifact)) then
+        throw "Set T3_WEASEL_VERSION and T3_WEASEL_ARTIFACT_SHA256 with either a matching T3_WEASEL_ARTIFACT_PATH or a T3_WEASEL_ARTIFACT_URL from T3_WEASEL_REPOSITORY"
       else
         let
-          src = pkgs.fetchurl { url = artifactUrl; sha256 = artifactHash; };
+          src = if artifactPath != "" then
+            builtins.path {
+              path = artifactPath;
+              name = "T3-Code-${version}-x86_64.AppImage";
+            }
+          else
+            pkgs.fetchurl { url = artifactUrl; sha256 = artifactHash; };
           appimageContents = pkgs.appimageTools.extractType2 {
             pname = "t3code-weasel";
             inherit version src;

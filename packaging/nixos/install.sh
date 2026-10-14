@@ -27,6 +27,51 @@ point_to() {
   ln -s "$install_dir/$1" "$next"
   mv -Tf "$next" "$current_link"
 }
+install_user_entries() {
+  local launcher_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
+  local desktop_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  local launcher="$launcher_dir/t3code-weasel"
+  local desktop="$desktop_dir/t3code-weasel.desktop"
+  local temporary
+  mkdir -p "$launcher_dir" "$desktop_dir"
+
+  if [[ -e "$launcher" || -L "$launcher" ]]; then
+    printf 'Preserving existing launcher: %s\n' "$launcher"
+  else
+    temporary="$(mktemp "$launcher_dir/.t3code-weasel.XXXXXXXX")"
+    printf '#!/usr/bin/env bash\nset -euo pipefail\nexport T3CODE_HOME=%q\nexec %q "$@"\n' \
+      "$base_dir" "$current_link/bin/t3code-weasel" >"$temporary"
+    chmod 0755 "$temporary"
+    if ! ln "$temporary" "$launcher" 2>/dev/null; then
+      [[ -e "$launcher" || -L "$launcher" ]] || die 'could not create the launcher'
+      printf 'Preserving launcher created concurrently: %s\n' "$launcher"
+    fi
+    rm -f -- "$temporary"
+  fi
+
+  if [[ -e "$desktop" || -L "$desktop" ]]; then
+    printf 'Preserving existing desktop entry: %s\n' "$desktop"
+  else
+    temporary="$(mktemp "$desktop_dir/.t3code-weasel.XXXXXXXX")"
+    cat >"$temporary" <<DESKTOP
+[Desktop Entry]
+Name=T3 Code (Weasel Nightly)
+Comment=AI coding assistant desktop app
+Exec="$launcher" %U
+Icon=applications-development
+Terminal=false
+Type=Application
+Categories=Development;IDE;
+StartupWMClass=T3 Code
+DESKTOP
+    chmod 0644 "$temporary"
+    if ! ln "$temporary" "$desktop" 2>/dev/null; then
+      [[ -e "$desktop" || -L "$desktop" ]] || die 'could not create the desktop entry'
+      printf 'Preserving desktop entry created concurrently: %s\n' "$desktop"
+    fi
+    rm -f -- "$temporary"
+  fi
+}
 
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'invalid release repository'
 [[ "$channel" == nightly || "$channel" == stable ]] || die 'channel must be nightly or stable'
@@ -104,23 +149,6 @@ if ! valid_install "$version"; then
 fi
 point_to "$version"
 if [[ "$managed" != 1 ]]; then
-  launcher_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
-  desktop_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-  mkdir -p "$launcher_dir" "$desktop_dir"
-  # Use a fixed absolute data path; preserve legacy profile identity.
-  printf '#!/usr/bin/env bash\nset -euo pipefail\nexport T3CODE_HOME=%q\nexec %q "$@"\n' "$base_dir" "$current_link/bin/t3code-weasel" >"$work_dir/launcher"
-  install -m 0755 "$work_dir/launcher" "$launcher_dir/t3code-weasel"
-  cat >"$work_dir/desktop" <<DESKTOP
-[Desktop Entry]
-Name=T3 Code (Weasel Nightly)
-Comment=AI coding assistant desktop app
-Exec=$launcher_dir/t3code-weasel %U
-Icon=applications-development
-Terminal=false
-Type=Application
-Categories=Development;IDE;
-StartupWMClass=T3 Code
-DESKTOP
-  install -m 0644 "$work_dir/desktop" "$desktop_dir/t3code-weasel.desktop"
+  install_user_entries
 fi
 printf 'Prepared %s; the next launch uses this version. Running processes unchanged.\n' "$version"

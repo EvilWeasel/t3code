@@ -80,6 +80,9 @@ state; `--status` reports local state without network access. `--rollback VERSIO
 selects an already installed Nix version. Previous packages remain rooted; this
 updater does not automatically delete versions. `T3_WEASEL_MANAGED=1` suppresses
 mutable desktop/launcher writes when Home Manager owns those files.
+Otherwise it creates the launcher and desktop entry only when their paths are
+absent. Existing user files remain byte-for-byte unchanged; replacement needs
+a separate, explicit user action.
 
 The `stable` channel requires fork-owned `Weasel Stable` releases; it never falls
 back to nightly. Release packaging currently publishes nightly only. Windows
@@ -87,3 +90,55 @@ continues to use the existing Electron/NSIS update feed from the same repository
 and ordinary Linux uses its AppImage updater. The NixOS updater is separate
 because store packages are immutable. This mechanism prepares a new version for
 the next launch; it does not force a desktop/server restart.
+
+## Namespace-built closure transfer
+
+For a release-qualified laptop install without a laptop Nix package build, use
+the prebuilt closure transfer. The release workflow must first provide a local
+AppImage that it has verified against the run's checksum receipt. In the
+Namespace job, set:
+
+- `T3_WEASEL_VERSION` to the exact artifact version
+- `T3_WEASEL_ARTIFACT_PATH` to the absolute path of the verified AppImage
+- `T3_WEASEL_ARTIFACT_SHA256` to its lowercase SHA-256
+- `WEASEL_SOURCE_SHA` to the 40-character source commit SHA
+- `T3_WEASEL_REPOSITORY` to the release repository when it is not the default
+
+Then build and export from `packaging/nixos`:
+
+```bash
+cd packaging/nixos
+NIXOS_PACKAGE_STORE_PATH="$(nix build --impure --no-link --print-out-paths .#t3code-weasel)"
+./export-closure.sh \
+  "$NIXOS_PACKAGE_STORE_PATH" \
+  "$WEASEL_SOURCE_SHA" \
+  "$T3_WEASEL_ARTIFACT_SHA256" \
+  "$T3_WEASEL_VERSION" \
+  "$RUNNER_TEMP/t3code-weasel-nixos-closure"
+```
+
+Upload that directory as a same-run GitHub Actions artifact and put the
+exporter's printed `Qualified manifest SHA-256` in the trusted run receipt. The
+current release workflow does not yet run these steps. Until it does, this
+closure import path is prepared but not available from a published release.
+
+On x86_64 Linux with Nix, after downloading and unpacking the closure bundle,
+import it with the three values from the trusted run receipt:
+
+```bash
+bash packaging/nixos/import-closure.sh \
+  /path/to/unpacked/t3code-weasel-nixos-closure \
+  "$WEASEL_SOURCE_SHA" \
+  "$WEASEL_APPIMAGE_SHA256" \
+  "$QUALIFIED_NIXOS_MANIFEST_SHA256"
+```
+
+The importer validates the independent manifest digest and bundle checksums,
+imports the existing Nix store export, checks the actual closure, roots the
+version, and then atomically changes `current`. It never evaluates the flake or
+builds a derivation on the laptop. It preserves existing launcher and desktop
+files, creating them only when absent. The previous version remains available
+for `install.sh --rollback VERSION`; running processes and user data are
+unchanged. `test-import-closure.sh <already-built-package-store-path>` stubs
+the Nix import command and exercises launcher preservation, version/current
+switching, GC rooting, and rollback without touching a real profile or DB.
