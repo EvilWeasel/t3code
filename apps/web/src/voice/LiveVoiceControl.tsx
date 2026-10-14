@@ -19,6 +19,7 @@ import {
 import { liveVoiceEnvironment } from "../state/liveVoice";
 import { useAtomCommand } from "../state/use-atom-command";
 import { Button } from "~/components/ui/button";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { randomUUID } from "~/lib/utils";
 import { LiveVoiceTranscript } from "./LiveVoiceTranscript";
 
@@ -224,11 +225,8 @@ export function LiveVoiceControl(props: {
     state.phase === "connecting" ||
     state.phase === "stopping";
   const canStart = props.eligible && target !== null && supported && !busy && !active;
-  const unavailableLabel = !supported
-    ? "Live voice needs browser WebRTC and microphone access."
-    : props.unavailableReason;
   const unavailableNotice = !supported
-    ? "Unsupported in this browser"
+    ? "Live voice needs browser WebRTC and microphone access."
     : !target
       ? "Open a thread for Live"
       : !props.eligible
@@ -277,21 +275,24 @@ export function LiveVoiceControl(props: {
               {statusText}
             </span>
           ) : null}
-          {state.phase !== "error" && unavailableNotice ? (
-            <span className="text-xs text-muted-foreground">{unavailableNotice}</span>
-          ) : null}
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-sm"
-            disabled={!canStart}
-            onPointerDown={(event) => event.preventDefault()}
-            onClick={onStart}
-            aria-label={props.eligible && supported ? "Start Live voice" : unavailableLabel}
-            title={props.eligible && supported ? "Start Live voice" : unavailableLabel}
-          >
-            <MicIcon />
-          </Button>
+          <Tooltip>
+            <TooltipTrigger
+              render={<span className="inline-flex" tabIndex={!canStart ? 0 : undefined} />}
+            >
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                disabled={!canStart}
+                onPointerDown={(event) => event.preventDefault()}
+                onClick={onStart}
+                aria-label="Start Live voice"
+              >
+                <MicIcon />
+              </Button>
+            </TooltipTrigger>
+            <TooltipPopup>{unavailableNotice ?? "Start Live voice"}</TooltipPopup>
+          </Tooltip>
         </>
       ) : (
         <>
