@@ -169,9 +169,11 @@ export const make = Effect.gen(function* () {
     // /tmp/.mount_* path — the handler must launch the AppImage itself.
     const launch = resolveUrlHandlerLaunch({
       defaultExecTarget: Option.getOrElse(environment.appImagePath, () => process.execPath),
-      configuredLauncher: Option.getOrUndefined(environment.linuxUrlHandlerLauncher),
-      home: Option.getOrUndefined(environment.linuxUrlHandlerHome),
-      profileId: Option.getOrUndefined(environment.profileId),
+      configuredLauncher: Option.getOrUndefined(
+        environment.linuxUrlHandlerLauncher ?? Option.none(),
+      ),
+      home: Option.getOrUndefined(environment.linuxUrlHandlerHome ?? Option.none()),
+      profileId: Option.getOrUndefined(environment.profileId ?? Option.none()),
     });
     const content = renderUrlHandlerDesktopEntry({
       displayName: environment.displayName,
