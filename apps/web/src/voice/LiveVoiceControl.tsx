@@ -13,7 +13,6 @@ import {
   type LiveVoiceSignalEvent,
   type LiveVoiceSignalingAdapter,
   type LiveVoiceState,
-  type LiveVoiceTranscript as LiveVoiceTranscriptEntry,
   type LiveVoiceTarget,
 } from "@t3tools/client-runtime/live-voice";
 
@@ -197,7 +196,7 @@ export function LiveVoiceControl(props: {
     transcriptLease.environmentId === props.environmentId &&
     transcriptLease.threadId === props.threadId &&
     transcriptLease.providerInstanceId === props.providerInstanceId;
-  const currentTranscript: ReadonlyArray<LiveVoiceTranscriptEntry> = transcriptMatchesTarget
+  const currentTranscript: LiveVoiceState["transcript"] = transcriptMatchesTarget
     ? state.transcript
     : [];
 

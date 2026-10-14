@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { CopyIcon } from "lucide-react";
-import type { LiveVoiceTranscript as LiveVoiceTranscriptEntry } from "@t3tools/client-runtime/live-voice";
+import type { LiveVoiceState } from "@t3tools/client-runtime/live-voice";
 
 import {
   Dialog,
@@ -13,6 +13,8 @@ import {
 } from "~/components/ui/dialog";
 import { Button } from "~/components/ui/button";
 import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
+
+type LiveVoiceTranscriptEntry = LiveVoiceState["transcript"][number];
 
 function transcriptText(transcript: ReadonlyArray<LiveVoiceTranscriptEntry>): string {
   return transcript

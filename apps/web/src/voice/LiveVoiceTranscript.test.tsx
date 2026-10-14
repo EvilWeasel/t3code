@@ -3,7 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import type { LiveVoiceTranscript as LiveVoiceTranscriptEntry } from "@t3tools/client-runtime/live-voice";
+import type { LiveVoiceState } from "@t3tools/client-runtime/live-voice";
 
 const clipboard = vi.hoisted(() => ({ writeTextToClipboard: vi.fn() }));
 vi.mock("~/hooks/useCopyToClipboard", () => ({
@@ -15,7 +15,7 @@ import { LiveVoiceTranscript } from "./LiveVoiceTranscript";
 let root: Root;
 let container: HTMLDivElement;
 
-const transcript: ReadonlyArray<LiveVoiceTranscriptEntry> = [
+const transcript: LiveVoiceState["transcript"] = [
   { speaker: "user", text: "First question", final: true },
   { speaker: "assistant", text: "First answer", final: true },
   { speaker: "user", text: `Second question ${"full text ".repeat(70)}`, final: true },
@@ -35,7 +35,7 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-async function render(entries: ReadonlyArray<LiveVoiceTranscriptEntry>) {
+async function render(entries: LiveVoiceState["transcript"]) {
   await act(async () => root.render(<LiveVoiceTranscript transcript={entries} />));
 }
 
