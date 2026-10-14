@@ -69,7 +69,7 @@ it.effect(
     Effect.gen(function* () {
       const now = yield* DateTime.now;
       const calls: Array<{ url: string; init?: RequestInit }> = [];
-      const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const fetchFn = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
         const url = String(input);
         calls.push({ url, ...(init ? { init } : {}) });
         return new Response(
@@ -79,7 +79,7 @@ it.effect(
               : {
                   id: "synthetic-once",
                   credential: "synthetic-one-time-grant",
-                  expiresAt: new Date(DateTime.toEpochMillis(now) + 300_000).toISOString(),
+                  expiresAt: DateTime.formatIso(DateTime.add(now, { minutes: 5 })),
                 },
           ),
           { status: 200 },

@@ -473,14 +473,15 @@ export const layer = HttpApiBuilder.group(
           yield* appendCredentialResponseHeaders;
           return yield* Fleet.issueFleetPairing(args.params.environmentId, session.scopes).pipe(
             Effect.catch((error) =>
-              error.reason === "not-configured"
-                ? failEnvironmentInvalidRequest("invalid_command")
-                : Effect.fail(
-                    new FleetConnectionUnavailableError({
-                      environmentId: args.params.environmentId,
-                      reason: error.reason,
-                    }),
-                  ),
+              Effect.gen(function* () {
+                if (error.reason === "not-configured") {
+                  return yield* failEnvironmentInvalidRequest("invalid_command");
+                }
+                return yield* new FleetConnectionUnavailableError({
+                  environmentId: args.params.environmentId,
+                  reason: error.reason,
+                });
+              }),
             ),
           );
         }),
