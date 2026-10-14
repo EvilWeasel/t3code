@@ -15,15 +15,15 @@ permissions:
 
 jobs:
   check:
-    if: github.repository == 'EvilWeasel/t3code'
-    runs-on: ubuntu-24.04
+    if: github.repository == 'EvilWeasel/t3code' || github.repository == 'morrowbyte/t3code'
+    runs-on: namespace-profile-ci-builder
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: true
+          cache: false
           run-install: true
       - name: Run focused source gates
         run: bash scripts/weasel/check.sh
