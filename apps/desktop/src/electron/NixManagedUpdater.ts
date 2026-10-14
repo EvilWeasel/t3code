@@ -83,7 +83,9 @@ export class NixManagedUpdater extends EventEmitter {
     const difference = compareSemverVersions(version, this.options.currentVersion);
     const available = difference > 0 || (difference < 0 && this.allowDowngrade);
     this.available = available ? version : undefined;
-    this.prepared = undefined;
+    // Background checks may run while the user reviews a downloaded update.
+    // Keep its verified preparation when the release has not changed.
+    if (!available || this.prepared !== version) this.prepared = undefined;
     this.emit(available ? "update-available" : "update-not-available", { version });
   }
 

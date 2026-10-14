@@ -51,6 +51,16 @@ describe("NixManagedUpdater", () => {
     expect(relaunch).not.toHaveBeenCalled();
   });
 
+  it("keeps an already prepared release installable after a background check", async () => {
+    const { updater, calls, relaunch } = fixture();
+    await updater.checkForUpdates();
+    await updater.downloadUpdate();
+    await updater.checkForUpdates();
+    await updater.quitAndInstall(true, true);
+    expect(calls.at(-1)).toEqual({ args: ["--activate", version], channel: "nightly" });
+    expect(relaunch).toHaveBeenCalledOnce();
+  });
+
   it("does not quit or relaunch after an activation failure", async () => {
     const { updater, run, relaunch } = fixture();
     await updater.checkForUpdates();
