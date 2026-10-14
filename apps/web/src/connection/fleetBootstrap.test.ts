@@ -2,9 +2,9 @@ import { EnvironmentId } from "@t3tools/contracts";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { bootstrapMissingFleetPeers } from "./fleetBootstrap";
 
-const primary = EnvironmentId.makeUnsafe("heph");
+const primary = EnvironmentId.make("heph");
 const peer = (id: string, httpBaseUrl = `https://${id}.example.test/`) => ({
-  environmentId: EnvironmentId.makeUnsafe(id),
+  environmentId: EnvironmentId.make(id),
   label: id,
   httpBaseUrl,
 });

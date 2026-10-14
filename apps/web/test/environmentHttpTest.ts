@@ -100,6 +100,10 @@ export async function installEnvironmentHttpTest(scenario: EnvironmentHttpTestSc
               }),
             )
             .handle("token", () => unexpectedEndpoint("auth.token"))
+            .handle("fleetConnections", () => unexpectedEndpoint("auth.fleetConnections"))
+            .handle("fleetPairingCredential", () =>
+              unexpectedEndpoint("auth.fleetPairingCredential"),
+            )
             .handle("webSocketTicket", () => unexpectedEndpoint("auth.webSocketTicket"))
             .handle(
               "pairingCredential",

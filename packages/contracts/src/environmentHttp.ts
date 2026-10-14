@@ -543,7 +543,11 @@ class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
         headers: OptionalBearerHeaders,
         params: Schema.Struct({ environmentId: EnvironmentId }),
         success: FleetPairingCredential,
-        error: [...EnvironmentScopedOperationErrors, FleetConnectionUnavailableError],
+        error: [
+          ...EnvironmentScopedOperationErrors,
+          EnvironmentRequestInvalidError,
+          FleetConnectionUnavailableError,
+        ],
       },
     ).middleware(EnvironmentAuthenticatedAuth),
   )
