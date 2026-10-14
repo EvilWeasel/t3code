@@ -12,12 +12,20 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import { decodeJwt } from "jose";
-import { CodexSettings } from "@t3tools/contracts";
+import {
+  CodexSettings,
+  VoiceTranscriptionSettings,
+  VoiceTranscriptionSettingsInput,
+  type ProviderInstanceConfig,
+} from "@t3tools/contracts";
 import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexProvider from "../provider/CodexProvider.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { resolveCodexLaunchArgs } from "../provider/codexLaunchArgs.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
+import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
+import { makeCodexManagedRuntime } from "../provider/CodexManagedRuntime.ts";
+import { makeVoiceSettings } from "./VoiceSettings.ts";
 import {
   materializeCodexShadowHome,
   resolveCodexHomeLayout,
@@ -372,6 +380,24 @@ export interface VoiceAudio {
   readonly fileName: string;
 }
 
+export function liveCodexTranscriptionConfigs(
+  configured: Readonly<Record<string, ProviderInstanceConfig>>,
+  live: ReadonlyArray<{
+    readonly instanceId: string;
+    readonly driverKind: string;
+    readonly enabled: boolean;
+  }>,
+): Record<string, ProviderInstanceConfig> {
+  const instances: Record<string, ProviderInstanceConfig> = {};
+  for (const instance of live) {
+    if (instance.driverKind !== "codex" || !instance.enabled) continue;
+    instances[instance.instanceId] = configured[instance.instanceId] ?? {
+      driver: "codex" as ProviderInstanceConfig["driver"],
+    };
+  }
+  return instances;
+}
+
 export function selectCodexTranscriptionInstance<
   T extends { readonly driver: string; readonly enabled?: boolean },
 >(
@@ -396,20 +422,20 @@ export function selectCodexTranscriptionInstance<
 export class VoiceTranscriptionService extends Context.Service<
   VoiceTranscriptionService,
   {
+    readonly getSettings: Effect.Effect<
+      typeof VoiceTranscriptionSettings.Type,
+      VoiceTranscriptionError
+    >;
+    readonly updateSettings: (
+      input: typeof VoiceTranscriptionSettingsInput.Type,
+    ) => Effect.Effect<typeof VoiceTranscriptionSettings.Type, VoiceTranscriptionError>;
     readonly transcribe: (
       audio: VoiceAudio,
     ) => Effect.Effect<string, VoiceTranscriptionError, FileSystem.FileSystem | Path.Path>;
   }
 >()("t3/voice/VoiceTranscriptionService") {}
 
-export const layer: Layer.Layer<
-  VoiceTranscriptionService,
-  never,
-  | ServerSettings.ServerSettingsService
-  | ChildProcessSpawner.ChildProcessSpawner
-  | FileSystem.FileSystem
-  | Path.Path
-> = Layer.effect(
+export const layer = Layer.effect(
   VoiceTranscriptionService,
   Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient;
@@ -417,7 +443,82 @@ export const layer: Layer.Layer<
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
+    const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+    const preferences = yield* makeVoiceSettings;
+    const runtimeContext =
+      yield* Effect.context<Effect.Services<ReturnType<typeof makeCodexManagedRuntime>>>();
+    const readPreferences = preferences.read.pipe(
+      Effect.mapError(
+        () =>
+          new VoiceTranscriptionError({
+            reason: "provider_unavailable",
+            detail: "Transcription settings could not be read.",
+          }),
+      ),
+    );
+    const getSettings = Effect.gen(function* () {
+      const config = yield* readPreferences;
+      const live = yield* registry.listInstances;
+      const settings = yield* settingsService.getSettings;
+      const candidates = live.filter((entry) => entry.driverKind === "codex" && entry.enabled);
+      const instances = yield* Effect.forEach(candidates, (entry) =>
+        entry.snapshot.getSnapshot.pipe(
+          Effect.map((snapshot) => ({
+            id: entry.instanceId,
+            label: entry.displayName || entry.instanceId,
+            authenticated: snapshot.auth.status === "authenticated",
+          })),
+        ),
+      );
+      const selected = config.instanceId
+        ? instances.find((entry) => entry.id === config.instanceId)
+        : (instances.find((entry) => entry.id === settings.defaultModelSelection?.instanceId) ??
+          instances.find((entry) => entry.id === "codex") ??
+          instances[0]);
+      const available =
+        config.provider === "openai-api"
+          ? Boolean(config.apiKey)
+          : Boolean(selected?.authenticated);
+      return {
+        provider: config.provider,
+        instanceId: config.instanceId,
+        model: config.model,
+        apiKeyConfigured: Boolean(config.apiKey),
+        apiKeySource: config.apiKeySource,
+        available,
+        instances,
+        message:
+          config.provider === "openai-api"
+            ? config.apiKey
+              ? "OpenAI API key configured on this environment."
+              : "Add an OpenAI API key on this environment."
+            : selected?.authenticated
+              ? "Uses the selected Codex ChatGPT account; no API key required."
+              : "Sign in to an enabled Codex provider on this environment.",
+      };
+    }).pipe(
+      Effect.mapError((cause) =>
+        cause instanceof VoiceTranscriptionError
+          ? cause
+          : new VoiceTranscriptionError({
+              reason: "provider_unavailable",
+              detail: "Transcription provider settings are unavailable.",
+            }),
+      ),
+    );
     return VoiceTranscriptionService.of({
+      getSettings,
+      updateSettings: (input) =>
+        preferences.write(input).pipe(
+          Effect.mapError(
+            () =>
+              new VoiceTranscriptionError({
+                reason: "provider_unavailable",
+                detail: "Transcription settings could not be saved.",
+              }),
+          ),
+          Effect.andThen(getSettings),
+        ),
       transcribe: (audio) => {
         if (audio.bytes.byteLength > MAX_VOICE_AUDIO_BYTES) {
           return Effect.fail(
@@ -427,97 +528,124 @@ export const layer: Layer.Layer<
             }),
           );
         }
-        const provider = process.env.T3CODE_TRANSCRIPTION_PROVIDER ?? "codex-account";
-        if (provider === "codex-account") {
-          return Effect.gen(function* () {
-            const settings = yield* settingsService.getSettings;
-            const requestedId = process.env.T3CODE_TRANSCRIPTION_CODEX_INSTANCE_ID;
-            const defaultId = settings.defaultModelSelection?.instanceId;
-            const selected = selectCodexTranscriptionInstance(
-              settings.providerInstances,
-              defaultId,
-              requestedId,
-            );
-            if (!selected) {
-              return yield* Effect.fail(
-                new VoiceTranscriptionError({
-                  reason: "provider_unavailable",
-                  detail: requestedId
-                    ? "The requested Codex provider instance is unavailable or disabled."
-                    : "No enabled Codex provider instance is configured.",
-                }),
-              );
-            }
-            const [, envelope] = selected;
-            const config = yield* Schema.decodeUnknownEffect(CodexSettings)(
-              envelope.config ?? {},
-            ).pipe(
-              Effect.mapError(
-                () =>
+        return Effect.gen(function* () {
+          const preferences = yield* readPreferences;
+          const provider = preferences.provider;
+          if (provider === "codex-account") {
+            return yield* Effect.gen(function* () {
+              const settings = yield* settingsService.getSettings;
+              const requestedId = preferences.instanceId ?? undefined;
+              const defaultId = settings.defaultModelSelection?.instanceId;
+              const live = yield* registry.listInstances;
+              // The live registry includes implicit built-ins omitted from the
+              // sparse persisted settings map. Respect its enabled state.
+              const instances = liveCodexTranscriptionConfigs(settings.providerInstances, live);
+              const selected = selectCodexTranscriptionInstance(instances, defaultId, requestedId);
+              if (!selected) {
+                return yield* Effect.fail(
                   new VoiceTranscriptionError({
                     reason: "provider_unavailable",
-                    detail: "The selected Codex configuration is invalid.",
+                    detail: requestedId
+                      ? "The requested Codex provider instance is unavailable or disabled."
+                      : "No enabled Codex provider instance is configured.",
                   }),
-              ),
-            );
-            if (!config.binaryPath) {
-              return yield* Effect.fail(
-                new VoiceTranscriptionError({
-                  reason: "provider_unavailable",
-                  detail: "The selected Codex instance has no executable.",
-                }),
+                );
+              }
+              const [, envelope] = selected;
+              const config = yield* Schema.decodeUnknownEffect(CodexSettings)(
+                envelope.config ?? {},
+              ).pipe(
+                Effect.mapError(
+                  () =>
+                    new VoiceTranscriptionError({
+                      reason: "provider_unavailable",
+                      detail: "The selected Codex configuration is invalid.",
+                    }),
+                ),
               );
-            }
-            const environment = yield* mergeProviderInstanceEnvironment(envelope.environment);
-            const codexEnvironment = { ...environment };
-            delete codexEnvironment.T3CODE_TRANSCRIPTION_API_KEY;
-            delete codexEnvironment.OPENAI_API_KEY;
-            // withCodexAppServerClient supplies the T3 Code originator itself.
-            delete codexEnvironment.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
-            const effectiveHomePath = yield* prepareCodexTranscriptionHome(config);
-            const { client: codex } = yield* CodexProvider.withCodexAppServerClient({
-              binaryPath: config.binaryPath,
-              homePath: effectiveHomePath,
-              launchArgs: resolveCodexLaunchArgs(config.launchArgs, codexEnvironment),
-              cwd: process.cwd(),
-              environment: codexEnvironment,
-              extendEnv: false,
-            });
-            return yield* transcribeCodexAccount(codex, client, audio).pipe(
+              if (!config.binaryPath) {
+                return yield* Effect.fail(
+                  new VoiceTranscriptionError({
+                    reason: "provider_unavailable",
+                    detail: "The selected Codex instance has no executable.",
+                  }),
+                );
+              }
+              const environment = yield* mergeProviderInstanceEnvironment(envelope.environment);
+              if (config.setupMode === "managed") {
+                const runtime = yield* makeCodexManagedRuntime({
+                  instanceId: selected[0] as import("@t3tools/contracts").ProviderInstanceId,
+                  enabled: true,
+                  environment,
+                  config,
+                }).pipe(Effect.provideContext(runtimeContext));
+                // Use T3's existing credential lease/refresh path. A ChatGPT
+                // token remains subscription auth; never fall back to an API key.
+                return yield* runtime.auth.controller.withAccess!(
+                  runtime.resolve.pipe(
+                    Effect.flatMap((effective) =>
+                      transcribeOpenAiApi(
+                        client,
+                        audio,
+                        effective.environment.ACCESS_TOKEN!,
+                        preferences.model,
+                      ),
+                    ),
+                  ),
+                );
+              }
+              const codexEnvironment = { ...environment };
+              delete codexEnvironment.T3CODE_TRANSCRIPTION_API_KEY;
+              delete codexEnvironment.OPENAI_API_KEY;
+              // withCodexAppServerClient supplies the T3 Code originator itself.
+              delete codexEnvironment.CODEX_INTERNAL_ORIGINATOR_OVERRIDE;
+              const effectiveHomePath = yield* prepareCodexTranscriptionHome(config);
+              const { client: codex } = yield* CodexProvider.withCodexAppServerClient({
+                binaryPath: config.binaryPath,
+                homePath: effectiveHomePath,
+                launchArgs: resolveCodexLaunchArgs(config.launchArgs, codexEnvironment),
+                cwd: process.cwd(),
+                environment: codexEnvironment,
+                extendEnv: false,
+              });
+              return yield* transcribeCodexAccount(codex, client, audio).pipe(
+                Effect.withTracerEnabled(false),
+              );
+            }).pipe(
+              Effect.scoped,
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+              Effect.timeout(VOICE_TRANSCRIPTION_TIMEOUT),
+              Effect.mapError((cause) =>
+                cause instanceof VoiceTranscriptionError ? cause : safeProviderError(cause),
+              ),
               Effect.withTracerEnabled(false),
             );
-          }).pipe(
-            Effect.scoped,
-            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-            Effect.timeout(VOICE_TRANSCRIPTION_TIMEOUT),
-            Effect.mapError((cause) =>
-              cause instanceof VoiceTranscriptionError ? cause : safeProviderError(cause),
-            ),
+          }
+          if (provider !== "openai-api") {
+            return yield* Effect.fail(
+              new VoiceTranscriptionError({
+                reason: "provider_unavailable",
+                detail: "T3CODE_TRANSCRIPTION_PROVIDER must be codex-account or openai-api.",
+              }),
+            );
+          }
+          const apiKey = preferences.apiKey;
+          if (!apiKey)
+            return yield* Effect.fail(
+              new VoiceTranscriptionError({
+                reason: "provider_unavailable",
+                detail: "T3CODE_TRANSCRIPTION_API_KEY is required.",
+              }),
+            );
+          return yield* transcribeOpenAiApi(client, audio, apiKey, preferences.model).pipe(
             Effect.withTracerEnabled(false),
           );
-        }
-        if (provider !== "openai-api") {
-          return Effect.fail(
-            new VoiceTranscriptionError({
-              reason: "provider_unavailable",
-              detail: "T3CODE_TRANSCRIPTION_PROVIDER must be codex-account or openai-api.",
-            }),
-          );
-        }
-        const apiKey = process.env.T3CODE_TRANSCRIPTION_API_KEY;
-        if (!apiKey)
-          return Effect.fail(
-            new VoiceTranscriptionError({
-              reason: "provider_unavailable",
-              detail: "T3CODE_TRANSCRIPTION_API_KEY is required.",
-            }),
-          );
-        return transcribeOpenAiApi(
-          client,
-          audio,
-          apiKey,
-          process.env.T3CODE_TRANSCRIPTION_MODEL || "gpt-transcribe",
-        ).pipe(Effect.withTracerEnabled(false));
+        }).pipe(
+          Effect.mapError((cause) =>
+            cause instanceof VoiceTranscriptionError ? cause : safeProviderError(cause),
+          ),
+          Effect.withTracerEnabled(false),
+        );
       },
     });
   }),

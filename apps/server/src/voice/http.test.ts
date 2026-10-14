@@ -31,6 +31,27 @@ const handlerFor = (scopes: ReadonlyArray<string>, fail = false) => {
       }),
   } as unknown as EnvironmentAuth.EnvironmentAuth["Service"];
   const service = {
+    getSettings: Effect.succeed({
+      provider: "codex-account" as const,
+      instanceId: null,
+      model: "gpt-transcribe",
+      apiKeyConfigured: false,
+      apiKeySource: "none" as const,
+      available: true,
+      message: "Ready",
+      instances: [],
+    }),
+    updateSettings: () =>
+      Effect.succeed({
+        provider: "codex-account" as const,
+        instanceId: null,
+        model: "gpt-transcribe",
+        apiKeyConfigured: false,
+        apiKeySource: "none" as const,
+        available: true,
+        message: "Ready",
+        instances: [],
+      }),
     transcribe: (audio: VoiceService.VoiceAudio) => {
       received = audio;
       return fail
@@ -113,6 +134,41 @@ it.effect("maps provider failures to the bounded typed HTTP error", () =>
       reason: "upstream_forbidden",
       detail: "Upstream rejected transcription.",
     });
+    yield* Effect.promise(() => route.dispose());
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("voice settings require read permission and writes require settings permission", () =>
+  Effect.gen(function* () {
+    const context = yield* Effect.context<FileSystem.FileSystem | Path.Path>();
+    const route = handlerFor(["orchestration:read"]);
+    const read = yield* Effect.promise(() =>
+      route.handler(
+        new Request("http://environment.test/api/voice/settings", {
+          headers: { authorization: "Bearer test-token" },
+        }),
+        context,
+      ),
+    );
+    expect(read.status).toBe(200);
+    const body = yield* Effect.promise(() => read.json());
+    expect(body).not.toHaveProperty("apiKey");
+    expect(body).toMatchObject({ provider: "codex-account", apiKeyConfigured: false });
+    const write = yield* Effect.promise(() =>
+      route.handler(
+        new Request("http://environment.test/api/voice/settings", {
+          method: "PUT",
+          headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+          body: JSON.stringify({
+            provider: "codex-account",
+            instanceId: null,
+            model: "gpt-transcribe",
+          }),
+        }),
+        context,
+      ),
+    );
+    expect(write.status).toBe(403);
     yield* Effect.promise(() => route.dispose());
   }).pipe(Effect.provide(NodeServices.layer)),
 );

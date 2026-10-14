@@ -680,6 +680,25 @@ export const VoiceTranscriptionUpload = HttpApiSchema.asMultipart({
   maxTotalSize: 25 * 1024 * 1024,
 })(Schema.Struct({ audio: Multipart.SingleFileSchema }));
 export const VoiceTranscriptionResult = Schema.Struct({ transcript: Schema.String });
+export const VoiceTranscriptionSettingsInput = Schema.Struct({
+  provider: Schema.Literals(["codex-account", "openai-api"]),
+  instanceId: Schema.NullOr(Schema.String.check(Schema.isMaxLength(200))),
+  model: Schema.String.check(Schema.isMaxLength(100)),
+  // Write-only. The response never includes a key or credential reference.
+  apiKey: Schema.optionalKey(Schema.NullOr(Schema.String.check(Schema.isMaxLength(1000)))),
+});
+export const VoiceTranscriptionSettings = Schema.Struct({
+  provider: Schema.Literals(["codex-account", "openai-api"]),
+  instanceId: Schema.NullOr(Schema.String),
+  model: Schema.String,
+  apiKeyConfigured: Schema.Boolean,
+  apiKeySource: Schema.Literals(["saved", "environment", "none"]),
+  available: Schema.Boolean,
+  message: Schema.String,
+  instances: Schema.Array(
+    Schema.Struct({ id: Schema.String, label: Schema.String, authenticated: Schema.Boolean }),
+  ),
+});
 export const VoiceTranscriptionFailureReason = Schema.Literals([
   "audio_too_large",
   "auth_required",
@@ -709,6 +728,17 @@ export class VoiceTranscriptionHttpError extends Schema.TaggedError<VoiceTranscr
   }
 }
 class EnvironmentVoiceHttpApi extends HttpApiGroup.make("voice").add(
+  HttpApiEndpoint.get("voiceSettings", "/api/voice/settings", {
+    headers: OptionalBearerHeaders,
+    success: VoiceTranscriptionSettings,
+    error: [EnvironmentAuthInvalidError, EnvironmentScopeRequiredError, EnvironmentInternalError],
+  }).middleware(EnvironmentAuthenticatedAuth),
+  HttpApiEndpoint.put("updateVoiceSettings", "/api/voice/settings", {
+    headers: OptionalBearerHeaders,
+    payload: VoiceTranscriptionSettingsInput,
+    success: VoiceTranscriptionSettings,
+    error: [EnvironmentAuthInvalidError, EnvironmentScopeRequiredError, EnvironmentInternalError],
+  }).middleware(EnvironmentAuthenticatedAuth),
   HttpApiEndpoint.post("voiceTranscription", "/api/voice/transcription", {
     headers: OptionalBearerHeaders,
     payload: VoiceTranscriptionUpload,

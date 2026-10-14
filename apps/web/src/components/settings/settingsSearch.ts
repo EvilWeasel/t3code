@@ -668,6 +668,14 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "voice-transcription",
+    title: "Voice transcription",
+    to: "/settings/integrations",
+    searchTerms: [
+      "voice audio microphone transcription dictation speech OpenAI API key Codex ChatGPT account provider model recording",
+    ],
+  },
+  {
     id: "usage-providers",
     title: "Usage providers",
     to: "/settings/providers",

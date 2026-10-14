@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { acquireMicrophoneOwnership } from "@t3tools/client-runtime/live-voice";
+import {
+  MAX_RECORDING_BYTES,
+  readRecordingDraft,
+  writeRecordingDraft,
+} from "./recordingDraftStore";
 
 export type VoiceDictationState =
   | { readonly phase: "idle" }
@@ -33,6 +38,7 @@ type ActiveCapture = {
 
 /** Browser capture and review lifecycle. Transcription is injected so transport/auth stays separate. */
 export function useVoiceDictation(input: {
+  readonly targetKey?: string;
   readonly transcribe: VoiceDictationTranscriber | null;
   readonly onTranscript: (transcript: string) => void;
 }) {
@@ -43,6 +49,7 @@ export function useVoiceDictation(input: {
   const audioUrlRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const generationRef = useRef(0);
+  const targetKey = input.targetKey;
 
   const releaseCapture = useCallback((capture: ActiveCapture) => {
     if (capture.timeout !== undefined) clearTimeout(capture.timeout);
@@ -68,8 +75,9 @@ export function useVoiceDictation(input: {
     if (capture) releaseCapture(capture);
     startingRef.current = false;
     clearAudio();
+    if (targetKey) writeRecordingDraft(targetKey, null);
     setState({ phase: "idle" });
-  }, [clearAudio, releaseCapture]);
+  }, [clearAudio, releaseCapture, targetKey]);
 
   const start = useCallback(async () => {
     if (
@@ -132,9 +140,17 @@ export function useVoiceDictation(input: {
           setState({ phase: "error", message: "The recording was empty. Try again." });
           return;
         }
+        if (audio.size > MAX_RECORDING_BYTES) {
+          setState({
+            phase: "error",
+            message: "This recording is too large. Record a shorter message.",
+          });
+          return;
+        }
         const audioUrl = URL.createObjectURL(audio);
         audioRef.current = audio;
         audioUrlRef.current = audioUrl;
+        if (targetKey) writeRecordingDraft(targetKey, { audio });
         setState({ phase: "review", audioUrl, audioType: audio.type });
       };
       recorder.onerror = () => {
@@ -160,7 +176,7 @@ export function useVoiceDictation(input: {
         message: "Microphone access is unavailable. Check browser permissions and try again.",
       });
     }
-  }, [clearAudio, releaseCapture, state.phase]);
+  }, [clearAudio, releaseCapture, state.phase, targetKey]);
 
   const stop = useCallback(() => {
     if (captureRef.current?.recorder?.state === "recording") captureRef.current.recorder.stop();
@@ -192,16 +208,19 @@ export function useVoiceDictation(input: {
         return;
       }
       input.onTranscript(transcript);
+      if (targetKey) writeRecordingDraft(targetKey, null);
       clearAudio();
       setState({ phase: "idle" });
     } catch (error) {
       if (generationRef.current !== generation || abortController.signal.aborted) return;
+      const message =
+        error instanceof VoiceDictationServiceError
+          ? error.message
+          : "Transcription failed. Your recording is still available to retry.";
+      if (targetKey) writeRecordingDraft(targetKey, { audio, message });
       setState({
         phase: "error",
-        message:
-          error instanceof VoiceDictationServiceError
-            ? error.message
-            : "Transcription failed. Your recording is still available to retry.",
+        message,
         audioUrl,
       });
     } finally {
@@ -209,16 +228,29 @@ export function useVoiceDictation(input: {
     }
   }, [clearAudio, input, state.phase]);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    const generation = ++generationRef.current;
+    setState({ phase: "idle" });
+    if (targetKey)
+      void readRecordingDraft(targetKey).then((draft) => {
+        if (!draft || generationRef.current !== generation || audioRef.current) return;
+        const audioUrl = URL.createObjectURL(draft.audio);
+        audioRef.current = draft.audio;
+        audioUrlRef.current = audioUrl;
+        setState(
+          draft.message
+            ? { phase: "error", audioUrl, message: draft.message }
+            : { phase: "review", audioUrl, audioType: draft.audio.type },
+        );
+      });
+    return () => {
       generationRef.current += 1;
       abortRef.current?.abort();
       const capture = captureRef.current;
       if (capture) releaseCapture(capture);
       clearAudio();
-    },
-    [clearAudio, releaseCapture],
-  );
+    };
+  }, [clearAudio, releaseCapture, targetKey]);
 
   return { state, start, stop, transcribe, cancel } as const;
 }

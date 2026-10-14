@@ -1,5 +1,7 @@
 import {
   AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
+  AuthSettingsWriteScope,
   EnvironmentHttpApi,
   VoiceTranscriptionHttpError,
 } from "@t3tools/contracts";
@@ -23,37 +25,54 @@ export const layer = HttpApiBuilder.group(
   Effect.fnUntraced(function* (handlers) {
     const service = yield* VoiceTranscriptionService.VoiceTranscriptionService;
     const fs = yield* FileSystem.FileSystem;
-    return handlers.handle(
-      "voiceTranscription",
-      Effect.fn("environment.voice.transcription")(function* (args) {
-        yield* annotateEnvironmentRequest(args.endpoint.name);
-        yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
-        const file = args.payload.audio;
-        if (!Multipart.isPersistedFile(file))
-          return yield* Effect.die(new Error("Invalid audio upload."));
-        const bytes = yield* fs
-          .readFile(file.path)
-          .pipe(Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)));
-        const transcript = yield* service
-          .transcribe({ bytes, contentType: file.contentType, fileName: file.name })
-          .pipe(
-            traceLocalHandlerWork,
-            Effect.catchTag("VoiceTranscriptionError", (error) =>
-              Effect.fail(
-                new VoiceTranscriptionHttpError({
-                  code: "voice_transcription_failed",
-                  reason: error.reason,
-                  detail: error.detail.slice(0, 180),
-                }),
-              ),
-            ),
-            Effect.catchIf(
-              (error) => !Schema.is(VoiceTranscriptionHttpError)(error),
-              (error) => failEnvironmentInternal("internal_error", error),
-            ),
+    return handlers
+      .handle("voiceSettings", () =>
+        Effect.gen(function* () {
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          return yield* service.getSettings.pipe(
+            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
           );
-        return { transcript };
-      }),
-    );
+        }),
+      )
+      .handle("updateVoiceSettings", ({ payload }) =>
+        Effect.gen(function* () {
+          yield* requireEnvironmentScope(AuthSettingsWriteScope);
+          return yield* service
+            .updateSettings(payload)
+            .pipe(Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)));
+        }).pipe(Effect.withTracerEnabled(false)),
+      )
+      .handle(
+        "voiceTranscription",
+        Effect.fn("environment.voice.transcription")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
+          const file = args.payload.audio;
+          if (!Multipart.isPersistedFile(file))
+            return yield* Effect.die(new Error("Invalid audio upload."));
+          const bytes = yield* fs
+            .readFile(file.path)
+            .pipe(Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)));
+          const transcript = yield* service
+            .transcribe({ bytes, contentType: file.contentType, fileName: file.name })
+            .pipe(
+              traceLocalHandlerWork,
+              Effect.catchTag("VoiceTranscriptionError", (error) =>
+                Effect.fail(
+                  new VoiceTranscriptionHttpError({
+                    code: "voice_transcription_failed",
+                    reason: error.reason,
+                    detail: error.detail.slice(0, 180),
+                  }),
+                ),
+              ),
+              Effect.catchIf(
+                (error) => !Schema.is(VoiceTranscriptionHttpError)(error),
+                (error) => failEnvironmentInternal("internal_error", error),
+              ),
+            );
+          return { transcript };
+        }),
+      );
   }),
 );

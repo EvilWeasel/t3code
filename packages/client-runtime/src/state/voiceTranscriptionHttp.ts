@@ -13,6 +13,27 @@ import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import type { PreparedConnection } from "../connection/model.ts";
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import { executeAuthenticatedEnvironmentHttpRequest } from "./environmentHttpAuth.ts";
+import type { VoiceTranscriptionSettingsInput } from "@t3tools/contracts";
+
+export const requestEnvironmentVoiceSettings = (input: {
+  readonly prepared: PreparedConnection;
+  readonly signer: Option.Option<ManagedRelay.ManagedRelayDpopSigner["Service"]>;
+  readonly remoteAuthorization: Option.Option<
+    RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]
+  >;
+  readonly update?: typeof VoiceTranscriptionSettingsInput.Type;
+}) =>
+  executeAuthenticatedEnvironmentHttpRequest({
+    ...input,
+    group: "voice",
+    method: input.update ? "PUT" : "GET",
+    timeoutMs: 15_000,
+    url: (urls) => urls.voiceSettings(),
+    request: ({ client, headers }) =>
+      input.update
+        ? client.updateVoiceSettings({ payload: input.update, headers })
+        : client.voiceSettings({ headers }),
+  });
 
 const TRANSCRIPTION_RESPONSE = Schema.Struct({ transcript: Schema.String });
 const decodeTranscriptionResponse = Schema.decodeUnknownEffect(TRANSCRIPTION_RESPONSE);

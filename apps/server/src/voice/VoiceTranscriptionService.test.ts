@@ -29,10 +29,13 @@ import {
   readTrustedAccountContext,
   safeProviderError,
   selectCodexTranscriptionInstance,
+  liveCodexTranscriptionConfigs,
   transcribeCodexAccount,
   transcribeOpenAiApi,
   validateVoiceAudio,
 } from "./VoiceTranscriptionService.ts";
+import { deriveProviderInstanceConfigMap } from "../provider/ProviderInstanceRegistryHydration.ts";
+import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
 import { requireEnvironmentScope } from "../auth/http.ts";
 
 const routeContext = {
@@ -43,6 +46,29 @@ const routeContext = {
     accountRoutingOverride: "us",
   },
 };
+
+it("uses the registry's implicit default Codex when persisted providerInstances is empty", () => {
+  const hydrated = deriveProviderInstanceConfigMap(DEFAULT_SERVER_SETTINGS);
+  assert.strictEqual(hydrated.codex?.driver, "codex");
+  const live = [{ instanceId: "codex", driverKind: hydrated.codex!.driver, enabled: true }];
+  const selected = selectCodexTranscriptionInstance(
+    liveCodexTranscriptionConfigs({}, live),
+    undefined,
+    undefined,
+  );
+  assert.strictEqual(selected?.[0], "codex");
+  assert.strictEqual(
+    Schema.decodeUnknownSync(CodexSettings)(selected?.[1].config ?? {}).binaryPath,
+    "codex",
+  );
+  assert.isUndefined(
+    selectCodexTranscriptionInstance(
+      liveCodexTranscriptionConfigs({}, [{ ...live[0]!, enabled: false }]),
+      undefined,
+      undefined,
+    ),
+  );
+});
 
 const jwt = (userId: string, accountId = "account-1") => {
   const payload = Buffer.from(

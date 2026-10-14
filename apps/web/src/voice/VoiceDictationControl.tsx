@@ -27,6 +27,7 @@ export function VoiceDictationControl(props: {
     [props.currentTargetKey],
   );
   const dictation = useVoiceDictation({
+    targetKey: props.targetKey,
     transcribe: transcribeCapturedRecording,
     onTranscript: (text) => {
       const targetKey = recordedTargetKey.current;
@@ -36,17 +37,12 @@ export function VoiceDictationControl(props: {
     },
   });
   const state = dictation.state;
-  const cancelRef = useRef(dictation.cancel);
-  useEffect(() => {
-    cancelRef.current = dictation.cancel;
-  }, [dictation.cancel]);
   useEffect(() => {
     if (recordedTargetKey.current !== props.targetKey) {
-      cancelRef.current();
-      recordingTranscriber.current = null;
+      recordingTranscriber.current = props.transcribe;
     }
     recordedTargetKey.current = props.targetKey;
-  }, [props.targetKey]);
+  }, [props.targetKey, props.transcribe]);
 
   if (state.phase === "idle" || (state.phase === "error" && !state.audioUrl)) {
     return (
@@ -118,7 +114,7 @@ export function VoiceDictationControl(props: {
       />
       {error ? (
         <span role="status" className="max-w-40 text-xs text-destructive">
-          {error}
+          {error} Open Settings → Integrations → Voice transcription to check this environment.
         </span>
       ) : null}
       <Button

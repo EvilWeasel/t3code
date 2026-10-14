@@ -7,6 +7,7 @@ import {
   type VoiceDictationTranscriber,
 } from "./useVoiceDictation";
 import { acquireMicrophoneOwnership } from "@t3tools/client-runtime/live-voice";
+import { readRecordingDraft } from "./recordingDraftStore";
 
 class FakeMediaRecorder {
   static instance: FakeMediaRecorder | null = null;
@@ -36,15 +37,21 @@ let onTranscript: ReturnType<typeof vi.fn<(transcript: string) => void>>;
 let trackStop: ReturnType<typeof vi.fn>;
 let revokedUrls: string[];
 
-function Probe({ transcribe }: { transcribe: VoiceDictationTranscriber | null }) {
-  latest = useVoiceDictation({ transcribe, onTranscript });
+function Probe({
+  transcribe,
+  targetKey,
+}: {
+  transcribe: VoiceDictationTranscriber | null;
+  targetKey?: string;
+}) {
+  latest = useVoiceDictation({ transcribe, onTranscript, ...(targetKey ? { targetKey } : {}) });
   return null;
 }
 
-function render(transcribe: VoiceDictationTranscriber | null) {
+function render(transcribe: VoiceDictationTranscriber | null, targetKey?: string) {
   act(() => {
-    if (renderer) renderer.update(<Probe transcribe={transcribe} />);
-    else renderer = create(<Probe transcribe={transcribe} />);
+    if (renderer) renderer.update(<Probe transcribe={transcribe} targetKey={targetKey} />);
+    else renderer = create(<Probe transcribe={transcribe} targetKey={targetKey} />);
   });
 }
 
@@ -84,6 +91,51 @@ afterEach(() => {
 });
 
 describe("useVoiceDictation", () => {
+  it("restores a failed recording after Settings navigation and retries after configuration", async () => {
+    const targetKey = "voice-recovery:environment:thread";
+    render(async () => {
+      throw new VoiceDictationServiceError("Provider unavailable");
+    }, targetKey);
+    await startAndStop();
+    await act(async () => latest?.transcribe());
+    expect(latest?.state.phase).toBe("error");
+    act(() => {
+      renderer?.unmount();
+      renderer = null;
+    });
+    expect((await readRecordingDraft(targetKey))?.audio.size).toBeGreaterThan(0);
+    const retry = vi.fn(async () => "recovered words");
+    await act(async () => render(retry, targetKey));
+    expect(latest?.state).toMatchObject({ phase: "error", audioUrl: "blob:voice-review" });
+    await act(async () => latest?.transcribe());
+    expect(onTranscript).toHaveBeenCalledWith("recovered words");
+    expect(await readRecordingDraft(targetKey)).toBeNull();
+  });
+
+  it("keeps recordings on their original draft across target switches", async () => {
+    const transcribe = vi.fn(async () => "words");
+    render(transcribe, "voice-switch:environment-a:thread");
+    await startAndStop();
+    await act(async () => render(transcribe, "voice-switch:environment-b:thread"));
+    expect(latest?.state.phase).toBe("idle");
+    await act(async () => render(transcribe, "voice-switch:environment-a:thread"));
+    expect(latest?.state.phase).toBe("review");
+    act(() => latest?.cancel());
+    expect(await readRecordingDraft("voice-switch:environment-a:thread")).toBeNull();
+  });
+
+  it("keeps the audio when transcript insertion fails", async () => {
+    const key = "voice-insertion:environment:thread";
+    onTranscript.mockImplementationOnce(() => {
+      throw new Error("Draft changed");
+    });
+    render(async () => "words", key);
+    await startAndStop();
+    await act(async () => latest?.transcribe());
+    expect((await readRecordingDraft(key))?.audio.size).toBeGreaterThan(0);
+    await act(async () => latest?.transcribe());
+    expect(await readRecordingDraft(key)).toBeNull();
+  });
   it("keeps the recording for playback review, then inserts only after explicit transcription", async () => {
     const transcribe = vi.fn(async () => "  recognized words  ");
     render(transcribe);
