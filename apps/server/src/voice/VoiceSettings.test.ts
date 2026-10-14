@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -26,9 +27,12 @@ it.effect("keeps an unchanged key private and removes only the explicitly saved 
     assert.equal((yield* store.read).apiKey, process.env.T3CODE_TRANSCRIPTION_API_KEY);
     assert.notEqual((yield* store.read).apiKeySource, "saved");
   }).pipe(
-    Effect.provide(ServerSecretStore.layer),
-    Effect.provide(ServerConfig.layerTest(process.cwd(), { prefix: "voice-settings-" })),
-    Effect.provide(NodeServices.layer),
+    Effect.provide(
+      ServerSecretStore.layer.pipe(
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "voice-settings-" })),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
     Effect.scoped,
   ),
 );
