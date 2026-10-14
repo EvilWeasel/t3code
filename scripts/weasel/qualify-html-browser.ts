@@ -5,6 +5,8 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import { FetchHttpClient } from "effect/http";
 
 import * as PreviewBrowser from "../../apps/server/src/preview/PreviewBrowser.ts";
 
@@ -35,7 +37,7 @@ const executable = await Effect.runPromise(
   PreviewBrowser.makePreviewBrowser({ baseDir: fixtureHome }).pipe(
     Effect.flatMap((browser) => browser.executable),
     Effect.scoped,
-    Effect.provide(NodeServices.layer),
+    Effect.provide(Layer.mergeAll(NodeServices.layer, FetchHttpClient.layer)),
   ),
 );
 const relativeExecutable = NodePath.relative(fixtureHome, executable);
