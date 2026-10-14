@@ -48,7 +48,7 @@ it("keeps unavailable Live quiet until the disabled control is focused", async (
   const reason = "Live voice is available only for a managed Codex thread.";
   await act(async () =>
     root.render(
-      <TooltipProvider>
+      <TooltipProvider delay={0}>
         <LiveVoiceControl
           environmentId={EnvironmentId.make("environment")}
           threadId={ThreadId.make("thread")}
@@ -67,7 +67,12 @@ it("keeps unavailable Live quiet until the disabled control is focused", async (
   await act(async () => button.click());
   expect(calls.start).not.toHaveBeenCalled();
   const trigger = container.querySelector<HTMLElement>('[data-slot="tooltip-trigger"]')!;
-  await act(async () => trigger.focus());
-  expect(document.querySelector('[role="tooltip"]')?.textContent).toContain(reason);
+  await act(async () => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+    trigger.focus();
+  });
+  await vi.waitFor(() =>
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toContain(reason),
+  );
   expect(calls.command).not.toHaveBeenCalled();
 });

@@ -9,19 +9,22 @@ import * as Electron from "electron";
 import { NixManagedUpdater } from "./NixManagedUpdater.ts";
 import { quitAndInstallInPlace } from "./quitAndInstallInPlace.ts";
 
-const autoUpdater =
-  process.platform === "linux" && process.env.T3CODE_NIX_UPDATER
-    ? new NixManagedUpdater({
-        command: process.env.T3CODE_NIX_UPDATER,
-        launcher: process.env.T3CODE_NIX_LAUNCHER ?? "",
-        currentVersion: Electron.app.getVersion(),
-        relaunch: (launcher) => {
-          Electron.app.relaunch({ execPath: launcher, args: process.argv.slice(1) });
-          Electron.autoUpdater.emit("before-quit-for-update");
-          Electron.app.quit();
-        },
-      })
-    : electronAutoUpdater;
+let updaterInstance: typeof electronAutoUpdater | NixManagedUpdater | undefined;
+function currentUpdater() {
+  return (updaterInstance ??=
+    process.platform === "linux" && process.env.T3CODE_NIX_UPDATER
+      ? new NixManagedUpdater({
+          command: process.env.T3CODE_NIX_UPDATER,
+          launcher: process.env.T3CODE_NIX_LAUNCHER ?? "",
+          currentVersion: Electron.app.getVersion(),
+          relaunch: (launcher) => {
+            Electron.app.relaunch({ execPath: launcher, args: process.argv.slice(1) });
+            Electron.autoUpdater.emit("before-quit-for-update");
+            Electron.app.quit();
+          },
+        })
+      : electronAutoUpdater);
+}
 
 type AutoUpdater = typeof electronAutoUpdater;
 
@@ -101,69 +104,69 @@ export class ElectronUpdater extends Context.Service<
 export const make = ElectronUpdater.of({
   setFeedURL: (options) =>
     Effect.suspend(() => {
-      autoUpdater.setFeedURL(options);
+      currentUpdater().setFeedURL(options);
       return Effect.void;
     }),
   setAutoDownload: (value) =>
     Effect.suspend(() => {
-      autoUpdater.autoDownload = value;
+      currentUpdater().autoDownload = value;
       return Effect.void;
     }),
   setAutoInstallOnAppQuit: (value) =>
     Effect.suspend(() => {
-      autoUpdater.autoInstallOnAppQuit = value;
+      currentUpdater().autoInstallOnAppQuit = value;
       return Effect.void;
     }),
   setChannel: (channel) =>
     Effect.suspend(() => {
-      autoUpdater.channel = channel;
+      currentUpdater().channel = channel;
       return Effect.void;
     }),
   setAllowPrerelease: (value) =>
     Effect.suspend(() => {
-      autoUpdater.allowPrerelease = value;
+      currentUpdater().allowPrerelease = value;
       return Effect.void;
     }),
-  allowDowngrade: Effect.sync(() => autoUpdater.allowDowngrade),
+  allowDowngrade: Effect.sync(() => currentUpdater().allowDowngrade),
   setAllowDowngrade: (value) =>
     Effect.suspend(() => {
-      autoUpdater.allowDowngrade = value;
+      currentUpdater().allowDowngrade = value;
       return Effect.void;
     }),
   setFullChangelog: (value) =>
     Effect.suspend(() => {
-      autoUpdater.fullChangelog = value;
+      currentUpdater().fullChangelog = value;
       return Effect.void;
     }),
   setDisableDifferentialDownload: (value) =>
     Effect.suspend(() => {
-      autoUpdater.disableDifferentialDownload = value;
+      currentUpdater().disableDifferentialDownload = value;
       return Effect.void;
     }),
   checkForUpdates: Effect.suspend(() => {
-    const channel = autoUpdater.channel;
+    const channel = currentUpdater().channel;
     return Effect.tryPromise({
       try: async () => {
-        await autoUpdater.checkForUpdates();
+        await currentUpdater().checkForUpdates();
       },
       catch: (cause) => new ElectronUpdaterCheckForUpdatesError({ channel, cause }),
     }).pipe(Effect.asVoid);
   }),
   downloadUpdate: Effect.suspend(() => {
-    const channel = autoUpdater.channel;
+    const channel = currentUpdater().channel;
     return Effect.tryPromise({
       try: async () => {
-        await autoUpdater.downloadUpdate();
+        await currentUpdater().downloadUpdate();
       },
       catch: (cause) => new ElectronUpdaterDownloadUpdateError({ channel, cause }),
     }).pipe(Effect.asVoid);
   }),
   quitAndInstall: ({ isSilent, isForceRunAfter }) =>
     Effect.suspend(() => {
-      const channel = autoUpdater.channel;
+      const channel = currentUpdater().channel;
       return Effect.tryPromise({
         try: async () => {
-          await quitAndInstallInPlace(autoUpdater, {
+          await quitAndInstallInPlace(currentUpdater(), {
             platform: process.platform,
             isPackaged: Electron.app.isPackaged,
             executable: process.execPath,
@@ -181,7 +184,7 @@ export const make = ElectronUpdater.of({
       });
     }),
   on: (eventName, listener) => {
-    const eventTarget = autoUpdater as unknown as {
+    const eventTarget = currentUpdater() as unknown as {
       on: (eventName: string, listener: (...args: Array<unknown>) => void) => void;
       removeListener: (eventName: string, listener: (...args: Array<unknown>) => void) => void;
     };
