@@ -1,11 +1,17 @@
 name: Weasel desktop nightly
-run-name: Weasel desktop release ${{ inputs.source_sha }}
+run-name: Weasel desktop ${{ inputs.build_mode }} ${{ inputs.source_sha }}
 
 on:
   workflow_dispatch:
     inputs:
+      build_mode:
+        description: Production release or isolated public artifact candidate
+        required: true
+        default: production
+        type: choice
+        options: [production, candidate]
       source_sha:
-        description: Fork main commit to build (set by the sync workflow)
+        description: Immutable commit SHA to build
         required: true
         type: string
 
@@ -20,7 +26,7 @@ permissions:
 jobs:
   preflight:
     if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: namespace-profile-ci-builder
     timeout-minutes: 15
     outputs:
       source_sha: ${{ steps.release.outputs.source_sha }}
@@ -33,7 +39,15 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
 
-      - name: Verify source is on fork main
+      - name: Validate build mode
+        env:
+          BUILD_MODE: ${{ inputs.build_mode }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_MODE" == production || "$BUILD_MODE" == candidate ]]
+
+      - name: Verify production source is the fork main tip
+        if: inputs.build_mode == 'production'
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
@@ -42,14 +56,26 @@ jobs:
           git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
           test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
 
+      - name: Verify isolated candidate source and public repository scope
+        if: inputs.build_mode == 'candidate'
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" == 72aa65d56601f3318cfaa7c05dbf93e936f2b575 ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$GH_REPO" = "$GITHUB_REPOSITORY"
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)" = public
+
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: ${{ !startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-') }}
+          cache: false
           run-install: false
       - name: Restore Namespace dependency volume
-        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           cache: pnpm
@@ -59,7 +85,7 @@ jobs:
       - name: Check source before release
         run: |
           set -euo pipefail
-          bash scripts/weasel/check.sh
+          if [[ "${{ inputs.build_mode }}" == production ]]; then bash scripts/weasel/check.sh; fi
 
       - id: release
         name: Resolve distinct fork version
@@ -70,6 +96,10 @@ jobs:
           GH_REPO: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
         run: |
           set -euo pipefail
+          if [[ "${{ inputs.build_mode }}" == candidate ]]; then
+            fork_version="$(bash scripts/weasel/resolve-candidate-version.sh "$SOURCE_SHA")"
+            fork_version="${fork_version#version=}"
+          else
           upstream_metadata="$RUNNER_TEMP/upstream-nightly.txt"
           run_created_at="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID" --jq .created_at)"
           release_date="$(bash scripts/weasel/resolve-run-date.sh "$run_created_at")"
@@ -82,6 +112,7 @@ jobs:
             "$source_nightly_base" \
             "$release_date" \
             "$RELEASE_RUN" | sed -n 's/^version=//p')"
+          fi
           if [[ -z "$fork_version" ]]; then
             echo "Could not resolve a fork release version." >&2
             exit 1
@@ -94,7 +125,7 @@ jobs:
 
   build_bundle:
     needs: [preflight]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: namespace-profile-ci-builder
     timeout-minutes: 30
     steps:
       - name: Checkout source
@@ -107,11 +138,10 @@ jobs:
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: ${{ !startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-') }}
+          cache: false
           run-install: false
 
       - name: Restore Namespace dependency volume
-        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           cache: pnpm
@@ -139,7 +169,7 @@ jobs:
 
   build_linux:
     needs: [preflight, build_bundle]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: namespace-profile-ci-builder
     timeout-minutes: 80
     permissions:
       contents: read
@@ -154,11 +184,10 @@ jobs:
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: true
+          cache: false
           run-install: false
 
       - name: Restore Namespace dependency volume
-        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
         uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
         with:
           cache: pnpm
@@ -200,15 +229,17 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --output-dir release-linux
-          test -s release-linux/nightly-linux.yml
-          shopt -s nullglob
-          stage_roots=(/tmp/t3code-desktop-linux-stage-* "$RUNNER_TEMP"/t3code-desktop-linux-stage-*)
-          test "${#stage_roots[@]}" -gt 0
-          update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
-          test -n "$update_config"
-          IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
-          grep -Fq "owner: $expected_owner" "$update_config"
-          grep -Fq "repo: $expected_repo" "$update_config"
+          if [[ "${{ inputs.build_mode }}" == production ]]; then
+            test -s release-linux/nightly-linux.yml
+            shopt -s nullglob
+            stage_roots=(/tmp/t3code-desktop-linux-stage-* "$RUNNER_TEMP"/t3code-desktop-linux-stage-*)
+            test "${#stage_roots[@]}" -gt 0
+            update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
+            test -n "$update_config"
+            IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
+            grep -Fq "owner: $expected_owner" "$update_config"
+            grep -Fq "repo: $expected_repo" "$update_config"
+          fi
 
       - name: Prepare NixOS download bundle
         run: |
@@ -257,7 +288,7 @@ jobs:
 
   build_windows:
     needs: [preflight, build_bundle, build_linux]
-    runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'nscloud-windows-2022-amd64-8x16' }}
+    runs-on: nscloud-windows-2022-amd64-8x16
     timeout-minutes: 50
     steps:
       - name: Checkout source
@@ -329,15 +360,19 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/build-desktop-artifact.ts --platform win --target nsis --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --wsl-runtime "$GITHUB_WORKSPACE"/wsl-runtime/t3-*-linux-x64.tar.gz --output-dir release-windows
-          test -s release-windows/nightly.yml
-          tmp_roots=("$RUNNER_TEMP")
-          [[ -n "${TEMP:-}" ]] && tmp_roots+=("$TEMP")
-          [[ -n "${TMP:-}" ]] && tmp_roots+=("$TMP")
-          update_config="$(find "${tmp_roots[@]}" -path '*/resources/app-update.yml' -print -quit 2>/dev/null || true)"
-          test -n "$update_config"
-          IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
-          grep -Fq "owner: $expected_owner" "$update_config"
-          grep -Fq "repo: $expected_repo" "$update_config"
+          if [[ "${{ inputs.build_mode }}" == candidate ]]; then
+            test -s "release-windows/T3-Code-${{ needs.preflight.outputs.version }}-x64.exe"
+          else
+            test -s release-windows/nightly.yml
+            tmp_roots=("$RUNNER_TEMP")
+            [[ -n "${TEMP:-}" ]] && tmp_roots+=("$TEMP")
+            [[ -n "${TMP:-}" ]] && tmp_roots+=("$TMP")
+            update_config="$(find "${tmp_roots[@]}" -path '*/resources/app-update.yml' -print -quit 2>/dev/null || true)"
+            test -n "$update_config"
+            IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
+            grep -Fq "owner: $expected_owner" "$update_config"
+            grep -Fq "repo: $expected_repo" "$update_config"
+          fi
 
       - name: Package and smoke-test Windows CLI archive
         shell: bash
@@ -347,6 +382,7 @@ jobs:
           mkdir -p "$monitor_dir"
           cp native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe "$monitor_dir/"
           node scripts/build-cli-archive.ts --platform win --arch x64 --version "${{ needs.preflight.outputs.version }}" --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" --output-dir release-cli
+          if [[ "${{ inputs.build_mode }}" == candidate ]]; then test -s "release-cli/t3-${{ needs.preflight.outputs.version }}-win32-x64.zip"; fi
           node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ needs.preflight.outputs.version }}"
 
       - name: Upload Windows release assets
@@ -366,8 +402,9 @@ jobs:
           retention-days: 1
 
   publish:
+    if: inputs.build_mode == 'production'
     needs: [preflight, build_linux, build_windows]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: namespace-profile-ci-builder
     timeout-minutes: 15
     permissions:
       contents: write
