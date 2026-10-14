@@ -42,6 +42,7 @@ focused_tests=(
   apps/desktop/src/electron/quitAndInstallInPlace.test.ts
   apps/web/src/components/sidebar/updateEverything.logic.test.ts
   apps/web/src/branding.test.ts
+  apps/web/src/connection/fleetBootstrap.test.ts
   packages/shared/src/cliRelease.test.ts
   apps/server/src/cli/update.test.ts
   apps/server/src/cloud/selfUpdate.test.ts

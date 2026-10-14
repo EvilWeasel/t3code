@@ -215,6 +215,10 @@
       "types": "./src/state/pullRequests.ts",
       "default": "./src/state/pullRequests.ts"
     },
+    "./state/fleet-connections": {
+      "types": "./src/state/fleetConnections.ts",
+      "default": "./src/state/fleetConnections.ts"
+    },
     "./state/voice-transcription": {
       "types": "./src/state/voiceTranscriptionHttp.ts",
       "default": "./src/state/voiceTranscriptionHttp.ts"
