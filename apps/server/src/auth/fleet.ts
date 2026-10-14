@@ -102,6 +102,7 @@ export function delegatedFleetScopes(
 export const issueFleetPairing = Effect.fn("auth.issueFleetPairing")(function* (
   environmentId: EnvironmentId,
   callerScopes: ReadonlySet<AuthEnvironmentScope>,
+  // @effect-diagnostics-next-line globalFetch:off - This private grant boundary forbids redirects and discards raw fetch errors.
   fetchFn: typeof fetch = fetch,
 ) {
   const entries = yield* readFleetConnections;

@@ -44,6 +44,8 @@ focused_tests=(
   apps/web/src/branding.test.ts
   apps/web/src/connection/fleetBootstrap.test.ts
   apps/web/src/components/FleetConnectionBootstrap.test.tsx
+  apps/server/src/auth/fleet.test.ts
+  apps/server/src/auth/http.test.ts
   packages/shared/src/cliRelease.test.ts
   apps/server/src/cli/update.test.ts
   apps/server/src/cloud/selfUpdate.test.ts
