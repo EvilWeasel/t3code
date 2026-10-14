@@ -12,6 +12,7 @@ vp_cmd() {
   fi
 }
 
+typecheck_failed=0
 for package in \
   @t3tools/contracts \
   @t3tools/client-runtime \
@@ -19,10 +20,17 @@ for package in \
   t3 \
   @t3tools/web \
   @t3tools/desktop; do
-  vp_cmd run --filter="$package" typecheck
+  if ! vp_cmd run --filter="$package" typecheck; then
+    typecheck_failed=1
+  fi
 done
 
-vp_cmd run --filter=@t3tools/scripts typecheck
+if ! vp_cmd run --filter=@t3tools/scripts typecheck; then
+  typecheck_failed=1
+fi
+if [[ "$typecheck_failed" != 0 ]]; then
+  exit 1
+fi
 focused_tests=(
   packages/contracts/src/server.test.ts \
   packages/client-runtime/src/state/serverConfigProjection.test.ts \
