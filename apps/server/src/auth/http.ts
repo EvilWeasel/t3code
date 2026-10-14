@@ -2,6 +2,8 @@ import {
   authScopeRequiredResponse,
   AuthAccessReadScope,
   AuthAccessWriteScope,
+  AuthEnvironmentMaintainScope,
+  FleetConnectionUnavailableError,
   AuthStandardClientScopes,
   AuthGrantScope,
   EnvironmentAuthInvalidError,
@@ -34,6 +36,7 @@ import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
 import * as SessionStore from "./SessionStore.ts";
+import * as Fleet from "./fleet.ts";
 import { traceAuthenticatedRelayRequest, traceRelayRequest } from "../cloud/traceRelayRequest.ts";
 import { deriveAuthClientMetadata } from "./utils.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
@@ -450,6 +453,37 @@ export const layer = HttpApiBuilder.group(
             failEnvironmentInternal("pairing_credential_issuance_failed", error),
           ),
         ),
+      )
+      .handle(
+        "fleetConnections",
+        Effect.fn("environment.auth.fleetConnections")(function* () {
+          yield* requireEnvironmentScope(AuthEnvironmentMaintainScope);
+          yield* appendCredentialResponseHeaders;
+          const connections = yield* Fleet.readFleetConnections.pipe(
+            Effect.map((entries) => entries.map(Fleet.publicConnection)),
+            Effect.catch(() => failEnvironmentInternal("internal_error")),
+          );
+          return { connections };
+        }),
+      )
+      .handle(
+        "fleetPairingCredential",
+        Effect.fn("environment.auth.fleetPairingCredential")(function* (args) {
+          const session = yield* requireEnvironmentScope(AuthEnvironmentMaintainScope);
+          yield* appendCredentialResponseHeaders;
+          return yield* Fleet.issueFleetPairing(args.params.environmentId, session.scopes).pipe(
+            Effect.catch((error) =>
+              error.reason === "not-configured"
+                ? failEnvironmentInvalidRequest("invalid_command")
+                : Effect.fail(
+                    new FleetConnectionUnavailableError({
+                      environmentId: args.params.environmentId,
+                      reason: error.reason,
+                    }),
+                  ),
+            ),
+          );
+        }),
       )
       .handle(
         "pairingLinks",

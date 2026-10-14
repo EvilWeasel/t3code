@@ -47,6 +47,7 @@ import {
 import {
   DpopFailureReason,
   AuthSessionId,
+  EnvironmentId,
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
@@ -447,6 +448,42 @@ export const AuthOtherClientSessionsRevokeResult = Schema.Struct({
 });
 export type AuthOtherClientSessionsRevokeResult = typeof AuthOtherClientSessionsRevokeResult.Type;
 
+export class FleetConnectionUnavailableError extends Schema.TaggedError<FleetConnectionUnavailableError>()(
+  "FleetConnectionUnavailableError",
+  {
+    environmentId: EnvironmentId,
+    reason: Schema.Literals([
+      "unavailable",
+      "authority-expired",
+      "authority-rejected",
+      "identity-mismatch",
+    ]),
+  },
+  { httpApiStatus: 503 },
+) {
+  [HttpServerRespondable.symbol]() {
+    return HttpServerResponse.schemaJson(FleetConnectionUnavailableError)(this, { status: 503 });
+  }
+  override get message(): string {
+    return `The configured fleet connection ${this.environmentId} is unavailable (${this.reason}).`;
+  }
+}
+
+export const FleetConnection = Schema.Struct({
+  environmentId: EnvironmentId,
+  label: TrimmedNonEmptyString,
+  httpBaseUrl: TrimmedNonEmptyString,
+  wsBaseUrl: TrimmedNonEmptyString,
+});
+export type FleetConnection = typeof FleetConnection.Type;
+export const FleetConnections = Schema.Struct({ connections: Schema.Array(FleetConnection) });
+export const FleetPairingCredential = Schema.Struct({
+  ...FleetConnection.fields,
+  credential: TrimmedNonEmptyString,
+  expiresAt: Schema.DateTimeUtc,
+});
+export type FleetPairingCredential = typeof FleetPairingCredential.Type;
+
 class EnvironmentMetadataHttpApi extends HttpApiGroup.make("metadata").add(
   HttpApiEndpoint.get("descriptor", "/.well-known/t3/environment", {
     success: ExecutionEnvironmentDescriptor,
@@ -490,6 +527,25 @@ class EnvironmentAuthHttpApi extends HttpApiGroup.make("auth")
       success: AuthPairingCredentialResult,
       error: EnvironmentPairingCredentialErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.get("fleetConnections", "/api/auth/fleet-connections", {
+      headers: OptionalBearerHeaders,
+      success: FleetConnections,
+      error: EnvironmentScopedOperationErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "fleetPairingCredential",
+      "/api/auth/fleet-connections/:environmentId/pairing-token",
+      {
+        headers: OptionalBearerHeaders,
+        params: Schema.Struct({ environmentId: EnvironmentId }),
+        success: FleetPairingCredential,
+        error: [...EnvironmentScopedOperationErrors, FleetConnectionUnavailableError],
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
     HttpApiEndpoint.get("pairingLinks", "/api/auth/pairing-links", {

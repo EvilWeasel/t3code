@@ -155,6 +155,32 @@ it.effect("sets the selected browser session cookies through the HTTP route", ()
           expect(restrictedCookies).toHaveLength(1);
           expect(restrictedCookies[0]).toMatch(/^t3_session_/);
           expect(restrictedCookies[0]).not.toContain("t3_dev_session_");
+          const fleetRequest = (cookie?: string) =>
+            new Request("http://127.0.0.1/api/auth/fleet-connections", {
+              headers: cookie ? { cookie } : {},
+            });
+          const anonymousFleet = await environmentA.handler(fleetRequest(), requestContext);
+          expect(anonymousFleet.status).toBe(401);
+          const restrictedFleet = await environmentA.handler(
+            fleetRequest(restrictedCookies[0]?.split(";", 1)[0]),
+            requestContext,
+          );
+          expect(restrictedFleet.status).toBe(403);
+          const ownerFleet = await environmentA.handler(
+            fleetRequest(devCookieHeader),
+            requestContext,
+          );
+          expect(ownerFleet.status).toBe(200);
+          expect(ownerFleet.headers.get("cache-control")).toBe("no-store");
+          expect(await ownerFleet.json()).toEqual({ connections: [] });
+          const unknownFleet = await environmentA.handler(
+            new Request("http://127.0.0.1/api/auth/fleet-connections/unknown/pairing-token", {
+              method: "POST",
+              headers: { cookie: devCookieHeader },
+            }),
+            requestContext,
+          );
+          expect(unknownFleet.status).toBe(400);
         }),
       ([environmentA, environmentB]) =>
         Effect.promise(() => Promise.all([environmentA.dispose(), environmentB.dispose()])),
