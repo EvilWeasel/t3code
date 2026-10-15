@@ -66,6 +66,7 @@ import { MENU_ACTION_CHANNEL, PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL } from ".
 import * as DesktopBrowserHost from "./DesktopBrowserHost.ts";
 import * as PreviewPasskeys from "./Passkeys.ts";
 import * as BrowserSession from "./BrowserSession.ts";
+import { AutofillUnavailable, validOrigin, type AutofillTarget } from "./ProtonPassAutofill.ts";
 import {
   ANNOTATION_CAPTURED_CHANNEL,
   ANNOTATION_SEND_ENABLED_CHANNEL,
@@ -549,6 +550,35 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const crypto = yield* Crypto.Crypto;
   const parentScope = yield* Scope.Scope;
   const browserHost = yield* DesktopBrowserHost.DesktopBrowserHost;
+  const sensitiveOperations = new Map<Electron.WebContents, number>();
+  const privateAdmission = <A, E, R>(wc: Electron.WebContents, operation: Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
+      Effect.try({
+        try: () => {
+          if (browserHost.isPrivateEntry(wc)) throw new Error("Private credential entry");
+          sensitiveOperations.set(wc, (sensitiveOperations.get(wc) ?? 0) + 1);
+        },
+        catch: () =>
+          new PreviewOperationError({
+            operation: "privateCredentialEntry",
+            webContentsId: wc.id,
+            cause: "Private credential entry",
+          }),
+      }),
+      () => operation,
+      () =>
+        Effect.sync(() => {
+          const count = (sensitiveOperations.get(wc) ?? 1) - 1;
+          if (count) sensitiveOperations.set(wc, count);
+          else sensitiveOperations.delete(wc);
+        }),
+    );
+  const protectedTabOperation = <A, E, R>(tabId: string, operation: Effect.Effect<A, E, R>) =>
+    Effect.gen(function* () {
+      const wc = yield* requireWebContents(tabId);
+      return yield* privateAdmission(wc, operation);
+    });
+  const autofillDocuments = new WeakMap<Electron.WebContents, { epoch: number }>();
   const passkeys = yield* PreviewPasskeys.PreviewPasskeys;
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
@@ -1054,7 +1084,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     }
   });
 
-  const ensureControlSession = Effect.fn("PreviewManager.ensureControlSession")(function* (
+  const ensureControlSessionImpl = Effect.fn("PreviewManager.ensureControlSession")(function* (
     wc: Electron.WebContents,
   ) {
     return yield* SynchronizedRef.modifyEffect(
@@ -1216,6 +1246,8 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       },
     );
   });
+  const ensureControlSession = (wc: Electron.WebContents) =>
+    privateAdmission(wc, ensureControlSessionImpl(wc));
 
   const cancelPickElement = Effect.fn("PreviewManager.cancelPickElement")(function* (
     tabId: string,
@@ -3396,9 +3428,118 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
 
   yield* Effect.addFinalizer(() => destroy().pipe(Effect.ignore));
 
+  const getAutofillTarget = Effect.fn("PreviewManager.getAutofillTarget")(function* (
+    wc: Electron.WebContents,
+    frame: Electron.WebFrameMain | null,
+  ) {
+    const tab = [...(yield* SynchronizedRef.get(tabsRef)).values()].find(
+      (entry) => entry.webContentsId === wc.id,
+    );
+    if (!tab || wc.isDestroyed() || !frame || frame !== wc.mainFrame) return undefined;
+    const capture = (yield* SynchronizedRef.get(frameCaptureSessionsRef)).get(tab.tabId);
+    const partition = wc.session.getStoragePath();
+    if (
+      !tab ||
+      !frame ||
+      frame !== wc.mainFrame ||
+      !partition ||
+      wc.isDestroyed() ||
+      wc.isDevToolsOpened() ||
+      tab.controller === "agent" ||
+      capture ||
+      (!validOrigin(frame.origin) && !browserHost.isPrivateEntry(wc))
+    )
+      return undefined;
+    let document = autofillDocuments.get(wc);
+    if (!document) {
+      document = { epoch: 0 };
+      autofillDocuments.set(wc, document);
+      const tracked = document;
+      wc.on("did-start-navigation", () => {
+        tracked.epoch += 1;
+      });
+    }
+    const trackedDocument = document;
+    const epoch = trackedDocument.epoch;
+    const origin = frame.origin;
+    const current = () =>
+      !wc.isDestroyed() &&
+      !frame.isDestroyed() &&
+      trackedDocument.epoch === epoch &&
+      wc.mainFrame === frame &&
+      frame.origin === origin &&
+      wc.isFocused() &&
+      !wc.isDevToolsOpened();
+    const assertCurrent = () => {
+      if (!current()) throw new AutofillUnavailable();
+    };
+    const prepare = `(() => {
+      const active = document.activeElement;
+      if (!(active instanceof HTMLInputElement) || !active.form) return false;
+      const form = active.form;
+      const passwords = [...form.querySelectorAll('input[type="password"]')].filter(input => !input.disabled && input.autocomplete !== 'new-password' && input.getClientRects().length);
+      let users = [...form.querySelectorAll('input[autocomplete="username"],input[autocomplete="email"],input[type="email"]')].filter(input => !input.disabled && input.getClientRects().length);
+      if (!users.length) users = [...form.querySelectorAll('input[type="text"],input:not([type])')].filter(input => !input.disabled && input.getClientRects().length);
+      if (passwords.length !== 1 || users.length !== 1 || ![passwords[0], users[0]].includes(active)) return false;
+      globalThis.__morrowbyteProtonFields = { username: users[0], password: passwords[0] }; return true;
+    })()`;
+    const target: AutofillTarget = {
+      origin,
+      partition: `persist:${partition}`,
+      privateEntry: browserHost.isPrivateEntry(wc),
+      current,
+      async enterPrivate() {
+        assertCurrent();
+        const latest = await Effect.runPromise(SynchronizedRef.get(tabsRef));
+        const activeCapture = await Effect.runPromise(SynchronizedRef.get(frameCaptureSessionsRef));
+        if (
+          latest.get(tab.tabId)?.webContentsId !== wc.id ||
+          latest.get(tab.tabId)?.controller === "agent" ||
+          activeCapture.has(tab.tabId) ||
+          (sensitiveOperations.get(wc) ?? 0) !== 0
+        )
+          throw new AutofillUnavailable();
+        assertCurrent();
+        browserHost.setPrivateEntry(wc, true);
+        if ((await frame.executeJavaScript(prepare)) !== true) throw new AutofillUnavailable();
+        assertCurrent();
+      },
+      async fill(username, password) {
+        for (const [name, value] of [
+          ["username", username],
+          ["password", password],
+        ] as const) {
+          assertCurrent();
+          if (!browserHost.isPrivateEntry(wc)) throw new AutofillUnavailable();
+          const focused = await frame.executeJavaScript(
+            `(() => { const field = globalThis.__morrowbyteProtonFields?.${name}; if (!(field instanceof HTMLInputElement) || !field.isConnected || field.disabled || field.form !== globalThis.__morrowbyteProtonFields.password.form) return false; field.focus(); field.select(); return document.activeElement === field; })()`,
+          );
+          assertCurrent();
+          if (!focused) throw new AutofillUnavailable();
+          // Native input avoids embedding credentials in scripts or a CDP command.
+          await wc.insertText(value);
+          assertCurrent();
+        }
+      },
+      async clearAndResume() {
+        assertCurrent();
+        if (
+          (await frame.executeJavaScript(
+            `(() => { for (const input of document.querySelectorAll('input[type="password"],input[autocomplete="username"],input[autocomplete="email"],input[type="email"]')) input.value = ''; const fields = globalThis.__morrowbyteProtonFields; if (fields) { fields.username.value = ''; fields.password.value = ''; } delete globalThis.__morrowbyteProtonFields; return true; })()`,
+          )) !== true
+        )
+          throw new AutofillUnavailable();
+        assertCurrent();
+        browserHost.setPrivateEntry(wc, false);
+      },
+    };
+    return target;
+  });
+
   return {
     cancelPickElement,
-    captureScreenshot,
+    getAutofillTarget,
+    captureScreenshot: (tabId: string) => protectedTabOperation(tabId, captureScreenshot(tabId)),
     closeTab,
     copyArtifactToClipboard,
     createTab,
@@ -3406,7 +3547,8 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     goForward,
     hardReload,
     navigate,
-    openPictureInPicture,
+    openPictureInPicture: (tabId: string) =>
+      protectedTabOperation(tabId, openPictureInPicture(tabId)),
     openDevTools,
     pickElement,
     prepareWebview,
@@ -3427,7 +3569,8 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       Effect.sync(() => {
         forwardedShortcuts = shortcuts;
       }),
-    startRecording,
+    startRecording: (tabId: string, options?: RecordingInputOptions) =>
+      protectedTabOperation(tabId, startRecording(tabId, options)),
     closePictureInPicture,
     stopRecording,
     subscribePointerEvents: (listener: PointerEventListener) =>
@@ -3587,6 +3730,10 @@ export type PreviewManagerError = typeof PreviewManagerError.Type;
 export class PreviewManager extends Context.Service<
   PreviewManager,
   {
+    readonly getAutofillTarget: (
+      wc: Electron.WebContents,
+      frame: Electron.WebFrameMain | null,
+    ) => Effect.Effect<AutofillTarget | undefined>;
     readonly setMainWindow: (window: BrowserWindow) => Effect.Effect<void, PreviewManagerError>;
     readonly setForwardedShortcuts: (
       shortcuts: ReadonlyArray<PreviewForwardedShortcut>,
@@ -3744,6 +3891,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
   );
 
   return PreviewManager.of({
+    getAutofillTarget: operations.getAutofillTarget,
     setMainWindow: operations.setMainWindow,
     setForwardedShortcuts: operations.setForwardedShortcuts,
     getBrowserSession: Effect.fn("PreviewManager.getBrowserSession")(

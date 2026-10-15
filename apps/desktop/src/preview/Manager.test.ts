@@ -2423,6 +2423,115 @@ describe("PreviewManager", () => {
     ),
   );
 
+  effectIt.effect(
+    "refuses private entry during capture and rejects private capture admissions before effects",
+    () =>
+      withManager((manager) =>
+        Effect.gen(function* () {
+          let signalStarted: (() => void) | undefined;
+          const started = new Promise<void>((resolve) => {
+            signalStarted = resolve;
+          });
+          let releaseCapture: (() => void) | undefined;
+          const image = { toPNG: () => Buffer.from("synthetic-image") };
+          const capturePage = vi.fn(
+            () =>
+              new Promise<typeof image>((resolve) => {
+                releaseCapture = () => resolve(image);
+                signalStarted?.();
+              }),
+          );
+          const preview = makeFaviconWebContents({ url: "https://example.com/login" });
+          const frame = {
+            origin: "https://example.com",
+            isDestroyed: () => false,
+            executeJavaScript: vi.fn(async () => true),
+          } as unknown as Electron.WebFrameMain;
+          const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
+            mainFrame: frame,
+            isFocused: () => true,
+            session: { fetch: vi.fn(), getStoragePath: () => "/synthetic/profile-a" },
+            capturePage,
+          });
+          fromId.mockReturnValue(wc);
+          yield* manager.createTab("private_tab");
+          yield* manager.registerWebview("private_tab", 42);
+          const target = yield* manager.getAutofillTarget(wc, frame);
+          expect(target).toBeDefined();
+          if (!target) return;
+
+          const capture = yield* manager.captureScreenshot("private_tab").pipe(Effect.forkScoped);
+          yield* Effect.promise(() => started);
+          const refused = yield* Effect.exit(Effect.tryPromise(() => target.enterPrivate()));
+          expect(Exit.isFailure(refused)).toBe(true);
+          expect(frame.executeJavaScript).not.toHaveBeenCalled();
+          releaseCapture?.();
+          yield* Fiber.join(capture);
+
+          yield* Effect.promise(() => target.enterPrivate());
+          const before = capturePage.mock.calls.length;
+          for (const operation of [
+            manager.captureScreenshot("private_tab"),
+            manager.startRecording("private_tab"),
+            manager.openPictureInPicture("private_tab"),
+            manager.setColorScheme("private_tab", "dark"),
+          ]) {
+            expect(Exit.isFailure(yield* Effect.exit(operation))).toBe(true);
+          }
+          expect(capturePage).toHaveBeenCalledTimes(before);
+          expect(writeFile).toHaveBeenCalledTimes(1);
+
+          yield* Effect.promise(() => target.clearAndResume());
+          capturePage.mockImplementation(async () => image);
+          yield* manager.captureScreenshot("private_tab");
+          expect(capturePage).toHaveBeenCalledTimes(before + 1);
+          expect(writeFile).toHaveBeenCalledTimes(2);
+        }),
+      ),
+  );
+
+  effectIt.effect("fences autofill to a focused persistent main-frame document", () =>
+    withManager((manager) =>
+      Effect.gen(function* () {
+        const preview = makeFaviconWebContents({ url: "https://example.com/login" });
+        let focused = true;
+        let storagePath: string | null = "/synthetic/profile-a";
+        const frame = {
+          origin: "https://example.com",
+          isDestroyed: () => false,
+          executeJavaScript: vi.fn(async () => true),
+        } as unknown as Electron.WebFrameMain;
+        const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
+          mainFrame: frame,
+          isFocused: () => focused,
+          session: { fetch: vi.fn(), getStoragePath: () => storagePath },
+        });
+        fromId.mockReturnValue(wc);
+        yield* manager.createTab("private_tab");
+        yield* manager.registerWebview("private_tab", 42);
+        expect(
+          yield* manager.getAutofillTarget(wc, { ...frame } as Electron.WebFrameMain),
+        ).toBeUndefined();
+        storagePath = null;
+        expect(yield* manager.getAutofillTarget(wc, frame)).toBeUndefined();
+        storagePath = "/synthetic/profile-a";
+        const target = yield* manager.getAutofillTarget(wc, frame);
+        expect(target?.current()).toBe(true);
+        focused = false;
+        expect(target?.current()).toBe(false);
+        focused = true;
+        preview.listeners.get("did-start-navigation")?.();
+        expect(target?.current()).toBe(false);
+        if (target) {
+          expect(
+            Exit.isFailure(yield* Effect.exit(Effect.tryPromise(() => target.enterPrivate()))),
+          ).toBe(true);
+        }
+        expect(frame.executeJavaScript).not.toHaveBeenCalled();
+      }),
+    ),
+  );
+
   effectIt.effect("captures a PNG screenshot into browser artifacts", () =>
     withManager((manager) =>
       Effect.gen(function* () {

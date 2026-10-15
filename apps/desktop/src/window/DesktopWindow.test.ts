@@ -332,6 +332,7 @@ function layerTest(input: {
           attachGuest: () => () => {},
         }),
         Layer.mock(PreviewManager.PreviewManager)({
+          getAutofillTarget: () => Effect.succeed(undefined),
           getBrowserSession: () => Effect.succeed({} as Electron.Session),
           setMainWindow: () => Effect.void,
           prepareWebview: () => Effect.void,
@@ -445,6 +446,7 @@ const makeSplashScenario = (createOutcomes: readonly (Electron.BrowserWindow | n
             attachGuest: () => () => {},
           }),
           Layer.mock(PreviewManager.PreviewManager)({
+            getAutofillTarget: () => Effect.succeed(undefined),
             getBrowserSession: () => Effect.succeed({} as Electron.Session),
             setMainWindow: () => Effect.void,
             isBrowserPartition: (partition) => partition.startsWith("persist:t3code-preview-"),

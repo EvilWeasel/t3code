@@ -20,9 +20,11 @@ const key = { threadId: "thread-1", tabId: "tab-1" };
 const makeDebuggee = () => {
   const emitter = new NodeEvents.EventEmitter();
   const pending: Array<() => void> = [];
+  const sent: string[] = [];
   const debuggee = Object.assign(emitter, {
     sendCommand: (method: string) =>
       new Promise((resolve) => {
+        sent.push(method);
         if (method === "Target.getTargetInfo") {
           resolve({ targetInfo: { targetId: "GUEST" } });
           return;
@@ -42,6 +44,7 @@ const makeDebuggee = () => {
     },
     emit: (method: string, params: unknown) => emitter.emit("message", {}, method, params, ""),
     release: () => pending.splice(0).forEach((resolve) => resolve()),
+    sent,
   };
 };
 
@@ -54,6 +57,44 @@ const takeEvents = (host: DesktopBrowserHost.DesktopBrowserHost["Service"], coun
   );
 
 describe("DesktopBrowserHost", () => {
+  it.effect(
+    "private entry blocks read-only CDP and events and drops pre-entry replies even after resume",
+    () =>
+      Effect.gen(function* () {
+        const host = yield* DesktopBrowserHost.make;
+        const debuggee = makeDebuggee();
+        host.attach(key, debuggee.tab);
+        const reader = yield* takeEvents(host, 3).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        const command = (id: number, method: string) =>
+          host.handleCommandLine(
+            encodeJson({
+              type: "cdp",
+              ...key,
+              message: encodeJson({ id, method, sessionId: "t3-preview-page" }),
+            }),
+          );
+        yield* command(1, "Page.captureScreenshot");
+        host.setPrivateEntry(debuggee.tab.webContents, true);
+        expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
+        yield* command(2, "DOM.getDocument");
+        debuggee.emit("Runtime.consoleAPICalled", { value: "fake-secret-must-not-relay" });
+        yield* host.handleCommandLine(encodeJson({ type: "release", ...key }));
+        expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
+        host.setPrivateEntry(debuggee.tab.webContents, false);
+        yield* command(3, "DOM.enable");
+        debuggee.release();
+        yield* Effect.promise(() => new Promise((resolve) => setImmediate(resolve)));
+        const events = yield* Fiber.join(reader);
+        expect(
+          events.slice(1).map((entry) => decodeCdpReply((entry as { message: string }).message).id),
+        ).toEqual([2, 3]);
+        expect(JSON.stringify(events)).toContain("private during credential entry");
+        expect(JSON.stringify(events)).not.toContain("fake-secret-must-not-relay");
+        expect(debuggee.sent).not.toContain("DOM.getDocument");
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("announces tabs already attached to a backend that starts later", () =>
     Effect.gen(function* () {
       const host = yield* DesktopBrowserHost.make;

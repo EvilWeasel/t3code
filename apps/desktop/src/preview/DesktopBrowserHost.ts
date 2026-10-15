@@ -79,6 +79,9 @@ export class DesktopBrowserHost extends Context.Service<
     readonly attach: (key: DesktopBrowserTabKey, debuggee: DesktopBrowserTabDebugger) => void;
     /** Withdraws it: closed, swapped, crashed, or devtools needs the debugger. */
     readonly detach: (key: DesktopBrowserTabKey) => void;
+    /** Native credential entry blocks every relay operation, including observations. */
+    readonly setPrivateEntry: (source: Electron.WebContents, active: boolean) => void;
+    readonly isPrivateEntry: (source: Electron.WebContents) => boolean;
     /**
      * Whether a server tab's download came from the person at this desktop:
      * the server sent the page no input just before it started.
@@ -106,6 +109,18 @@ export const make = Effect.gen(function* () {
   }>(16);
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
   const tabs = new Map<string, AttachedTab>();
+  const privateContents = new WeakSet<Electron.WebContents>();
+  const setPrivateEntry = (source: Electron.WebContents, active: boolean) => {
+    if (active) privateContents.add(source);
+    else privateContents.delete(source);
+    for (const tab of tabs.values()) {
+      if (tab.debuggee.webContents !== source) continue;
+      // Old asynchronous replies must remain invalid even after explicit resume.
+      tab.relay = null;
+      tab.downloadDirectory = null;
+      tab.pendingDownloadGuid = null;
+    }
+  };
   const emit = (event: DesktopBrowserEventType) => runFork(PubSub.publish(outbox, event));
 
   const relayFor = (tab: AttachedTab) => {
@@ -113,24 +128,37 @@ export const make = Effect.gen(function* () {
     const { webContents, debugger: debuggee } = tab.debuggee;
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
-        send: (method, params, sessionId) =>
-          sessionId === undefined
+        send: (method, params, sessionId) => {
+          if (privateContents.has(webContents) || tab.relay !== relay)
+            return Promise.reject(new Error("Private credential entry"));
+          return sessionId === undefined
             ? debuggee.sendCommand(method, params)
-            : debuggee.sendCommand(method, params, sessionId),
-        targetId: () =>
-          debuggee
-            .sendCommand("Target.getTargetInfo")
-            .then((result: { targetInfo: { targetId: string } }) => result.targetInfo.targetId),
+            : debuggee.sendCommand(method, params, sessionId);
+        },
+        targetId: async () => {
+          if (privateContents.has(webContents) || tab.relay !== relay)
+            throw new Error("Private credential entry");
+          const result: { targetInfo: { targetId: string } } =
+            await debuggee.sendCommand("Target.getTargetInfo");
+          if (privateContents.has(webContents) || tab.relay !== relay)
+            throw new Error("Private credential entry");
+          return result.targetInfo.targetId;
+        },
         url: () => webContents.getURL(),
         title: () => webContents.getTitle(),
         userAgent: () => webContents.getUserAgent(),
         setDownloadDirectory: (directory) => {
-          tab.downloadDirectory = directory;
+          if (!privateContents.has(webContents) && tab.relay === relay)
+            tab.downloadDirectory = directory;
         },
       },
       // A released relay's late replies belong to a connection that is gone.
       (message) => {
-        if (tab.relay === relay && tabs.get(keyOf(tab.key)) === tab) {
+        if (
+          !privateContents.has(webContents) &&
+          tab.relay === relay &&
+          tabs.get(keyOf(tab.key)) === tab
+        ) {
           emit({ type: "cdp", ...tab.key, message });
         }
       },
@@ -146,7 +174,10 @@ export const make = Effect.gen(function* () {
    */
   const placeDownload = (source: Electron.WebContents, item: Electron.DownloadItem) => {
     const tab = [...tabs.values()].find(
-      (candidate) => candidate.debuggee.webContents === source && candidate.downloadDirectory,
+      (candidate) =>
+        candidate.debuggee.webContents === source &&
+        !privateContents.has(source) &&
+        candidate.downloadDirectory,
     );
     if (!tab?.downloadDirectory || !tab.pendingDownloadGuid) return false;
     item.setSavePath(NodePath.join(tab.downloadDirectory, tab.pendingDownloadGuid));
@@ -175,6 +206,7 @@ export const make = Effect.gen(function* () {
       pendingDownloadGuid: null,
       agentInputAt: Number.NEGATIVE_INFINITY,
       onMessage: (_event, method, params, sessionId) => {
+        if (privateContents.has(debuggee.webContents)) return;
         if (method === "Browser.downloadWillBegin") {
           const guid = (params as { guid?: unknown } | undefined)?.guid;
           tab.pendingDownloadGuid = typeof guid === "string" ? guid : null;
@@ -193,6 +225,30 @@ export const make = Effect.gen(function* () {
       if (Option.isNone(command)) return;
       const tab = tabs.get(keyOf(command.value));
       if (!tab) return;
+      if (privateContents.has(tab.debuggee.webContents)) {
+        if (command.value.type === "cdp") {
+          try {
+            const request: unknown = JSON.parse(command.value.message);
+            if (
+              typeof request === "object" &&
+              request !== null &&
+              "id" in request &&
+              typeof request.id === "number"
+            )
+              emit({
+                type: "cdp",
+                ...tab.key,
+                message: JSON.stringify({
+                  id: request.id,
+                  error: { code: -32000, message: "This tab is private during credential entry." },
+                }),
+              });
+          } catch {
+            /* Ignore malformed protocol messages without exposing payloads. */
+          }
+        }
+        return;
+      }
       if (command.value.type === "pointer") {
         const { threadId, tabId, phase, x, y } = command.value;
         runFork(PubSub.publish(pointers, { key: { threadId, tabId }, phase, x, y }));
@@ -237,6 +293,8 @@ export const make = Effect.gen(function* () {
     handleCommandLine,
     attach,
     detach,
+    setPrivateEntry,
+    isPrivateEntry: (source) => privateContents.has(source),
     placeDownload,
     humanStartedDownload,
   });
