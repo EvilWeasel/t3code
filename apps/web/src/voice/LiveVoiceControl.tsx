@@ -351,6 +351,8 @@ export function createLiveVoiceDiagnosticProducer(
   let disposed = false;
   let unsubscribe: (() => void) | null = null;
   let lastObservedTime = -Infinity;
+  let mainSession: string | null = null;
+  let requestHighwater = 0;
   type ActiveBinding = {
     readonly binding: MainRendererDiagnosticsRequest;
     readonly epoch: number;
@@ -392,6 +394,10 @@ export function createLiveVoiceDiagnosticProducer(
     }
     const now = readTime();
     if (now === null || decoded.expiresAtMs <= now || decoded.expiresAtMs - now > 5_000) return;
+    if (mainSession !== null && decoded.mainSession !== mainSession) return;
+    if (decoded.requestSequence <= requestHighwater) return;
+    mainSession = decoded.mainSession;
+    requestHighwater = decoded.requestSequence;
     if (
       active &&
       (active.binding.requestId === decoded.requestId ||

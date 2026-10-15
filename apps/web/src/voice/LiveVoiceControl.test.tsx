@@ -122,6 +122,7 @@ const localInput: AvailabilityInput = {
 };
 
 function diagnosticBridgeFixture() {
+  let requestSequence = 0;
   let listener: ((request: MainRendererDiagnosticsRequest) => void) | null = null;
   const unsubscribe = vi.fn();
   const bridge = {
@@ -143,6 +144,7 @@ function diagnosticBridgeFixture() {
     expiresAtMs = 5_000,
   ): MainRendererDiagnosticsRequest => ({
     version: 1,
+    requestSequence: ++requestSequence,
     requestId,
     requestNonce: `nonce-${requestId}`,
     target: {
@@ -168,6 +170,73 @@ function diagnosticBridgeFixture() {
 }
 
 describe("explicit main renderer diagnostic requests", () => {
+  it("pins only the first valid unexpired session and rejects foreign sessions without consuming their sequence", () => {
+    const fixture = diagnosticBridgeFixture();
+    const producer = createLiveVoiceDiagnosticProducer(fixture.bridge, {
+      nowMs: () => 1_000,
+      scheduleExpiry: () => () => {},
+    })!;
+    producer.update(gateFor(localInput));
+    producer.start();
+    fixture.send({ ...fixture.request("expired-foreign", 1_000), mainSession: "foreign" });
+    const a = fixture.request("valid-a");
+    fixture.send(a);
+    fixture.send({ ...fixture.request("foreign-b"), mainSession: "foreign", requestSequence: 100 });
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledOnce();
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).not.toHaveBeenCalled();
+    const b = fixture.request("valid-b");
+    fixture.send(b);
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledTimes(2);
+    expect(fixture.bridge.respondMainRendererDiagnostics.mock.calls[1]![0].binding).toEqual(b);
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).toHaveBeenCalledExactlyOnceWith({
+      binding: a,
+      rendererEpoch: 1,
+      revision: 1,
+    });
+    producer.dispose();
+    const next = createLiveVoiceDiagnosticProducer(fixture.bridge, {
+      nowMs: () => 1_000,
+      scheduleExpiry: () => () => {},
+    })!;
+    next.update(gateFor(localInput));
+    next.start();
+    fixture.send({
+      ...fixture.request("fresh-producer"),
+      mainSession: "foreign",
+      requestSequence: 1,
+    });
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledTimes(3);
+    next.dispose();
+    expectPassive();
+  });
+
+  it("does not resnapshot retired A or invalidate replacement B on a still-unexpired A replay", async () => {
+    const fixture = diagnosticBridgeFixture();
+    Object.defineProperty(window, "desktopBridge", { configurable: true, value: fixture.bridge });
+    await render(localInput);
+    const expiresAtMs = DateTime.toEpochMillis(DateTime.nowUnsafe()) + 4_000;
+    const a = fixture.request("retired-a", expiresAtMs);
+    const b = fixture.request("current-b", expiresAtMs);
+    await act(async () => fixture.send(a));
+    await act(async () => fixture.send(b));
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledTimes(2);
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).toHaveBeenCalledOnce();
+    expect(fixture.bridge.invalidateMainRendererDiagnostics.mock.calls[0]![0].binding).toEqual(a);
+    await act(async () => fixture.send(a));
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledTimes(2);
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).toHaveBeenCalledOnce();
+    const bResponse = fixture.bridge.respondMainRendererDiagnostics.mock.calls[1]![0];
+    expect(bResponse.binding).toEqual(b);
+    await render({ ...localInput, canOperate: false });
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).toHaveBeenCalledTimes(2);
+    expect(fixture.bridge.invalidateMainRendererDiagnostics.mock.calls[1]![0]).toEqual({
+      binding: b,
+      rendererEpoch: bResponse.rendererEpoch,
+      revision: bResponse.revision,
+    });
+    expectPassive();
+  });
+
   it.each([
     "onMainRendererDiagnosticsRequest",
     "respondMainRendererDiagnostics",
