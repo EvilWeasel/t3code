@@ -221,9 +221,7 @@ export function LiveVoiceControl(props: {
       typeof navigator === "undefined" ? undefined : navigator.mediaDevices?.getUserMedia,
   });
   const active =
-    state.phase === "live" ||
-    state.phase === "playback-blocked" ||
-    state.phase === "reconnecting";
+    state.phase === "live" || state.phase === "playback-blocked" || state.phase === "reconnecting";
   const busy =
     state.phase === "preparing" ||
     state.phase === "prepared" ||
