@@ -6,7 +6,8 @@ vi.mock("electron", async () => {
   class BrowserWindow extends EventEmitter {
     destroyed = false;
     readonly webContents = { executeJavaScript: async () => undefined };
-    constructor(readonly bounds: object) { super(); windows.push(this); }
+    readonly bounds: object;
+    constructor(bounds: object) { super(); this.bounds = bounds; windows.push(this); }
     getBounds() { return this.bounds; }
     isDestroyed() { return this.destroyed; }
     destroy() { this.destroyed = true; this.emit("closed"); }
