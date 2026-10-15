@@ -18,6 +18,11 @@ on:
         required: false
         default: false
         type: boolean
+      qualifyCoreUpdateAdmission:
+        description: Qualify isolated CORE native admission without running an installer
+        required: false
+        default: false
+        type: boolean
   push:
     branches: [main, "weasel/**"]
   pull_request:
@@ -76,8 +81,18 @@ jobs:
           CANDIDATE_VERSION: ${{ inputs.candidateVersion }}
           SOURCE_SHA: ${{ github.sha }}
           SOURCE_REPOSITORY: ${{ github.repository }}
+          QUALIFY_CORE_UPDATE_ADMISSION: ${{ inputs.qualifyCoreUpdateAdmission || false }}
+          PROBE_PROTON_PASS: ${{ inputs.probeProtonPass || false }}
         run: |
           set -euo pipefail
+          if [[ "$QUALIFY_CORE_UPDATE_ADMISSION" == true ]]; then
+            test "$SOURCE_REPOSITORY" = morrowbyte/t3code
+            [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+            test "$BUILD_CANDIDATE_CLI" != true
+            test "$PROBE_PROTON_PASS" != true
+            test -z "$CANDIDATE_VERSION"
+          fi
           if [[ "$BUILD_CANDIDATE_CLI" != true ]]; then
             test -z "$CANDIDATE_VERSION"
             exit 0
@@ -102,6 +117,40 @@ jobs:
           name: voice-ui-${{ github.sha }}
           path: product-evidence/voice-ui
           if-no-files-found: warn
+          retention-days: 7
+      - name: Qualify isolated CORE native update admission on pinned Electron
+        if: inputs.qualifyCoreUpdateAdmission
+        timeout-minutes: 5
+        env:
+          MORROWBYTE_CORE_UPDATE_ADMISSION: "1"
+          MORROWBYTE_RUNNER_PROFILE: blacksmith-8vcpu-ubuntu-2404
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$RUNNER_OS" = Linux
+          test -n "$GITHUB_RUN_ID"
+          test -n "$GITHUB_JOB"
+          test -x /usr/bin/git
+          test -x /usr/bin/xvfb-run
+          test -x /usr/bin/Xvfb
+          test -s apps/desktop/dist-electron/preload.cjs
+          export MORROWBYTE_CORE_UPDATE_ADMISSION_BUNDLE_DIR="$RUNNER_TEMP/core-update-admission-build"
+          (cd apps/desktop/scripts/core-update-admission-fixture && vp pack)
+          test -s "$RUNNER_TEMP/core-update-admission-build/main.cjs"
+          core_electron="$(node apps/desktop/scripts/ensure-electron-runtime.mjs)"
+          xvfb-run --auto-servernum node apps/desktop/scripts/core-update-admission-fixture/run.mjs --electron "$core_electron" --entry "$RUNNER_TEMP/core-update-admission-build/main.cjs" --output "$RUNNER_TEMP/core-update-admission-fixture"
+      - name: Preserve isolated CORE admission receipts
+        if: always() && inputs.qualifyCoreUpdateAdmission
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-update-admission-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/core-update-admission-fixture/fixture-receipt.json
+            ${{ runner.temp }}/core-update-admission-fixture/fixture-receipt.partial.json
+            ${{ runner.temp }}/core-update-admission-fixture/runner-receipt.json
+            ${{ runner.temp }}/core-update-admission-fixture/electron.log
+          if-no-files-found: error
           retention-days: 7
       - name: Probe synthetic Proton extension compatibility on pinned Electron
         if: inputs.probeProtonPass

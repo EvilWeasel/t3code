@@ -111,6 +111,32 @@ for automatic_update_test in "${automatic_update_tests[@]}"; do
   fi
   focused_tests+=("$automatic_update_test")
 done
+core_update_tests=(
+  apps/desktop/src/electron/ElectronWindow.module.test.ts
+  apps/desktop/src/electron/ElectronWindow.test.ts
+  apps/desktop/src/electron/WindowsForegroundFocusThread.test.ts
+  apps/desktop/src/permissions/MacPermissionHelper.test.ts
+  apps/desktop/src/preview/Manager.test.ts
+  apps/desktop/src/snapShot/DesktopSnapShot.test.ts
+  apps/desktop/src/snapShot/RegionSnapShot.test.ts
+  apps/desktop/src/snapShot/SnapShotAccessibilityProcess.test.ts
+  apps/desktop/src/snapShot/SnapShotTransition.test.ts
+  apps/desktop/src/telemetry/DesktopTelemetryPublisher.test.ts
+  apps/desktop/src/window/DesktopWindow.test.ts
+  apps/server/src/desktopUpdate/DesktopAppUpdate.test.ts
+  apps/server/src/orchestration-v2/ProviderEventIngestor.test.ts
+  apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts
+  apps/server/src/resourceTelemetry/DesktopTelemetryReceiver.test.ts
+  apps/server/src/serverRuntimeStartup.test.ts
+  packages/contracts/src/resourceTelemetry.test.ts
+)
+for core_update_test in "${core_update_tests[@]}"; do
+  if [[ ! -f "$core_update_test" ]]; then
+    echo "Required CORE update gate is missing: $core_update_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$core_update_test")
+done
 approval_tests=(
   apps/web/src/components/chat/ComposerPendingApprovalPanel.test.tsx
   apps/web/src/components/chat/ComposerPendingApprovalActions.test.tsx
