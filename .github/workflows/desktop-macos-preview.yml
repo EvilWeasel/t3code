@@ -30,7 +30,7 @@ jobs:
   build:
     name: Build preview JS bundle
     if: github.event.label.name == 'preview:mac'
-    runs-on: namespace-profile-ci-builder
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       # This repository is public, so Git needs no credentials. checkout's

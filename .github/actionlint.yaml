@@ -10,9 +10,3 @@ self-hosted-runner:
     - blacksmith-6vcpu-macos-26
     - blacksmith-8vcpu-ubuntu-2404
     - blacksmith-8vcpu-windows-2025
-    - namespace-profile-ci-builder
-    - nscloud-macos-tahoe-arm64-12x28
-    - nscloud-macos-tahoe-arm64-6x14
-    - nscloud-ubuntu-24.04-arm64-16x32
-    - nscloud-windows-2022-amd64-32x64
-    - nscloud-windows-2022-amd64-8x16

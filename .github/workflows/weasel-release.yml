@@ -4,6 +4,10 @@ run-name: Weasel desktop release ${{ inputs.source_sha }}
 on:
   workflow_dispatch:
     inputs:
+      publish:
+        description: Publish the built prerelease (false keeps artifacts only)
+        type: boolean
+        default: true
       source_sha:
         description: Fork main commit to build (set by the sync workflow)
         required: true
@@ -20,7 +24,7 @@ permissions:
 jobs:
   preflight:
     if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 15
     outputs:
       source_sha: ${{ steps.release.outputs.source_sha }}
@@ -46,13 +50,8 @@ jobs:
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: ${{ !startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-') }}
+          cache: true
           run-install: false
-      - name: Restore Namespace dependency volume
-        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
-        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
-        with:
-          cache: pnpm
       - name: Install dependencies
         run: vp install --frozen-lockfile
 
@@ -94,7 +93,7 @@ jobs:
 
   build_bundle:
     needs: [preflight]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 30
     steps:
       - name: Checkout source
@@ -107,14 +106,8 @@ jobs:
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: ${{ !startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-') }}
+          cache: true
           run-install: false
-
-      - name: Restore Namespace dependency volume
-        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
-        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
-        with:
-          cache: pnpm
 
       - name: Install bundle dependencies
         run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
@@ -139,7 +132,7 @@ jobs:
 
   build_linux:
     needs: [preflight, build_bundle]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 80
     permissions:
       contents: read
@@ -156,12 +149,6 @@ jobs:
           node-version-file: package.json
           cache: true
           run-install: false
-
-      - name: Restore Namespace dependency volume
-        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
-        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
-        with:
-          cache: pnpm
 
       - name: Install Linux build dependencies
         run: |
@@ -257,7 +244,7 @@ jobs:
 
   build_nixos:
     needs: [preflight, build_linux]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -272,7 +259,7 @@ jobs:
         with:
           name: weasel-release-linux
           path: release-linux
-      - name: Build immutable NixOS closure on Namespace
+      - name: Build immutable NixOS closure on Blacksmith
         env:
           T3_WEASEL_REPOSITORY: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
         run: bash scripts/weasel/build-nixos-closure.sh "${{ needs.preflight.outputs.version }}" "release-linux/T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage" release-nixos
@@ -285,7 +272,7 @@ jobs:
 
   build_windows:
     needs: [preflight, build_bundle, build_linux]
-    runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'nscloud-windows-2022-amd64-8x16' }}
+    runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'blacksmith-8vcpu-windows-2025' }}
     timeout-minutes: 50
     steps:
       - name: Checkout source
@@ -394,8 +381,9 @@ jobs:
           retention-days: 1
 
   publish:
+    if: inputs.publish
     needs: [preflight, build_linux, build_nixos, build_windows]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 15
     permissions:
       contents: write

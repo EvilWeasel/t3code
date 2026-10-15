@@ -1,28 +1,13 @@
-# Namespace CI
+# CI runners
 
-Set `WEASEL_LINUX_RUNNER` to the exact runner-profile label provisioned in
-Namespace after the GitHub App is installed for `morrowbyte/t3code`. The existing
-CI and Linux release stages use this variable. Windows continues to use its
-existing runner because this migration targets the Linux/shared-bundle work.
+The owner migrated `morrowbyte/t3code` to Blacksmith on 2026-10-15 after account verification and billing setup. This supersedes the earlier Namespace-only build policy for this repository. Compilation and full suites remain remote; there is no laptop or Hephaestus fallback.
 
-Enable a cache volume on the profile and protect cache writes to trusted branches.
-The workflow restores pnpm dependencies before installing them. GitHub-hosted
-fallback runs retain setup-vp caching. `Weasel CI` can be manually dispatched for
-runner acceptance without publishing a release.
+`WEASEL_LINUX_RUNNER=blacksmith-8vcpu-ubuntu-2404` and `WEASEL_WINDOWS_RUNNER=blacksmith-8vcpu-windows-2025` control the fork CI and desktop release. Workflow defaults use the same labels. Linux ARM uses `blacksmith-16vcpu-ubuntu-2404-arm`; macOS uses the 6- or 12-vCPU macOS 26 runners. Existing larger Windows jobs retain 32 vCPUs.
 
-Reference: https://namespace.so/docs/solutions/github-actions
+The native Windows ARM64 release lane retains `windows-11-arm`: Blacksmith currently documents Windows x64 only. That lane runs ARM64 PowerShell and builds and smoke-tests native ARM64 CLI executables. Replacing its runner with x64 would not preserve this behavior. This is the only GitHub-hosted platform exception.
 
-The x86-64 Linux runner labels in all workflows, including reusable desktop
-build callers, are now `namespace-profile-ci-builder`. ARM, macOS and Windows
-retain their architecture-specific runners. Blacksmith-only apt mirror rewriting
-is conditional. Validation: git diff --check and actionlint comparison against the unmodified
-baseline. Four preexisting actionlint findings remain identical (discussion
-events, concurrency queue and run_started_at context); no new findings. Runner execution is
-separate from source migration.
+Namespace cache-volume actions were removed. Vite+ and upstream Actions caches use Blacksmith's transparent Actions cache service. The synthetic Electron probe uses provider-neutral `MORROWBYTE_CI_PROBE` / `MORROWBYTE_CI_PROFILE` while retaining its CI-only, synthetic-profile guard.
 
-The fork Windows release now selects `nscloud-windows-2022-amd64-8x16` directly,
-which avoids requiring a second dashboard profile. Remaining Blacksmith Windows,
-macOS and Linux ARM labels also select the corresponding documented Namespace
-machine shapes. Windows ARM remains on its existing GitHub runner because the
-Namespace machine-label reference lists Windows AMD64 only. First packaging runs
-are the compatibility evidence; runner-label configuration alone is not acceptance.
+Run `Weasel CI` manually to build an unpublished product bundle. `Weasel desktop nightly` accepts `publish=false` to exercise Linux, NixOS and Windows packaging without changing the release feed; normal release callers retain publishing by default. A runner acceptance workflow in `morrowbyte/.github` covers Linux x64/ARM64, Windows x64 and macOS. Dispatch, successful source checks, packaged artifacts and installed behavior are distinct evidence.
+
+Runner and cache reference: https://docs.blacksmith.sh/blacksmith-runners/overview and https://docs.blacksmith.sh/blacksmith-caching/dependencies-actions.

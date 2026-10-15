@@ -33,20 +33,15 @@ permissions:
 jobs:
   check:
     if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: ${{ !startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-') }}
+          cache: true
           run-install: false
-      - name: Restore Namespace dependency volume
-        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
-        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
-        with:
-          cache: pnpm
       - name: Install dependencies
         run: vp install --frozen-lockfile
       - name: Run focused source gates
@@ -54,20 +49,15 @@ jobs:
   product_bundle:
     needs: [check, windows_installer_guard]
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
-          cache: ${{ !startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-') }}
+          cache: true
           run-install: false
-      - name: Restore Namespace dependency volume
-        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
-        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
-        with:
-          cache: pnpm
       - name: Install bundle dependencies
         run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
       - name: Validate explicit unpublished candidate inputs
@@ -107,8 +97,8 @@ jobs:
         if: inputs.probeProtonPass
         timeout-minutes: 5
         env:
-          MORROWBYTE_NAMESPACE_PROBE: "1"
-          MORROWBYTE_NAMESPACE_PROFILE: namespace-profile-ci-builder
+          MORROWBYTE_CI_PROBE: "1"
+          MORROWBYTE_CI_PROFILE: blacksmith-8vcpu-ubuntu-2404
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = morrowbyte/t3code
@@ -190,7 +180,7 @@ jobs:
           retention-days: 7
   windows_installer_guard:
     if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
-    runs-on: windows-latest
+    runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'blacksmith-8vcpu-windows-2025' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4

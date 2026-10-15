@@ -1,4 +1,4 @@
-/** Node assertions, plus the explicit Namespace-only Electron child runner. */
+/** Node assertions, plus the explicit CI-only Electron child runner. */
 import * as NodeTest from "node:test";
 import * as NodeAssert from "node:assert/strict";
 import * as NodeFSP from "node:fs/promises";
@@ -16,7 +16,7 @@ import {
 } from "./proton-pass-compatibility.mjs";
 
 if (process.argv.includes("--electron")) {
-  await runNamespaceChild();
+  await runCIChild();
 } else {
   NodeTest.test(
     "accepts native main-frame identity but rejects another tab/profile or stale navigation",
@@ -217,9 +217,9 @@ if (process.argv.includes("--electron")) {
   );
 }
 
-async function runNamespaceChild() {
-  if (process.env.GITHUB_ACTIONS !== "true" || process.env.MORROWBYTE_NAMESPACE_PROBE !== "1")
-    throw new Error("Namespace Actions execution only; do not launch on a workstation");
+async function runCIChild() {
+  if (process.env.GITHUB_ACTIONS !== "true" || process.env.MORROWBYTE_CI_PROBE !== "1")
+    throw new Error("CI Actions execution only; do not launch on a workstation");
   const electron = await NodeFSP.realpath(process.argv[process.argv.indexOf("--electron") + 1]);
   if (!process.argv.includes("--output")) throw new Error("Provide --output <artifact directory>");
   const output = NodePath.resolve(process.argv[process.argv.indexOf("--output") + 1]);
@@ -255,8 +255,8 @@ async function runNamespaceChild() {
       "GITHUB_RUN_ID",
       "GITHUB_JOB",
       "RUNNER_NAME",
-      "MORROWBYTE_NAMESPACE_PROFILE",
-      "MORROWBYTE_NAMESPACE_PROBE",
+      "MORROWBYTE_CI_PROFILE",
+      "MORROWBYTE_CI_PROBE",
     ];
     const env = Object.fromEntries(
       inheritedNames.flatMap((name) =>

@@ -17,7 +17,7 @@ permissions:
 jobs:
   sync:
     if: github.repository == 'morrowbyte/t3code'
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 35
     steps:
       - name: Require workflow-capable upstream sync token

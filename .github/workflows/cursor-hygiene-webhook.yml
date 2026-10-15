@@ -16,7 +16,7 @@ permissions:
 jobs:
   forward:
     name: POST to Cursor
-    runs-on: namespace-profile-ci-builder
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - name: POST to Cursor
         env:

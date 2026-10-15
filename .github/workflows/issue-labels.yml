@@ -15,7 +15,7 @@ permissions:
 jobs:
   sync:
     name: Sync issue labels
-    runs-on: namespace-profile-ci-builder
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     steps:
       - name: Ensure managed issue labels exist
         uses: actions/github-script@v7

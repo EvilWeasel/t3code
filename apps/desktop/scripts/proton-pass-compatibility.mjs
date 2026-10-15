@@ -1,4 +1,4 @@
-/** Namespace-only synthetic Electron probe. Never imports Proton or reads a real profile. */
+/** CI-only synthetic Electron probe. Never imports Proton or reads a real profile. */
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
@@ -141,9 +141,9 @@ export function persistProbeReceipt(output, serialized, preservePartial = false)
 
 export async function runProbe() {
   // Starting this script on a workstation must fail before Electron app readiness.
-  if (process.env.GITHUB_ACTIONS !== "true" || process.env.MORROWBYTE_NAMESPACE_PROBE !== "1")
+  if (process.env.GITHUB_ACTIONS !== "true" || process.env.MORROWBYTE_CI_PROBE !== "1")
     throw new Error(
-      "Run only in the integration-owned Namespace Actions job with MORROWBYTE_NAMESPACE_PROBE=1",
+      "Run only in the integration-owned CI Actions job with MORROWBYTE_CI_PROBE=1",
     );
   const output = NodePath.resolve(process.argv[process.argv.indexOf("--output") + 1] ?? "");
   if (!process.argv.includes("--output") || output === process.cwd())
@@ -188,7 +188,7 @@ export async function runProbe() {
       runId: process.env.GITHUB_RUN_ID ?? null,
       job: process.env.GITHUB_JOB ?? null,
       name: process.env.RUNNER_NAME ?? null,
-      namespaceProfile: process.env.MORROWBYTE_NAMESPACE_PROFILE ?? null,
+      runnerProfile: process.env.MORROWBYTE_CI_PROFILE ?? null,
     },
     fixtureHashes: {},
     externalRequests: [],

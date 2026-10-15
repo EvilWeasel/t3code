@@ -10,7 +10,7 @@ jobs:
     if: |
       contains(github.event.pull_request.labels.*.name, '🚀 Mobile Continuous Deployment') &&
       (github.event.action != 'labeled' || github.event.label.name == '🚀 Mobile Continuous Deployment')
-    runs-on: namespace-profile-ci-builder
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     concurrency:
       group: mobile-eas-preview-${{ github.event.pull_request.number }}
       cancel-in-progress: true

@@ -1,4 +1,4 @@
-// Namespace-only visual fixtures: real components/styles, synthetic state and no media/provider access.
+// CI-only visual fixtures: real components/styles, synthetic state and no media/provider access.
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, resolve, join } from "node:path";
@@ -15,7 +15,7 @@ const { default: tailwind } = await import(pathToFileURL(webRequire.resolve("@ta
 const { chromium } = serverRequire("playwright-core");
 const cli = join(dirname(serverRequire.resolve("playwright-core/package.json")), "cli.js");
 const install = spawnSync(process.execPath, [cli, "install", "--with-deps", "chromium"], { stdio: "inherit" });
-if (install.status !== 0) throw new Error("Pinned Namespace browser installation failed");
+if (install.status !== 0) throw new Error("Pinned CI browser installation failed");
 const output = resolve(process.argv[2] ?? "product-evidence/voice-ui");
 await mkdir(output, { recursive: true });
 await mkdir(join(repo, ".t3"), { recursive: true });
