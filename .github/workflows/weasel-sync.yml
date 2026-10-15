@@ -1,8 +1,8 @@
-name: Weasel upstream nightly sync
+name: Weasel upstream main sync
 
 on:
   schedule:
-    - cron: "37 */6 * * *"
+    - cron: "37 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -10,48 +10,335 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: write
-  contents: write
-  issues: write
+  contents: read
 
 jobs:
-  sync:
+  prepare:
     if: github.repository == 'morrowbyte/t3code'
+    permissions:
+      contents: write
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
-    timeout-minutes: 35
+    timeout-minutes: 10
+    outputs:
+      candidate: ${{ steps.prepare.outputs.candidate }}
+      fork: ${{ steps.reserve.outputs.fork }}
+      upstream: ${{ steps.reserve.outputs.upstream }}
+      reserved: ${{ steps.reserve.outputs.reserved }}
+      activeLedger: ${{ steps.persist.outputs.commit }}
     steps:
-      - name: Require workflow-capable upstream sync token
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+      - name: Require fresh trusted workflow attempt and reviewed helper
         env:
-          WEASEL_UPSTREAM_TOKEN: ${{ secrets.WEASEL_UPSTREAM_TOKEN }}
+          TRUSTED_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = morrowbyte/t3code
-          if [[ -z "$WEASEL_UPSTREAM_TOKEN" ]]; then
-            echo "Repository Actions secret WEASEL_UPSTREAM_TOKEN is required for sync checkout, GitHub API calls, and fast-forward promotion." >&2
-            exit 1
-          fi
-
-      - name: Checkout fork main
-        uses: actions/checkout@v4
-        with:
-          repository: morrowbyte/t3code
-          ref: main
-          fetch-depth: 0
-          token: ${{ secrets.WEASEL_UPSTREAM_TOKEN }}
-
-      - name: Configure upstream remote
-        run: git remote add upstream https://github.com/pingdotgg/t3code.git
-
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
-        with:
-          node-version-file: package.json
-          cache: true
-          run-install: false
-
-      - name: Sync, validate, and promote latest published nightly
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(git rev-parse HEAD)" = "$TRUSTED_SHA"
+          printf '%s\n' '66d266734ce2bba96965fce8f088a9d78d0dfcfeda1b0fc04ee66b4840dda410  scripts/weasel/sync-upstream-main.sh' '18a850e5eb68f0f143b7c9ab52996615169b262e57be310e7baaf30c2c7c5433  scripts/weasel/test-sync-upstream-main.sh' | sha256sum --check --status
+      - name: Probe latest public upstream main without models or installation
+        run: bash scripts/weasel/sync-upstream-main.sh probe --output "$RUNNER_TEMP/probe"
+      - name: Restore protected fork ledger ref or refuse
         env:
-          GH_TOKEN: ${{ secrets.WEASEL_UPSTREAM_TOKEN }}
+          REVIEWED_INITIAL_PAIR: ${{ vars.WEASEL_UPSTREAM_MAIN_REVIEWED_INITIAL_PAIR }}
         run: |
           set -euo pipefail
-          bash scripts/weasel/sync-upstream-nightly.sh
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          test "$REVIEWED_INITIAL_PAIR" = '260451f5536555af1970f52e7f4ae16578ae26c8:81493efb71e8e8244f95d3e9f71d8369654ab151'
+          # Only trusted contents:write jobs can update this ref; candidate jobs
+          # have contents:read. Uploaded artifacts are never ledger authority.
+          # There is deliberately no initialization or missing-state fallback.
+          git fetch origin refs/heads/automation/upstream-main-ledger
+          git rev-parse FETCH_HEAD > "$RUNNER_TEMP/pre-attempt-ledger.commit"
+          git show FETCH_HEAD:ledger.json > "$RUNNER_TEMP/pre-attempt-ledger.json"
+      - name: Pin objects and validate pre-attempt ledger without changing it
+        run: |
+          set -euo pipefail
+          fork="$(jq -er .forkSha "$RUNNER_TEMP/probe/receipt.json")"
+          upstream="$(jq -er .upstreamSha "$RUNNER_TEMP/probe/receipt.json")"
+          [[ "$fork" =~ ^[0-9a-f]{40}$ && "$upstream" =~ ^[0-9a-f]{40}$ ]]
+          git fetch origin "$fork"
+          # The public fetch has no fork header, helper or ambient Git config.
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -c http.extraHeader= -c credential.helper= -c core.askPass= fetch https://github.com/pingdotgg/t3code.git "$upstream"
+      - name: Reserve pair before any publication or qualification
+        id: reserve
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,pathlib
+          import time,subprocess,re
+          root=pathlib.Path(os.environ['RUNNER_TEMP']); r=json.loads((root/'probe/receipt.json').read_text())
+          def strict(pairs):
+              result={}
+              for k,v in pairs:
+                  if k in result: raise SystemExit('Duplicate ledger key')
+                  result[k]=v
+              return result
+          snapshot=root/'pre-attempt-ledger.json'
+          if snapshot.stat().st_size>2097152: raise SystemExit('Ledger oversized')
+          ledger=json.loads(snapshot.read_text(),object_pairs_hook=strict)
+          if set(ledger)!={'schemaVersion','repository','initialized','expiresAt','pairs'} or type(ledger['schemaVersion'])is not int or ledger['schemaVersion']!=1 or ledger['repository']!='morrowbyte/t3code' or ledger['initialized']is not True or type(ledger['expiresAt'])is not int or not time.time()<ledger['expiresAt']<=9007199254740991 or not isinstance(ledger['pairs'],list) or len(ledger['pairs'])>10000: raise SystemExit('Invalid or expired ledger')
+          seen=set()
+          for e in ledger['pairs']:
+              if not isinstance(e,dict) or set(e)!={'forkSha','upstreamSha','status'} or not isinstance(e['forkSha'],str) or not re.fullmatch('[0-9a-f]{40}',e['forkSha']) or not isinstance(e['upstreamSha'],str) or not re.fullmatch('[0-9a-f]{40}',e['upstreamSha']) or e['status'] not in ('active','failed','success'): raise SystemExit('Invalid ledger entry')
+              pair=(e['forkSha'],e['upstreamSha'])
+              if pair in seen: raise SystemExit('Duplicate ledger pair')
+              seen.add(pair)
+          if (r['forkSha'],r['upstreamSha']) in seen: raise SystemExit(0)
+          contained=subprocess.run(['git','merge-base','--is-ancestor',r['upstreamSha'],r['forkSha']]).returncode
+          if contained==0: raise SystemExit(0)
+          if contained!=1: raise SystemExit('Ancestry check failed')
+          ledger['pairs'].append({'forkSha':r['forkSha'],'upstreamSha':r['upstreamSha'],'status':'active'})
+          if len(ledger['pairs'])>10000: raise SystemExit('Ledger capacity exhausted')
+          (root/'active').mkdir(); (root/'active/ledger.json').write_text(json.dumps(ledger))
+          with open(os.environ['GITHUB_OUTPUT'],'a') as out: out.write('reserved=true\nfork='+r['forkSha']+'\nupstream='+r['upstreamSha']+'\n')
+          PY
+      - name: Persist active reservation before any prepare or candidate execution
+        id: persist
+        if: steps.reserve.outputs.reserved == 'true'
+        run: |
+          set -euo pipefail
+          previous="$(cat "$RUNNER_TEMP/pre-attempt-ledger.commit")"
+          git fetch origin refs/heads/automation/upstream-main-ledger
+          test "$(git rev-parse FETCH_HEAD)" = "$previous"
+          blob="$(git hash-object -w "$RUNNER_TEMP/active/ledger.json")"
+          tree="$(printf '100644 blob %s\tledger.json\n' "$blob" | git mktree)"
+          commit="$(printf 'Reserve upstream main pair before attempt\n' | env GIT_AUTHOR_NAME='github-actions[bot]' GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' GIT_COMMITTER_NAME='github-actions[bot]' GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' git -c commit.gpgsign=false commit-tree "$tree" -p "$previous")"
+          git push origin "$commit:refs/heads/automation/upstream-main-ledger"
+          test "$(git ls-remote origin refs/heads/automation/upstream-main-ledger | cut -f1)" = "$commit"
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+      - name: Validate real Git helper fixtures on trusted source
+        if: steps.persist.outputs.commit != ''
+        run: bash scripts/weasel/test-sync-upstream-main.sh
+      - name: Prepare from immutable pre-attempt snapshot
+        id: prepare
+        if: steps.persist.outputs.commit != ''
+        run: |
+          set -euo pipefail
+          fork="$(jq -er .forkSha "$RUNNER_TEMP/probe/receipt.json")"
+          upstream="$(jq -er .upstreamSha "$RUNNER_TEMP/probe/receipt.json")"
+          bash scripts/weasel/sync-upstream-main.sh prepare --fork-sha "$fork" --upstream-sha "$upstream" --state-file "$RUNNER_TEMP/pre-attempt-ledger.json" --output "$RUNNER_TEMP/prepared"
+          test "$(jq -r .status "$RUNNER_TEMP/prepared/receipt.json")" = candidate_unqualified
+          candidate="$(jq -er .candidateSha "$RUNNER_TEMP/prepared/receipt.json")"
+          printf 'candidate=%s\nfork=%s\nupstream=%s\n' "$candidate" "$fork" "$upstream" >> "$GITHUB_OUTPUT"
+      - name: Preserve exact attempt source and reservation evidence
+        if: always() && steps.reserve.outputs.reserved == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-main-attempt
+          path: |
+            ${{ runner.temp }}/pre-attempt-ledger.json
+            ${{ runner.temp }}/prepared
+            ${{ runner.temp }}/probe
+          if-no-files-found: error
+          retention-days: 90
+
+  publish_candidate:
+    needs: prepare
+    if: needs.prepare.outputs.candidate != ''
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-main-attempt
+          path: attempt
+      - name: Verify inert candidate bundle and publish only fork ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.prepare.outputs.candidate }}
+          FORK: ${{ needs.prepare.outputs.fork }}
+          UPSTREAM: ${{ needs.prepare.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ && "$FORK" =~ ^[0-9a-f]{40}$ && "$UPSTREAM" =~ ^[0-9a-f]{40}$ ]]
+          bundle=attempt/prepared/candidate.bundle
+          test "$(sha256sum "$bundle" | cut -d' ' -f1)" = "$(jq -er .bundleSha256 attempt/prepared/receipt.json)"
+          git bundle verify "$bundle"
+          git fetch "$bundle" "refs/weasel-sync/$FORK-$UPSTREAM"
+          test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE"
+          test "$(git show -s --format=%P "$CANDIDATE")" = "$FORK $UPSTREAM"
+          test "$(git rev-parse "$CANDIDATE^{tree}")" = "$(jq -er .treeSha attempt/prepared/receipt.json)"
+          # Candidate changes to its gate policy require manual integration, never
+          # a self-issued passing check or workflow modification.
+          test -z "$(git diff --name-only "$FORK" "$CANDIDATE" -- .github/workflows scripts/weasel apps/desktop/resources/morrowbyte-installer-guard.ps1 apps/desktop/resources/test-morrowbyte-installer-guard.ps1)"
+          git -c credential.helper='!gh auth git-credential' fetch origin main
+          test "$(git rev-parse FETCH_HEAD)" = "$FORK"
+          ref="refs/heads/automation/upstream-main/$FORK-$UPSTREAM"
+          test -z "$(git -c credential.helper='!gh auth git-credential' ls-remote origin "$ref")"
+          git -c credential.helper='!gh auth git-credential' push origin "$CANDIDATE:$ref"
+          test "$(git -c credential.helper='!gh auth git-credential' ls-remote origin "$ref" | cut -f1)" = "$CANDIDATE"
+
+  qualify:
+    needs: [prepare, publish_candidate]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/weasel-ci.yml
+    with:
+      qualificationSourceSha: ${{ needs.prepare.outputs.candidate }}
+    # No secrets inheritance; the candidate runs only with contents:read.
+
+  promote:
+    needs: [prepare, publish_candidate, qualify]
+    permissions:
+      contents: write
+      actions: read
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync-qualification-${{ needs.prepare.outputs.candidate }}
+          path: qualification
+      - name: Verify source/run gates and perform only fresh fast-forward
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.prepare.outputs.candidate }}
+          QUALIFIED: ${{ needs.qualify.outputs.qualifiedSourceSha }}
+          FORK: ${{ needs.prepare.outputs.fork }}
+          UPSTREAM: ${{ needs.prepare.outputs.upstream }}
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$QUALIFIED" = "$CANDIDATE"
+          grep -Fx "source_sha=$CANDIDATE" qualification/receipt.txt
+          grep -Fx "trusted_workflow_sha=$TRUSTED_WORKFLOW_SHA" qualification/receipt.txt
+          grep -Fx "run_id=$GITHUB_RUN_ID" qualification/receipt.txt
+          grep -Fx "run_attempt=$GITHUB_RUN_ATTEMPT" qualification/receipt.txt
+          gh api --method GET "repos/morrowbyte/t3code/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" > "$RUNNER_TEMP/jobs.json"
+          jq -e '[.jobs[] | select(.name | startswith("qualify / ")) | select(.name | test("(check|product_bundle|windows_installer_guard)$"))] | length == 3 and all(.[]; .conclusion == "success" and any(.labels[]; startswith("blacksmith-")))' "$RUNNER_TEMP/jobs.json"
+          git -c credential.helper='!gh auth git-credential' fetch origin "refs/heads/automation/upstream-main/$FORK-$UPSTREAM"
+          test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE"
+          gh api --method GET "repos/morrowbyte/t3code/actions/runs/$GITHUB_RUN_ID" > "$RUNNER_TEMP/run.json"
+          gh api --method GET "repos/morrowbyte/t3code/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > "$RUNNER_TEMP/product-artifacts.json"
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess,zipfile,stat
+          root=pathlib.Path(os.environ['RUNNER_TEMP']); run=json.loads((root/'run.json').read_text())
+          if run['repository']['full_name']!='morrowbyte/t3code' or run['head_sha']!=os.environ['TRUSTED_WORKFLOW_SHA'] or run['path']!='.github/workflows/weasel-sync.yml' or run['run_attempt']!=1: raise SystemExit('Trusted caller run mismatch')
+          rows=[a for a in json.loads((root/'product-artifacts.json').read_text())['artifacts'] if a['name']=='product-bundle-'+os.environ['CANDIDATE']]
+          if len(rows)!=1 or rows[0]['expired'] or not 0<rows[0]['size_in_bytes']<=1073741824: raise SystemExit('Missing or invalid exact product artifact')
+          artifact=rows[0]; archive=root/'product.zip'
+          with archive.open('xb') as out:
+              proc=subprocess.Popen(['gh','api','--method','GET',f"repos/morrowbyte/t3code/actions/artifacts/{artifact['id']}/zip"],stdout=subprocess.PIPE)
+              size=0; digest=hashlib.sha256()
+              try:
+                  while True:
+                      chunk=proc.stdout.read(1048576)
+                      if not chunk: break
+                      size+=len(chunk)
+                      if size>1073741824: raise SystemExit('Product archive oversized')
+                      digest.update(chunk);out.write(chunk)
+                  if proc.wait()!=0: raise SystemExit('Product archive retrieval failed')
+              finally:
+                  if proc.poll()is None: proc.kill();proc.wait()
+          if 'sha256:'+digest.hexdigest()!=artifact.get('digest'): raise SystemExit('Product API digest mismatch')
+          with zipfile.ZipFile(archive) as z:
+              names=z.namelist()
+              if len(names)!=len(set(names)) or any(n.startswith('/') or '..' in pathlib.PurePosixPath(n).parts for n in names): raise SystemExit('Unsafe product inventory')
+              if sum(i.file_size for i in z.infolist())>2147483648 or any(stat.S_ISLNK(i.external_attr>>16) for i in z.infolist()): raise SystemExit('Product inventory bounds')
+              receipt=z.read('product-evidence/BUILD-RECEIPT.txt').decode('utf8').splitlines()
+              required=['source_sha='+os.environ['CANDIDATE'],'run_id='+os.environ['GITHUB_RUN_ID'],'run_attempt=1','trusted_workflow_sha='+os.environ['TRUSTED_WORKFLOW_SHA']]
+              if not all(receipt.count(v)==1 for v in required): raise SystemExit('Product source/run receipt mismatch')
+              lock=subprocess.check_output(['git','show',os.environ['CANDIDATE']+':pnpm-lock.yaml'])
+              if receipt.count(hashlib.sha256(lock).hexdigest()+'  pnpm-lock.yaml')!=1: raise SystemExit('Product lock binding mismatch')
+              # The exact candidate is fetched and checked below before promotion;
+              # hash inventory verifies downloaded product bytes independently.
+              sums=z.read('product-evidence/SHA256SUMS').decode('utf8').splitlines()
+              if not sums: raise SystemExit('Empty product payload inventory')
+              for line in sums:
+                  digest,name=line.split('  ',1)
+                  if name not in names or not name.startswith(('apps/server/dist/','apps/desktop/dist-electron/')): raise SystemExit('Product payload path mismatch')
+                  h=hashlib.sha256()
+                  with z.open(name) as f:
+                      for chunk in iter(lambda:f.read(1048576),b''):h.update(chunk)
+                  if h.hexdigest()!=digest: raise SystemExit('Product payload checksum mismatch')
+          PY
+          git -c credential.helper='!gh auth git-credential' fetch origin "refs/heads/automation/upstream-main/$FORK-$UPSTREAM"
+          test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE"
+          test "$(git show -s --format=%P "$CANDIDATE")" = "$FORK $UPSTREAM"
+          git -c credential.helper='!gh auth git-credential' fetch origin main
+          test "$(git rev-parse FETCH_HEAD)" = "$FORK"
+          observed="$(env -i PATH="$PATH" HOME="$RUNNER_TEMP" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= ls-remote https://github.com/pingdotgg/t3code.git refs/heads/main | cut -f1)"
+          test "$observed" = "$UPSTREAM"
+          git merge-base --is-ancestor "$FORK" "$CANDIDATE"
+          git -c credential.helper='!gh auth git-credential' push origin "$CANDIDATE:refs/heads/main"
+          test "$(git -c credential.helper='!gh auth git-credential' ls-remote origin refs/heads/main | cut -f1)" = "$CANDIDATE"
+          # No release dispatch: publication remains independently authorized.
+
+  record:
+    if: always() && needs.prepare.outputs.activeLedger != ''
+    needs: [prepare, publish_candidate, qualify, promote]
+    permissions:
+      contents: write
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+      - name: Read exact current run reservation from fork state ref
+        env:
+          ACTIVE_LEDGER: ${{ needs.prepare.outputs.activeLedger }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          [[ "$ACTIVE_LEDGER" =~ ^[0-9a-f]{40}$ ]]
+          git fetch origin refs/heads/automation/upstream-main-ledger
+          test "$(git rev-parse FETCH_HEAD)" = "$ACTIVE_LEDGER"
+          mkdir active
+          git show "$ACTIVE_LEDGER:ledger.json" > active/ledger.json
+      - name: Retain terminal outcome without replay or extending expiry
+        env:
+          PROMOTED: ${{ needs.promote.result }}
+          FORK: ${{ needs.prepare.outputs.fork }}
+          UPSTREAM: ${{ needs.prepare.outputs.upstream }}
+          ACTIVE_LEDGER: ${{ needs.prepare.outputs.activeLedger }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json,os,pathlib
+          p=pathlib.Path('active/ledger.json'); ledger=json.loads(p.read_text())
+          # Only the last reservation from this serialized run is transitioned.
+          if not ledger['pairs'] or ledger['pairs'][-1]!={'forkSha':os.environ['FORK'],'upstreamSha':os.environ['UPSTREAM'],'status':'active'}: raise SystemExit('Missing exact active reservation')
+          ledger['pairs'][-1]['status']='success' if os.environ['PROMOTED']=='success' else 'failed'
+          pathlib.Path('final').mkdir();pathlib.Path('final/ledger.json').write_text(json.dumps(ledger))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
+              out.write('Upstream pair recorded '+ledger['pairs'][-1]['status']+'. No automatic replay; private attempt artifacts retain details.\n')
+          PY
+          previous="$ACTIVE_LEDGER"
+          git fetch origin refs/heads/automation/upstream-main-ledger
+          test "$(git rev-parse FETCH_HEAD)" = "$previous"
+          blob="$(git hash-object -w final/ledger.json)"
+          tree="$(printf '100644 blob %s\tledger.json\n' "$blob" | git mktree)"
+          commit="$(printf 'Retain upstream main attempt outcome\n' | env GIT_AUTHOR_NAME='github-actions[bot]' GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' GIT_COMMITTER_NAME='github-actions[bot]' GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' git -c commit.gpgsign=false commit-tree "$tree" -p "$previous")"
+          git push origin "$commit:refs/heads/automation/upstream-main-ledger"
+          test "$(git ls-remote origin refs/heads/automation/upstream-main-ledger | cut -f1)" = "$commit"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: upstream-main-ledger-final
+          path: final/ledger.json
+          if-no-files-found: error
+          retention-days: 90

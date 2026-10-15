@@ -1,6 +1,16 @@
 name: Weasel CI
 
 on:
+  workflow_call:
+    inputs:
+      qualificationSourceSha:
+        description: Exact unpublished source qualified by the trusted caller workflow
+        required: true
+        type: string
+    outputs:
+      qualifiedSourceSha:
+        description: Source only after all existing platform gates pass
+        value: ${{ jobs.qualification_receipt.outputs.source }}
   workflow_dispatch:
     inputs:
       buildCandidateCLI:
@@ -24,7 +34,7 @@ on:
     branches: [main, "weasel/**"]
 
 concurrency:
-  group: weasel-ci-${{ github.event.pull_request.number || github.ref }}
+  group: weasel-ci-${{ inputs.qualificationSourceSha || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -32,16 +42,29 @@ permissions:
 
 jobs:
   check:
-    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
+    if: (inputs.qualificationSourceSha != '' && github.repository == 'morrowbyte/t3code') || (inputs.qualificationSourceSha == '' && github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code'))
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.qualificationSourceSha || github.sha }}
+          persist-credentials: false
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
           cache: true
           run-install: false
+      - name: Validate reusable source admission
+        if: inputs.qualificationSourceSha != ''
+        env:
+          QUALIFICATION_SOURCE_SHA: ${{ inputs.qualificationSourceSha }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          [[ "$QUALIFICATION_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_SOURCE_SHA"
+          test -z "$(git status --porcelain)"
       - name: Install dependencies
         run: vp install --frozen-lockfile
       - name: Prepare pinned Electron runtime before desktop imports
@@ -61,11 +84,14 @@ jobs:
           packages/provider-core/src/server/ProviderAdapter.ts
   product_bundle:
     needs: [check]
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || inputs.qualificationSourceSha != ''
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.qualificationSourceSha || github.sha }}
+          persist-credentials: false
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version-file: package.json
@@ -75,12 +101,19 @@ jobs:
         run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
       - name: Validate explicit unpublished candidate inputs
         env:
+          QUALIFICATION_SOURCE_SHA: ${{ inputs.qualificationSourceSha }}
           BUILD_CANDIDATE_CLI: ${{ inputs.buildCandidateCLI || false }}
           CANDIDATE_VERSION: ${{ inputs.candidateVersion }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ inputs.qualificationSourceSha || github.sha }}
           SOURCE_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
+          if [[ -n "$QUALIFICATION_SOURCE_SHA" ]]; then
+            test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+            test "$BUILD_CANDIDATE_CLI" = false
+            test -z "$CANDIDATE_VERSION"
+            test "$(git rev-parse HEAD)" = "$QUALIFICATION_SOURCE_SHA"
+          fi
           if [[ "$BUILD_CANDIDATE_CLI" != true ]]; then
             test -z "$CANDIDATE_VERSION"
             exit 0
@@ -102,7 +135,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: voice-ui-${{ github.sha }}
+          name: voice-ui-${{ inputs.qualificationSourceSha || github.sha }}
           path: product-evidence/voice-ui
           if-no-files-found: warn
           retention-days: 7
@@ -112,10 +145,11 @@ jobs:
         env:
           MORROWBYTE_CI_PROBE: "1"
           MORROWBYTE_CI_PROFILE: blacksmith-8vcpu-ubuntu-2404
+          SOURCE_SHA: ${{ inputs.qualificationSourceSha || github.sha }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = morrowbyte/t3code
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           node --test apps/desktop/scripts/proton-pass-compatibility.test.mjs
           sudo apt-get install -y xvfb
           proton_probe_electron="$(node apps/desktop/scripts/ensure-electron-runtime.mjs)"
@@ -124,7 +158,7 @@ jobs:
         if: always() && inputs.probeProtonPass
         uses: actions/upload-artifact@v4
         with:
-          name: proton-pass-compatibility-${{ github.sha }}
+          name: proton-pass-compatibility-${{ inputs.qualificationSourceSha || github.sha }}
           path: |
             ${{ runner.temp }}/proton-pass-compatibility/fixture-receipt.json
             ${{ runner.temp }}/proton-pass-compatibility/fixture-receipt.partial.json
@@ -142,7 +176,7 @@ jobs:
         env:
           VP_NODE_VERSION: "26.8.2"
           CANDIDATE_VERSION: ${{ inputs.candidateVersion }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ inputs.qualificationSourceSha || github.sha }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
@@ -164,26 +198,29 @@ jobs:
         if: inputs.buildCandidateCLI
         uses: actions/upload-artifact@v4
         with:
-          name: linux-cli-candidate-${{ github.sha }}
+          name: linux-cli-candidate-${{ inputs.qualificationSourceSha || github.sha }}
           path: product-evidence/linux-cli
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
       - name: Bind bundle to exact source
         env:
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ inputs.qualificationSourceSha || github.sha }}
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          TRUSTED_WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           mkdir -p product-evidence
           printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' "$SOURCE_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > product-evidence/BUILD-RECEIPT.txt
+          printf 'trusted_workflow_sha=%s\ntrusted_workflow_ref=%s\n' "$TRUSTED_WORKFLOW_SHA" "$TRUSTED_WORKFLOW_REF" >> product-evidence/BUILD-RECEIPT.txt
           sha256sum pnpm-lock.yaml >> product-evidence/BUILD-RECEIPT.txt
           find apps/server/dist apps/desktop/dist-electron -type f -print0 | sort -z | xargs -0 sha256sum > product-evidence/SHA256SUMS
           test -s product-evidence/SHA256SUMS
       - name: Upload reviewable product bundle
         uses: actions/upload-artifact@v4
         with:
-          name: product-bundle-${{ github.sha }}
+          name: product-bundle-${{ inputs.qualificationSourceSha || github.sha }}
           include-hidden-files: true
           path: |
             apps/server/dist
@@ -192,11 +229,48 @@ jobs:
           if-no-files-found: error
           retention-days: 7
   windows_installer_guard:
-    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
+    if: (inputs.qualificationSourceSha != '' && github.repository == 'morrowbyte/t3code') || (inputs.qualificationSourceSha == '' && github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code'))
     runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'blacksmith-8vcpu-windows-2025' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.qualificationSourceSha || github.sha }}
+          persist-credentials: false
       - name: Verify Windows installer process isolation
         shell: powershell
         run: ./apps/desktop/resources/test-morrowbyte-installer-guard.ps1
+
+  qualification_receipt:
+    if: inputs.qualificationSourceSha != ''
+    needs: [check, product_bundle, windows_installer_guard]
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 5
+    outputs:
+      source: ${{ steps.receipt.outputs.source }}
+    steps:
+      - name: Bind successful normal gates to source and trusted workflow
+        id: receipt
+        env:
+          SOURCE_SHA: ${{ inputs.qualificationSourceSha }}
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          TRUSTED_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CHECK: ${{ needs.check.result }}
+          PRODUCT: ${{ needs.product_bundle.result }}
+          WINDOWS: ${{ needs.windows_installer_guard.result }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$CHECK" = success
+          test "$PRODUCT" = success
+          test "$WINDOWS" = success
+          mkdir qualification
+          printf 'source_sha=%s\ntrusted_workflow_sha=%s\ntrusted_workflow_ref=%s\nrun_id=%s\nrun_attempt=%s\ncheck=success\nproduct_bundle=success\nwindows_installer_guard=success\n' "$SOURCE_SHA" "$TRUSTED_WORKFLOW_SHA" "$TRUSTED_WORKFLOW_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > qualification/receipt.txt
+          printf 'source=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sync-qualification-${{ inputs.qualificationSourceSha }}
+          path: qualification/receipt.txt
+          if-no-files-found: error
+          retention-days: 30
