@@ -46,6 +46,7 @@ $fixtureFailure = $null
 $fixtureCleanupFallback = $false
 $fixtureCleanupFailed = $false
 $fixtureBoundaryTimeoutMs = 5000
+$fixtureReleaseBytes = [Text.Encoding]::ASCII.GetBytes("MORROWBYTE_GUARD_FIXTURE_RELEASE`n")
 try {
     New-Item -ItemType Directory -Path $fixtureRoot -ErrorAction Stop | Out-Null
     $fixtureRootCreated = $true
@@ -67,7 +68,12 @@ public static class MorrowbyteGuardFixture {
     public static int Main() {
         Console.WriteLine("MORROWBYTE_GUARD_FIXTURE_READY");
         Console.Out.Flush();
-        return Console.ReadLine() == "MORROWBYTE_GUARD_FIXTURE_RELEASE" ? 0 : 2;
+        var expected = System.Text.Encoding.ASCII.GetBytes("MORROWBYTE_GUARD_FIXTURE_RELEASE\n");
+        var input = Console.OpenStandardInput();
+        for (int i = 0; i < expected.Length; i++) {
+            if (input.ReadByte() != expected[i]) return 2;
+        }
+        return 0;
     }
 }
 '@
@@ -107,10 +113,12 @@ public static class MorrowbyteGuardFixture {
     Assert-Equal 10 $LASTEXITCODE
     Assert-Equal $false $fixtureProcess.HasExited
 
-    $fixtureProcess.StandardInput.WriteLine('MORROWBYTE_GUARD_FIXTURE_RELEASE')
-    $fixtureProcess.StandardInput.Flush()
-    $fixtureProcess.StandardInput.Close()
+    $fixtureInput = $fixtureProcess.StandardInput.BaseStream
+    $fixtureInput.Write($fixtureReleaseBytes, 0, $fixtureReleaseBytes.Length)
+    $fixtureInput.Flush()
+    $fixtureInput.Close()
     if (-not $fixtureProcess.WaitForExit($fixtureBoundaryTimeoutMs)) { throw 'Owned fixture exit was not observed.' }
+    Write-Output ('Morrowbyte guard fixture: release_exit={0}' -f $fixtureProcess.ExitCode)
     Assert-Equal 0 $fixtureProcess.ExitCode
     & $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PSScriptRoot\morrowbyte-installer-guard.ps1" -InstallRoot $fixtureRoot -AppExecutable $fixtureName -WaitSeconds 0
     Assert-Equal 0 $LASTEXITCODE
@@ -123,9 +131,10 @@ public static class MorrowbyteGuardFixture {
         if (-not $fixtureProcess.HasExited) {
             $normalExit = $false
             try {
-                $fixtureProcess.StandardInput.WriteLine('MORROWBYTE_GUARD_FIXTURE_RELEASE')
-                $fixtureProcess.StandardInput.Flush()
-                $fixtureProcess.StandardInput.Close()
+                $fixtureInput = $fixtureProcess.StandardInput.BaseStream
+                $fixtureInput.Write($fixtureReleaseBytes, 0, $fixtureReleaseBytes.Length)
+                $fixtureInput.Flush()
+                $fixtureInput.Close()
                 $normalExit = $fixtureProcess.WaitForExit($fixtureBoundaryTimeoutMs) -and $fixtureProcess.ExitCode -eq 0
             } catch { $normalExit = $false }
             if (-not $normalExit) {
