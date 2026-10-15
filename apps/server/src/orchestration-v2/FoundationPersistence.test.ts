@@ -56,6 +56,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+import { makeBackendUpdateCoordinator } from "../serverRuntimeStartup.ts";
 
 const isLiveStreamBufferError = Schema.is(LiveStreamBufferError);
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -2860,97 +2861,221 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
       }),
   );
 
+  it.effect("an admitted SQL claim drains before the update cut and leaves preparation busy", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const gate = yield* ProviderRuntimeRecovery.makeBackendUpdateGate;
+        const admitted = yield* Deferred.make<void>();
+        const executeSql = yield* Deferred.make<void>();
+        // Pause inside the actual admission permit, before the real claim UPDATE.
+        outbox.setUpdateAdmissionGate!({
+          ...gate,
+          run: (effect) =>
+            gate.run(
+              Deferred.succeed(admitted, undefined).pipe(
+                Effect.andThen(Deferred.await(executeSql)),
+                Effect.andThen(effect),
+              ),
+            ),
+        });
+        const claim = yield* outbox
+          .claimNext({ workerId: "pre-cut", leaseDurationMs: 30_000 })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(admitted);
+        const responses: Array<{ type: string; reason?: string }> = [];
+        let preparations = 0;
+        const now = DateTime.toEpochMillis(yield* DateTime.now);
+        const coordinator = yield* makeBackendUpdateCoordinator({
+          environmentId: "env",
+          bootId: "boot",
+          gate,
+          prepare: Effect.sync(() => {
+            preparations++;
+            return { runIds: [], effectIds: [] };
+          }),
+          validate: Effect.succeed(true),
+          clear: Effect.void,
+          busy: outbox.hasUnsettledForUpdate!,
+          wake: Effect.void,
+          now: Effect.map(DateTime.now, DateTime.toEpochMillis),
+          send: (response) =>
+            Effect.sync(() => {
+              responses.push(response);
+            }),
+        });
+        const hold = yield* coordinator
+          .request({
+            version: 1,
+            type: "prepareBackendUpdate",
+            context: {
+              environmentId: "env",
+              bootId: "boot",
+              requestId: "in-flight-claim",
+              targetVersion: "26",
+              admissionGeneration: 1,
+              expiresAt: now + 20_000,
+            },
+          })
+          .pipe(Effect.forkChild);
+        yield* gate.awaitHeld;
+        assert.isUndefined(hold.pollUnsafe());
+        assert.deepEqual(responses, []);
+        assert.isTrue(
+          Option.isNone(yield* outbox.claimNext({ workerId: "held", leaseDurationMs: 1000 })),
+        );
+        yield* outbox.enqueue([
+          {
+            id: "effect:admitted-claim",
+            commandId: CommandId.make("command:admitted-claim"),
+            threadId: ThreadId.make("thread:admitted-claim"),
+            request: { type: "terminal.cleanup" },
+          },
+        ]);
+        yield* Deferred.succeed(executeSql, undefined);
+        const claimed = yield* Fiber.join(claim);
+        yield* Fiber.join(hold);
+        assert.isTrue(Option.isSome(claimed));
+        assert.isTrue(yield* outbox.hasUnsettledForUpdate!);
+        assert.deepEqual(
+          responses.map(({ type, reason }) => ({ type, reason })),
+          [{ type: "backendUpdateRefused", reason: "busy" }],
+        );
+        assert.equal(preparations, 0);
+        assert.isFalse(gate.isHeld());
+        yield* outbox.succeed({ effectId: "effect:admitted-claim", workerId: "pre-cut" });
+      }),
+    ).pipe(Effect.provide(layerIsolatedOutbox)),
+  );
+
   it.effect(
     "strict update preparation persists canonical IDs, abort removes only its rows and a held gate prevents worker claims",
     () =>
-      Effect.gen(function* () {
-        const outbox = yield* EffectOutbox.EffectOutboxV2;
-        const now = yield* DateTime.now;
-        const threadId = ThreadId.make("thread:strict-update-prepare");
-        const runId = RunId.make("run:strict-update-prepare");
-        const providerThreadId = ProviderThreadId.make("provider-thread:strict-update-prepare");
-        const sessionId = ProviderSessionId.make("session:strict-update-prepare");
-        const attemptId = RunAttemptId.make("attempt:strict-update-prepare");
-        const projection = {
-          thread: makeThread(threadId, now),
-          runs: [
-            {
-              id: runId,
-              ordinal: 1,
-              status: "running",
-              providerInstanceId,
-              providerThreadId,
-              activeAttemptId: attemptId,
-            },
-          ],
-          providerThreads: [
-            {
-              id: providerThreadId,
-              appThreadId: threadId,
-              ownerNodeId: null,
-              driver: "codex",
-              providerInstanceId,
-              providerSessionId: sessionId,
-              status: "active",
-              nativeThreadRef: {
-                driver: "codex",
-                nativeId: "saved-native-thread",
-                strength: "strong",
+      Effect.scoped(
+        Effect.gen(function* () {
+          const outbox = yield* EffectOutbox.EffectOutboxV2;
+          const now = yield* DateTime.now;
+          const threadId = ThreadId.make("thread:strict-update-prepare");
+          const runId = RunId.make("run:strict-update-prepare");
+          const providerThreadId = ProviderThreadId.make("provider-thread:strict-update-prepare");
+          const sessionId = ProviderSessionId.make("session:strict-update-prepare");
+          const attemptId = RunAttemptId.make("attempt:strict-update-prepare");
+          const projection = {
+            thread: makeThread(threadId, now),
+            runs: [
+              {
+                id: runId,
+                ordinal: 1,
+                status: "running",
+                providerInstanceId,
+                providerThreadId,
+                activeAttemptId: attemptId,
               },
-            },
-          ],
-          providerSessions: [
-            { id: sessionId, driver: "codex", providerInstanceId, status: "running" },
-          ],
-          providerTurns: [{ providerThreadId, runAttemptId: attemptId, status: "running" }],
-          runtimeRequests: [],
-          turnItems: [],
-        } as unknown as OrchestrationV2ThreadProjection;
-        const recovery = yield* ProviderRuntimeRecovery.make.pipe(
-          Effect.provide(
-            Layer.mergeAll(
-              ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
-              Layer.mock(ProjectionStore.ProjectionStoreV2)({
-                getRecoveryThreadIds: () => Effect.succeed([threadId]),
-                getRuntimeRecoveryProjection: () => Effect.succeed(projection),
-              }),
-              Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
+            ],
+            providerThreads: [
+              {
+                id: providerThreadId,
+                appThreadId: threadId,
+                ownerNodeId: null,
+                driver: "codex",
+                providerInstanceId,
+                providerSessionId: sessionId,
+                status: "active",
+                nativeThreadRef: {
+                  driver: "codex",
+                  nativeId: "saved-native-thread",
+                  strength: "strong",
+                },
+              },
+            ],
+            providerSessions: [
+              { id: sessionId, driver: "codex", providerInstanceId, status: "running" },
+            ],
+            providerTurns: [{ providerThreadId, runAttemptId: attemptId, status: "running" }],
+            runtimeRequests: [],
+            turnItems: [],
+          } as unknown as OrchestrationV2ThreadProjection;
+          const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+                Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                  getRecoveryThreadIds: () => Effect.succeed([threadId]),
+                  getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+                }),
+                Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
+              ),
             ),
-          ),
-        );
-        const gate = yield* ProviderRuntimeRecovery.makeBackendUpdateGate;
-        outbox.setUpdateAdmissionGate!(gate);
-        yield* gate.hold;
-        const proof = yield* recovery.prepareForUpdate!;
-        assert.deepEqual(proof.runIds, [runId]);
-        assert.isTrue(
-          Option.isNone(
-            yield* outbox.claimNext({
-              workerId: "must-not-start-during-update",
-              leaseDurationMs: 1000,
-            }),
-          ),
-        );
-        yield* recovery.abortPreparedUpdate!;
-        assert.isTrue(Option.isNone(yield* outbox.get(`effect:restart-continuation:${runId}`)));
-        yield* recovery.prepareForUpdate!;
-        const effects = yield* outbox.listByCommandId(
-          CommandId.make(`command:restart-prepare:${runId}`),
-        );
-        assert.lengthOf(effects, 1);
-        assert.equal(effects[0]?.status, "pending");
-        assert.deepEqual(effects[0]?.request, {
-          type: "provider-runtime.continue",
-          sourceRunId: runId,
-        });
-        // This fixture shares the database; settle its intent before later claim tests.
-        yield* outbox.cancelUnsettled({
-          threadId,
-          effectTypes: ["provider-runtime.continue"],
-          reason: "fixture complete",
-        });
-        yield* gate.release;
-      }),
+          );
+          const gate = yield* ProviderRuntimeRecovery.makeBackendUpdateGate;
+          outbox.setUpdateAdmissionGate!(gate);
+          yield* gate.hold;
+          const proof = yield* recovery.prepareForUpdate!;
+          assert.deepEqual(proof.runIds, [runId]);
+          assert.isTrue(
+            Option.isNone(
+              yield* outbox.claimNext({
+                workerId: "must-not-start-during-update",
+                leaseDurationMs: 1000,
+              }),
+            ),
+          );
+          yield* recovery.abortPreparedUpdate!;
+          assert.isTrue(Option.isNone(yield* outbox.get(`effect:restart-continuation:${runId}`)));
+          yield* gate.release;
+          const responses: string[] = [];
+          const coordinator = yield* makeBackendUpdateCoordinator({
+            environmentId: "env",
+            bootId: "boot",
+            gate,
+            prepare: recovery.prepareForUpdate!,
+            validate: recovery.validatePreparedUpdate!,
+            clear: recovery.abortPreparedUpdate!,
+            busy: outbox.hasUnsettledForUpdate!,
+            wake: Effect.void,
+            now: Effect.map(DateTime.now, DateTime.toEpochMillis),
+            send: (response) =>
+              Effect.sync(() => {
+                responses.push(response.type);
+              }),
+          });
+          const context = {
+            environmentId: "env",
+            bootId: "boot",
+            requestId: "persisted-proof",
+            targetVersion: "26",
+            admissionGeneration: 1,
+            expiresAt: DateTime.toEpochMillis(now) + 20_000,
+          };
+          yield* coordinator.request({ version: 1, type: "prepareBackendUpdate", context });
+          yield* coordinator.request({ version: 1, type: "commitBackendUpdate", context });
+          assert.deepEqual(responses, ["backendUpdatePrepared", "backendUpdateCommitted"]);
+          assert.isTrue(gate.isHeld());
+          assert.isTrue(yield* recovery.validatePreparedUpdate!);
+          assert.isTrue(
+            Option.isNone(
+              yield* outbox.claimNext({ workerId: "commit-held", leaseDurationMs: 1000 }),
+            ),
+          );
+          const effects = yield* outbox.listByCommandId(
+            CommandId.make(`command:restart-prepare:${runId}`),
+          );
+          assert.lengthOf(effects, 1);
+          assert.equal(effects[0]?.status, "pending");
+          assert.deepEqual(effects[0]?.request, {
+            type: "provider-runtime.continue",
+            sourceRunId: runId,
+          });
+          // This fixture shares the database; settle its intent before later claim tests.
+          yield* outbox.cancelUnsettled({
+            threadId,
+            effectTypes: ["provider-runtime.continue"],
+            reason: "fixture complete",
+          });
+          assert.isFalse(yield* recovery.validatePreparedUpdate!);
+          yield* gate.release;
+        }),
+      ),
   );
 
   it.effect("leaves restart continuation pending until normal worker claims are enabled", () =>

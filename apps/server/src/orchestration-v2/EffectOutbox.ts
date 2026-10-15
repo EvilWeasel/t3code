@@ -577,17 +577,17 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           { discard: true },
         ).pipe(Effect.andThen(signalSettled(ids))),
       claimNext: ({ workerId, leaseDurationMs, excludeRestartContinuations = false }) =>
-        Effect.gen(function* () {
-          if (updateGate?.isHeld()) return Option.none();
-          const now = yield* DateTime.now;
-          const nowIso = DateTime.formatIso(now);
-          const leaseExpiresAt = DateTime.formatIso(
-            DateTime.add(now, { milliseconds: Math.max(1, leaseDurationMs) }),
-          );
-          // Empty safety claims are expected while the daemon is idle. Tracing
-          // this query records the full SQL text on every poll and can dominate
-          // the local trace without adding actionable information.
-          const claimStatement = sql<EffectRow>`
+        Effect.suspend(() => {
+          const claim = Effect.gen(function* () {
+            const now = yield* DateTime.now;
+            const nowIso = DateTime.formatIso(now);
+            const leaseExpiresAt = DateTime.formatIso(
+              DateTime.add(now, { milliseconds: Math.max(1, leaseDurationMs) }),
+            );
+            // Empty safety claims are expected while the daemon is idle. Tracing
+            // this query records the full SQL text on every poll and can dominate
+            // the local trace without adding actionable information.
+            const claimStatement = sql<EffectRow>`
             UPDATE orchestration_v2_effect_outbox
             SET
               status = 'running',
@@ -606,11 +606,23 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
             )
             RETURNING *
           `;
-          const rows = yield* claimStatement.pipe(Effect.withTracerEnabled(false));
-          const row = rows[0];
-          if (row === undefined) return Option.none();
-          cancellationSignals.set(row.effect_id, Deferred.makeUnsafe<void>());
-          return Option.some(yield* rowToEffect(row));
+            const rows = yield* claimStatement.pipe(Effect.withTracerEnabled(false));
+            const row = rows[0];
+            if (row === undefined) return Option.none();
+            cancellationSignals.set(row.effect_id, Deferred.makeUnsafe<void>());
+            return Option.some(yield* rowToEffect(row));
+          });
+          // Drain every admitted SQL claim before acknowledging a checkpoint cut.
+          // A claim that starts after the hold never reaches SQL.
+          return updateGate
+            ? updateGate
+                .run(claim)
+                .pipe(
+                  Effect.catchTag("BackendUpdateAdmissionClosed", () =>
+                    Effect.succeed(Option.none()),
+                  ),
+                )
+            : claim;
         }).pipe(Effect.mapError((cause) => new EffectOutboxError({ operation: "claim", cause }))),
       nextClaimableAt: Effect.gen(function* () {
         if (updateGate?.isHeld()) return Option.none();

@@ -1979,32 +1979,41 @@ export const layerWithOptions = (
                     }).pipe(entry.requestEventPermit.withPermits(1));
                     return;
                   }
-                  // Count semantic events until the canonical async subscriber persists them.
-                  if (
-                    updateGate &&
-                    (yield* Ref.get(entry.eventSubscribers)).size > 0 &&
-                    (event.type === "provider_turn.updated" ||
-                      event.type === "provider_thread.updated" ||
-                      event.type === "subagent.updated" ||
-                      event.type === "runtime_request.updated" ||
-                      (event.type === "node.updated" && event.node.kind !== "assistant_message") ||
-                      (event.type === "turn_item.updated" &&
-                        event.turnItem.type !== "assistant_message" &&
-                        event.turnItem.type !== "reasoning"))
-                  )
-                    updateGate.noteNativeQueued(event);
                   yield* publishToSubscribers(entry.eventSubscribers, { type: "event", event });
                 }),
               ),
             );
             if (!updateGate) return consume;
-            const terminal =
-              event.type === "turn.terminal" ||
-              (event.type === "provider_turn.updated" &&
-                ["completed", "cancelled", "failed", "interrupted"].includes(
-                  event.providerTurn.status,
-                ));
-            return terminal ? updateGate.terminal(consume) : updateGate.observe(consume);
+            const gate = updateGate;
+            return Effect.gen(function* () {
+              // Register input before observe can block the serial pump. Even a
+              // nonsemantic event may have a terminal event queued behind it.
+              gate.noteNativeQueued(event);
+              gate.noteControl();
+              const canonicalSubscriber =
+                (yield* Ref.get(entry.eventSubscribers)).size > 0 &&
+                (event.type === "provider_turn.updated" ||
+                  event.type === "provider_thread.updated" ||
+                  event.type === "subagent.updated" ||
+                  event.type === "runtime_request.updated" ||
+                  (event.type === "node.updated" && event.node.kind !== "assistant_message") ||
+                  (event.type === "turn_item.updated" &&
+                    event.turnItem.type !== "assistant_message" &&
+                    event.turnItem.type !== "reasoning"));
+              const terminal =
+                event.type === "turn.terminal" ||
+                (event.type === "provider_turn.updated" &&
+                  ["completed", "cancelled", "failed", "interrupted"].includes(
+                    event.providerTurn.status,
+                  ));
+              return yield* (terminal ? gate.terminal(consume) : gate.observe(consume)).pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    if (!canonicalSubscriber) gate.noteNativeSettled(event);
+                  }),
+                ),
+              );
+            });
           }),
           Effect.exit,
           Effect.flatMap((exit) =>

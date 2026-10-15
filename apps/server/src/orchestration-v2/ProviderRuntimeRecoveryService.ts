@@ -17,6 +17,7 @@ import * as Deferred from "effect/Deferred";
 import { type RunId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -971,6 +972,14 @@ export const make = Effect.gen(function* () {
     const current = yield* settings.getSettings;
     if (!current.continueThreadsAfterServerUpdate) return false;
     for (const item of updatePrepared) {
+      const intent = yield* outbox.get(item.effectId);
+      if (
+        Option.isNone(intent) ||
+        intent.value.status !== "pending" ||
+        intent.value.request.type !== "provider-runtime.continue" ||
+        intent.value.request.sourceRunId !== item.runId
+      )
+        return false;
       const projection = yield* projections.getRuntimeRecoveryProjection(item.threadId);
       if (
         !resolveProjectSettings(current, projection.thread.projectId).settings

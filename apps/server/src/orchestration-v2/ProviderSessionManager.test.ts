@@ -4,6 +4,8 @@ import { assert, it } from "@effect/vitest";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import {
   EnvironmentId,
+  type DesktopBackendUpdateResponse,
+  type OrchestrationV2Run,
   type ModelSelection,
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
@@ -51,6 +53,9 @@ import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { makeBackendUpdateGate } from "./ProviderRuntimeRecoveryService.ts";
+import { restartContinuationRun } from "./RestartContinuation.ts";
+import { makeBackendUpdateCoordinator } from "../serverRuntimeStartup.ts";
 
 const layerTestDatabase = SqlitePersistence.layerMemory;
 const layerTestStores = Layer.merge(EventStore.layer, ProjectionStore.layer).pipe(
@@ -520,6 +525,7 @@ function layerTest(input: {
   );
   return Layer.mergeAll(
     layerTestStores,
+    layerProviderEventIngestorTest,
     layerConfiguredEventSink,
     IdAllocator.layer,
     layerConfiguredMcpRegistry,
@@ -4758,4 +4764,217 @@ it.effect(
       });
       assert.isFalse(denied?.capabilities?.has("device"));
     }),
+);
+
+it.effect(
+  "ordered native input invalidates a held cut before publication and drains completed state into SQL",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const state = yield* Ref.make(emptyState);
+        yield* Effect.gen(function* () {
+          const sink = yield* EventSink.EventSinkV2;
+          const allocator = yield* IdAllocator.IdAllocatorV2;
+          const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+          const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          const now = yield* DateTime.now;
+          const threadId = ThreadId.make("thread:ordered-update-cut");
+          const sessionId = yield* allocator.allocate.providerSession({
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+          });
+          const created = yield* makeThreadCreatedEvent({ idAllocator: allocator, threadId, now });
+          yield* sink.write({ events: [created] });
+          const runtime = yield* manager.open({
+            threadId,
+            providerSessionId: sessionId,
+            modelSelection,
+            runtimePolicy,
+          });
+          const providerThread = {
+            ...makeProviderThread({
+              idAllocator: allocator,
+              threadId,
+              providerSessionId: sessionId,
+              now,
+            }),
+            status: "active" as const,
+          };
+          const runId = allocator.derive.run({ threadId, ordinal: 1 });
+          const attemptId = allocator.derive.runAttempt({ runId, attemptOrdinal: 1 });
+          const run: OrchestrationV2Run = {
+            id: runId,
+            threadId,
+            ordinal: 1,
+            providerInstanceId: modelSelection.instanceId,
+            modelSelection,
+            providerThreadId: providerThread.id,
+            userMessageId: yield* allocator.allocate.message({ threadId, ordinal: 1 }),
+            rootNodeId: null,
+            activeAttemptId: attemptId,
+            status: "running",
+            queuePosition: null,
+            requestedAt: now,
+            startedAt: now,
+            completedAt: null,
+            checkpointId: null,
+            contextHandoffId: null,
+          };
+          yield* sink.write({
+            events: [
+              {
+                id: yield* allocator.allocate.event({ threadId }),
+                type: "run.created",
+                providerInstanceId: modelSelection.instanceId,
+                threadId,
+                runId,
+                occurredAt: now,
+                payload: run,
+              },
+            ],
+          });
+          const turn = {
+            id: allocator.derive.providerTurn({
+              driver: CODEX_DRIVER,
+              nativeTurnId: "ordered-cut-turn",
+            }),
+            providerThreadId: providerThread.id,
+            nodeId: allocator.derive.rootNode({ runId }),
+            runAttemptId: attemptId,
+            nativeTurnRef: null,
+            ordinal: 1,
+            status: "running" as const,
+            startedAt: now,
+            completedAt: null,
+          };
+          const ingest = (event: ProviderAdapter.ProviderAdapterV2Event) =>
+            ingestor.ingestNormalized({
+              providerSessionId: sessionId,
+              providerInstanceId: modelSelection.instanceId,
+              threadId,
+              runId,
+              event,
+            });
+          yield* ingest({ type: "provider_thread.updated", driver: CODEX_DRIVER, providerThread });
+          yield* ingest({
+            type: "provider_turn.updated",
+            driver: CODEX_DRIVER,
+            providerTurn: turn,
+          });
+          assert.equal(
+            restartContinuationRun(yield* projections.getRuntimeRecoveryProjection(threadId), now)
+              ?.id,
+            runId,
+          );
+          const terminalEvent = {
+            type: "turn.terminal" as const,
+            driver: CODEX_DRIVER,
+            providerThreadId: providerThread.id,
+            providerTurnId: turn.id,
+            runOrdinal: 1,
+            status: "completed" as const,
+            failure: null,
+            threadDisposition: "reusable" as const,
+          };
+          const terminalSettled = yield* Deferred.make<void>();
+          const gate = yield* makeBackendUpdateGate;
+          const blocked = yield* Deferred.make<void>();
+          manager.setUpdateAdmissionGate!({
+            ...gate,
+            noteNativeSettled: (event) => {
+              gate.noteNativeSettled(event);
+              if (event === terminalEvent)
+                Effect.runSync(Deferred.succeed(terminalSettled, undefined));
+            },
+            observe: (effect) =>
+              Effect.suspend(() =>
+                gate.isHeld()
+                  ? Deferred.succeed(blocked, undefined).pipe(Effect.andThen(gate.observe(effect)))
+                  : gate.observe(effect),
+              ),
+          });
+          const subscription = yield* Effect.acquireRelease(
+            runtime.subscribeEvents!,
+            (sub) => sub.close,
+          );
+          const drained = yield* Deferred.make<void>();
+          yield* subscription.events.pipe(
+            Stream.runForEach((event) =>
+              ingest(event).pipe(
+                Effect.andThen(
+                  event.type === "turn.terminal"
+                    ? Deferred.succeed(drained, undefined)
+                    : Effect.void,
+                ),
+              ),
+            ),
+            Effect.forkChild,
+          );
+          const enteredPrepare = yield* Deferred.make<void>();
+          const finishPrepare = yield* Deferred.make<void>();
+          const responses: DesktopBackendUpdateResponse[] = [];
+          const coordinator = yield* makeBackendUpdateCoordinator({
+            environmentId: "env",
+            bootId: "boot",
+            gate,
+            prepare: Deferred.succeed(enteredPrepare, undefined).pipe(
+              Effect.andThen(Deferred.await(finishPrepare)),
+              Effect.as({ runIds: [runId], effectIds: [] }),
+            ),
+            validate: Effect.succeed(true),
+            clear: Effect.void,
+            busy: Effect.succeed(false),
+            wake: Effect.void,
+            send: (response) =>
+              Effect.sync(() => {
+                responses.push(response);
+              }),
+            now: Effect.map(DateTime.now, DateTime.toEpochMillis),
+          });
+          const context = {
+            environmentId: "env",
+            bootId: "boot",
+            requestId: "request",
+            targetVersion: "26",
+            admissionGeneration: 1,
+            expiresAt: DateTime.toEpochMillis(now) + 20_000,
+          };
+          const preparation = yield* coordinator
+            .request({ version: 1, type: "prepareBackendUpdate", context })
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(enteredPrepare);
+          const queue = (yield* Ref.get(state)).eventQueues.get(String(sessionId))!;
+          yield* Queue.offer(queue, {
+            type: "provider_thread.updated",
+            driver: CODEX_DRIVER,
+            providerThread,
+          });
+          yield* Queue.offer(queue, {
+            type: "provider_turn.updated",
+            driver: CODEX_DRIVER,
+            providerTurn: { ...turn, status: "completed", completedAt: now },
+          });
+          yield* Queue.offer(queue, terminalEvent);
+          yield* Deferred.await(blocked);
+          assert.equal(gate.pendingNative(), 1);
+          yield* Deferred.succeed(finishPrepare, undefined);
+          yield* Fiber.join(preparation);
+          assert.isFalse(responses.some((response) => response.type === "backendUpdatePrepared"));
+          assert.isTrue(
+            responses.some(
+              (response) => response.type === "backendUpdateRefused" && response.reason === "stale",
+            ),
+          );
+          yield* coordinator.request({ version: 1, type: "commitBackendUpdate", context });
+          assert.isFalse(responses.some((response) => response.type === "backendUpdateCommitted"));
+          yield* Deferred.await(drained);
+          yield* Deferred.await(terminalSettled);
+          assert.equal(gate.pendingNative(), 0);
+          const final = yield* projections.getRuntimeRecoveryProjection(threadId);
+          assert.equal(final.providerTurns[0]?.status, "completed");
+          assert.isUndefined(restartContinuationRun(final, now));
+        }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+      }),
+    ),
 );
