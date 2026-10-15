@@ -1,5 +1,8 @@
 import {
   DesktopHostTelemetryMessage,
+  type DesktopBackendUpdateBinding,
+  type DesktopBackendUpdateRequest,
+  DesktopBackendUpdateResponse,
   type DesktopHostTelemetrySnapshot,
   type DesktopTelemetryControlMessage,
   type DesktopTelemetryCancelDesktopUpdate,
@@ -10,6 +13,9 @@ import {
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
+import * as Scope from "effect/Scope";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -58,9 +64,43 @@ interface HostPowerIntervals {
   readonly idle: Duration.Duration;
 }
 
+export interface DesktopBackendUpdatePeer {
+  readonly sourceGeneration: number;
+  readonly environmentId: string;
+  readonly bootId: string;
+}
+
+export interface DesktopBackendUpdateSource {
+  readonly closed: Effect.Effect<void>;
+  readonly encoded: Stream.Stream<Uint8Array>;
+  readonly handleControl: (message: DesktopTelemetryControlMessage) => Effect.Effect<void>;
+}
+
+const sameUpdateBinding = (left: DesktopBackendUpdateBinding, right: DesktopBackendUpdateBinding) =>
+  left.environmentId === right.environmentId && left.bootId === right.bootId &&
+  left.requestId === right.requestId && left.targetVersion === right.targetVersion &&
+  left.admissionGeneration === right.admissionGeneration && left.expiresAt === right.expiresAt;
+
+type BackendUpdateAck = Exclude<DesktopBackendUpdateResponse, { readonly type: "backendUpdateHello" }>;
+interface BackendUpdateSourceState {
+  readonly generation: number;
+  readonly outgoing: Queue.Queue<DesktopBackendUpdateRequest>;
+  open: boolean;
+  hello: DesktopBackendUpdatePeer | undefined;
+  outcome: BackendUpdateAck | undefined;
+  pending: {
+    readonly request: DesktopBackendUpdateRequest;
+    readonly signal: Deferred.Deferred<Option.Option<BackendUpdateAck>>;
+  } | undefined;
+}
+
 export class DesktopTelemetryPublisher extends Context.Service<
   DesktopTelemetryPublisher,
   {
+    readonly openBackendUpdateSource?: (sourceId: string) => Effect.Effect<DesktopBackendUpdateSource, never, Scope.Scope>;
+    readonly backendUpdatePeer?: (sourceId: string) => Effect.Effect<Option.Option<DesktopBackendUpdatePeer>>;
+    readonly exchangeBackendUpdate?: (sourceId: string, sourceGeneration: number, request: DesktopBackendUpdateRequest) => Effect.Effect<Option.Option<BackendUpdateAck>>;
+    readonly backendUpdateProofValid?: (sourceId: string, sourceGeneration: number, context: DesktopBackendUpdateBinding, phase: "prepared" | "committed", committedShutdown?: boolean) => Effect.Effect<boolean>;
     readonly latest: Effect.Effect<Option.Option<DesktopHostTelemetrySnapshot>>;
     readonly changes: Stream.Stream<DesktopHostTelemetrySnapshot>;
     readonly encoded: Stream.Stream<Uint8Array>;
@@ -179,6 +219,40 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
   const updateRequestQueue = yield* Queue.unbounded<DesktopTelemetryRequestDesktopUpdate>();
   const updateCommitQueue = yield* Queue.unbounded<DesktopTelemetryCommitDesktopUpdate>();
   const updateCancellationQueue = yield* Queue.unbounded<DesktopTelemetryCancelDesktopUpdate>();
+  const clock = yield* Clock.Clock;
+  const backendSources = new Map<string, BackendUpdateSourceState>();
+  let sourceGeneration = 0;
+  const closeSource = (source: BackendUpdateSourceState) => Effect.gen(function* () {
+    source.open = false;
+    source.hello = undefined;
+    source.outcome = undefined;
+    const pending = source.pending;
+    source.pending = undefined;
+    if (pending !== undefined) yield* Deferred.succeed(pending.signal, Option.none());
+  });
+  const handleBackendResponse = (sourceId: string, source: BackendUpdateSourceState, message: DesktopBackendUpdateResponse) => Effect.gen(function* () {
+    if (!source.open || backendSources.get(sourceId) !== source) return;
+    if (message.type === "backendUpdateHello") {
+      if (source.hello === undefined) {
+        source.hello = { sourceGeneration: source.generation, environmentId: message.environmentId, bootId: message.bootId };
+      } else if (source.hello.environmentId !== message.environmentId || source.hello.bootId !== message.bootId) {
+        yield* closeSource(source); // A different boot cannot replace this pipe's first identity.
+      }
+      return;
+    }
+    const hello = source.hello;
+    if (hello === undefined || hello.environmentId !== message.context.environmentId || hello.bootId !== message.context.bootId) return;
+    const pending = source.pending;
+    if (message.type === "backendUpdateRevoked" && source.outcome !== undefined && sameUpdateBinding(source.outcome.context, message.context)) {
+      source.outcome = message;
+    }
+    if (pending === undefined || !sameUpdateBinding(pending.request.context, message.context)) return;
+    const expected = pending.request.type === "prepareBackendUpdate" ? "backendUpdatePrepared"
+      : pending.request.type === "commitBackendUpdate" ? "backendUpdateCommitted" : "backendUpdateAborted";
+    if (message.type !== expected && message.type !== "backendUpdateRefused" && message.type !== "backendUpdateRevoked") return;
+    source.outcome = message;
+    yield* Deferred.succeed(pending.signal, Option.some(message));
+  });
 
   const offer = (event: PowerEvent): void => {
     Queue.offerUnsafe(powerEvents, event);
@@ -325,6 +399,14 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
     message,
   ) => {
     switch (message.type) {
+      case "backendUpdateHello":
+      case "backendUpdatePrepared":
+      case "backendUpdateCommitted":
+      case "backendUpdateAborted":
+      case "backendUpdateRefused":
+      case "backendUpdateRevoked":
+        // Only a particular process's scoped bootstrap callback can admit these.
+        return Effect.void;
       case "setDiagnosticsDemand":
         return Ref.modify(diagnosticsDemandSources, (sources) => {
           const previous = sources.size > 0;
@@ -414,7 +496,57 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
       Effect.asVoid,
     );
 
+  const openBackendUpdateSource = (sourceId: string) => Effect.gen(function* () {
+    const outgoing = yield* Queue.sliding<DesktopBackendUpdateRequest>(1);
+    const source: BackendUpdateSourceState = { generation: ++sourceGeneration, outgoing, open: true,
+      hello: undefined, outcome: undefined, pending: undefined };
+    const previous = backendSources.get(sourceId);
+    if (previous !== undefined) yield* closeSource(previous);
+    backendSources.set(sourceId, source);
+    yield* Effect.addFinalizer(() => closeSource(source).pipe(Effect.andThen(Effect.sync(() => {
+      if (backendSources.get(sourceId) === source) backendSources.delete(sourceId);
+    }))));
+    return {
+      closed: closeSource(source),
+      encoded: Stream.merge(encoded, Stream.fromQueue(outgoing).pipe(Stream.filter((message) => source.open && source.pending?.request === message), Stream.map((message) => textEncoder.encode(`${encodeMessage(message)}\n`)))),
+      handleControl: (message: DesktopTelemetryControlMessage) => Schema.is(DesktopBackendUpdateResponse)(message)
+        ? handleBackendResponse(sourceId, source, message)
+        : handleControlForSource(sourceId, message),
+    } satisfies DesktopBackendUpdateSource;
+  });
+  const backendUpdatePeer = (sourceId: string) => Effect.sync(() => {
+    const source = backendSources.get(sourceId);
+    return source?.open === true ? Option.fromUndefinedOr(source.hello) : Option.none<DesktopBackendUpdatePeer>();
+  });
+  const backendUpdateProofValid = (sourceId: string, generation: number, context: DesktopBackendUpdateBinding, phase: "prepared" | "committed", committedShutdown = false) => Effect.sync(() => {
+    const source = backendSources.get(sourceId);
+    const outcome = source?.outcome;
+    return source?.open === true && source.generation === generation && outcome !== undefined &&
+      sameUpdateBinding(outcome.context, context) && outcome.reason === "ready" &&
+      outcome.type === (phase === "prepared" ? "backendUpdatePrepared" : "backendUpdateCommitted") &&
+      ((phase === "committed" && committedShutdown) || clock.currentTimeMillisUnsafe() < context.expiresAt);
+  });
+  const exchangeBackendUpdate = (sourceId: string, generation: number, request: DesktopBackendUpdateRequest) => Effect.scoped(Effect.gen(function* () {
+    const source = backendSources.get(sourceId);
+    if (source === undefined || !source.open || source.generation !== generation || source.pending !== undefined ||
+      source.hello?.environmentId !== request.context.environmentId || source.hello.bootId !== request.context.bootId ||
+      (request.type !== "abortBackendUpdate" && clock.currentTimeMillisUnsafe() >= request.context.expiresAt)) return Option.none<BackendUpdateAck>();
+    const signal = yield* Deferred.make<Option.Option<BackendUpdateAck>>();
+    const pending = { request, signal };
+    source.pending = pending;
+    yield* Effect.addFinalizer(() => Effect.sync(() => { if (source.pending === pending) source.pending = undefined; }));
+    yield* Queue.offer(source.outgoing, request);
+    return yield* Deferred.await(signal).pipe(
+      Effect.timeoutOption(Duration.seconds(5)),
+      Effect.map(Option.flatten),
+    );
+  }));
+
   return DesktopTelemetryPublisher.of({
+    openBackendUpdateSource,
+    backendUpdatePeer,
+    exchangeBackendUpdate,
+    backendUpdateProofValid,
     latest: Ref.get(latest),
     changes: Stream.fromPubSub(changes),
     encoded,

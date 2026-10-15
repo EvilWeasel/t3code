@@ -23,6 +23,7 @@
 //     pulls from `DesktopBackendOutputLogFactory.forInstance(spec.id)`,
 //     so each instance lands in its own rotating file.
 
+import type { DesktopBackendUpdateBinding } from "@t3tools/contracts";
 import * as Brand from "effect/Brand";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
@@ -233,6 +234,7 @@ interface RunBackendProcessOptions extends DesktopBackendStartConfig {
   readonly onDesktopTelemetryControl?: (
     message: DesktopTelemetryControlMessageValue,
   ) => Effect.Effect<void>;
+  readonly onDesktopTelemetryControlClosed?: Effect.Effect<void>;
   readonly readinessTimeout?: Duration.Duration;
   readonly outputDrainTimeout?: Duration.Duration;
   readonly onStarted?: (pid: number) => Effect.Effect<void>;
@@ -269,9 +271,21 @@ export const PRIMARY_INSTANCE_ID: BackendInstanceId = BackendInstanceId(
 // One pooled backend instance. Same lifecycle surface as the legacy
 // `DesktopBackendManagerShape`; the id and label give the pool registry
 // + UI something to route on.
+export interface DesktopBackendUpdateProof {
+  readonly instanceId: BackendInstanceId;
+  readonly context: DesktopBackendUpdateBinding;
+  readonly persistedRunIds: ReadonlyArray<string>;
+  readonly commit: Effect.Effect<boolean>;
+  readonly abort: Effect.Effect<boolean>;
+  readonly isValid: Effect.Effect<boolean>;
+  readonly recover: Effect.Effect<void>;
+}
+
 export interface DesktopBackendInstance {
   readonly id: BackendInstanceId;
   readonly label: Effect.Effect<string>;
+  readonly prepareUpdate?: (request: { readonly requestId: string; readonly targetVersion: string; readonly admissionGeneration: number; readonly expiresAt: number }) => Effect.Effect<Option.Option<DesktopBackendUpdateProof>>;
+  readonly stopForUpdate?: (proof: DesktopBackendUpdateProof) => Effect.Effect<boolean>;
   readonly start: Effect.Effect<void>;
   readonly stop: (options?: { readonly timeout?: Duration.Duration }) => Effect.Effect<void>;
   readonly currentConfig: Effect.Effect<Option.Option<DesktopBackendStartConfig>>;
@@ -561,7 +575,7 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
           version: 1,
           type: "setDiagnosticsDemand",
           enabled: false,
-        }),
+        }).pipe(Effect.andThen(options.onDesktopTelemetryControlClosed ?? Effect.void)),
       ),
       Effect.forkScoped,
     );
@@ -957,14 +971,17 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           );
         });
 
+        const updateSource = desktopTelemetryPublisher.openBackendUpdateSource === undefined ? undefined
+          : yield* desktopTelemetryPublisher.openBackendUpdateSource(spec.id).pipe(Scope.provide(runScope));
         const program = runBackendProcess({
           ...config.value,
-          desktopTelemetryStream: desktopTelemetryPublisher.encoded,
+          desktopTelemetryStream: updateSource?.encoded ?? desktopTelemetryPublisher.encoded,
           // Only a bootstrap that names the browser fds (the local primary) gets them.
           desktopBrowserStream: desktopBrowserHost.events,
           onDesktopBrowserCommand: desktopBrowserHost.handleCommandLine,
           onDesktopTelemetryControl: (message) =>
-            desktopTelemetryPublisher.handleControlForSource(spec.id, message),
+            updateSource?.handleControl(message) ?? desktopTelemetryPublisher.handleControlForSource(spec.id, message),
+          onDesktopTelemetryControlClosed: updateSource?.closed,
           onStarted: Effect.fn("desktop.backendInstance.onStarted")(function* (pid) {
             yield* updateActiveRun(runId, (run) => ({
               ...run,
@@ -1104,9 +1121,11 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     });
   });
 
+  const updateStopRevision = yield* Ref.make(0);
   const stop = Effect.fn("desktop.backendInstance.stop")(function* (options?: {
     readonly timeout?: Duration.Duration;
-  }) {
+  }, admittedUpdate = false) {
+    if (!admittedUpdate) yield* Ref.update(updateStopRevision, (revision) => revision + 1);
     const { active, restartFiber, notifyShutdown } = yield* mutex.withPermits(1)(
       Effect.gen(function* () {
         const result = yield* Ref.modify(state, (latest) => {
@@ -1213,11 +1232,80 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
       Effect.map(Option.getOrElse(() => false)),
     );
 
+  const updateProofs = new Set<DesktopBackendUpdateProof>();
+  const committedProofs = new Map<DesktopBackendUpdateProof, { readonly generation: number; readonly stopRevision: number }>();
+  const prepareUpdate = (request: { readonly requestId: string; readonly targetVersion: string; readonly admissionGeneration: number; readonly expiresAt: number }) => Effect.gen(function* () {
+    const peerFor = desktopTelemetryPublisher.backendUpdatePeer;
+    const exchange = desktopTelemetryPublisher.exchangeBackendUpdate;
+    const valid = desktopTelemetryPublisher.backendUpdateProofValid;
+    if (peerFor === undefined || exchange === undefined || valid === undefined) return Option.none<DesktopBackendUpdateProof>();
+    const before = yield* snapshot;
+    const stopRevision = yield* Ref.get(updateStopRevision);
+    if (!before.ready || !before.desiredRunning || Option.isNone(before.activePid) || before.restartScheduled) return Option.none<DesktopBackendUpdateProof>();
+    const peer = yield* peerFor(spec.id);
+    if (Option.isNone(peer)) return Option.none<DesktopBackendUpdateProof>();
+    const generation = peer.value.sourceGeneration;
+    const context = Object.freeze({ ...request, environmentId: peer.value.environmentId, bootId: peer.value.bootId });
+    const prepared = yield* exchange(spec.id, generation, { version: 1, type: "prepareBackendUpdate", context });
+    if (Option.isNone(prepared) || prepared.value.type !== "backendUpdatePrepared" || prepared.value.reason !== "ready") {
+      yield* exchange(spec.id, generation, { version: 1, type: "abortBackendUpdate", context });
+      return Option.none<DesktopBackendUpdateProof>();
+    }
+    let phase: "prepared" | "committed" | "aborted" = "prepared";
+    const proof: DesktopBackendUpdateProof = Object.freeze({
+      instanceId: spec.id, context, persistedRunIds: Object.freeze([...prepared.value.persistedRunIds]),
+      isValid: Effect.gen(function* () {
+        const phaseSnapshot = phase;
+        if (phaseSnapshot === "aborted") return false;
+        const current = yield* snapshot;
+        return phase === phaseSnapshot && (yield* Ref.get(updateStopRevision)) === stopRevision && current.ready && current.desiredRunning &&
+          Option.isSome(current.activePid) && Option.isSome(before.activePid) && current.activePid.value === before.activePid.value &&
+          !current.restartScheduled && (yield* valid(spec.id, generation, context, phaseSnapshot));
+      }),
+      recover: Effect.gen(function* () {
+        // A later explicit stop is a takeover, never a reason to restart it.
+        if ((yield* Ref.get(updateStopRevision)) === stopRevision) yield* start;
+      }),
+      commit: Effect.gen(function* () {
+        if (phase !== "prepared" || !(yield* valid(spec.id, generation, context, "prepared"))) return false;
+        const result = yield* exchange(spec.id, generation, { version: 1, type: "commitBackendUpdate", context });
+        if (Option.isNone(result) || result.value.type !== "backendUpdateCommitted" || result.value.reason !== "ready") return false;
+        phase = "committed";
+        committedProofs.set(proof, { generation, stopRevision });
+        return true;
+      }),
+      abort: Effect.gen(function* () {
+        const result = yield* exchange(spec.id, generation, { version: 1, type: "abortBackendUpdate", context });
+        const aborted = Option.isSome(result) && result.value.type === "backendUpdateAborted";
+        if (aborted) { phase = "aborted"; updateProofs.delete(proof); committedProofs.delete(proof); }
+        return aborted;
+      }),
+    });
+    updateProofs.add(proof);
+    return Option.some(proof);
+  });
+  const stopForUpdate = (proof: DesktopBackendUpdateProof) => Effect.gen(function* () {
+    const committed = committedProofs.get(proof);
+    const valid = desktopTelemetryPublisher.backendUpdateProofValid;
+    if (!updateProofs.has(proof) || committed === undefined || proof.instanceId !== spec.id || valid === undefined ||
+      (yield* Ref.get(updateStopRevision)) !== committed.stopRevision ||
+      !(yield* valid(spec.id, committed.generation, proof.context, "committed", true))) return false;
+    // The batch already checked expiry before ANY stop. Committed server gates
+    // remain held across shutdown; expiry cannot reopen or cancel this phase.
+    yield* stop({ timeout: DEFAULT_BACKEND_TERMINATE_GRACE }, true);
+    updateProofs.delete(proof);
+    committedProofs.delete(proof);
+    const after = yield* snapshot;
+    return Option.isNone(after.activePid) && !after.ready && !after.desiredRunning;
+  });
+
   yield* Effect.addFinalizer(() => stop());
 
   return {
     id: spec.id,
     label: spec.label,
+    prepareUpdate,
+    stopForUpdate,
     start,
     stop,
     currentConfig,

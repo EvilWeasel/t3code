@@ -32,6 +32,8 @@ export interface UpdatesHarnessOptions {
   readonly downloadUpdate?: Effect.Effect<void>;
   readonly quitAndInstall?: Effect.Effect<void, ElectronUpdater.ElectronUpdaterQuitAndInstallError | ElectronUpdater.ElectronUpdaterNixActivationAdmissionError>;
   readonly stopBackend?: Effect.Effect<void>;
+  readonly backendInstances?: ReadonlyArray<DesktopBackendPool.DesktopBackendInstance>;
+  readonly inventoryLane?: <A, E, R>(use: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   readonly startBackend?: Effect.Effect<void>;
   readonly env?: Record<string, string | undefined>;
   readonly platform?: NodeJS.Platform;
@@ -47,7 +49,7 @@ export interface UpdatesHarnessOptions {
   readonly backendSnapshot?: DesktopBackendPool.DesktopBackendInstance["snapshot"];
   /** Contents of the install record a previous run left behind. */
   readonly installRecord?: string | undefined;
-  readonly beforeWriteInstallRecord?: Effect.Effect<void>;
+  readonly beforeWriteInstallRecord?: Effect.Effect<void, PlatformError.PlatformError>;
 }
 
 export function makeHarness(options: UpdatesHarnessOptions = {}) {
@@ -172,15 +174,16 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     }),
     waitForReady: () => Effect.succeed(true),
   };
+  const backendInstances = options.backendInstances ?? [stubBackendInstance];
   const layerBackend = options.clientOnlyInventory === undefined
-    ? DesktopBackendPool.layerTest([stubBackendInstance])
+    ? DesktopBackendPool.layerTest(backendInstances)
     : Layer.succeed(DesktopBackendPool.DesktopBackendPool, {
       primary: Effect.succeed(stubBackendInstance),
       get: () => Effect.succeedSome(stubBackendInstance),
-      list: Effect.succeed([stubBackendInstance]),
+      list: Effect.succeed(backendInstances),
       register: () => Effect.die("unexpected backend registration"),
       unregister: () => Effect.die("unexpected backend removal"),
-      withUpdateInventory: (use) => use([stubBackendInstance]).pipe(Effect.map(Option.some)),
+      withUpdateInventory: (use) => (options.inventoryLane?.(use(backendInstances)) ?? use(backendInstances)).pipe(Effect.map(Option.some)),
     });
 
   const layerEnvironment = DesktopEnvironment.layer({
@@ -287,7 +290,7 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
   });
 
   const layer = DesktopUpdates.layer.pipe(
-    Layer.provideMerge(options.omitInstallQualification ? Layer.empty : Layer.succeed(DesktopUpdates.DesktopUpdateInstallQualification, {
+    Layer.provideMerge(options.omitInstallQualification || options.clientOnlyInventory === undefined ? Layer.empty : Layer.succeed(DesktopUpdates.DesktopUpdateInstallQualification, {
       acquireRuntimeReservation: () => Effect.acquireRelease(
         Effect.sync(() => options.clientOnlyInventory === undefined || options.clientOnlyInstallQualified === false
           ? Option.none()

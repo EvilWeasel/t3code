@@ -8,17 +8,50 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import * as References from "effect/References";
 import * as Ref from "effect/Ref";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
+import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
 import * as ElectronUpdater from "../electron/ElectronUpdater.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopState from "../app/DesktopState.ts";
 import * as DesktopUpdates from "./DesktopUpdates.ts";
 import { flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
+
+function ownedBackendFixture(
+  name: string,
+  steps: string[],
+  options: { readonly refusal?: "prepare" | "commit" | "stale" | "busy"; readonly commit?: Effect.Effect<boolean>; readonly stop?: Effect.Effect<boolean>; readonly recover?: Effect.Effect<void> } = {},
+): DesktopBackendPool.DesktopBackendInstance {
+  return {
+    id: DesktopBackendPool.BackendInstanceId(name), label: Effect.succeed(name),
+    start: Effect.sync(() => { steps.push(`recover:${name}`); }),
+    stop: () => Effect.die("admitted update must not call unqualified raw stop"),
+    currentConfig: Effect.succeedNone,
+    snapshot: Effect.succeed({ desiredRunning: true, ready: options.refusal !== "busy", activePid: Option.some(123), restartAttempt: 0, restartScheduled: false }),
+    waitForReady: () => Effect.succeed(true),
+    prepareUpdate: (request) => Effect.sync(() => {
+      steps.push(`prepare:${name}`);
+      if (options.refusal === "prepare") return Option.none();
+      return Option.some({
+        instanceId: DesktopBackendPool.BackendInstanceId(name),
+        context: { ...request, environmentId: name, bootId: `boot:${name}` }, persistedRunIds: [`eligible:${name}`],
+        isValid: Effect.succeed(options.refusal !== "stale"),
+        recover: options.recover ?? Effect.sync(() => { steps.push(`recover:${name}`); }),
+        commit: (options.commit ?? Effect.succeed(options.refusal !== "commit")).pipe(Effect.tap((accepted) => Effect.sync(() => {
+          steps.push(`${accepted ? "committed" : "refused"}:${name}`);
+        }))),
+        abort: Effect.sync(() => { steps.push(`abort:${name}`); return true; }),
+      });
+    }),
+    stopForUpdate: () => Effect.sync(() => { steps.push(`stop:${name}`); }).pipe(Effect.andThen(options.stop ?? Effect.succeed(true))),
+  };
+}
 
 describe("DesktopUpdates", () => {
   it.effect("keeps the production default staged when the qualification service is completely absent", () => {
@@ -292,6 +325,125 @@ describe("DesktopUpdates", () => {
       assert.equal(harness.stopCount(), 0);
     })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   });
+
+  it.effect("prepares and commits ALL owned backends before stopping any of them", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const steps: string[] = [];
+      const commitStarted = yield* Deferred.make<void>();
+      const finishCommit = yield* Deferred.make<void>();
+      const installed = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        clientOnlyInventory: [],
+        backendInstances: [ownedBackendFixture("primary", steps), ownedBackendFixture("wsl", steps, {
+          commit: Deferred.succeed(commitStarted, undefined).pipe(Effect.andThen(Deferred.await(finishCommit)), Effect.as(true)),
+        })],
+        quitAndInstall: Effect.sync(() => { steps.push("native"); }).pipe(Effect.andThen(Deferred.succeed(installed, undefined)), Effect.asVoid),
+      });
+      yield* Effect.scoped(Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        yield* TestClock.adjust(Duration.seconds(15));
+        harness.emit("update-downloaded", { version: "1.2.4" });
+        yield* flushCallbacks;
+        yield* TestClock.adjust(Duration.seconds(45));
+        yield* Deferred.await(commitStarted);
+        assert.isFalse(steps.some((step) => step.startsWith("stop:")));
+        assert.equal(harness.quitAndInstalls(), 0);
+        yield* Deferred.succeed(finishCommit, undefined);
+        yield* Deferred.await(installed);
+        const firstStop = steps.findIndex((step) => step.startsWith("stop:"));
+        assert.isAbove(firstStop, steps.indexOf("committed:primary"));
+        assert.isAbove(firstStop, steps.indexOf("committed:wsl"));
+        assert.isAbove(steps.indexOf("native"), steps.indexOf("stop:primary"));
+        assert.isAbove(steps.indexOf("native"), steps.indexOf("stop:wsl"));
+        assert.isFalse(steps.some((step) => step.startsWith("abort:")));
+      })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+    })),
+  );
+
+  it.effect("keeps the update staged and aborts prepared peers on any owned refusal with ZERO stops", () =>
+    Effect.gen(function* () {
+      for (const refusal of ["prepare", "commit", "stale", "busy"] as const) {
+        const steps: string[] = [];
+        const released = yield* Deferred.make<void>();
+        const harness = makeHarness({ clientOnlyInventory: [],
+          backendInstances: [ownedBackendFixture("primary", steps), ownedBackendFixture("wsl", steps, { refusal })],
+          runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
+        });
+        yield* Effect.scoped(Effect.gen(function* () {
+          const updates = yield* DesktopUpdates.DesktopUpdates;
+          yield* updates.configure;
+          yield* TestClock.adjust(Duration.seconds(15));
+          harness.emit("update-downloaded", { version: "1.2.4" });
+          yield* flushCallbacks;
+          yield* TestClock.adjust(Duration.seconds(45));
+          yield* Deferred.await(released);
+          assert.isFalse(steps.some((step) => step.startsWith("stop:")), refusal);
+          assert.isTrue(steps.includes("abort:primary"), refusal);
+          assert.equal(harness.quitAndInstalls(), 0, refusal);
+          assert.equal((yield* updates.getState).status, "downloaded", refusal);
+        })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+      }
+    }),
+  );
+
+  it.effect("aborts all committed peers without stopping when the batch expires during a delayed commit ACK", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const commitStarted = yield* Deferred.make<void>();
+      const finishCommit = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      const steps: string[] = [];
+      const harness = makeHarness({ clientOnlyInventory: [],
+        backendInstances: [ownedBackendFixture("primary", steps), ownedBackendFixture("secondary", steps, {
+          commit: Deferred.succeed(commitStarted, undefined).pipe(Effect.andThen(Deferred.await(finishCommit)), Effect.as(true)),
+        })],
+        runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
+      });
+      yield* Effect.scoped(Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        yield* TestClock.adjust(Duration.seconds(15));
+        harness.emit("update-downloaded", { version: "1.2.4" });
+        yield* flushCallbacks;
+        yield* TestClock.adjust(Duration.seconds(45));
+        yield* Deferred.await(commitStarted);
+        yield* TestClock.adjust(Duration.seconds(30));
+        yield* Deferred.succeed(finishCommit, undefined);
+        yield* Deferred.await(released);
+        assert.isTrue(steps.includes("committed:primary"));
+        assert.isTrue(steps.includes("committed:secondary"));
+        assert.isTrue(steps.includes("abort:primary"));
+        assert.isTrue(steps.includes("abort:secondary"));
+        assert.isFalse(steps.some((step) => step.startsWith("stop:")));
+        assert.equal(harness.quitAndInstalls(), 0);
+        assert.equal((yield* updates.getState).status, "downloaded");
+      })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+    })),
+  );
+
+  it.effect("refuses local installation on an unverifiable install-record write before ANY owned stop", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const steps: string[] = [];
+      const released = yield* Deferred.make<void>();
+      const harness = makeHarness({ clientOnlyInventory: [], backendInstances: [ownedBackendFixture("primary", steps)],
+        beforeWriteInstallRecord: Effect.fail(PlatformError.systemError({ _tag: "PermissionDenied", module: "FileSystem", method: "writeFileString" })),
+        runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
+      });
+      yield* Effect.scoped(Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        yield* TestClock.adjust(Duration.seconds(15));
+        harness.emit("update-downloaded", { version: "1.2.4" });
+        yield* flushCallbacks;
+        yield* TestClock.adjust(Duration.seconds(45));
+        yield* Deferred.await(released);
+        assert.isFalse(steps.some((step) => step.startsWith("stop:")));
+        assert.isTrue(steps.includes("abort:primary"));
+        assert.equal(harness.quitAndInstalls(), 0);
+        assert.equal((yield* updates.getState).status, "downloaded");
+      })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+    })),
+  );
 
   it.effect("only enables the packaged fork feed and never polls upstream or custom hosts", () =>
     Effect.gen(function* () {
@@ -1487,3 +1639,59 @@ describe("describeUpdateErrorCause", () => {
     assert.equal(DesktopUpdates.describeUpdateErrorCause(unreadable), "UnknownError");
   });
 });
+
+it.effect("releases the held pool lane before canonical backend recovery after installer failure", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const lane = yield* Semaphore.make(1);
+    const recovered = yield* Deferred.make<void>();
+    const steps: string[] = [];
+    const harness = makeHarness({ clientOnlyInventory: [], inventoryLane: (use) => lane.withPermits(1)(use),
+      backendInstances: [ownedBackendFixture("primary", steps, {
+        recover: lane.withPermits(1)(Effect.sync(() => { steps.push("recovered"); }).pipe(Effect.andThen(Deferred.succeed(recovered, undefined)), Effect.asVoid)),
+      })],
+      quitAndInstall: Effect.fail(new ElectronUpdater.ElectronUpdaterQuitAndInstallError({ channel: "nightly", isSilent: true, isForceRunAfter: true, cause: "installer refused" })),
+    });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      yield* Deferred.await(recovered);
+      const { changes } = yield* updates.subscribe;
+      yield* changes.pipe(Stream.filter((state) => state.errorContext === "install"), Stream.runHead);
+      assert.isTrue(steps.includes("stop:primary"));
+      assert.isTrue(steps.includes("recovered"));
+      assert.isFalse(steps.includes("abort:primary")); // A committed/stopped peer is never reopened by abort.
+      assert.equal((yield* updates.getState).errorContext, "install");
+    })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  })),
+);
+
+it.effect("uses explicit recovery after partial shutdown and never falsely reports zero stops", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const recovered = yield* Deferred.make<void>();
+    const steps: string[] = [];
+    const harness = makeHarness({ clientOnlyInventory: [], backendInstances: [
+      ownedBackendFixture("primary", steps),
+      ownedBackendFixture("wsl", steps, { stop: Effect.succeed(false), recover: Deferred.succeed(recovered, undefined).pipe(Effect.asVoid) }),
+    ] });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      yield* Deferred.await(recovered);
+      const { changes } = yield* updates.subscribe;
+      yield* changes.pipe(Stream.filter((state) => state.errorContext === "install"), Stream.runHead);
+      assert.isTrue(steps.includes("stop:primary"));
+      assert.isTrue(steps.includes("stop:wsl"));
+      assert.isFalse(steps.some((step) => step.startsWith("abort:")));
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.equal((yield* updates.getState).errorContext, "install");
+    })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  })),
+);

@@ -112,6 +112,7 @@ export type BackendInstanceId = DesktopBackendManager.BackendInstanceId;
 export const BackendInstanceId = DesktopBackendManager.BackendInstanceId;
 export const PRIMARY_INSTANCE_ID = DesktopBackendManager.PRIMARY_INSTANCE_ID;
 export type DesktopBackendInstance = DesktopBackendManager.DesktopBackendInstance;
+export type DesktopBackendUpdateProof = DesktopBackendManager.DesktopBackendUpdateProof;
 export type BackendInstanceSpec = DesktopBackendManager.BackendInstanceSpec;
 
 // Caller tried to register an id that's already in the pool. The pool

@@ -1673,3 +1673,53 @@ describe("DesktopBackendManager", () => {
     ),
   );
 });
+
+it.effect("requires an owned committed proof before canonical stop and preserves a later explicit stop during recovery", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const ready = yield* Deferred.make<void>();
+    let starts = 0;
+    let closes = 0;
+    let phase: "prepared" | "committed" | "aborted" = "prepared";
+    const spawnerLayer = Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, ChildProcessSpawner.make(() => Effect.gen(function* () {
+      starts++;
+      const exited = yield* Deferred.make<void>();
+      const scope = yield* Scope.Scope;
+      const close = Effect.sync(() => { closes++; }).pipe(Effect.andThen(Deferred.succeed(exited, undefined)), Effect.asVoid);
+      yield* Scope.addFinalizer(scope, close);
+      return makeProcess({
+        exitCode: Deferred.await(exited).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+        getOutputFd: () => Stream.never,
+        kill: () => close,
+      });
+    })));
+    const instance = yield* makeTestInstance({ spawnerLayer, onReady: Deferred.succeed(ready, undefined).pipe(Effect.asVoid),
+      desktopTelemetryPublisher: {
+        openBackendUpdateSource: () => Effect.succeed({ encoded: Stream.empty, closed: Effect.void, handleControl: () => Effect.void }),
+        backendUpdatePeer: () => Effect.succeedSome({ sourceGeneration: 1, environmentId: "owned-env", bootId: "actual-boot" }),
+        exchangeBackendUpdate: (_sourceId, _sourceGeneration, request) => Effect.sync(() => {
+          phase = request.type === "commitBackendUpdate" ? "committed" : request.type === "abortBackendUpdate" ? "aborted" : "prepared";
+          return Option.some({ version: 1 as const,
+            type: phase === "committed" ? "backendUpdateCommitted" as const : phase === "aborted" ? "backendUpdateAborted" as const : "backendUpdatePrepared" as const,
+            context: request.context, persistedRunIds: ["eligible-native-run"], reason: phase === "aborted" ? "aborted" as const : "ready" as const,
+          });
+        }),
+        backendUpdateProofValid: (_sourceId, _sourceGeneration, _context, expected) => Effect.sync(() => expected === phase),
+      },
+    });
+    yield* instance.start;
+    yield* Deferred.await(ready);
+    const prepare = instance.prepareUpdate;
+    const stopForUpdate = instance.stopForUpdate;
+    if (!prepare || !stopForUpdate) return yield* Effect.die("missing update admission");
+    const proof = Option.getOrThrow(yield* prepare({ requestId: "attempt", targetVersion: "1.2.4", admissionGeneration: 1, expiresAt: (yield* Effect.clockWith((clock) => clock.currentTimeMillis)) + 30_000 }));
+    assert.isFalse(yield* stopForUpdate(proof));
+    assert.equal(closes, 0);
+    assert.isTrue(yield* proof.commit);
+    assert.isTrue(yield* stopForUpdate(proof));
+    assert.equal(closes, 1);
+    assert.isTrue(Option.isNone((yield* instance.snapshot).activePid));
+    yield* instance.stop(); // A later explicit user stop overrides automatic restoration.
+    yield* proof.recover;
+    assert.equal(starts, 1);
+  })),
+);

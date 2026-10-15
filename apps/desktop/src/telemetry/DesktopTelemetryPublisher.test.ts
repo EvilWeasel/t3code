@@ -788,3 +788,94 @@ describe("DesktopRendererHistory", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
+
+const backendUpdateTestLayer = DesktopTelemetryPublisher.layer.pipe(Layer.provide(Layer.mergeAll(
+  layerElectronApp([]), layerHistory,
+  Layer.succeed(ElectronPowerMonitor.ElectronPowerMonitor, {
+    isOnBatteryPower: Effect.succeed(false), getSystemIdleTime: Effect.succeed(0),
+    getSystemIdleState: () => Effect.succeed("active"), getCurrentThermalState: Effect.succeed("nominal"),
+    onSimpleEvent: () => Effect.void, onThermalStateChange: () => Effect.void, onSpeedLimitChange: () => Effect.void,
+  }),
+)));
+
+it.effect("binds backend update ACKs to the exact scoped bootstrap and rejects stale context or revocation", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const publisher = yield* DesktopTelemetryPublisher.DesktopTelemetryPublisher;
+    const open = publisher.openBackendUpdateSource;
+    const peerFor = publisher.backendUpdatePeer;
+    const exchange = publisher.exchangeBackendUpdate;
+    const valid = publisher.backendUpdateProofValid;
+    if (!open || !peerFor || !exchange || !valid) return yield* Effect.die("missing owned backend update protocol");
+    const source = yield* open("owned-primary");
+    yield* publisher.handleControlForSource("owned-primary", { version: 1, type: "backendUpdateHello", environmentId: "env", bootId: "boot" });
+    assert.isTrue(Option.isNone(yield* peerFor("owned-primary"))); // Unbound generic callback cannot qualify a peer.
+    yield* source.handleControl({ version: 1, type: "backendUpdateHello", environmentId: "env", bootId: "boot" });
+    const peer = Option.getOrThrow(yield* peerFor("owned-primary"));
+    const now = yield* Effect.clockWith((clock) => Effect.succeed(clock.currentTimeMillisUnsafe()));
+    const context = { environmentId: "env", bootId: "boot", requestId: "attempt", targetVersion: "1.2.4", admissionGeneration: 1, expiresAt: now + 20_000 };
+    const decode = Schema.decodeUnknownSync(Schema.fromJsonString(DesktopHostTelemetryMessage));
+    const request = yield* source.encoded.pipe(
+      Stream.map((bytes) => decode(new TextDecoder().decode(bytes))),
+      Stream.filter((message) => message.type === "prepareBackendUpdate"), Stream.runHead, Effect.forkScoped,
+    );
+    const response = yield* exchange("owned-primary", peer.sourceGeneration, { version: 1, type: "prepareBackendUpdate", context }).pipe(Effect.forkScoped);
+    assert.isTrue(Option.isSome(yield* Fiber.join(request)));
+    yield* source.handleControl({ version: 1, type: "backendUpdatePrepared", context: { ...context, requestId: "old-attempt" }, persistedRunIds: [], reason: "ready" });
+    assert.isUndefined(response.pollUnsafe());
+    yield* source.handleControl({ version: 1, type: "backendUpdatePrepared", context, persistedRunIds: ["eligible-run"], reason: "ready" });
+    const accepted = yield* Fiber.join(response);
+    assert.isTrue(Option.isSome(accepted));
+    assert.isTrue(yield* valid("owned-primary", peer.sourceGeneration, context, "prepared"));
+    yield* source.handleControl({ version: 1, type: "backendUpdateRevoked", context, persistedRunIds: [], reason: "busy" });
+    assert.isFalse(yield* valid("owned-primary", peer.sourceGeneration, context, "prepared"));
+  })).pipe(Effect.provide(backendUpdateTestLayer)),
+);
+
+it.effect("cannot let an old source callback or finalizer replace the new process identity", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const publisher = yield* DesktopTelemetryPublisher.DesktopTelemetryPublisher;
+    const open = publisher.openBackendUpdateSource;
+    const peerFor = publisher.backendUpdatePeer;
+    if (!open || !peerFor) return yield* Effect.die("missing bootstrap scope");
+    const oldScope = yield* Scope.make();
+    const old = yield* open("owned-primary").pipe(Scope.provide(oldScope));
+    yield* old.handleControl({ version: 1, type: "backendUpdateHello", environmentId: "same-env", bootId: "old-boot" });
+    const before = Option.getOrThrow(yield* peerFor("owned-primary"));
+    const fresh = yield* open("owned-primary");
+    yield* old.handleControl({ version: 1, type: "backendUpdateHello", environmentId: "same-env", bootId: "old-boot" });
+    assert.isTrue(Option.isNone(yield* peerFor("owned-primary")));
+    yield* fresh.handleControl({ version: 1, type: "backendUpdateHello", environmentId: "same-env", bootId: "new-boot" });
+    yield* Scope.close(oldScope, Exit.void);
+    const current = Option.getOrThrow(yield* peerFor("owned-primary"));
+    assert.equal(current.bootId, "new-boot");
+    assert.isAbove(current.sourceGeneration, before.sourceGeneration);
+    yield* fresh.handleControl({ version: 1, type: "backendUpdateHello", environmentId: "same-env", bootId: "unexpected-third-boot" });
+    assert.isTrue(Option.isNone(yield* peerFor("owned-primary"))); // No mid-pipe rebinding.
+  })).pipe(Effect.provide(backendUpdateTestLayer)),
+);
+
+it.effect("does not accept a missing ACK or a late ACK after its exact exchange expired", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const publisher = yield* DesktopTelemetryPublisher.DesktopTelemetryPublisher;
+    const open = publisher.openBackendUpdateSource;
+    const peerFor = publisher.backendUpdatePeer;
+    const exchange = publisher.exchangeBackendUpdate;
+    const valid = publisher.backendUpdateProofValid;
+    if (!open || !peerFor || !exchange || !valid) return yield* Effect.die("missing backend capability");
+    const source = yield* open("owned-primary");
+    yield* source.handleControl({ version: 1, type: "backendUpdateHello", environmentId: "env", bootId: "boot" });
+    const peer = Option.getOrThrow(yield* peerFor("owned-primary"));
+    const context = { environmentId: "env", bootId: "boot", requestId: "missing-ack", targetVersion: "1.2.4", admissionGeneration: 1, expiresAt: 30_000 };
+    const decode = Schema.decodeUnknownSync(Schema.fromJsonString(DesktopHostTelemetryMessage));
+    const observed = yield* source.encoded.pipe(Stream.map((bytes) => decode(new TextDecoder().decode(bytes))),
+      Stream.filter((message) => message.type === "prepareBackendUpdate"), Stream.runHead, Effect.forkScoped);
+    const response = yield* exchange("owned-primary", peer.sourceGeneration, { version: 1, type: "prepareBackendUpdate", context }).pipe(Effect.forkScoped);
+    yield* Fiber.join(observed);
+    yield* TestClock.adjust(Duration.seconds(5));
+    assert.isTrue(Option.isNone(yield* Fiber.join(response)));
+    yield* source.handleControl({ version: 1, type: "backendUpdatePrepared", context, reason: "ready", persistedRunIds: [] });
+    assert.isFalse(yield* valid("owned-primary", peer.sourceGeneration, context, "prepared"));
+    yield* source.closed;
+    assert.isTrue(Option.isNone(yield* peerFor("owned-primary")));
+  })).pipe(Effect.provide(Layer.merge(TestClock.layer(), backendUpdateTestLayer))),
+);

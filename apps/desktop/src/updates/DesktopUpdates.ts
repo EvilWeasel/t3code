@@ -166,9 +166,13 @@ export class DesktopUpdateUnexpectedActionError extends Schema.TaggedError<Deskt
 
 export type DesktopUpdateConfigureError = never;
 
-/** Production intentionally supplies no qualification: guest WebContents and
- * native auxiliary-window creation still lack a complete held admission fence.
- * Existing automatic downloads remain enabled independently of installation. */
+interface OwnedBackendInstallAdmission {
+  readonly instances: ReadonlyArray<DesktopBackendPool.DesktopBackendInstance>;
+  readonly stopAll: Effect.Effect<boolean>;
+  readonly stopping: () => boolean;
+  readonly deferRecovery: (message: string, preserveInstallRecord?: boolean) => Effect.Effect<void>;
+}
+
 export interface DesktopUpdateRuntimeReservation {
   /** Must inspect the live reservation, including revocation and expiry. */
   readonly isValid: () => boolean;
@@ -176,6 +180,9 @@ export interface DesktopUpdateRuntimeReservation {
   readonly tryCommit: () => boolean;
 }
 
+/** Production supplies no qualification until complete activity, native creation
+ * and backend continuation admission have been independently qualified.
+ * Verified background preparation remains independent of installation. */
 export class DesktopUpdateInstallQualification extends Context.Service<
   DesktopUpdateInstallQualification,
   {
@@ -387,6 +394,9 @@ export const make = Effect.gen(function* () {
   const finishedUpdateActions = yield* PubSub.unbounded<UpdateAction>();
   const updaterConfiguredRef = yield* Ref.make(false);
   const clientOnlyInstallRef = yield* Ref.make(false);
+  const recoveryInstancesRef = yield* Ref.make<ReadonlyArray<DesktopBackendPool.DesktopBackendInstance> | null>(null);
+  const heldRecoveryRef = yield* Ref.make<OwnedBackendInstallAdmission["deferRecovery"] | null>(null);
+  const admissionSequence = yield* Ref.make(0);
   const pendingReadiness = yield* Ref.make<{
     readonly lease: DesktopUpdateInstallLease;
     readonly senders: ReadonlySet<number>;
@@ -672,9 +682,10 @@ export const make = Effect.gen(function* () {
     fileSystem.makeDirectory(updateRestartMarkerDir, { recursive: true }).pipe(
       Effect.andThen(encodeInstallRecord({ fromVersion: environment.appVersion, targetVersion })),
       Effect.flatMap((text) => fileSystem.writeFileString(installRecordPath, text)),
-      Effect.catch((error) =>
-        logUpdaterWarning("Could not record the update install.", { errorTag: error._tag }),
-      ),
+      Effect.andThen(fileSystem.readFileString(installRecordPath)),
+      Effect.flatMap(decodeInstallRecord),
+      Effect.map((record) => record.fromVersion === environment.appVersion && record.targetVersion === targetVersion),
+      Effect.catch((error) => logUpdaterWarning("Could not verify the update install record.", { errorTag: error._tag }).pipe(Effect.as(false))),
     );
   const removeInstallRecord = fileSystem
     .remove(installRecordPath, { force: true })
@@ -713,6 +724,8 @@ export const make = Effect.gen(function* () {
       finishUpdateAction("install"),
       Ref.set(desktopState.quitting, false),
       Ref.set(clientOnlyInstallRef, false),
+      Ref.set(recoveryInstancesRef, null),
+      Ref.set(heldRecoveryRef, null),
       removeUpdateRestartMarker,
       removeInstallRecord,
     ],
@@ -723,6 +736,12 @@ export const make = Effect.gen(function* () {
     message: string,
     preserveInstallRecord = false,
   ) {
+    const heldRecovery = yield* Ref.get(heldRecoveryRef);
+    if (heldRecovery !== null) {
+      yield* heldRecovery(message, preserveInstallRecord);
+      yield* PubSub.publish(finishedUpdateActions, "install-recovery");
+      return;
+    }
     const ownsRecovery = yield* Ref.modify(activeUpdateActionRef, (activeAction) =>
       Option.isSome(activeAction) && activeAction.value === "install"
         ? ([true, Option.some<UpdateAction>("install-recovery")] as const)
@@ -734,7 +753,8 @@ export const make = Effect.gen(function* () {
     yield* removeUpdateRestartMarker;
     if (!preserveInstallRecord) yield* removeInstallRecord;
     yield* Effect.gen(function* () {
-      const instances = (yield* Ref.get(clientOnlyInstallRef)) ? [] : yield* pool.list;
+      const recoveryInstances = yield* Ref.get(recoveryInstancesRef);
+      const instances = recoveryInstances ?? ((yield* Ref.get(clientOnlyInstallRef)) ? [] : yield* pool.list);
       const restartExit = yield* Effect.forEach(instances, (instance) => instance.start, {
         concurrency: "unbounded",
         discard: true,
@@ -751,7 +771,7 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const installDownloadedUpdate = (expectedVersion?: string, clientOnly = false, runtime?: DesktopUpdateRuntimeReservation) =>
+  const installDownloadedUpdate = (expectedVersion?: string, clientOnly = false, runtime?: DesktopUpdateRuntimeReservation, owned?: OwnedBackendInstallAdmission) =>
     Effect.scoped(
       Effect.gen(function* () {
         const actionCompletions = yield* PubSub.subscribe(finishedUpdateActions);
@@ -764,7 +784,7 @@ export const make = Effect.gen(function* () {
               const hasExpectedDownload =
                 state.downloadedVersion !== null &&
                 (expectedVersion === undefined || state.downloadedVersion === expectedVersion);
-              if (clientOnly && (state.installLease?.phase !== "commit" ||
+              if (runtime !== undefined && (state.installLease?.phase !== "commit" ||
                 state.installLease.targetVersion !== expectedVersion ||
                 (yield* Clock.currentTimeMillis) >= state.installLease.expiresAt - 5_000)) return "refused" as const;
               if (
@@ -803,12 +823,21 @@ export const make = Effect.gen(function* () {
         }
 
         yield* Ref.set(clientOnlyInstallRef, clientOnly);
+        yield* Ref.set(recoveryInstancesRef, owned?.instances ?? null);
+        yield* Ref.set(heldRecoveryRef, owned?.deferRecovery ?? null);
         yield* Ref.set(desktopState.quitting, true);
 
+        const recover = (message: string, preserveInstallRecord = false) => owned === undefined
+          ? recoverFailedInstall(message, preserveInstallRecord)
+          : owned.deferRecovery(message, preserveInstallRecord);
         return yield* Effect.gen(function* () {
           if (!clientOnly) yield* writeUpdateRestartMarker;
           const { downloadedVersion } = yield* Ref.get(updateStateRef);
-          if (downloadedVersion !== null) yield* writeInstallRecord(downloadedVersion);
+          const recordVerified = downloadedVersion !== null && (yield* writeInstallRecord(downloadedVersion));
+          if (runtime !== undefined && !recordVerified) {
+            yield* resetInstallAction;
+            return { accepted: false, completed: false, failed: false };
+          }
           // Stop every backend in the pool, not just the primary. With
           // parallel WSL + Windows backends, leaving the WSL instance up
           // means quitAndInstall's app.quit() exits before the pool's
@@ -816,31 +845,38 @@ export const make = Effect.gen(function* () {
           // WSL child gets hard-killed by the OS instead of receiving
           // SIGTERM + grace. Stops run concurrently with the same 5s
           // budget the primary had on its own.
-          const instances = clientOnly ? [] : yield* pool.list;
-          yield* Effect.forEach(
-            instances,
-            (instance) => instance.stop({ timeout: Duration.seconds(5) }),
-            { concurrency: "unbounded" },
-          );
+          if (owned !== undefined) {
+            if (!(yield* owned.stopAll)) {
+              if (owned.stopping()) {
+                yield* recover("Prepared backend shutdown did not complete; installation was deferred.");
+                return { accepted: true, completed: false, failed: true };
+              }
+              yield* resetInstallAction;
+              return { accepted: false, completed: false, failed: false };
+            }
+          } else {
+            const instances = clientOnly ? [] : yield* pool.list;
+            yield* Effect.forEach(instances, (instance) => instance.stop({ timeout: Duration.seconds(5) }), { concurrency: "unbounded" });
+          }
           yield* electronUpdater.quitAndInstall({
             isSilent: true,
             isForceRunAfter: true,
-            ...(clientOnly ? { beforeInstall: () => runtime?.isValid() === true } : {}),
+            ...(runtime === undefined ? {} : { beforeInstall: () => runtime.isValid() }),
           });
           return { accepted: true, completed: false, failed: false };
         }).pipe(
           Effect.catchTags({
-            ElectronUpdaterNixActivationAdmissionError: (error) => recoverFailedInstall(error.message, true).pipe(
+            ElectronUpdaterNixActivationAdmissionError: (error) => recover(error.message, true).pipe(
               Effect.as({ accepted: true, completed: false, failed: true }),
             ),
-            ElectronUpdaterInstallAdmissionError: () => clientOnly
+            ElectronUpdaterInstallAdmissionError: () => (clientOnly || (owned !== undefined && !owned.stopping()))
               ? resetInstallAction.pipe(Effect.as({ accepted: false, completed: false, failed: false }))
-              : recoverFailedInstall("Desktop update admission was revoked before installation.").pipe(
+              : recover("Desktop update admission was revoked before installation.").pipe(
                 Effect.as({ accepted: true, completed: false, failed: true }),
               ),
             ElectronUpdaterQuitAndInstallError: Effect.fn("desktop.updates.handleInstallFailure")(
               function* (error) {
-                yield* recoverFailedInstall(error.message);
+                yield* recover(error.message);
                 yield* logUpdaterError(error.message, {
                   errorTag: error._tag,
                   cause: describeUpdateErrorCause(error.cause),
@@ -852,14 +888,14 @@ export const make = Effect.gen(function* () {
               },
             ),
           }),
-          Effect.onInterrupt(() => resetInstallAction),
+          Effect.onInterrupt(() => owned?.stopping() ? recover("Desktop update was interrupted after backend shutdown began.") : resetInstallAction),
           Effect.catchCause((cause) =>
             Effect.gen(function* () {
               if (Cause.hasInterruptsOnly(cause)) {
                 return yield* Effect.failCause(cause);
               }
               const error = new DesktopUpdateUnexpectedActionError({ action: "install", cause });
-              yield* recoverFailedInstall(error.message);
+              yield* recover(error.message);
               yield* logUpdaterError(error.message, {
                 errorTag: error._tag,
                 cause: describeUpdateErrorCause(error.cause),
@@ -883,7 +919,9 @@ export const make = Effect.gen(function* () {
         state: yield* Ref.get(updateStateRef),
       };
     }
-    const result = yield* installDownloadedUpdate(expectedVersion);
+    const result = yield* (Option.isSome(qualification)
+      ? attemptAdmittedInstall(expectedVersion, "manual")
+      : installDownloadedUpdate(expectedVersion));
     return {
       accepted: result.accepted,
       completed: result.completed,
@@ -892,72 +930,109 @@ export const make = Effect.gen(function* () {
     };
   });
 
-  const attemptClientOnlyInstall = Effect.gen(function* () {
-    if (Option.isNone(qualification)) return;
+  const refusedInstall = { accepted: false, completed: false, failed: false };
+  const attemptAdmittedInstall = (expectedVersion?: string, trigger: "automatic" | "manual" = "automatic") => Effect.gen(function* () {
+    if (Option.isNone(qualification)) return refusedInstall;
     const runtimeQualification = qualification.value;
     const state = yield* Ref.get(updateStateRef);
     const holdPool = pool.withUpdateInventory;
     const holdRenderers = electronWindow.withUpdateRenderers;
     const inventory = electronWindow.updateInventory;
-    if (state.status !== "downloaded" || state.downloadedVersion === null ||
-      state.notAppliedVersion === state.downloadedVersion ||
+    if (Option.isSome(yield* Ref.get(activeUpdateActionRef)) || state.status !== "downloaded" || state.downloadedVersion === null ||
+      (expectedVersion !== undefined && state.downloadedVersion !== expectedVersion) ||
+      (trigger === "automatic" && state.notAppliedVersion === state.downloadedVersion) ||
       holdPool === undefined || holdRenderers === undefined || inventory === undefined ||
-      (yield* Ref.get(desktopState.quitting))) return;
+      (yield* Ref.get(desktopState.quitting))) return refusedInstall;
     const targetVersion = state.downloadedVersion;
-    if (compareSemverVersions(targetVersion, state.currentVersion) <= 0) return;
-    yield* holdPool((instances) => holdRenderers(Effect.scoped(Effect.gen(function* () {
-      const generation = `${targetVersion}:${yield* Clock.currentTimeMillis}`;
-      const expiresAt = (yield* Clock.currentTimeMillis) + 20_000;
+    if (compareSemverVersions(targetVersion, state.currentVersion) <= 0) return refusedInstall;
+    let recovery: { readonly message: string; readonly preserveInstallRecord: boolean } | undefined;
+    let recoveryHook: OwnedBackendInstallAdmission["deferRecovery"] | undefined;
+    const result = yield* holdPool((instances) => holdRenderers(Effect.scoped(Effect.gen(function* () {
+      const admissionGeneration = yield* Ref.modify(admissionSequence, (value) => [value + 1, value + 1]);
+      const generation = `${targetVersion}:${yield* Clock.currentTimeMillis}:${admissionGeneration}`;
+      const expiresAt = (yield* Clock.currentTimeMillis) + 30_000;
       const reservation = yield* runtimeQualification.acquireRuntimeReservation({ generation, targetVersion, expiresAt });
-      if (Option.isNone(reservation) || !reservation.value.isValid()) return;
+      if (Option.isNone(reservation) || !reservation.value.isValid()) return refusedInstall;
       const runtime = reservation.value;
-      const isEmpty = Effect.forEach(instances, (instance) => instance.snapshot).pipe(
-        Effect.map((snapshots) => snapshots.every((snapshot) =>
-          snapshot.desiredRunning === false && snapshot.ready === false && Option.isNone(snapshot.activePid) &&
-          snapshot.restartScheduled === false,
-        )),
-      );
-      if (!(yield* isEmpty)) return;
+      const prepared: Array<{ instance: DesktopBackendPool.DesktopBackendInstance; proof: DesktopBackendPool.DesktopBackendUpdateProof }> = [];
+      let stopping = false;
+      yield* Effect.addFinalizer(() => stopping ? Effect.void : Effect.forEach(prepared, ({ proof }) => proof.abort, { concurrency: "unbounded" }).pipe(
+        Effect.flatMap((aborted) => aborted.every(Boolean) ? Effect.void : logUpdaterWarning("Some backend update holds could not be released; no backend was stopped.")),
+      ));
+      const snapshots = yield* Effect.forEach(instances, (instance) => instance.snapshot);
+      // Pool instances are app-owned. Externally managed services are never in
+      // this inventory and are never shutdown targets for a client update.
+      const preparation = yield* Effect.forEach(instances, (instance, index) => Effect.gen(function* () {
+        const snapshot = snapshots[index];
+        if (snapshot === undefined) return false;
+        const inactive = !snapshot.desiredRunning && !snapshot.ready && Option.isNone(snapshot.activePid) && !snapshot.restartScheduled;
+        if (inactive) return true;
+        if (!snapshot.desiredRunning || !snapshot.ready || Option.isNone(snapshot.activePid) || snapshot.restartScheduled ||
+          instance.prepareUpdate === undefined || instance.stopForUpdate === undefined) return false;
+        const proof = yield* instance.prepareUpdate({ requestId: generation, targetVersion, admissionGeneration, expiresAt });
+        if (Option.isNone(proof)) return false;
+        prepared.push({ instance, proof: proof.value });
+        return true;
+      }), { concurrency: "unbounded" });
+      if (!preparation.every(Boolean) || !runtime.isValid()) return refusedInstall;
       const expected = yield* inventory;
-      if (expected.some((renderer) => renderer.audible !== false)) return;
+      if (expected.some((renderer) => renderer.audible !== false)) return refusedInstall;
       for (const phase of ["prepare", "validate"] as const) {
-        if (!runtime.isValid()) return;
+        if (!runtime.isValid()) return refusedInstall;
         const lease = { generation, targetVersion, expiresAt, phase };
         const signal = yield* Deferred.make<boolean>();
         yield* Ref.set(pendingReadiness, { lease, senders: new Set(expected.map((item) => item.id)), signal });
         yield* updateState((current) => ({ ...current, installLease: lease }));
         if (expected.length > 0) {
           const ready = yield* Deferred.await(signal).pipe(Effect.timeoutOption(Duration.seconds(5)));
-          if (Option.isNone(ready) || !ready.value) return;
+          if (Option.isNone(ready) || !ready.value) return refusedInstall;
         }
       }
       const currentInventory = yield* inventory;
       const sameInventory = expected.length === currentInventory.length && expected.every((renderer, index) => {
         const current = currentInventory[index];
-        return current !== undefined && renderer.id === current.id &&
-          renderer.generation === current.generation && renderer.audible === current.audible;
+        return current !== undefined && renderer.id === current.id && renderer.generation === current.generation && renderer.audible === current.audible;
       });
-      if (!sameInventory || !(yield* isEmpty) || !runtime.isValid() ||
-        (yield* Clock.currentTimeMillis) >= expiresAt - 5_000 || !runtime.tryCommit()) return;
-      yield* updateState((current) => ({ ...current, installLease: {
-        generation, targetVersion, expiresAt, phase: "commit",
-      } }));
+      const validPrepared = yield* Effect.forEach(prepared, ({ proof }) => proof.isValid);
+      if (!sameInventory || !validPrepared.every(Boolean) || !runtime.isValid() || (yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return refusedInstall;
+      const committed = yield* Effect.forEach(prepared, ({ proof }) => proof.commit, { concurrency: "unbounded" });
+      if (!committed.every(Boolean) || !runtime.isValid() ||
+        (yield* Clock.currentTimeMillis) >= expiresAt - 5_000 || !runtime.tryCommit()) return refusedInstall;
+      yield* updateState((current) => ({ ...current, installLease: { generation, targetVersion, expiresAt, phase: "commit" } }));
       const completions = yield* PubSub.subscribe(finishedUpdateActions);
-      const result = yield* installDownloadedUpdate(targetVersion, true, runtime);
-      // Keep register/unregister/start and window creation fenced until the
-      // app exits. A failed installer releases through the surrounding scope.
-      if (result.accepted && !result.failed) {
-        while ((yield* PubSub.take(completions)) !== "install-recovery") { /* Await exit or recovery. */ }
+      const owned: OwnedBackendInstallAdmission = {
+        instances: prepared.map(({ instance, proof }) => ({ ...instance, start: proof.recover })),
+        stopping: () => stopping,
+        deferRecovery: (message, preserveInstallRecord = false) => Effect.sync(() => { recovery = { message, preserveInstallRecord }; }),
+        stopAll: Effect.gen(function* () {
+          const valid = yield* Effect.forEach(prepared, ({ proof }) => proof.isValid);
+          if (!runtime.isValid() || !valid.every(Boolean) || (yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return false;
+          // Irreversible batch admission: no peer may be aborted/opened once
+          // the first canonical shutdown can begin. Later failure is recovery.
+          stopping = prepared.length > 0;
+          const stopped = yield* Effect.forEach(prepared, ({ instance, proof }) => instance.stopForUpdate?.(proof) ?? Effect.succeed(false), { concurrency: "unbounded" });
+          return stopped.every(Boolean);
+        }),
+      };
+      recoveryHook = owned.deferRecovery;
+      const installed = yield* installDownloadedUpdate(targetVersion, prepared.length === 0, runtime, owned);
+      if (installed.accepted && !installed.failed) {
+        while ((yield* PubSub.take(completions)) !== "install-recovery") { /* Hold until exit or recovery. */ }
       }
+      return installed;
     }))).pipe(Effect.ensuring(Effect.gen(function* () {
       yield* Ref.set(pendingReadiness, null);
       yield* updateState(({ installLease: _lease, ...current }) => current);
-    }))));
-  }).pipe(Effect.catchCause(() => logUpdaterWarning("Client update window could not be verified; update remains prepared.")));
+    })))).pipe(Effect.onExit(() => Ref.update(heldRecoveryRef, (current) => current === recoveryHook ? null : current).pipe(
+      Effect.andThen(Effect.suspend(() => recovery === undefined ? Effect.void : recoverFailedInstall(recovery.message, recovery.preserveInstallRecord))),
+    )));
+    return Option.getOrElse(result, () => refusedInstall);
+  }).pipe(Effect.catchCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) :
+    logUpdaterWarning("Update admission could not be verified; update remains prepared.").pipe(Effect.as(refusedInstall))));
 
   const startUpdatePollers: Effect.Effect<void, never, Scope.Scope> = Effect.gen(function* () {
     yield* Effect.sleep("1 minute").pipe(
-      Effect.andThen(attemptClientOnlyInstall), Effect.forever, Effect.forkScoped,
+      Effect.andThen(attemptAdmittedInstall()), Effect.forever, Effect.forkScoped,
     );
     // Keep Electron's implicit download/install hooks disabled. The same action
     // reservation and failure handling serve manual and background downloads;
