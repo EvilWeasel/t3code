@@ -4,6 +4,7 @@ import {
   INCOGNITO_BROWSER_PROFILE_ID,
   type PreviewSessionSnapshot,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
@@ -29,6 +30,73 @@ const snapshot: PreviewSessionSnapshot = {
 };
 
 describe("closedViewStore", () => {
+  it("retains execution references across remember, persistence and reload without raw code fields", async () => {
+    const target = {
+      environmentId: refA.environmentId,
+      threadId: refA.threadId,
+      itemId: TurnItemId.make("execution"),
+      runId: null,
+      code: "PRIVATE SOURCE",
+    };
+    const surface = {
+      id: "execution",
+      kind: "execution",
+      target,
+      rawCode: "PRIVATE SOURCE",
+    } as const;
+    useClosedViewStore.getState().remember({ kind: "panel-tab", threadRef: refA, surface });
+    expect(JSON.stringify(useClosedViewStore.getState().entries)).not.toContain("PRIVATE SOURCE");
+    const { storage, name } = useClosedViewStore.persist.getOptions();
+    const persisted = await storage!.getItem(name!);
+    expect(JSON.stringify(persisted)).not.toContain("PRIVATE SOURCE");
+    await storage!.setItem(name!, {
+      state: { entries: [{ id: "restored", kind: "panel-tab", threadRef: refA, surface }] },
+      version: 2,
+    });
+    await useClosedViewStore.persist.rehydrate();
+    expect(useClosedViewStore.getState().entries).toEqual([
+      {
+        id: "restored",
+        kind: "panel-tab",
+        threadRef: refA,
+        surface: {
+          id: "execution",
+          kind: "execution",
+          target: {
+            environmentId: refA.environmentId,
+            threadId: refA.threadId,
+            itemId: target.itemId,
+            runId: null,
+          },
+        },
+      },
+    ]);
+    expect(JSON.stringify(useClosedViewStore.getState().entries)).not.toContain("PRIVATE SOURCE");
+  });
+  it.each([
+    undefined,
+    {},
+    { environmentId: "other", threadId: "thread", itemId: "item", runId: null },
+    { environmentId: "env-1", threadId: "", itemId: "item", runId: null },
+    { environmentId: "env-1", threadId: "thread", itemId: "item", runId: 7 },
+  ])("rejects invalid execution references at reload: %#", async (target) => {
+    const { storage, name } = useClosedViewStore.persist.getOptions();
+    await storage!.setItem(name!, {
+      state: {
+        entries: [
+          {
+            id: "invalid",
+            kind: "panel-tab",
+            threadRef: refA,
+            surface: { id: "execution", kind: "execution", target },
+          },
+        ],
+      } as unknown as { entries: ClosedViewEntry[] },
+      version: 2,
+    });
+    await useClosedViewStore.persist.rehydrate();
+    expect(useClosedViewStore.getState().entries).toEqual([]);
+  });
   it.each([null, {}, { entries: null }, { entries: {} }, { entries: "invalid" }])(
     "rehydrates malformed older history %j as empty history",
     async (state) => {

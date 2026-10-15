@@ -1,9 +1,16 @@
-import type { OrchestrationV2TurnItem, RunId, ThreadId, TurnItemId } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  OrchestrationV2TurnItem,
+  RunId,
+  ThreadId,
+  TurnItemId,
+} from "@t3tools/contracts";
 import { commandHighlightLanguage } from "@t3tools/client-runtime/work-log/command-label";
 import { isJavaScriptReplTool } from "@t3tools/shared/toolActivity";
 
 /** References only: recorded inputs must never be copied into panel persistence. */
 export interface ExecutionCodeTarget {
+  readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly itemId: TurnItemId;
   readonly runId: RunId | null;

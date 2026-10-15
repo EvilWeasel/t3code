@@ -55,7 +55,7 @@ function render(overrides: Partial<ComponentProps<typeof ExecutionCodePanel>> = 
     root!.render(
       <ExecutionCodePanel
         threadRef={scopeThreadRef(environmentId, base.threadId)}
-        target={{ threadId: base.threadId, itemId: base.id, runId: base.runId }}
+        target={{ environmentId, threadId: base.threadId, itemId: base.id, runId: base.runId }}
         wireItem={item}
         {...overrides}
       />,
@@ -71,6 +71,34 @@ afterEach(() => {
 });
 const inputText = () => host.querySelector('[aria-label="Recorded input"]')?.textContent;
 describe("execution code panel", () => {
+  it("does not query another environment while panel presence still holds the old surface", () => {
+    harness.query.mockReturnValue({ data: { item }, isPending: false, error: null });
+    render({ threadRef: scopeThreadRef(EnvironmentId.make("other-host"), base.threadId) });
+    expect(harness.query).toHaveBeenLastCalledWith(null);
+    expect(inputText()).toBeUndefined();
+  });
+  it("shows an explicitly recorded script field on real lines, retaining the full arguments separately", () => {
+    const code = "function greet() {\n  return '🦦';\n}\ngreet();\n";
+    const dynamic: OrchestrationV2TurnItem = {
+      ...base,
+      type: "dynamic_tool",
+      toolName: "js",
+      input: { code, extra: "original argument" },
+    };
+    harness.query.mockReturnValue({ data: { item: dynamic }, isPending: false, error: null });
+    render({ wireItem: dynamic });
+    expect(inputText()).toBe(code);
+    expect(host.querySelector('[aria-label="Complete structured input"]')?.textContent).toContain(
+      '"extra": "original argument"',
+    );
+  });
+  it("retains complete large code while omitting expensive syntax coloring", () => {
+    const large = "# original 🦦\n".repeat(10_000);
+    harness.query.mockReturnValue({ data: null, isPending: false, error: null });
+    render({ wireItem: { ...item, input: large } });
+    expect(inputText()).toBe(large);
+    expect(host.textContent).toContain("complete plain text");
+  });
   it("fetches through the existing authorized item route and keeps command/output separate after completion", () => {
     harness.query.mockReturnValue({ data: null, isPending: true, error: null });
     render();
@@ -126,6 +154,7 @@ describe("execution code panel", () => {
     render({
       threadRef: scopeThreadRef(EnvironmentId.make("other-host"), ThreadId.make("other-thread")),
       target: {
+        environmentId: EnvironmentId.make("other-host"),
         threadId: ThreadId.make("other-thread"),
         itemId: base.id,
         runId: RunId.make("other-run"),

@@ -21,20 +21,46 @@ export interface ExecutionCodePanelProps {
   readonly wireItem?: OrchestrationV2TurnItem | undefined;
 }
 
+function ExecutionSyntax(props: {
+  code: string;
+  language: string;
+  shell: boolean;
+  theme: "light" | "dark";
+}) {
+  const embedded = useMemo(
+    () => (props.shell && props.language === "shellscript" ? embeddedScripts(props.code) : []),
+    [props.code, props.language, props.shell],
+  );
+  return (
+    <HighlightedTokens
+      code={props.code}
+      language={props.language}
+      embedded={embedded}
+      theme={props.theme}
+    />
+  );
+}
+
 /** Uses the same authorized on-demand item read as the timeline inspector. */
 export function ExecutionCodePanel(props: ExecutionCodePanelProps) {
+  const bound = props.threadRef.environmentId === props.target.environmentId;
   const validWire =
-    props.wireItem && matchesExecutionTarget(props.wireItem, props.target)
+    bound && props.wireItem && matchesExecutionTarget(props.wireItem, props.target)
       ? props.wireItem
       : undefined;
-  const detail = useTurnItemDetail({
-    environmentId: props.threadRef.environmentId,
-    threadId: props.target.threadId,
-    itemId: props.target.itemId,
-    revision: validWire ? turnItemDetailRevision(validWire) : "restored",
-  });
+  const detail = useTurnItemDetail(
+    bound
+      ? {
+          environmentId: props.threadRef.environmentId,
+          threadId: props.target.threadId,
+          itemId: props.target.itemId,
+          revision: validWire ? turnItemDetailRevision(validWire) : "restored",
+        }
+      : null,
+  );
   const fetched = detail.data?.item;
   const fresh =
+    bound &&
     fetched &&
     matchesExecutionTarget(fetched, props.target) &&
     (!validWire ||
@@ -48,9 +74,9 @@ export function ExecutionCodePanel(props: ExecutionCodePanelProps) {
       : (fresh ?? validWire);
   return (
     <ExecutionCodeView
-      key={`${props.threadRef.environmentId}:${props.target.threadId}:${props.target.itemId}`}
-      environmentId={props.threadRef.environmentId}
-      environmentLabel={props.environmentLabel}
+      key={`${props.target.environmentId}:${props.target.threadId}:${props.target.runId}:${props.target.itemId}`}
+      environmentId={props.target.environmentId}
+      environmentLabel={bound ? props.environmentLabel : undefined}
       target={props.target}
       item={item}
       pending={detail.isPending}
@@ -71,11 +97,6 @@ export function ExecutionCodeView(props: {
   const item =
     props.item && matchesExecutionTarget(props.item, props.target) ? props.item : undefined;
   const code = useMemo(() => (item ? executionCode(item) : null), [item]);
-  const embedded = useMemo(
-    () =>
-      code?.text && code.shell && code.language === "shellscript" ? embeddedScripts(code.text) : [],
-    [code],
-  );
   const [query, setQuery] = useState("");
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const matches = useMemo(() => {
@@ -124,6 +145,11 @@ export function ExecutionCodeView(props: {
       ) : null}
       {code?.text !== null && code?.text !== undefined ? (
         <>
+          {code.text.length > 65_536 ? (
+            <p className="mb-2 text-xs text-muted-foreground">
+              Large input shown as complete plain text.
+            </p>
+          ) : null}
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <label className="min-w-0 flex-1 text-xs">
               Find in recorded input
@@ -168,12 +194,16 @@ export function ExecutionCodeView(props: {
           >
             <RenderErrorBoundary fallback={code.text} resetKeys={[code.text]}>
               <Suspense fallback={code.text}>
-                <HighlightedTokens
-                  code={code.text}
-                  language={code.language}
-                  embedded={embedded}
-                  theme={resolvedTheme}
-                />
+                {code.text.length > 65_536 ? (
+                  code.text
+                ) : (
+                  <ExecutionSyntax
+                    code={code.text}
+                    language={code.language}
+                    shell={code.shell}
+                    theme={resolvedTheme}
+                  />
+                )}
               </Suspense>
             </RenderErrorBoundary>
           </pre>

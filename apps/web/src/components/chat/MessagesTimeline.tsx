@@ -5785,6 +5785,7 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
                 const projected = workEntry.projectedItem;
                 if (!ctx.threadRef || !projected) return;
                 useRightPanelStore.getState().openExecution(ctx.threadRef, {
+                  environmentId: ctx.activeThreadEnvironmentId,
                   threadId: projected.sourceThreadId,
                   itemId: projected.sourceItemId,
                   runId: projected.item.runId,

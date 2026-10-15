@@ -82,6 +82,8 @@ for approval_test in "${approval_tests[@]}"; do
   focused_tests+=("$approval_test")
 done
 execution_tests=(
+  apps/web/src/reopenClosedView.test.ts
+  apps/web/src/closedViewStore.test.ts
   apps/web/src/rightPanelStore.test.ts
   apps/web/src/components/RightPanelTabs.test.tsx
   apps/web/src/lib/executionCode.test.ts

@@ -2,6 +2,7 @@ import {
   DEFAULT_CLIENT_SETTINGS,
   type PreviewSessionSnapshot,
   type ScopedThreadRef,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
@@ -45,6 +46,28 @@ beforeEach(() => {
 });
 
 describe("reopenClosedView", () => {
+  it("restores recorded execution references without opening a browser or executing code", async () => {
+    const openPreview = vi.fn();
+    const target = {
+      environmentId: threadRef.environmentId,
+      threadId: threadRef.threadId,
+      itemId: TurnItemId.make("recorded-execution"),
+      runId: null,
+    };
+    const reopened = await reopenClosedView(
+      { kind: "panel-tab", threadRef, surface: { id: "execution", kind: "execution", target } },
+      { openPreview, workspaceAvailable: false },
+    );
+    expect(reopened).toBe(true);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, threadRef),
+    ).toMatchObject({
+      isOpen: true,
+      activeSurfaceId: "execution",
+      surfaces: [{ id: "execution", kind: "execution", target }],
+    });
+    expect(openPreview).not.toHaveBeenCalled();
+  });
   it("restores a file tab at its line without creating a browser session", async () => {
     const openPreview = vi.fn();
     const reopened = await reopenClosedView(

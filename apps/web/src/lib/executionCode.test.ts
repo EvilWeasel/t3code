@@ -1,4 +1,10 @@
-import { RunId, ThreadId, TurnItemId, type OrchestrationV2TurnItem } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  RunId,
+  ThreadId,
+  TurnItemId,
+  type OrchestrationV2TurnItem,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 import { executionCode, matchesExecutionTarget } from "./executionCode";
@@ -71,7 +77,12 @@ describe("recorded execution input", () => {
   });
   it("rejects a stale run or thread even when an item ID is reused", () => {
     const item = command("echo original");
-    const target = { threadId: base.threadId, itemId: base.id, runId: base.runId };
+    const target = {
+      environmentId: EnvironmentId.make("env"),
+      threadId: base.threadId,
+      itemId: base.id,
+      runId: base.runId,
+    };
     expect(matchesExecutionTarget(item, target)).toBe(true);
     expect(matchesExecutionTarget(item, { ...target, threadId: ThreadId.make("other") })).toBe(
       false,

@@ -60,6 +60,19 @@ const isClosedViewEntry = (entry: unknown): entry is ClosedViewEntry => {
   const surface = view.surface;
   if (!surface || typeof surface.id !== "string") return false;
   switch (surface.kind) {
+    case "execution":
+      return (
+        surface.id === "execution" &&
+        surface.target !== null &&
+        typeof surface.target === "object" &&
+        surface.target.environmentId === view.threadRef.environmentId &&
+        typeof surface.target.threadId === "string" &&
+        surface.target.threadId.length > 0 &&
+        typeof surface.target.itemId === "string" &&
+        surface.target.itemId.length > 0 &&
+        (surface.target.runId === null ||
+          (typeof surface.target.runId === "string" && surface.target.runId.length > 0))
+      );
     case "diff":
     case "files":
     case "pull-requests":
@@ -98,17 +111,49 @@ const isClosedViewEntry = (entry: unknown): entry is ClosedViewEntry => {
   }
 };
 
+const sanitizeClosedViewEntry = (value: unknown): ClosedViewEntry | null => {
+  if (!isClosedViewEntry(value)) return null;
+  if (value.kind !== "panel-tab" || value.surface.kind !== "execution") return value;
+  const target = value.surface.target;
+  return {
+    id: value.id,
+    kind: "panel-tab",
+    threadRef: { environmentId: value.threadRef.environmentId, threadId: value.threadRef.threadId },
+    surface: {
+      id: "execution",
+      kind: "execution",
+      target: {
+        environmentId: target.environmentId,
+        threadId: target.threadId,
+        itemId: target.itemId,
+        runId: target.runId,
+      },
+    },
+  };
+};
+const savedEntries = (persisted: unknown) => {
+  const entries = (persisted as Partial<Pick<ClosedViewStoreState, "entries">> | null)?.entries;
+  return Array.isArray(entries)
+    ? entries.flatMap((entry) => {
+        const safe = sanitizeClosedViewEntry(entry);
+        return safe && isPersistentView(safe) ? [safe] : [];
+      })
+    : [];
+};
+
 export const useClosedViewStore = create<ClosedViewStoreState>()(
   persist(
     (set) => ({
       entries: [],
       remember: (view) => {
         const id = randomUUID();
+        const safe = sanitizeClosedViewEntry({ ...view, id });
+        if (safe === null) return id;
         set((state) => ({
-          entries: [
-            { ...view, id },
-            ...state.entries.filter((entry) => !sameTarget(entry, view)),
-          ].slice(0, 20),
+          entries: [safe, ...state.entries.filter((entry) => !sameTarget(entry, view))].slice(
+            0,
+            20,
+          ),
         }));
         return id;
       },
@@ -128,16 +173,9 @@ export const useClosedViewStore = create<ClosedViewStoreState>()(
         resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
       ),
       version: 2,
-      migrate: (persisted) => {
-        const entries = (persisted as Partial<Pick<ClosedViewStoreState, "entries">> | null)
-          ?.entries;
-        return {
-          entries: Array.isArray(entries)
-            ? entries.filter(isClosedViewEntry).filter(isPersistentView)
-            : [],
-        };
-      },
-      partialize: ({ entries }) => ({ entries: entries.filter(isPersistentView) }),
+      migrate: (persisted) => ({ entries: savedEntries(persisted) }),
+      merge: (persisted, current) => ({ ...current, entries: savedEntries(persisted) }),
+      partialize: ({ entries }) => ({ entries: savedEntries({ entries }) }),
     },
   ),
 );

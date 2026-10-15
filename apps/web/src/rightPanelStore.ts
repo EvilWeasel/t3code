@@ -479,6 +479,8 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                       const target = surface.target;
                       if (
                         !target ||
+                        typeof target.environmentId !== "string" ||
+                        target.environmentId !== parseScopedThreadKey(threadKey)?.environmentId ||
                         typeof target.threadId !== "string" ||
                         typeof target.itemId !== "string" ||
                         (target.runId !== null && typeof target.runId !== "string")
@@ -490,6 +492,7 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                           id: "execution",
                           kind: "execution",
                           target: {
+                            environmentId: target.environmentId,
                             threadId: target.threadId,
                             itemId: target.itemId,
                             runId: target.runId,
@@ -675,19 +678,26 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
         ),
       openExecution: (ref, target) =>
         set((state) =>
-          userAction(state, scopedThreadKey(ref), (current) => ({
-            ...current,
-            isOpen: true,
-            activeSurfaceId: "execution",
-            surfaces: [
-              ...current.surfaces.filter((surface) => surface.kind !== "execution"),
-              {
-                id: "execution",
-                kind: "execution",
-                target: { threadId: target.threadId, itemId: target.itemId, runId: target.runId },
-              },
-            ],
-          })),
+          target.environmentId !== ref.environmentId
+            ? state
+            : userAction(state, scopedThreadKey(ref), (current) => ({
+                ...current,
+                isOpen: true,
+                activeSurfaceId: "execution",
+                surfaces: [
+                  ...current.surfaces.filter((surface) => surface.kind !== "execution"),
+                  {
+                    id: "execution",
+                    kind: "execution",
+                    target: {
+                      environmentId: ref.environmentId,
+                      threadId: target.threadId,
+                      itemId: target.itemId,
+                      runId: target.runId,
+                    },
+                  },
+                ],
+              })),
         ),
       openDevice: (ref, target, automatic = false) =>
         set((state) =>
@@ -1102,11 +1112,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
         resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
       ),
       partialize: (state) => ({
-        byThreadKey: Object.fromEntries(
-          Object.entries(state.byThreadKey).filter(
-            ([threadKey]) => !isPullRequestsPanelKey(threadKey),
-          ),
-        ),
+        byThreadKey: migratePersistedRightPanelState(state).byThreadKey,
         threadPanelVisibilityByThreadKey: Object.fromEntries(
           Object.entries(state.threadPanelVisibilityByThreadKey).flatMap(
             ([threadKey, visibility]) =>

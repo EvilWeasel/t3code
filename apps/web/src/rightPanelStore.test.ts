@@ -33,6 +33,7 @@ describe("rightPanelStore", () => {
   it("keeps execution references scoped, replaces the selected item and never persists raw code", () => {
     const store = useRightPanelStore.getState();
     const target = {
+      environmentId: refA.environmentId,
       threadId: refA.threadId,
       itemId: TurnItemId.make("execution-a"),
       runId: RunId.make("run-a"),
@@ -42,7 +43,12 @@ describe("rightPanelStore", () => {
     expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
       id: "execution",
       kind: "execution",
-      target: { threadId: refA.threadId, itemId: target.itemId, runId: target.runId },
+      target: {
+        environmentId: refA.environmentId,
+        threadId: refA.threadId,
+        itemId: target.itemId,
+        runId: target.runId,
+      },
     });
     expect(
       selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refB),
@@ -65,7 +71,12 @@ describe("rightPanelStore", () => {
   });
   it("keeps manual close and manual tab choices until the user selects execution code again", () => {
     const store = useRightPanelStore.getState();
-    const target = { threadId: refA.threadId, itemId: TurnItemId.make("execution"), runId: null };
+    const target = {
+      environmentId: refA.environmentId,
+      threadId: refA.threadId,
+      itemId: TurnItemId.make("execution"),
+      runId: null,
+    };
     store.openExecution(refA, target);
     store.open(refA, "files");
     expect(selectActiveRightPanel(useRightPanelStore.getState().byThreadKey, refA)).toBe("files");
