@@ -1771,21 +1771,15 @@ it.effect("strictly decodes only new diagnostic control messages before delivery
       request,
       { version: 1, type: "setDiagnosticsDemand", enabled: true, legacyExtra: "still accepted" },
     ];
+    const preparedBytes = yield* Effect.forEach(messages, (message) =>
+      encodeRaw(message).pipe(Effect.map((line) => new TextEncoder().encode(line + "\n"))),
+    );
     const spawner = Layer.succeed(
       ChildProcessSpawner.ChildProcessSpawner,
       ChildProcessSpawner.make(() =>
         Effect.succeed(
           makeProcess({
-            getOutputFd: (fd) =>
-              fd === 5
-                ? Stream.fromIterable(messages).pipe(
-                    Stream.mapEffect((message) =>
-                      encodeRaw(message).pipe(
-                        Effect.map((line) => new TextEncoder().encode(line + "\n")),
-                      ),
-                    ),
-                  )
-                : Stream.empty,
+            getOutputFd: (fd) => (fd === 5 ? Stream.fromIterable(preparedBytes) : Stream.empty),
             exitCode: Deferred.await(exit).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
           }),
         ),
