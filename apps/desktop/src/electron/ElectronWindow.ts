@@ -156,7 +156,7 @@ export function makeRendererCreationAdmission(
     } catch { return false; }
   };
   const tryReserveRendererCreation = (request: { readonly kind: RendererCreationKind; readonly owner: number | null }) => {
-    if (held !== undefined) return undefined;
+    if (held !== undefined || request.kind === "preview-guest" || request.kind === "preview-popup") return undefined;
     if (request.owner !== null && !allContents().some((item) => item.id === request.owner && !item.isDestroyed())) return undefined;
     const reservedAt = epoch;
     let bound: Electron.WebContents | undefined;
@@ -166,6 +166,9 @@ export function makeRendererCreationAdmission(
         const entry = contents.get(item);
         if (released || bound !== undefined || held !== undefined || entry === undefined ||
           entry.bound || entry.epoch <= reservedAt || item.isDestroyed()) return false;
+        // Only these same-stack BrowserWindow constructors have exact object
+        // correlation. A later guest/popup allocation can never borrow a token.
+        try { if (item.getType() !== "window") return false; } catch { return false; }
         if (request.owner !== null && !allContents().some((owner) => owner.id === request.owner && !owner.isDestroyed())) return false;
         entry.bound = true;
         bound = item;
@@ -275,6 +278,17 @@ export const make = Effect.gen(function* () {
       NodePath.join(__dirname, "electron", "WindowsForegroundFocusWorker.cjs"),
     );
     return windowsForegroundFocus;
+  };
+  const runForegroundNative = (kind: "prepare" | "focus", window: Electron.BrowserWindow) => {
+    if (kind === "focus" && windowsForegroundFocus === undefined) return Promise.resolve(false);
+    const activity = admission.tryReserveRuntimeActivity({ kind: "snapshot-capture" });
+    if (activity === undefined) return Promise.resolve(false);
+    const thread = kind === "prepare" ? ensureWindowsForegroundFocus() : windowsForegroundFocus!;
+    const request = thread[kind](windowsForegroundFocusTarget(window));
+    // Logical timeout/result is not native retirement. A legacy/missing
+    // retirement capability remains UNKNOWN and keeps admission refused.
+    void request.nativeRetired?.then(activity.release, () => undefined);
+    return request.catch(() => false);
   };
   // Tracks a capture reveal in flight. Ordinary reveals keep Electron's native path.
   const captureRevealWindows = new Set<number>();
@@ -422,9 +436,7 @@ export const make = Effect.gen(function* () {
           return false;
         }
         captureRevealWindows.add(window.id);
-        return ensureWindowsForegroundFocus()
-          .prepare(windowsForegroundFocusTarget(window))
-          .catch(() => false);
+        return runForegroundNative("prepare", window);
       }),
     reveal: (window) =>
       Effect.tryPromise({
@@ -463,18 +475,14 @@ export const make = Effect.gen(function* () {
 
           if (captureReveal) {
             if (shellHostedForeground) {
-              await windowsForegroundFocus
-                ?.focus(windowsForegroundFocusTarget(window))
-                .catch(() => false);
+              await runForegroundNative("focus", window);
             }
             try {
               await activateWindowsForeground(window.getNativeWindowHandle());
             } catch {
               const needsFocus = !(await isWindowsBrowserWindowForeground(window));
               if (needsFocus && !window.isDestroyed()) {
-                await windowsForegroundFocus
-                  ?.focus(windowsForegroundFocusTarget(window))
-                  .catch(() => false);
+                await runForegroundNative("focus", window);
               }
               if (!window.isDestroyed()) {
                 await activateWindowsForeground(window.getNativeWindowHandle());

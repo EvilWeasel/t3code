@@ -27,6 +27,7 @@ export type RegionSnapShotChild = {
   readonly send: (request: RegionSnapShotRequest) => void;
   readonly onMessage: (listener: (message: unknown) => void) => void;
   readonly onExit: (listener: () => void) => void;
+  readonly onError?: (listener: () => void) => void;
   readonly kill: () => void;
 };
 
@@ -41,14 +42,15 @@ function forkRegionSnapShotChild(workerPath: string): RegionSnapShotChild {
     onMessage: (listener) => child.on("message", listener),
     onExit: (listener) => {
       child.once("exit", listener);
-      child.once("error", listener);
     },
+    onError: (listener) => child.once("error", listener),
     kill: () => child.kill(),
   };
 }
 
 export type RegionSnapShotProcess = {
   readonly alive: boolean;
+  readonly nativeRetired?: Promise<void>;
   readonly capture: (
     region: Electron.Rectangle,
   ) => Promise<{ width: number; height: number; png: Buffer }>;
@@ -69,19 +71,22 @@ export function startRegionSnapShotProcess(
   } catch {
     return {
       alive: false,
+      nativeRetired: Promise.resolve(),
       capture: () => Promise.reject(new Error("Windows window capture is unavailable.")),
       close: () => undefined,
     };
   }
+  const nativeRetired = Promise.withResolvers<void>();
   const ready = Promise.withResolvers<void>();
   const result = Promise.withResolvers<{ width: number; height: number; png: Buffer }>();
   let settled = false;
-  const finish = (error?: Error, value?: { width: number; height: number; png: Buffer }) => {
+  const finish = (error?: Error, value?: { width: number; height: number; png: Buffer }, acknowledged = false) => {
     if (settled) return;
     settled = true;
     ready.resolve();
     if (value) result.resolve(value);
     else result.reject(error ?? new Error("Windows window capture failed."));
+    if (acknowledged) nativeRetired.resolve();
     child.kill();
   };
   child.onMessage((message) => {
@@ -90,19 +95,21 @@ export function startRegionSnapShotProcess(
       return;
     }
     const response = message as RegionSnapShotResult;
-    if (response.type === "error") finish(new Error(response.message));
+    if (response.type === "error") finish(new Error(response.message), undefined, true);
     else if (response.type === "result") {
       finish(undefined, {
         width: response.width,
         height: response.height,
         png: Buffer.from(response.png, "base64"),
-      });
+      }, true);
     }
   });
-  child.onExit(() => finish(new Error("Windows window capture helper exited.")));
+  child.onExit(() => { nativeRetired.resolve(); finish(new Error("Windows window capture helper exited.")); });
+  child.onError?.(() => finish(new Error("Windows window capture helper failed.")));
   void result.promise.catch(() => undefined);
 
   return {
+    nativeRetired: nativeRetired.promise,
     get alive() {
       return !settled;
     },
@@ -126,7 +133,13 @@ export function startRegionSnapShotProcess(
   };
 }
 
+export type RegionSnapShotCapture = {
+  readonly result: Promise<{ width: number; height: number; png: Buffer }>;
+  readonly nativeRetired: Promise<void>;
+};
+
 export type RegionSnapShotPool = {
+  readonly captureWithRetirement?: (region: Electron.Rectangle) => RegionSnapShotCapture;
   readonly warm: () => void;
   readonly cool: () => void;
   readonly capture: (
@@ -150,24 +163,25 @@ export function makeRegionSnapShotPool(
     standby?.close();
     standby = undefined;
   };
+  const captureWithRetirement = (region: Electron.Rectangle): RegionSnapShotCapture => {
+    if (closed || inFlight?.alive) return {
+      result: Promise.reject(new Error(closed ? "Windows window capture is unavailable." : "Windows window capture is still in progress. Try again.")),
+      nativeRetired: Promise.resolve(),
+    };
+    const current = standby?.alive ? standby : start(workerPath);
+    standby = undefined;
+    inFlight = current;
+    const result = current.capture(region).finally(() => {
+      if (inFlight === current) inFlight = undefined;
+      warm();
+    });
+    return { result, nativeRetired: current.nativeRetired ?? new Promise<void>(() => {}) };
+  };
   return {
     warm,
     cool,
-    capture: async (region) => {
-      if (closed) throw new Error("Windows window capture is unavailable.");
-      if (inFlight?.alive) {
-        throw new Error("Windows window capture is still in progress. Try again.");
-      }
-      const current = standby?.alive ? standby : start(workerPath);
-      standby = undefined;
-      inFlight = current;
-      try {
-        return await current.capture(region);
-      } finally {
-        if (inFlight === current) inFlight = undefined;
-        warm();
-      }
-    },
+    captureWithRetirement,
+    capture: (region) => captureWithRetirement(region).result,
     close: () => {
       closed = true;
       cool();
@@ -177,12 +191,16 @@ export function makeRegionSnapShotPool(
 }
 
 export async function captureRegionWindowSnapshot(
-  pool: Pick<RegionSnapShotPool, "capture">,
+  pool: Pick<RegionSnapShotPool, "capture" | "captureWithRetirement">,
   active: ActiveWindow,
   region: Electron.Rectangle,
   maxSize: Electron.Size,
+  trackNativeRetirement?: (retired: Promise<void>) => void,
 ): Promise<{ readonly source: RegionSnapShotSource; readonly png: Buffer }> {
-  const shot = await pool.capture(region);
+  const capture = pool.captureWithRetirement?.(region);
+  const result = capture?.result ?? pool.capture(region);
+  trackNativeRetirement?.(capture?.nativeRetired ?? new Promise<void>(() => {}));
+  const shot = await result;
   const scale = Math.min(maxSize.width / shot.width, maxSize.height / shot.height, 1);
   const png =
     scale < 1

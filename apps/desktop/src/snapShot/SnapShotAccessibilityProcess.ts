@@ -12,6 +12,7 @@ const START_TIMEOUT_MS = 1_000;
 const RESULT_TIMEOUT_MS = 4_000;
 
 export type AccessibilityRead = {
+  readonly nativeRetired?: Promise<void>;
   readonly started: Promise<void>;
   readonly result: Promise<CapturedWindowAccessibilityContext | undefined>;
 };
@@ -37,6 +38,7 @@ type AccessibilityMessage =
 const completedRead = (context?: CapturedWindowAccessibilityContext): AccessibilityRead => ({
   started: Promise.resolve(),
   result: Promise.resolve(context),
+  nativeRetired: Promise.resolve(),
 });
 
 const unavailableProcess = (): AccessibilityProcess => ({
@@ -63,6 +65,7 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
     return unavailableProcess();
   }
 
+  const nativeRetired = Promise.withResolvers<void>();
   let ready = false;
   let request: SnapShotAccessibilityRequest | undefined;
   let startedResolve: (() => void) | undefined;
@@ -76,13 +79,14 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
     if (startTimeout) clearTimeout(startTimeout);
     if (resultTimeout) clearTimeout(resultTimeout);
   };
-  const finish = (context?: CapturedWindowAccessibilityContext) => {
+  const finish = (context?: CapturedWindowAccessibilityContext, acknowledged = false) => {
     if (settled) return;
     settled = true;
     settledContext = context;
     clearTimers();
     startedResolve?.();
     resultResolve?.(context);
+    if (acknowledged) nativeRetired.resolve();
     worker.kill();
   };
   const sendRequest = () => {
@@ -107,18 +111,18 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
       if (startTimeout) clearTimeout(startTimeout);
       startedResolve?.();
     } else {
-      finish(message.context);
+      if (message.type === "result") finish(message.context, true);
     }
   });
   worker.once("error", () => finish());
-  worker.once("exit", () => finish());
+  worker.once("exit", () => { nativeRetired.resolve(); finish(); });
 
   return {
     get alive() {
       return !settled;
     },
     read: (nextRequest) => {
-      if (settled) return completedRead(settledContext);
+      if (settled) return { ...completedRead(settledContext), nativeRetired: nativeRetired.promise };
       request = nextRequest;
       const started = Promise.withResolvers<void>();
       const result = Promise.withResolvers<CapturedWindowAccessibilityContext | undefined>();
@@ -127,7 +131,7 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
       resultTimeout = setTimeout(() => finish(), RESULT_TIMEOUT_MS);
       resultTimeout.unref();
       sendRequest();
-      return { started: started.promise, result: result.promise };
+      return { started: started.promise, result: result.promise, nativeRetired: nativeRetired.promise };
     },
     close: () => finish(),
   };
@@ -159,10 +163,7 @@ export function makeSnapShotAccessibilityProcessPool(workerPath: string): Access
       warm();
       active.add(workerProcess);
       const read = workerProcess.read(request);
-      void read.result.then(
-        () => active.delete(workerProcess),
-        () => active.delete(workerProcess),
-      );
+      void read.nativeRetired?.then(() => active.delete(workerProcess), () => undefined);
       return read;
     },
     close: () => {

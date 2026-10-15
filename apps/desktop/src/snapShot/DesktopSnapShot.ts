@@ -406,6 +406,7 @@ async function captureSource({
   regionSnapShotPool,
   prepareReveal,
   onLinuxFeedback,
+  trackNativeRetirement,
 }: {
   mode: DesktopSnapShotState["mode"];
   captureId: string;
@@ -420,6 +421,7 @@ async function captureSource({
   accessibilityProcessPool: AccessibilityProcessPool;
   regionSnapShotPool: RegionSnapShotPool;
   prepareReveal: () => Promise<void>;
+  trackNativeRetirement: (retired: Promise<void>) => void;
   onLinuxFeedback: (feedback: LinuxCaptureFeedback) => void;
 }) {
   let active: ActiveWindow | undefined;
@@ -433,6 +435,7 @@ async function captureSource({
   {
     const revealPreparation =
       platform === "win32" ? prepareReveal().catch(() => undefined) : Promise.resolve();
+    trackNativeRetirement(revealPreparation);
     if (mode === "direct") {
       active = await activeWindow(platform);
     }
@@ -459,6 +462,7 @@ async function captureSource({
         active,
         snapShotFlashBounds(active, platform),
         snapShotThumbnailSize(active),
+        trackNativeRetirement,
       ));
     } else {
       const { captureLinuxWindow } = await import("./LinuxSnapShot.ts");
@@ -518,6 +522,7 @@ async function captureSource({
           })
         : undefined;
     if (accessibilityRead) {
+      trackNativeRetirement(accessibilityRead.nativeRetired ?? new Promise<void>(() => {}));
       await accessibilityRead.started;
     }
     const contextPromise = accessibilityRead?.result ?? Promise.resolve(undefined);
@@ -887,9 +892,9 @@ export const make = Effect.gen(function* () {
         try: async () => {
           const nativeActivity = reserveActivity?.({ kind: "snapshot-capture" });
           if (reserveActivity !== undefined && nativeActivity === undefined) throw new Error("Capture refused during update admission");
-          let returned = false;
+          const nativeRetirements: Array<Promise<void>> = [];
           try {
-            const snapshot = await captureSource({
+            return await captureSource({
             mode,
             captureId: id,
             platform: environment.platform,
@@ -903,17 +908,16 @@ export const make = Effect.gen(function* () {
             accessibilityProcessPool,
             regionSnapShotPool,
             prepareReveal: () => runPromise(desktopWindow.prepareCaptureReveal),
+            trackNativeRetirement: (retired) => { nativeRetirements.push(retired); },
             onLinuxFeedback: (feedback) => {
               linuxFeedback = { id, feedback };
             },
           });
-            // Interruption of the Effect cannot cancel the underlying native
-            // promise. Keep its separate hold until real completion, including
-            // the accessibility read which otherwise outlives pixel capture.
-            void snapshot.contextPromise.then(() => nativeActivity?.release(), () => nativeActivity?.release());
-            returned = true;
-            return snapshot;
-          } finally { if (!returned) nativeActivity?.release(); }
+          } finally {
+            // Every started sibling/helper has its own retirement evidence.
+            // Logical failure, timeout or Effect interruption cannot release it.
+            void Promise.all(nativeRetirements).then(() => nativeActivity?.release(), () => undefined);
+          }
         },
         catch: (cause) => captureFailure(cause, id),
       });

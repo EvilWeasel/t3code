@@ -30,6 +30,7 @@ beforeEach(() => {
   transitionCapturePageMock.mockReset().mockResolvedValue(undefined);
   transitionSnapshotMock.mockReset().mockResolvedValue(undefined);
   prepareCaptureRevealMock.mockReset();
+  regionCaptureWithRetirementMock.mockReset();
   accessibilityListMock.mockReset().mockResolvedValue([]);
 });
 
@@ -62,6 +63,7 @@ const {
   prepareCaptureRevealMock,
   nextPortalState,
   regionCaptureMock,
+  regionCaptureWithRetirementMock,
   screenToDipRectMock,
   shortcutForkArgs,
   shortcutForkOptions,
@@ -139,6 +141,7 @@ const {
     hasSession: boolean;
   }>,
   prepareCaptureRevealMock: vi.fn(),
+  regionCaptureWithRetirementMock: vi.fn(),
   regionCaptureMock:
     vi.fn<
       (region: Electron.Rectangle) => Promise<{ width: number; height: number; png: Buffer }>
@@ -184,6 +187,7 @@ vi.mock("./RegionSnapShot.ts", async (original) => ({
     cool: vi.fn(),
     close: vi.fn(),
     capture: regionCaptureMock,
+    captureWithRetirement: regionCaptureWithRetirementMock,
   }),
 }));
 vi.mock("./WindowsCaptureFeedback.ts", () => ({
@@ -4005,5 +4009,87 @@ it.effect("retains a pending native capture hold after Effect interruption until
     Effect.provide(layerTest("win32", { makeDirectory: () => Effect.void })),
     Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: reserve } as ElectronWindow.ElectronWindow["Service"]),
     Effect.ensuring(Effect.sync(() => { finishNative.resolve(undefined); activeWindowMock.mockReset(); })),
+  );
+});
+
+it.effect.each([false, true])("joins outstanding reveal preparation after capture failure/interruption=%s", (interrupt) => {
+  const preparation = Promise.withResolvers<void>();
+  const active = Promise.withResolvers<undefined>();
+  const started = Promise.withResolvers<void>();
+  const nativeRetired = Promise.withResolvers<void>();
+  prepareCaptureRevealMock.mockImplementation(() => { started.resolve(); return preparation.promise; });
+  activeWindowMock.mockReset().mockImplementation(() => interrupt ? active.promise : Promise.resolve(undefined));
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  let reservations = 0;
+  const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
+    const token = gate.tryReserveRuntimeActivity(request);
+    const native = ++reservations === 2;
+    return token === undefined ? undefined : { release: () => {
+      token.release();
+      if (native) nativeRetired.resolve();
+    } };
+  };
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    yield* service.configure(enabledSettings({ snapShotFlash: false, snapShotAnimations: false }));
+    const capture = yield* service.capture.pipe(Effect.exit, Effect.forkScoped);
+    yield* Effect.promise(() => started.promise);
+    if (interrupt) {
+      yield* Fiber.interrupt(capture);
+      active.resolve(undefined);
+    } else {
+      const exit = yield* Fiber.join(capture);
+      assert.equal(exit._tag, "Failure");
+    }
+    assert.isUndefined(gate.acquire(200));
+    preparation.resolve();
+    yield* Effect.promise(() => nativeRetired.promise);
+    const held = gate.acquire(200);
+    assert.isDefined(held);
+    held!.release();
+  })).pipe(
+    Effect.provide(layerTest("win32", { makeDirectory: () => Effect.void })),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: reserve } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => { preparation.resolve(); active.resolve(undefined); prepareCaptureRevealMock.mockReset(); activeWindowMock.mockReset(); })),
+  );
+});
+
+it.effect("retains timed-out region capture admission while actual helper exit is withheld", () => {
+  const started = Promise.withResolvers<void>();
+  const result = Promise.withResolvers<{ width: number; height: number; png: Buffer }>();
+  const exit = Promise.withResolvers<void>();
+  const retired = Promise.withResolvers<void>();
+  activeWindowMock.mockReset().mockResolvedValue({
+    title: "Owned fixture", owner: { name: "Fixture", processId: 42 }, bounds: { x: 0, y: 0, width: 10, height: 10 },
+  });
+  regionCaptureWithRetirementMock.mockImplementation(() => {
+    started.resolve();
+    return { result: result.promise, nativeRetired: exit.promise };
+  });
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  let reservations = 0;
+  const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
+    const token = gate.tryReserveRuntimeActivity(request);
+    const native = ++reservations === 2;
+    return token === undefined ? undefined : { release: () => { token.release(); if (native) retired.resolve(); } };
+  };
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    yield* service.configure(enabledSettings({ snapShotFlash: false, snapShotAnimations: false }));
+    const capture = yield* service.capture.pipe(Effect.exit, Effect.forkScoped);
+    yield* Effect.promise(() => started.promise);
+    result.reject(new Error("logical timeout; kill requested"));
+    const failure = yield* Fiber.join(capture);
+    assert.equal(failure._tag, "Failure");
+    assert.isUndefined(gate.acquire(200));
+    exit.resolve();
+    yield* Effect.promise(() => retired.promise);
+    const held = gate.acquire(200);
+    assert.isDefined(held);
+    held!.release();
+  })).pipe(
+    Effect.provide(layerTest("win32", { makeDirectory: () => Effect.void })),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: reserve } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => { exit.resolve(); regionCaptureWithRetirementMock.mockReset(); activeWindowMock.mockReset(); })),
   );
 });

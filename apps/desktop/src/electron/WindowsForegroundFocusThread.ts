@@ -15,9 +15,11 @@ export type WindowsForegroundFocusTarget = {
   readonly contentBounds: Electron.Rectangle;
 };
 
+export type WindowsForegroundFocusRequest = Promise<boolean> & { readonly nativeRetired: Promise<void> };
+
 export type WindowsForegroundFocusThread = {
-  readonly prepare: (target: WindowsForegroundFocusTarget) => Promise<boolean>;
-  readonly focus: (target: WindowsForegroundFocusTarget) => Promise<boolean>;
+  readonly prepare: (target: WindowsForegroundFocusTarget) => WindowsForegroundFocusRequest;
+  readonly focus: (target: WindowsForegroundFocusTarget) => WindowsForegroundFocusRequest;
   readonly close: () => void;
 };
 
@@ -34,8 +36,8 @@ type FocusResult = {
 };
 
 const unavailableThread = (): WindowsForegroundFocusThread => ({
-  prepare: async () => false,
-  focus: async () => false,
+  prepare: () => Object.assign(Promise.resolve(false), { nativeRetired: Promise.resolve() }),
+  focus: () => Object.assign(Promise.resolve(false), { nativeRetired: Promise.resolve() }),
   close: () => undefined,
 });
 
@@ -46,21 +48,31 @@ export function startWindowsForegroundFocusThread(
   let ready = false;
   let closed = false;
   let nextRequestId = 1;
+  const retirements = new Map<NodeWorkerThreads.Worker, Set<() => void>>();
+  const retireWorker = (retiredWorker: NodeWorkerThreads.Worker) => {
+    for (const retire of retirements.get(retiredWorker) ?? []) retire();
+    retirements.delete(retiredWorker);
+  };
+  const terminate = (retiringWorker: NodeWorkerThreads.Worker) => {
+    void retiringWorker.terminate().then(() => retireWorker(retiringWorker), () => undefined);
+  };
   const pending = new Map<
     number,
     {
       readonly request: FocusRequest;
       readonly resolve: (focused: boolean) => void;
+      readonly retire: () => void;
       readonly timeout: ReturnType<typeof setTimeout>;
     }
   >();
 
-  const finish = (requestId: number, focused: boolean) => {
+  const finish = (requestId: number, focused: boolean, acknowledged = false) => {
     const request = pending.get(requestId);
     if (!request) return;
     pending.delete(requestId);
     clearTimeout(request.timeout);
     request.resolve(focused);
+    if (acknowledged) request.retire();
   };
   const send = (request: FocusRequest, targetWorker: NodeWorkerThreads.Worker) => {
     if (!ready || closed || worker !== targetWorker) return;
@@ -97,10 +109,10 @@ export function startWindowsForegroundFocusThread(
         return;
       }
       const message = rawMessage as FocusResult;
-      if (message.type === "result") finish(message.requestId, message.focused);
+      if (message.type === "result") finish(message.requestId, message.focused, true);
     });
     nextWorker.once("error", reset);
-    nextWorker.once("exit", reset);
+    nextWorker.once("exit", () => { retireWorker(nextWorker); reset(); });
     return true;
   };
 
@@ -111,13 +123,15 @@ export function startWindowsForegroundFocusThread(
     worker = undefined;
     ready = false;
     for (const requestId of pending.keys()) finish(requestId, false);
-    void timedOutWorker.terminate();
+    terminate(timedOutWorker);
     start();
   };
-  const request = (type: FocusRequest["type"], target: WindowsForegroundFocusTarget) =>
-    new Promise<boolean>((resolve) => {
+  const request = (type: FocusRequest["type"], target: WindowsForegroundFocusTarget): WindowsForegroundFocusRequest => {
+    const nativeRetired = Promise.withResolvers<void>();
+    const result = new Promise<boolean>((resolve) => {
       if (closed || (!worker && !start())) {
         resolve(false);
+        nativeRetired.resolve();
         return;
       }
       const requestId = nextRequestId++;
@@ -128,9 +142,21 @@ export function startWindowsForegroundFocusThread(
         restart(requestWorker);
       }, FOCUS_TIMEOUT_MS);
       timeout.unref();
-      pending.set(requestId, { request: focusRequest, resolve, timeout });
+      let retired = false;
+      const retire = () => {
+        if (retired) return;
+        retired = true;
+        retirements.get(requestWorker)?.delete(retire);
+        nativeRetired.resolve();
+      };
+      const workerRetirements = retirements.get(requestWorker) ?? new Set<() => void>();
+      workerRetirements.add(retire);
+      retirements.set(requestWorker, workerRetirements);
+      pending.set(requestId, { request: focusRequest, resolve, retire, timeout });
       send(focusRequest, requestWorker);
     });
+    return Object.assign(result, { nativeRetired: nativeRetired.promise });
+  };
 
   return {
     prepare: (target) => request("prepare", target),
@@ -142,7 +168,7 @@ export function startWindowsForegroundFocusThread(
       worker = undefined;
       ready = false;
       for (const requestId of pending.keys()) finish(requestId, false);
-      if (activeWorker) void activeWorker.terminate();
+      if (activeWorker) terminate(activeWorker);
     },
   };
 }

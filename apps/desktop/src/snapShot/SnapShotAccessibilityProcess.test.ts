@@ -139,3 +139,33 @@ it("allows cold startup to exceed the request-start budget", async () => {
     vi.useRealTimers();
   }
 });
+
+it("keeps timeout retirement pending after kill while the native child has not exited", async () => {
+  vi.useFakeTimers();
+  const process = startSnapShotAccessibilityProcess("accessibility.cjs");
+  try {
+    const read = process.read(request);
+    let retired = false;
+    void read.nativeRetired!.then(() => { retired = true; });
+    worker.emit("message", "ready");
+    worker.emit("message", "started");
+    await vi.advanceTimersByTimeAsync(4_000);
+    assert.isUndefined(await read.result);
+    assert.lengthOf(worker.kill.mock.calls, 1);
+    assert.isFalse(retired);
+    worker.emit("exit", 0);
+    await read.nativeRetired;
+    assert.isTrue(retired);
+  } finally { process.close(); worker.emit("exit", 0); vi.useRealTimers(); }
+});
+
+it("retires a successful accessibility request from the real result ACK without requiring worker exit", async () => {
+  const process = startSnapShotAccessibilityProcess("accessibility.cjs");
+  const read = process.read(request);
+  worker.emit("message", "ready");
+  worker.emit("message", "started");
+  worker.emit("message", { type: "result", context: { accessibleText: "owned fixture" } });
+  await read.result;
+  await read.nativeRetired;
+  process.close();
+});

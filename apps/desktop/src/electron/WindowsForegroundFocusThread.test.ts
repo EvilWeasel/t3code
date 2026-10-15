@@ -98,3 +98,62 @@ it("replaces a timed-out helper before accepting more work", async () => {
     vi.useRealTimers();
   }
 });
+
+it.each(["timeout", "error", "close"] as const)("does not retire native work on logical %s before actual exit or termination", async (reason) => {
+  vi.useFakeTimers();
+  const terminated = Promise.withResolvers<number>();
+  worker.terminate.mockImplementation(() => terminated.promise);
+  const replacement = makeWorker();
+  workerConstructorMock.mockReturnValueOnce(worker).mockReturnValueOnce(replacement);
+  const thread = startWindowsForegroundFocusThread("focus.cjs");
+  try {
+    worker.emit("message", "ready");
+    const request = thread.prepare(target);
+    let retired = false;
+    void request.nativeRetired.then(() => { retired = true; });
+    if (reason === "timeout") await vi.advanceTimersByTimeAsync(1_000);
+    else if (reason === "error") worker.emit("error", new Error("native helper failed"));
+    else thread.close();
+    assert.isFalse(await request);
+    assert.isFalse(retired);
+    if (reason === "error") worker.emit("exit", 1);
+    else terminated.resolve(0);
+    await request.nativeRetired;
+    assert.isTrue(retired);
+  } finally { thread.close(); terminated.resolve(0); vi.useRealTimers(); }
+});
+
+it("retires an acknowledged request without requiring the pooled worker to exit", async () => {
+  const thread = startWindowsForegroundFocusThread("focus.cjs");
+  try {
+    worker.emit("message", "ready");
+    const request = thread.prepare(target);
+    worker.emit("message", { type: "result", requestId: 1, focused: true });
+    assert.isTrue(await request);
+    await request.nativeRetired;
+    assert.lengthOf(worker.terminate.mock.calls, 0);
+  } finally { thread.close(); }
+});
+
+it("does not let an old worker exit retire a new worker's pending request", async () => {
+  const old = worker;
+  const replacement = makeWorker();
+  workerConstructorMock.mockReturnValueOnce(old).mockReturnValueOnce(replacement);
+  const thread = startWindowsForegroundFocusThread("focus.cjs");
+  try {
+    old.emit("message", "ready");
+    const first = thread.prepare(target);
+    old.emit("error", new Error("reset"));
+    assert.isFalse(await first);
+    const next = thread.prepare(target);
+    let retired = false;
+    void next.nativeRetired.then(() => { retired = true; });
+    old.emit("exit", 1);
+    await first.nativeRetired;
+    assert.isFalse(retired);
+    replacement.emit("message", "ready");
+    replacement.emit("message", { type: "result", requestId: 2, focused: true });
+    assert.isTrue(await next);
+    await next.nativeRetired;
+  } finally { thread.close(); }
+});

@@ -293,3 +293,34 @@ it("closes the standby and the in-flight child", async () => {
   await expect(pool.capture(region)).rejects.toThrow(/unavailable/);
   assert.lengthOf(processes, 2);
 });
+
+it("keeps native retirement pending after timeout/kill until the child actually exits", async () => {
+  vi.useFakeTimers();
+  const fake = fakeChild();
+  const child = startRegionSnapShotProcess("worker.cjs", () => fake.child);
+  try {
+    let retired = false;
+    void child.nativeRetired!.then(() => { retired = true; });
+    const failed = expect(child.capture(region)).rejects.toThrow(/timed out/);
+    fake.emit("ready");
+    await vi.advanceTimersByTimeAsync(15_000);
+    await failed;
+    assert.lengthOf(fake.kill.mock.calls, 1);
+    assert.isFalse(retired);
+    fake.exit();
+    await child.nativeRetired;
+    assert.isTrue(retired);
+  } finally { fake.exit(); vi.useRealTimers(); }
+});
+
+it("retires a successful native capture on its actual result acknowledgement", async () => {
+  const fake = fakeChild();
+  const child = startRegionSnapShotProcess("worker.cjs", () => fake.child);
+  const capturing = child.capture(region);
+  fake.emit("ready");
+  fake.emit({ type: "result", width: 1, height: 1, png: Buffer.from([1]).toString("base64") });
+  await capturing;
+  await child.nativeRetired;
+  // The request ACK is sufficient even before the single-use child exits.
+  assert.lengthOf(fake.kill.mock.calls, 1);
+});

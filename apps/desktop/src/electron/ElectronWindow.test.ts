@@ -144,7 +144,7 @@ describe("ElectronWindow", () => {
     const create = gate.tryReserveRendererCreation({ kind: "main-window", owner: null });
     assert.isDefined(create);
     assert.isUndefined(gate.acquire(200));
-    const first = { id: 7, isDestroyed: () => false } as Electron.WebContents;
+    const first = { id: 7, isDestroyed: () => false, getType: () => "window" } as Electron.WebContents;
     contents.push(first);
     gate.observeCreated(first);
     assert.isTrue(create!.bind(first));
@@ -187,6 +187,33 @@ describe("ElectronWindow", () => {
     held!.release(); // An old identity cannot open the new reservation.
     assert.isFalse(gate.canCreateUncorrelatedRenderer());
     newer!.release();
+  });
+
+  it("never binds a later webview allocation with any supported native constructor token", () => {
+    for (const kind of ["main-window", "permission-window", "snapshot-window", "preview-pip"] as const) {
+      const source = { id: 7, isDestroyed: () => false, getType: () => "webview" } as Electron.WebContents;
+      const contents = [source];
+      const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => contents);
+      gate.observeCreated(source);
+      const token = gate.tryReserveRendererCreation({ kind, owner: kind === "preview-pip" ? 7 : null });
+      assert.isDefined(token);
+      const laterGuest = { id: 8, isDestroyed: () => false, getType: () => "webview" } as Electron.WebContents;
+      contents.push(laterGuest);
+      gate.observeCreated(laterGuest);
+      assert.isFalse(token!.bind(laterGuest));
+      token!.release();
+      assert.isUndefined(gate.acquire(200));
+      assert.isUndefined(gate.tryReserveRendererCreation({ kind: "preview-guest", owner: 7 }));
+      assert.isUndefined(gate.tryReserveRendererCreation({ kind: "preview-popup", owner: 7 }));
+      // Ordinary PiP can use an UNKNOWN guest as its source provenance. Only
+      // its exact new BrowserWindow contents becomes bound, never the guest.
+      const pip = gate.tryReserveRendererCreation({ kind: "preview-pip", owner: 7 });
+      const native = { id: 9, isDestroyed: () => false, getType: () => "window" } as Electron.WebContents;
+      contents.push(native);
+      gate.observeCreated(native);
+      assert.isTrue(pip!.bind(native));
+      assert.isUndefined(gate.acquire(200)); // Live source/later guest still UNKNOWN.
+    }
   });
 
   it.effect("preserves schema-safe creation context and the Electron cause", () =>
