@@ -1,17 +1,29 @@
 import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { Atom } from "effect/reactivity";
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 
 import { APP_VERSION } from "~/branding";
+import { isElectron } from "~/env";
+import { usePrimaryEnvironmentId } from "~/state/environments";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { useDesktopUpdateState } from "~/state/desktopUpdate";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import {
   getUpdateEverythingToastView,
-  persistUpdateEverythingResult,
-  clearUpdateEverythingResult,
   takeUpdateEverythingResult,
+  acknowledgeUpdateOutcomeNotice,
+  clearUpdateOutcomeHistory,
+  completeUpdateOutcome,
+  readUpdateOutcomeHistory,
+  resolvePendingUpdateOutcome,
+  updateOutcomeScope,
+  writeUpdateOutcomeHistory,
+  type UpdateOutcomeScope,
+  type UpdateOutcomeHistory,
+  type UpdateHistoryRead,
+  type LastCompletedUpdate,
+  type PendingUpdateInstall,
   type UpdateEverythingResult,
   type UpdateEverythingRun,
 } from "./updateEverything.logic";
@@ -51,23 +63,6 @@ export function settleUpdateRunMachine(
   );
 }
 
-/** Keeps a result through this app's relaunch; failed storage defers that install. */
-export function saveUpdateEverythingResult(result: UpdateEverythingResult): boolean {
-  try {
-    return persistUpdateEverythingResult(result, window.localStorage, Date.now());
-  } catch {
-    return false;
-  }
-}
-
-export function clearSavedUpdateEverythingResult(): void {
-  try {
-    clearUpdateEverythingResult(window.localStorage);
-  } catch {
-    // Storage can be unavailable during shutdown.
-  }
-}
-
 function takeSavedUpdateEverythingResult(): UpdateEverythingResult | null {
   try {
     return takeUpdateEverythingResult(window.localStorage, Date.now());
@@ -91,6 +86,118 @@ export function showUpdateEverythingResult(result: UpdateEverythingResult): void
   );
 }
 
+const historyRevisionAtom = Atom.make(0).pipe(Atom.keepAlive);
+const unavailableScopes = new Set<string>();
+const liveInstallIds = new Set<string>();
+const scopeId = (scope: UpdateOutcomeScope) => `${scope.surface}:${scope.primaryEnvironmentId}`;
+const notifyHistoryChanged = () => appAtomRegistry.update(historyRevisionAtom, (value) => value + 1);
+
+export function useUpdateOutcomeScope(): UpdateOutcomeScope | null {
+  const primary = usePrimaryEnvironmentId();
+  return useMemo(() => updateOutcomeScope(isElectron ? "desktop" : "web", primary), [primary]);
+}
+
+/** The sole production writer for last-result metadata. Never invokes update APIs. */
+function changeHistory(
+  scope: UpdateOutcomeScope | null,
+  change: (history: UpdateOutcomeHistory) => UpdateOutcomeHistory | null,
+): boolean {
+  if (scope === null) return false;
+  let saved = false;
+  try { saved = writeUpdateOutcomeHistory(window.localStorage, scope, change); } catch { /* unavailable */ }
+  if (saved) unavailableScopes.delete(scopeId(scope));
+  else unavailableScopes.add(scopeId(scope));
+  notifyHistoryChanged();
+  return saved;
+}
+
+export function acknowledgeDisplayedUpdateOutcome(scope: UpdateOutcomeScope | null, id: string): boolean {
+  if (scope === null) return false;
+  let acknowledged = false;
+  try { acknowledged = acknowledgeUpdateOutcomeNotice(window.localStorage, scope, id); } catch { /* unavailable */ }
+  if (!acknowledged) unavailableScopes.add(scopeId(scope));
+  notifyHistoryChanged();
+  return acknowledged;
+}
+
+export function saveCompletedUpdateOutcome(
+  scope: UpdateOutcomeScope | null, completed: LastCompletedUpdate,
+): boolean {
+  return changeHistory(scope, (previous) => completeUpdateOutcome(previous, completed));
+}
+
+export function prepareUpdateOutcome(
+  scope: UpdateOutcomeScope | null, pending: PendingUpdateInstall,
+): boolean {
+  const saved = changeHistory(scope, (previous) => previous.pendingInstall && liveInstallIds.has(previous.pendingInstall.id) ? null
+    : { ...previous, pendingInstall: pending });
+  if (saved) liveInstallIds.add(pending.id);
+  return saved;
+}
+
+export function discardPendingUpdateOutcome(scope: UpdateOutcomeScope | null, id: string): void {
+  changeHistory(scope, (previous) => previous.pendingInstall?.id === id
+    ? { ...previous, pendingInstall: null } : null);
+  liveInstallIds.delete(id);
+}
+
+function readHistory(scope: UpdateOutcomeScope | null): UpdateHistoryRead {
+  if (scope === null || unavailableScopes.has(scopeId(scope))) return { status: "unavailable" };
+  try { return readUpdateOutcomeHistory(window.localStorage, scope); }
+  catch { return { status: "unavailable" }; }
+}
+
+export function useLastUpdateOutcome() {
+  const scope = useUpdateOutcomeScope();
+  const revision = useAtomValue(historyRevisionAtom);
+  const desktop = useDesktopUpdateState();
+  const history = useMemo(() => readHistory(scope), [scope, revision]);
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key?.startsWith("t3code:update-everything:last-outcome:v2:")) notifyHistoryChanged();
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  useEffect(() => {
+    if (scope === null || history.status !== "ready") return;
+    const fresh = readHistory(scope);
+    if (fresh.status !== "ready") return;
+    const pending = fresh.value.pendingInstall;
+    if (pending && desktop && (!liveInstallIds.has(pending.id) ||
+        (desktop.status === "error" && desktop.errorContext === "install"))) {
+      const next = resolvePendingUpdateOutcome(fresh.value, desktop, Date.now());
+      if (next) {
+        const saved = changeHistory(scope, (current) => current.pendingInstall?.id === pending.id
+          ? resolvePendingUpdateOutcome(current, desktop, Date.now()) : null);
+        if (saved) liveInstallIds.delete(pending.id);
+        return;
+      }
+    }
+    const completed = fresh.value.lastCompleted;
+    if (!completed || fresh.value.pendingNoticeId !== completed.id) return;
+    if (!acknowledgeDisplayedUpdateOutcome(scope, completed.id)) return;
+    toastManager.add(stackedThreadToast({
+      type: completed.rows.some((row) => row.status === "failed") ? "error"
+        : completed.rows.every((row) => row.status === "updated") ? "success" : "warning",
+      title: "Update results",
+      description: "The last completed update result is available from Last update.",
+    }));
+  }, [scope, history, desktop]);
+
+  const clear = () => {
+    if (scope === null) return false;
+    let cleared = false;
+    try { cleared = clearUpdateOutcomeHistory(window.localStorage, scope); } catch { /* unavailable */ }
+    if (cleared) unavailableScopes.delete(scopeId(scope));
+    else unavailableScopes.add(scopeId(scope));
+    notifyHistoryChanged();
+    return cleared;
+  };
+  return { history, clear };
+}
+
 let notifiedNotAppliedVersion: string | null = null;
 
 /**
@@ -99,6 +206,7 @@ let notifiedNotAppliedVersion: string | null = null;
  * Mount once at the app root.
  */
 export function DesktopUpdateLaunchNotice() {
+  useLastUpdateOutcome();
   const notAppliedVersion = useDesktopUpdateState()?.notAppliedVersion ?? null;
 
   useEffect(() => {

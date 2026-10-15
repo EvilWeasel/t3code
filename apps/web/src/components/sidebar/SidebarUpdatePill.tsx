@@ -32,6 +32,7 @@ import {
   shouldToastDesktopUpdateActionResult,
 } from "../desktopUpdate.logic";
 import { showDesktopUpdateDownloadedToast } from "../desktopUpdate.toast";
+import { Button } from "../ui/button";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
 import { Popover, PopoverCreateHandle, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { SidebarMenuItem } from "../ui/sidebar";
@@ -49,7 +50,7 @@ import {
   resolveUpdateRunMachineStatus,
   type UpdateEverythingRun,
 } from "./updateEverything.logic";
-import { useUpdateEverythingRun } from "./updateEverythingRun";
+import { useLastUpdateOutcome, useUpdateEverythingRun } from "./updateEverythingRun";
 import { type ReportLocalUpdateError, useUpdateEverything } from "./useUpdateEverything";
 
 type SidebarUpdatePopoverChangeDetails = Parameters<
@@ -253,6 +254,8 @@ function SidebarUpdateControl() {
   const state = useDesktopUpdateState();
   const [isActionPending, setIsActionPending] = useState(false);
   const [isConfirmingEverything, setIsConfirmingEverything] = useState(false);
+  const [isViewingLastOutcome, setIsViewingLastOutcome] = useState(false);
+  const lastOutcome = useLastUpdateOutcome();
   const [checkAnimationKey, setCheckAnimationKey] = useState(0);
   const [isCheckAnimationLatched, setIsCheckAnimationLatched] = useState(false);
   const [releaseNotesPopoverHandle] = useState(() => PopoverCreateHandle());
@@ -440,7 +443,7 @@ function SidebarUpdateControl() {
   }, [prefersReducedMotion, state?.status]);
 
   // Web has no local app to check, so it only shows the button for remote work.
-  if (!isElectron && !runsEverything && !isRunningEverything) return null;
+  const showUpdateAction = isElectron || runsEverything || isRunningEverything;
 
   const updateButton = (
     <button
@@ -494,7 +497,7 @@ function SidebarUpdateControl() {
 
   return (
     <SidebarMenuItem className="ml-auto shrink-0">
-      <Popover
+      {showUpdateAction ? <Popover
         handle={releaseNotesPopoverHandle}
         onOpenChange={(open, details) => {
           if (open && !showReleaseNotesPopover) {
@@ -558,7 +561,15 @@ function SidebarUpdateControl() {
             />
           </PopoverPopup>
         ) : null}
-      </Popover>
+      </Popover> : null}
+      <Button variant="ghost" size="xs" onClick={() => setIsViewingLastOutcome(true)}>Last update</Button>
+      <UpdateEverythingDialog
+        mode="history"
+        open={isViewingLastOutcome}
+        onOpenChange={setIsViewingLastOutcome}
+        history={lastOutcome.history}
+        onClear={lastOutcome.clear}
+      />
       <UpdateEverythingDialog
         open={isConfirmingEverything}
         onOpenChange={setIsConfirmingEverything}

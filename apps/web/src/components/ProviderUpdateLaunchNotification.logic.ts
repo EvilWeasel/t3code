@@ -348,20 +348,36 @@ export interface ProviderUpdateRun {
  * line that names the machine and provider, such as "alvin · Codex: npm exited".
  */
 export type ProviderUpdateRunOutcome =
-  | { readonly status: "updated" }
-  | { readonly status: "failed" | "interrupted"; readonly line: string };
+  (
+    | { readonly status: "updated" }
+    | { readonly status: "failed" | "interrupted"; readonly line: string }
+  ) & {
+    readonly identity?: {
+      readonly environmentId: EnvironmentId;
+      readonly machineLabel: string;
+      readonly driver: ProviderDriverKind;
+      readonly instanceId: ProviderInstanceId;
+    };
+  };
 
 export function getProviderUpdateRunOutcome(
   run: ProviderUpdateRun,
 ): ProviderUpdateRunOutcome {
   const label = `${run.machineLabel} · ${PROVIDER_DISPLAY_NAMES[run.driver] ?? run.driver}`;
+  const identity = {
+    environmentId: run.environmentId,
+    machineLabel: run.machineLabel,
+    driver: run.driver,
+    instanceId: run.instanceId,
+  };
   if (isAtomCommandInterrupted(run.result)) {
-    return { status: "interrupted", line: `${label}: Update was interrupted.` };
+    return { status: "interrupted", line: `${label}: Update was interrupted.`, identity };
   }
   if (run.result._tag === "Failure") {
     const error = squashAtomCommandFailure(run.result);
     return {
       status: "failed",
+      identity,
       line: `${label}: ${error instanceof Error ? error.message : "Provider update failed."}`,
     };
   }
@@ -369,9 +385,10 @@ export function getProviderUpdateRunOutcome(
     (provider) => provider.instanceId === run.instanceId,
   )?.updateState;
   return updateState?.status === "succeeded"
-    ? { status: "updated" }
+    ? { status: "updated", identity }
     : {
         status: "failed",
+        identity,
         line: `${label}: ${updateState?.message ?? "Provider update did not finish."}`,
       };
 }

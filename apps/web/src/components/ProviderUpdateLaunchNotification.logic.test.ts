@@ -1126,6 +1126,10 @@ describe("getProviderUpdateRunToastView", () => {
     expect(getProviderUpdateRunOutcome(interrupted)).toEqual({
       status: "interrupted",
       line: "Laptop · Codex: Update was interrupted.",
+      identity: {
+        environmentId: EnvironmentId.make("Laptop"), machineLabel: "Laptop",
+        driver: driver("codex"), instanceId: instanceId("codex"),
+      },
     });
     expect(getProviderUpdateRunToastView([interrupted])).toBeNull();
   });
@@ -1138,6 +1142,14 @@ describe("getProviderUpdateRunToastView", () => {
           updateState: updateState("succeeded", "Provider updated."),
         }),
       ],
+    });
+
+    expect(getProviderUpdateRunOutcome(run("Laptop", "codex", succeeded))).toMatchObject({
+      status: "updated",
+      identity: {
+        environmentId: EnvironmentId.make("Laptop"), machineLabel: "Laptop",
+        driver: driver("codex"), instanceId: instanceId("codex"),
+      },
     });
 
     expect(

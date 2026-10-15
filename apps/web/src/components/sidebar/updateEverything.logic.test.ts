@@ -4,7 +4,7 @@ import {
   ProviderInstanceId,
   type ServerSelfUpdateCapability,
 } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/reactivity";
 import { getProviderUpdateRunOutcome } from "../ProviderUpdateLaunchNotification.logic";
@@ -24,6 +24,17 @@ import {
   type UpdateEverythingMachine,
   type UpdateRunMachine,
   type UpdateEverythingResult,
+  acknowledgeUpdateOutcomeNotice,
+  buildUpdateOutcomeRows,
+  clearUpdateOutcomeHistory,
+  completeUpdateOutcome,
+  readUpdateOutcomeHistory,
+  resolvePendingUpdateOutcome,
+  updateOutcomeScope,
+  writeUpdateOutcomeHistory,
+  type LastCompletedUpdate,
+  type PendingUpdateInstall,
+  type UpdateOutcomeHistory,
 } from "./updateEverything.logic";
 
 function machine(
@@ -516,5 +527,206 @@ describe("describeUpdateEverything", () => {
         ],
       }).summary,
     ).toBe("Update 1 provider");
+  });
+});
+
+describe("durable last completed Update all outcome", () => {
+  const scope = { surface: "desktop", primaryEnvironmentId: "primary-A" } as const;
+  const makeStore = () => {
+    const values = new Map<string, string>();
+    let removes = 0;
+    return {
+      values,
+      removes: () => removes,
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { removes += 1; values.delete(key); },
+    };
+  };
+  const identity = (id: string) => ({
+    environmentId: EnvironmentId.make(id), machineLabel: id,
+    driver: ProviderDriverKind.make("codex"), instanceId: ProviderInstanceId.make(`codex-${id}`),
+  });
+  const completed = (id = "completed-1"): LastCompletedUpdate => ({
+    id, completedAt: 1_000, clientVersion: "1.2.3", targetVersion: null,
+    rows: [{ environmentId: "primary-A", machineLabel: "ready", component: "server",
+      driver: null, instanceId: null, status: "updated", reason: "none" }],
+  });
+  const pending = (): PendingUpdateInstall => ({
+    id: "install-1", startedAt: 2_000, fromVersion: "1.2.3", targetVersion: "1.2.4",
+    previousNotAppliedVersion: null, rows: completed().rows,
+  });
+  const read = (store: ReturnType<typeof makeStore>, selected = scope): UpdateOutcomeHistory => {
+    const result = readUpdateOutcomeHistory(store, selected);
+    if (result.status !== "ready") throw new Error("Expected a readable history");
+    return result.value;
+  };
+
+  it("retains mixed machine/provider identities after notice consumption, relaunch and 24 hours", () => {
+    const store = makeStore();
+    const interrupted = getProviderUpdateRunOutcome({
+      ...identity("interrupted"), result: AsyncResult.failure(Cause.interrupt()),
+    });
+    const rows = buildUpdateOutcomeRows({
+      providers: [
+        { status: "updated", identity: identity("updated") },
+        { status: "failed", line: "DO NOT PERSIST token=secret / draft / raw stderr", identity: identity("failed") },
+        interrupted,
+      ],
+      servers: [{ environmentId: "ready", label: "ready", outcome: { status: "updated" } }],
+      skipped: [{ environmentId: EnvironmentId.make("offline"), label: "offline", reason: "not connected" }],
+    });
+    if (rows === null) throw new Error("Missing identity");
+    const last = { ...completed(), rows };
+    expect(writeUpdateOutcomeHistory(store, scope, (previous) => completeUpdateOutcome(previous, last))).toBe(true);
+    expect(acknowledgeUpdateOutcomeNotice(store, scope, last.id)).toBe(true);
+    const afterRelaunch = read(store);
+    expect(afterRelaunch.lastCompleted).toEqual(last);
+    expect(afterRelaunch.pendingNoticeId).toBeNull();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_000 + 25 * 60 * 60 * 1000);
+    try {
+      expect(readUpdateOutcomeHistory({ ...store }, scope)).toEqual({ status: "ready", value: afterRelaunch });
+      expect(acknowledgeUpdateOutcomeNotice(store, scope, last.id)).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+    expect(last.rows.map((row) => [row.machineLabel, row.status])).toEqual([
+      ["updated", "updated"], ["failed", "failed"], ["interrupted", "interrupted"],
+      ["ready", "updated"], ["offline", "skipped"],
+    ]);
+    const bytes = [...store.values.values()].join("");
+    expect(bytes).not.toContain("secret");
+    expect(bytes).not.toContain("raw stderr");
+    expect(last.rows[0]?.instanceId).toBe("codex-updated");
+  });
+
+  it("keeps previous completed data inside pending install and only finalizes observed versions", () => {
+    const store = makeStore();
+    const prior = completed();
+    expect(writeUpdateOutcomeHistory(store, scope, (old) => completeUpdateOutcome(old, prior))).toBe(true);
+    expect(writeUpdateOutcomeHistory(store, scope, (old) => ({ ...old, pendingInstall: pending() }))).toBe(true);
+    const staged = read(store);
+    expect(staged.lastCompleted).toEqual(prior);
+    const remoteOnly = completeUpdateOutcome(staged, completed("remote-completed"));
+    expect(remoteOnly?.lastCompleted?.id).toBe("remote-completed");
+    expect(remoteOnly?.pendingInstall).toEqual(pending());
+    expect(resolvePendingUpdateOutcome(staged, { currentVersion: "1.2.3" }, 3_000)).toBeNull();
+    const applied = resolvePendingUpdateOutcome(staged, { currentVersion: "1.2.4" }, 3_000);
+    expect(applied?.lastCompleted).toMatchObject({ id: "install-1", targetVersion: "1.2.4", completedAt: 3_000 });
+    expect(applied?.lastCompleted?.rows.at(-1)?.status).toBe("updated");
+    const failed = resolvePendingUpdateOutcome(staged, { currentVersion: "1.2.3", notAppliedVersion: "1.2.4" }, 3_000);
+    expect(failed?.lastCompleted?.rows.at(-1)?.reason).toBe("install-not-applied");
+    const asyncFailure = resolvePendingUpdateOutcome(staged, {
+      currentVersion: "1.2.3", status: "error", errorContext: "install", downloadedVersion: "1.2.4",
+    }, 3_000);
+    expect(asyncFailure?.lastCompleted?.rows.at(-1)?.reason).toBe("install-failed");
+    expect(resolvePendingUpdateOutcome(staged, {
+      currentVersion: "1.2.3", status: "error", errorContext: "install", downloadedVersion: "different",
+    }, 3_000)).toBeNull();
+    const staleFlag = { ...staged, pendingInstall: { ...pending(), previousNotAppliedVersion: "1.2.4" } };
+    expect(resolvePendingUpdateOutcome(staleFlag, { currentVersion: "1.2.3", notAppliedVersion: "1.2.4" }, 3_000)).toBeNull();
+    const unrelated = resolvePendingUpdateOutcome(staged, { currentVersion: "1.2.5" }, 3_000);
+    expect(unrelated?.lastCompleted?.rows.at(-1)).toMatchObject({ status: "skipped", reason: "unverified-install" });
+    expect(staged.lastCompleted).toEqual(prior);
+  });
+
+  it("never replays an install when reading, acknowledging or clearing the completed result", async () => {
+    const store = makeStore();
+    let installs = 0;
+    expect(await installAfterUpdateEverything({
+      result: { localVersion: "1.2.4", updatedServers: 1, updatedProviders: 0, failures: [] },
+      localReady: true,
+      save: () => writeUpdateOutcomeHistory(store, scope, (old) => ({ ...old, pendingInstall: pending() })),
+      install: async () => { installs += 1; return true; },
+      clear: () => { throw new Error("Accepted install must retain its pending handoff"); },
+    })).toBe("relaunching");
+    expect(writeUpdateOutcomeHistory(store, scope, (old) =>
+      resolvePendingUpdateOutcome(old, { currentVersion: "1.2.4" }, 3_000),
+    )).toBe(true);
+    expect(acknowledgeUpdateOutcomeNotice(store, scope, "install-1")).toBe(true);
+    expect(read(store).lastCompleted?.id).toBe("install-1");
+    expect(readUpdateOutcomeHistory({ ...store }, scope).status).toBe("ready");
+    expect(clearUpdateOutcomeHistory(store, scope)).toBe(true);
+    expect(read(store).lastCompleted).toBeNull();
+    expect(installs).toBe(1);
+  });
+
+  it("isolates profiles/environments/surfaces and explicitly clears only the selected scope", () => {
+    const first = makeStore();
+    const otherProfile = makeStore();
+    const otherScope = { ...scope, primaryEnvironmentId: "primary-B" };
+    const webScope = { ...scope, surface: "web" as const };
+    for (const selected of [scope, otherScope, webScope]) {
+      expect(writeUpdateOutcomeHistory(first, selected, (old) => completeUpdateOutcome(old, completed()))).toBe(true);
+    }
+    expect(readUpdateOutcomeHistory(otherProfile, scope)).toMatchObject({ status: "ready", value: { lastCompleted: null } });
+    expect(clearUpdateOutcomeHistory(first, scope)).toBe(true);
+    expect(read(first).lastCompleted).toBeNull();
+    expect(readUpdateOutcomeHistory(first, otherScope)).toMatchObject({ status: "ready", value: { lastCompleted: completed() } });
+    expect(readUpdateOutcomeHistory(first, webScope)).toMatchObject({ status: "ready", value: { lastCompleted: completed() } });
+    expect(updateOutcomeScope("desktop", null)).toBeNull();
+    expect(writeUpdateOutcomeHistory(first, null, (old) => old)).toBe(false);
+    expect(readUpdateOutcomeHistory(first, null).status).toBe("unavailable");
+  });
+
+  it("rejects malformed, oversized, foreign-version and wrong-scope records without destructive reads", () => {
+    const store = makeStore();
+    expect(writeUpdateOutcomeHistory(store, scope, (old) => completeUpdateOutcome(old, completed()))).toBe(true);
+    const key = [...store.values.keys()][0]!;
+    const original = read(store);
+    for (const raw of [
+      "not JSON", "x".repeat(65_537),
+      JSON.stringify({ ...original, schemaVersion: 3 }),
+      JSON.stringify({ ...original, scope: { ...scope, primaryEnvironmentId: "different" } }),
+      JSON.stringify({ ...original, lastCompleted: { ...completed(), completedAt: -1 } }),
+    ]) {
+      store.values.set(key, raw);
+      expect(readUpdateOutcomeHistory(store, scope).status).toBe("unavailable");
+      expect(store.values.get(key)).toBe(raw);
+      expect(store.removes()).toBe(0);
+    }
+  });
+
+  it("caps UTF8 payload, machine count and row count without truncating or deleting the last result", () => {
+    const store = makeStore();
+    expect(writeUpdateOutcomeHistory(store, scope, (old) => completeUpdateOutcome(old, completed()))).toBe(true);
+    const original = [...store.values.values()][0];
+    const row = completed().rows[0]!;
+    const cases = [
+      Array.from({ length: 129 }, (_, i) => ({ ...row, environmentId: `env-${i}` })),
+      Array.from({ length: 513 }, () => row),
+      Array.from({ length: 128 }, () => ({ ...row, machineLabel: "猫".repeat(256) })),
+    ];
+    for (const rows of cases) {
+      expect(writeUpdateOutcomeHistory(store, scope, (old) => completeUpdateOutcome(old, { ...completed(), rows }))).toBe(false);
+      expect([...store.values.values()][0]).toBe(original);
+      expect(store.removes()).toBe(0);
+    }
+  });
+
+  it("keeps local install at zero on quota/readback failure and never removes prior data", async () => {
+    const store = makeStore();
+    expect(writeUpdateOutcomeHistory(store, scope, (old) => completeUpdateOutcome(old, completed()))).toBe(true);
+    let installs = 0;
+    const quota = { ...store, setItem: () => { throw new Error("quota"); } };
+    let written = false;
+    const brokenReadback = { ...store,
+      setItem: (key: string, raw: string) => { store.setItem(key, raw); written = true; },
+      getItem: (key: string) => written ? "corrupt" : store.getItem(key),
+    };
+    for (const storage of [quota, brokenReadback]) {
+      expect(await installAfterUpdateEverything({
+        result: { localVersion: "1.2.4", updatedServers: 1, updatedProviders: 0, failures: [] },
+        localReady: true,
+        save: () => writeUpdateOutcomeHistory(storage, scope, (old) => ({ ...old, pendingInstall: pending() })),
+        install: async () => { installs += 1; return true; },
+        clear: () => { throw new Error("Failed saves must not clear old history"); },
+      })).toBe("storage-failed");
+    }
+    expect(installs).toBe(0);
+    expect(store.removes()).toBe(0);
+    // The provisional bytes include prior data; the failed readback is still unavailable.
+    expect(JSON.parse([...store.values.values()][0]!).lastCompleted).toEqual(completed());
+    expect(readUpdateOutcomeHistory(brokenReadback, scope).status).toBe("unavailable");
   });
 });

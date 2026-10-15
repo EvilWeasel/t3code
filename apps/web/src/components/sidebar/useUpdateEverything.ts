@@ -7,6 +7,7 @@ import { APP_VERSION } from "~/branding";
 import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
 import { isElectron } from "~/env";
 import { useEnvironments } from "~/state/environments";
+import { useDesktopUpdateState } from "~/state/desktopUpdate";
 import { serverEnvironment } from "~/state/server";
 import { environmentSession } from "~/state/session";
 import { getProviderUpdateRunOutcome } from "../ProviderUpdateLaunchNotification.logic";
@@ -16,14 +17,20 @@ import {
   collectRestartingMachines,
   collectServerUpdateTargets,
   collectUpdateEverythingResult,
+  buildUpdateOutcomeRows,
+  localUpdateOutcomeRow,
+  type LastUpdateRow,
   describeUpdateEverything,
   installAfterUpdateEverything,
   runUpdateEverything,
   type UpdateRunMachine,
 } from "./updateEverything.logic";
 import {
-  clearSavedUpdateEverythingResult,
-  saveUpdateEverythingResult,
+  acknowledgeDisplayedUpdateOutcome,
+  discardPendingUpdateOutcome,
+  prepareUpdateOutcome,
+  saveCompletedUpdateOutcome,
+  useUpdateOutcomeScope,
   setUpdateEverythingRun,
   settleUpdateRunMachine,
   showUpdateEverythingResult,
@@ -43,6 +50,8 @@ export type ReportLocalUpdateError = (title: string, description: string) => voi
 export function useUpdateEverything(localUpdateVersion: string | null) {
   const targetVersion = localUpdateVersion ?? APP_VERSION;
   const { environments } = useEnvironments();
+  const historyScope = useUpdateOutcomeScope();
+  const priorNotAppliedVersion = useDesktopUpdateState()?.notAppliedVersion;
   const machinesAtom = useMemo(
     () =>
       Atom.make((get) =>
@@ -101,6 +110,8 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
       downloadLocal?: (reportError: ReportLocalUpdateError) => Promise<boolean>;
       installLocal?: (reportError: ReportLocalUpdateError) => Promise<boolean>;
     }) => {
+      const capturedScope = historyScope;
+      const outcomeId = crypto.randomUUID();
       const localFailures: Array<string> = [];
       const reportLocalError: ReportLocalUpdateError = (title, description) => {
         localFailures.push(`${title}: ${description}`);
@@ -172,7 +183,7 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
                         interruptedProviderMachines.has(server.environmentId)
                       ? "skipped" : "done",
                 );
-                return { label: server.serverLabel, outcome: serverOutcome };
+                return { environmentId: server.environmentId, label: server.serverLabel, outcome: serverOutcome };
               }),
             ),
         });
@@ -184,21 +195,44 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
             servers: outcome.servers,
             providers: outcome.providers,
           });
-        if (outcome.localReady && installLocal) {
+        const rows = buildUpdateOutcomeRows({
+          providers: outcome.providers, servers: outcome.servers, skipped,
+        });
+        let localStatus: LastUpdateRow["status"] = localFailures.length > 0 ? "failed" : "skipped";
+        let localReason: LastUpdateRow["reason"] = localFailures.length > 0 ? "download-failed" : "not-started";
+        if (outcome.localReady && installLocal && localVersion) {
           setUpdateEverythingRun((run) => run && { ...run, phase: "installing" });
           const installOutcome = await installAfterUpdateEverything({
             result: { ...result(), localVersion },
             localReady: outcome.localReady,
-            save: saveUpdateEverythingResult,
+            save: () => rows !== null && prepareUpdateOutcome(capturedScope, {
+              id: outcomeId, startedAt: Date.now(), fromVersion: APP_VERSION,
+              targetVersion: localVersion, previousNotAppliedVersion: priorNotAppliedVersion ?? null, rows,
+            }),
             install: () => installLocal(reportLocalError),
-            clear: clearSavedUpdateEverythingResult,
+            clear: () => discardPendingUpdateOutcome(capturedScope, outcomeId),
           });
           if (installOutcome === "relaunching") return;
           if (installOutcome === "storage-failed") {
             reportLocalError("Update remains ready", "Could not save the update results. The app will stay open so those results are preserved.");
+            showUpdateEverythingResult(result());
+            return;
           }
+          localStatus = localFailures.length > 0 ? "failed" : "skipped";
+          localReason = localFailures.length > 0 ? "install-failed" : "not-started";
+        }
+        const completedRows = rows && capturedScope
+          ? [...rows, ...(installLocal ? [localUpdateOutcomeRow(capturedScope, localStatus, localReason)] : [])]
+          : null;
+        const completedSaved = completedRows !== null && saveCompletedUpdateOutcome(capturedScope, {
+          id: outcomeId, completedAt: Date.now(), clientVersion: APP_VERSION,
+          targetVersion: localVersion, rows: completedRows,
+        });
+        if (!completedSaved) {
+          reportLocalError("Result unavailable", "Could not durably save the last update result.");
         }
         showUpdateEverythingResult(result());
+        if (completedSaved) acknowledgeDisplayedUpdateOutcome(capturedScope, outcomeId);
       } finally {
         setUpdateEverythingRun(() => null);
       }
