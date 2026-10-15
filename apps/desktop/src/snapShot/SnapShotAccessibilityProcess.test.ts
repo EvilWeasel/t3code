@@ -159,13 +159,63 @@ it("keeps timeout retirement pending after kill while the native child has not e
   } finally { process.close(); worker.emit("exit", 0); vi.useRealTimers(); }
 });
 
-it("retires a successful accessibility request from the real result ACK without requiring worker exit", async () => {
+it("keeps even an accessibility result separate from actual child retirement", async () => {
   const process = startSnapShotAccessibilityProcess("accessibility.cjs");
   const read = process.read(request);
   worker.emit("message", "ready");
   worker.emit("message", "started");
   worker.emit("message", { type: "result", context: { accessibleText: "owned fixture" } });
   await read.result;
+  let retired = false;
+  void read.nativeRetired!.then(() => { retired = true; });
+  await Promise.resolve();
+  assert.isFalse(retired);
+  worker.emit("exit", 0);
   await read.nativeRetired;
   process.close();
+});
+
+it("retains admission after the real reader's inner timeout result while native read and child exit are withheld", async () => {
+  const { readAccessibleWindowContextWithApp } = await import("./SnapShotAccessibility.ts");
+  const { makeRendererCreationAdmission } = await import("../electron/ElectronWindow.ts");
+  vi.useFakeTimers();
+  const native = Promise.withResolvers<{ value: string; children: never[] }>();
+  const nativeStarted = Promise.withResolvers<void>();
+  const window = {
+    role: "window", name: request.active.title, bounds: request.active.bounds,
+    tree: () => { nativeStarted.resolve(); return native.promise; },
+    children: async () => [],
+  };
+  const App = {
+    byPid: async () => ({ children: async () => [window] }),
+    list: async () => [],
+  } as unknown as Parameters<typeof readAccessibleWindowContextWithApp>[0];
+  const gate = makeRendererCreationAdmission(() => 100, () => []);
+  const activity = gate.tryReserveRuntimeActivity({ kind: "snapshot-capture" });
+  const process = startSnapShotAccessibilityProcess("accessibility.cjs");
+  try {
+    const read = process.read(request);
+    void read.nativeRetired!.then(() => activity!.release());
+    worker.emit("message", "ready");
+    const logical = readAccessibleWindowContextWithApp(App, request, () => worker.emit("message", "started"));
+    await nativeStarted.promise;
+    await read.started;
+    await vi.advanceTimersByTimeAsync(3_000);
+    // This is exactly the real worker's forwarding seam: its result need not
+    // mean the reader's already-started native tree() call has completed.
+    worker.emit("message", { type: "result", context: await logical });
+    await read.result;
+    assert.lengthOf(worker.kill.mock.calls, 1);
+    assert.isUndefined(gate.acquire(200));
+    worker.emit("exit", 0);
+    await read.nativeRetired;
+    const held = gate.acquire(200);
+    assert.isDefined(held);
+    held!.release();
+  } finally {
+    native.resolve({ value: "completed", children: [] });
+    worker.emit("exit", 0);
+    process.close();
+    vi.useRealTimers();
+  }
 });

@@ -65,6 +65,8 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
     return unavailableProcess();
   }
 
+  // A result may be the reader's inner timeout snapshot while native calls
+  // continue. Only actual exit retires this single-use child's work.
   const nativeRetired = Promise.withResolvers<void>();
   let ready = false;
   let request: SnapShotAccessibilityRequest | undefined;
@@ -79,14 +81,13 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
     if (startTimeout) clearTimeout(startTimeout);
     if (resultTimeout) clearTimeout(resultTimeout);
   };
-  const finish = (context?: CapturedWindowAccessibilityContext, acknowledged = false) => {
+  const finish = (context?: CapturedWindowAccessibilityContext) => {
     if (settled) return;
     settled = true;
     settledContext = context;
     clearTimers();
     startedResolve?.();
     resultResolve?.(context);
-    if (acknowledged) nativeRetired.resolve();
     worker.kill();
   };
   const sendRequest = () => {
@@ -111,7 +112,7 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
       if (startTimeout) clearTimeout(startTimeout);
       startedResolve?.();
     } else {
-      if (message.type === "result") finish(message.context, true);
+      if (message.type === "result") finish(message.context);
     }
   });
   worker.once("error", () => finish());
