@@ -12,6 +12,57 @@ vp_cmd() {
   fi
 }
 
+# Route generation is hosted evidence, not a committed source edit.
+if [[ -f apps/web/src/routes/observatory.tsx ]]; then
+  test "${GITHUB_ACTIONS:-}" = true
+  test -n "${RUNNER_TEMP:-}"
+  timeout 90s node --input-type=module <<'OBSERVATORY_ROUTE_GENERATION'
+import { createRequire } from 'node:module';
+import { readFileSync, writeFileSync, mkdirSync, copyFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { join, resolve } from 'node:path';
+const root = process.cwd();
+const generated = 'apps/web/src/routeTree.gen.ts';
+const directory = join(process.env.RUNNER_TEMP, 'observatory-route-generation');
+mkdirSync(directory, { recursive: false, mode: 0o700 });
+const git = (...args) => execFileSync('git', args, { cwd: root, maxBuffer: 4 * 1024 * 1024 }).toString();
+const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+const receipt = { status: 'incomplete', source: git('rev-parse', 'HEAD').trim(), run: process.env.GITHUB_RUN_ID,
+  attempt: process.env.GITHUB_RUN_ATTEMPT, lockSha256: sha(readFileSync('pnpm-lock.yaml')),
+  beforeSha256: sha(readFileSync(generated)), command: 'Generator({config:getConfig({autoCodeSplitting:true},appsWebRoot),root:appsWebRoot}).run()',
+  config: { autoCodeSplitting: true }, generatorVersion: null, afterSha256: null,
+  checkScriptSha256: sha(readFileSync('scripts/weasel/check.sh')) };
+const persist = () => writeFileSync(join(directory, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
+persist();
+try {
+  if (git('status', '--porcelain', '--untracked-files=all').trim()) throw Error('checkout-not-clean');
+  if (receipt.source !== process.env.GITHUB_SHA) throw Error('source-mismatch');
+  const require = createRequire(resolve('apps/web/package.json'));
+  const pluginRequire = createRequire(require.resolve('@tanstack/router-plugin/vite'));
+  receipt.generatorResolvedPath = pluginRequire.resolve('@tanstack/router-generator');
+  receipt.generatorVersion = pluginRequire('@tanstack/router-generator/package.json').version;
+  if (receipt.generatorVersion !== '1.167.12') throw Error('generator-version-mismatch');
+  persist();
+  const { Generator, getConfig } = pluginRequire('@tanstack/router-generator');
+  const web = resolve('apps/web');
+  await new Generator({ config: getConfig({ autoCodeSplitting: true }, web), root: web }).run();
+  const changes = git('diff', '--name-only', 'HEAD').trim().split('\n').filter(Boolean);
+  if (changes.length !== 1 || changes[0] !== generated) throw Error('unexpected-tracked-delta');
+  if (git('ls-files', '--others', '--exclude-standard').trim()) throw Error('unexpected-untracked-file');
+  if (git('rev-parse', 'HEAD').trim() !== receipt.source || sha(readFileSync('pnpm-lock.yaml')) !== receipt.lockSha256) throw Error('source-changed');
+  const bytes = readFileSync(generated);
+  if (bytes.length > 1024 * 1024 || !bytes.toString().includes('/observatory')) throw Error('generated-route-missing-or-oversized');
+  receipt.afterSha256 = sha(bytes);
+  const diff = git('diff', '--binary', 'HEAD', '--', generated);
+  if (Buffer.byteLength(diff) > 2 * 1024 * 1024) throw Error('generated-diff-oversized');
+  copyFileSync(generated, join(directory, 'routeTree.gen.ts'));
+  writeFileSync(join(directory, 'routeTree.diff'), diff, { mode: 0o600 });
+  receipt.status = 'generated-unreviewed';
+} finally { persist(); }
+OBSERVATORY_ROUTE_GENERATION
+fi
+
 typecheck_failed=0
 for package in \
   @t3tools/contracts \
@@ -76,6 +127,20 @@ focused_tests=(
   apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
   apps/web/src/voice/voiceSettingsClient.test.ts
 )
+observatory_tests=(
+  apps/web/src/observatory/AgentObservatory.test.tsx
+  packages/client-runtime/src/observatory/authored.test.ts
+  packages/client-runtime/src/observatory/bridge.test.ts
+  packages/client-runtime/src/observatory/state.test.ts
+  packages/contracts/src/agentObservatory.test.ts
+)
+for observatory_test in "${observatory_tests[@]}"; do
+  if [[ ! -f "$observatory_test" ]]; then
+    echo "Required agent observatory gate is missing: $observatory_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$observatory_test")
+done
 main_renderer_diagnostics_tests=(
   apps/desktop/src/ipc/DesktopIpc.test.ts
   packages/contracts/src/rpc.test.ts
