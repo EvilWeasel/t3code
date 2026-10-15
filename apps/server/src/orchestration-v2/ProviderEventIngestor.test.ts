@@ -1,3 +1,4 @@
+import { makeBackendUpdateGate } from "./ProviderRuntimeRecoveryService.ts";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointId,
@@ -1799,3 +1800,96 @@ layer("ProviderEventIngestorV2", (it) => {
     }),
   );
 });
+
+it.effect(
+  "queued provider publication is counted across a held cut and abort drains into the real SQL projection",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const now = yield* DateTime.now;
+        const sink = yield* EventSink.EventSinkV2;
+        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+        const allocator = yield* IdAllocator.IdAllocatorV2;
+        const created = yield* threadCreatedEvent(now);
+        yield* sink.write({ events: [created] });
+        const session = yield* allocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId: created.threadId,
+        });
+        const providerThreadId = allocator.derive.providerThread({
+          driver: CODEX_DRIVER,
+          nativeThreadId: "cut-thread",
+        });
+        const turn = {
+          id: allocator.derive.providerTurn({ driver: CODEX_DRIVER, nativeTurnId: "cut-turn" }),
+          providerThreadId,
+          nodeId: NodeId.make("node:cut"),
+          runAttemptId: null,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "running" as const,
+          startedAt: now,
+          completedAt: null,
+        };
+        const event = {
+          type: "provider_turn.updated" as const,
+          driver: CODEX_DRIVER,
+          providerTurn: turn,
+        };
+        const gate = yield* makeBackendUpdateGate;
+        ingestor.setUpdateAdmissionGate!(gate);
+        gate.noteNativeQueued(event);
+        yield* gate.hold;
+        const started = yield* Deferred.make<void>();
+        const consumer = yield* Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(
+            ingestor.ingestNormalized({
+              providerSessionId: session,
+              providerInstanceId: modelSelection.instanceId,
+              threadId: created.threadId,
+              event,
+            }),
+          ),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(started);
+        assert.equal(gate.pendingNative(), 1);
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        assert.lengthOf(
+          (yield* store.getThreadRecords(created.threadId, ["providerTurns"])).providerTurns,
+          0,
+        );
+        yield* gate.release;
+        yield* Fiber.join(consumer);
+        assert.equal(gate.pendingNative(), 0);
+        assert.equal(
+          (yield* store.getThreadRecords(created.threadId, ["providerTurns"])).providerTurns[0]
+            ?.status,
+          "running",
+        );
+        // Terminal state crosses a held cut, advances its revision, and is never discarded.
+        yield* gate.hold;
+        const revision = gate.revision();
+        const terminal = {
+          ...event,
+          providerTurn: { ...turn, status: "completed" as const, completedAt: now },
+        };
+        gate.noteNativeQueued(terminal);
+        yield* ingestor.ingestNormalized({
+          providerSessionId: session,
+          providerInstanceId: modelSelection.instanceId,
+          threadId: created.threadId,
+          event: terminal,
+        });
+        assert.isTrue(gate.isHeld());
+        assert.isTrue(gate.revision() > revision);
+        assert.equal(gate.pendingNative(), 0);
+        assert.equal(
+          (yield* store.getThreadRecords(created.threadId, ["providerTurns"])).providerTurns[0]
+            ?.status,
+          "completed",
+        );
+        yield* gate.release;
+      }),
+    ).pipe(Effect.provide(layerTest)),
+);

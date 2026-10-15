@@ -1,3 +1,4 @@
+import type { BackendUpdateGate } from "./ProviderRuntimeRecoveryService.ts";
 import {
   NodeId,
   CommandId,
@@ -263,6 +264,7 @@ export interface ProviderEventIngestInput {
 }
 
 export interface ProviderEventIngestorV2Shape {
+  readonly setUpdateAdmissionGate?: (gate: BackendUpdateGate) => void;
   readonly normalize: (
     input: ProviderEventIngestInput,
   ) => Effect.Effect<ReadonlyArray<OrchestrationV2DomainEvent>, ProviderEventIngestorV2Error>;
@@ -729,100 +731,118 @@ export const layer: Layer.Layer<
         ),
       );
 
-    return ProviderEventIngestorV2.of({
-      normalize,
-      ingestNormalized: (input) =>
-        Effect.gen(function* () {
-          const events = yield* normalize(input);
-          if (events.length === 0) {
-            return [];
-          }
-          const mapWriteError = (cause: unknown) =>
-            new ProviderEventPublishError({
-              providerSessionId: input.providerSessionId,
-              eventCount: events.length,
-              cause,
-            });
-          if (input.writeIfProviderThreadOwner !== undefined) {
-            const ownerResult = yield* eventSink
-              .writeIfProviderThreadOwner({
-                guardPendingUserInputCancellations: true,
-                ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-                ...input.writeIfProviderThreadOwner,
-                events,
-              })
-              .pipe(Effect.mapError(mapWriteError));
-            return ownerResult.storedEvents;
-          }
-          if (input.writeIfRunCurrent === undefined) {
-            return yield* eventSink
-              .write({
-                guardPendingUserInputCancellations: true,
-                ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-                events,
-              })
-              .pipe(Effect.mapError(mapWriteError));
-          }
-          const result = yield* eventSink
-            .writeIfRunCurrent({
+    let updateGate: BackendUpdateGate | undefined;
+    const ingestNormalized: ProviderEventIngestorV2Shape["ingestNormalized"] = (input) =>
+      Effect.gen(function* () {
+        const events = yield* normalize(input);
+        if (events.length === 0) {
+          return [];
+        }
+        const mapWriteError = (cause: unknown) =>
+          new ProviderEventPublishError({
+            providerSessionId: input.providerSessionId,
+            eventCount: events.length,
+            cause,
+          });
+        if (input.writeIfProviderThreadOwner !== undefined) {
+          const ownerResult = yield* eventSink
+            .writeIfProviderThreadOwner({
               guardPendingUserInputCancellations: true,
               ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
-              threadId: input.threadId,
-              ...input.writeIfRunCurrent,
+              ...input.writeIfProviderThreadOwner,
               events,
             })
             .pipe(Effect.mapError(mapWriteError));
-          return result.storedEvents;
-        }).pipe(
-          Effect.flatMap((storedEvents) =>
-            storedEvents.length === 0 || input.event.type !== "subagent.updated"
-              ? Effect.succeed(storedEvents)
-              : syncSubagentThreadModel(input, input.event.subagent).pipe(
-                  Effect.map((synced) => [...storedEvents, ...synced]),
-                  Effect.mapError(
-                    (cause) =>
-                      new ProviderEventPublishError({
-                        providerSessionId: input.providerSessionId,
-                        eventCount: 1,
-                        cause,
-                      }),
-                  ),
+          return ownerResult.storedEvents;
+        }
+        if (input.writeIfRunCurrent === undefined) {
+          return yield* eventSink
+            .write({
+              guardPendingUserInputCancellations: true,
+              ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+              events,
+            })
+            .pipe(Effect.mapError(mapWriteError));
+        }
+        const result = yield* eventSink
+          .writeIfRunCurrent({
+            guardPendingUserInputCancellations: true,
+            ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+            threadId: input.threadId,
+            ...input.writeIfRunCurrent,
+            events,
+          })
+          .pipe(Effect.mapError(mapWriteError));
+        return result.storedEvents;
+      }).pipe(
+        Effect.flatMap((storedEvents) =>
+          storedEvents.length === 0 || input.event.type !== "subagent.updated"
+            ? Effect.succeed(storedEvents)
+            : syncSubagentThreadModel(input, input.event.subagent).pipe(
+                Effect.map((synced) => [...storedEvents, ...synced]),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderEventPublishError({
+                      providerSessionId: input.providerSessionId,
+                      eventCount: 1,
+                      cause,
+                    }),
                 ),
-          ),
-          Effect.tap((storedEvents) =>
-            Effect.gen(function* () {
-              if (storedEvents.length === 0 || input.event.type !== "provider_turn.updated") return;
-              const providerTurn = input.event.providerTurn;
-              if (
-                providerTurn.status !== "completed" &&
-                providerTurn.status !== "failed" &&
-                providerTurn.status !== "interrupted" &&
-                providerTurn.status !== "cancelled"
-              )
-                return;
-              const key = `${input.providerInstanceId}:${providerTurn.id}`;
-              if (completedTurnAnalytics.has(key)) return;
-              completedTurnAnalytics.add(key);
-              if (completedTurnAnalytics.size > 4096) {
-                const oldest = completedTurnAnalytics.values().next().value;
-                if (oldest !== undefined) completedTurnAnalytics.delete(oldest);
-              }
-              yield* analytics.record(
-                providerTurnAnalyticsProperties({
-                  driver: input.event.driver,
-                  providerTurn,
-                  ...(input.analyticsContext === undefined
-                    ? {}
-                    : { context: input.analyticsContext }),
-                }),
-              );
-            }),
-          ),
-          (effect) =>
-            input.event.type === "app_thread.created"
-              ? threadCommands.withLock(input.event.appThread.id, effect)
-              : effect,
+              ),
         ),
+        Effect.tap((storedEvents) =>
+          Effect.gen(function* () {
+            if (storedEvents.length === 0 || input.event.type !== "provider_turn.updated") return;
+            const providerTurn = input.event.providerTurn;
+            if (
+              providerTurn.status !== "completed" &&
+              providerTurn.status !== "failed" &&
+              providerTurn.status !== "interrupted" &&
+              providerTurn.status !== "cancelled"
+            )
+              return;
+            const key = `${input.providerInstanceId}:${providerTurn.id}`;
+            if (completedTurnAnalytics.has(key)) return;
+            completedTurnAnalytics.add(key);
+            if (completedTurnAnalytics.size > 4096) {
+              const oldest = completedTurnAnalytics.values().next().value;
+              if (oldest !== undefined) completedTurnAnalytics.delete(oldest);
+            }
+            yield* analytics.record(
+              providerTurnAnalyticsProperties({
+                driver: input.event.driver,
+                providerTurn,
+                ...(input.analyticsContext === undefined
+                  ? {}
+                  : { context: input.analyticsContext }),
+              }),
+            );
+          }),
+        ),
+        (effect) =>
+          input.event.type === "app_thread.created"
+            ? threadCommands.withLock(input.event.appThread.id, effect)
+            : effect,
+      );
+
+    return ProviderEventIngestorV2.of({
+      normalize,
+      setUpdateAdmissionGate: (gate) => {
+        updateGate = gate;
+      },
+      ingestNormalized: (input) =>
+        Effect.suspend(() => {
+          const effect = ingestNormalized(input).pipe(
+            Effect.ensuring(Effect.sync(() => updateGate?.noteNativeSettled(input.event))),
+          );
+          if (!updateGate) return effect;
+          const terminal =
+            input.event.type === "provider_turn.updated" &&
+            ["completed", "cancelled", "failed", "interrupted"].includes(
+              input.event.providerTurn.status,
+            );
+          return terminal ? updateGate.terminal(effect) : updateGate.observe(effect);
+        }),
     });
   }),
 );

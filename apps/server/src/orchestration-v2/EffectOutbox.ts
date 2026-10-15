@@ -1,3 +1,4 @@
+import type { BackendUpdateGate } from "./ProviderRuntimeRecoveryService.ts";
 import {
   CheckpointId,
   CheckpointScopeId,
@@ -204,6 +205,11 @@ export class EffectOutboxError extends Schema.TaggedError<EffectOutboxError>()(
 const isEffectOutboxError = Schema.is(EffectOutboxError);
 
 export interface EffectOutboxV2Shape {
+  readonly setUpdateAdmissionGate?: (gate: BackendUpdateGate) => void;
+  readonly hasUnsettledForUpdate?: Effect.Effect<boolean, EffectOutboxError>;
+  readonly discardUpdatePreparation?: (
+    ids: ReadonlyArray<string>,
+  ) => Effect.Effect<void, EffectOutboxError>;
   readonly awaitAvailable: Effect.Effect<void>;
   readonly notifyAvailable: (count?: number) => Effect.Effect<void>;
   /** Persist rows only. Notify workers after the surrounding transaction commits. */
@@ -304,6 +310,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
   EffectOutboxV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    let updateGate: BackendUpdateGate | undefined;
     // Availability is only a bounded latency hint; durable rows remain
     // authoritative. Retaining a small burst lets multiple worker slots wake
     // for distinct threads without allowing notifications to grow unbounded.
@@ -549,8 +556,29 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           (cause) => new EffectOutboxError({ operation: "reconcile-process-loss", cause }),
         ),
       ),
+      setUpdateAdmissionGate: (gate) => {
+        updateGate = gate;
+      },
+      hasUnsettledForUpdate: sql<{
+        count: number;
+      }>`SELECT COUNT(*) AS count FROM orchestration_v2_effect_outbox WHERE status IN ('pending','running')`.pipe(
+        Effect.map((rows) => Number(rows[0]?.count ?? 0) > 0),
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "update-preflight", cause })),
+      ),
+      discardUpdatePreparation: (ids) =>
+        Effect.forEach(
+          ids,
+          (id) =>
+            sql`DELETE FROM orchestration_v2_effect_outbox WHERE effect_id=${id} AND effect_type='provider-runtime.continue' AND status='pending'`.pipe(
+              Effect.mapError(
+                (cause) => new EffectOutboxError({ operation: "update-abort", cause }),
+              ),
+            ),
+          { discard: true },
+        ).pipe(Effect.andThen(signalSettled(ids))),
       claimNext: ({ workerId, leaseDurationMs, excludeRestartContinuations = false }) =>
         Effect.gen(function* () {
+          if (updateGate?.isHeld()) return Option.none();
           const now = yield* DateTime.now;
           const nowIso = DateTime.formatIso(now);
           const leaseExpiresAt = DateTime.formatIso(
@@ -585,6 +613,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           return Option.some(yield* rowToEffect(row));
         }).pipe(Effect.mapError((cause) => new EffectOutboxError({ operation: "claim", cause }))),
       nextClaimableAt: Effect.gen(function* () {
+        if (updateGate?.isHeld()) return Option.none();
         const rows = yield* sql<{ readonly available_at: string | null }>`
           SELECT MIN(candidate.available_at) AS available_at
           FROM orchestration_v2_effect_outbox AS candidate

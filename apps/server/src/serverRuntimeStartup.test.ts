@@ -1,3 +1,8 @@
+import * as Clock from "effect/Clock";
+import * as Queue from "effect/Queue";
+import * as TestClock from "effect/testing/TestClock";
+import { RunId, type DesktopBackendUpdateResponse } from "@t3tools/contracts";
+import * as Recovery from "./orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import { assert, it } from "@effect/vitest";
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -193,4 +198,260 @@ it.effect("automatic pull only updates enabled, behind, clean default-branch che
     ).pipe(Effect.provideService(GitVcsDriver.GitVcsDriver, git));
     assert.deepStrictEqual(pulled, ["/inherited"]);
   }),
+);
+
+const updateContext = {
+  environmentId: "env",
+  bootId: "boot",
+  requestId: "update",
+  targetVersion: "25",
+  admissionGeneration: 1,
+  expiresAt: 20000,
+};
+const updateFixture = Effect.gen(function* () {
+  const gate = yield* Recovery.makeBackendUpdateGate;
+  const responses = yield* Queue.unbounded<DesktopBackendUpdateResponse>();
+  let prepared = 0,
+    cleared = 0,
+    busy = false,
+    valid = true,
+    failClear = false,
+    failPrepare = false;
+  const coordinator = yield* ServerRuntimeStartup.makeBackendUpdateCoordinator({
+    environmentId: "env",
+    bootId: "boot",
+    gate,
+    prepare: Effect.suspend(() => {
+      prepared++;
+      return failPrepare
+        ? Effect.fail("unsupported")
+        : Effect.succeed({
+            runIds: [RunId.make("source-run")],
+            effectIds: ["effect:restart-continuation:source-run"],
+          });
+    }),
+    validate: Effect.sync(() => valid),
+    clear: Effect.suspend(() => {
+      if (failClear) return Effect.fail("storage");
+      cleared++;
+      return Effect.void;
+    }),
+    busy: Effect.sync(() => busy),
+    wake: Effect.void,
+    send: (response) => Queue.offer(responses, response).pipe(Effect.asVoid),
+    now: Clock.currentTimeMillis,
+  });
+  return {
+    gate,
+    responses,
+    coordinator,
+    counts: () => ({ prepared, cleared }),
+    setBusy: (value: boolean) => {
+      busy = value;
+    },
+    invalidate: () => {
+      valid = false;
+    },
+    failCleanup: () => {
+      failClear = true;
+    },
+    failPreparation: () => {
+      failPrepare = true;
+    },
+  };
+});
+it.effect(
+  "owned update preparation drains existing admission and rejects new work before durable proof",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* updateFixture;
+        const started = yield* Deferred.make<void>();
+        const finish = yield* Deferred.make<void>();
+        const active = yield* f.gate
+          .run(Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(finish))))
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(started);
+        const prepare = yield* f.coordinator
+          .request({ version: 1, type: "prepareBackendUpdate", context: updateContext })
+          .pipe(Effect.forkChild);
+        yield* f.gate.awaitHeld;
+        assert.equal(f.counts().prepared, 0);
+        let newWork = 0;
+        yield* f.gate
+          .run(
+            Effect.sync(() => {
+              newWork++;
+            }),
+          )
+          .pipe(Effect.flip);
+        assert.equal(newWork, 0);
+        yield* Deferred.succeed(finish, undefined);
+        yield* Fiber.join(active);
+        yield* Fiber.join(prepare);
+        assert.deepEqual(yield* Queue.take(f.responses), {
+          version: 1,
+          type: "backendUpdatePrepared",
+          context: updateContext,
+          persistedRunIds: ["source-run"],
+          reason: "ready",
+        });
+        yield* f.coordinator.request({
+          version: 1,
+          type: "abortBackendUpdate",
+          context: updateContext,
+        });
+        assert.isFalse(f.gate.isHeld());
+      }),
+    ),
+);
+it.effect(
+  "committed update ACK keeps gates through expiry and disconnect; explicit abort before shutdown is correlated and replayable",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* updateFixture;
+        yield* f.coordinator.request({
+          version: 1,
+          type: "prepareBackendUpdate",
+          context: updateContext,
+        });
+        yield* Queue.take(f.responses);
+        yield* f.coordinator.request({
+          version: 1,
+          type: "commitBackendUpdate",
+          context: updateContext,
+        });
+        assert.equal((yield* Queue.take(f.responses)).type, "backendUpdateCommitted");
+        yield* TestClock.adjust("30 seconds");
+        yield* f.coordinator.disconnected;
+        assert.isTrue(f.gate.isHeld());
+        assert.equal(f.counts().cleared, 0);
+        yield* f.coordinator.request({
+          version: 1,
+          type: "abortBackendUpdate",
+          context: { ...updateContext, bootId: "old" },
+        });
+        assert.equal((yield* Queue.take(f.responses)).type, "backendUpdateRefused");
+        assert.isTrue(f.gate.isHeld());
+        yield* f.coordinator.request({
+          version: 1,
+          type: "abortBackendUpdate",
+          context: updateContext,
+        });
+        assert.equal((yield* Queue.take(f.responses)).type, "backendUpdateAborted");
+        assert.isFalse(f.gate.isHeld());
+        yield* f.coordinator.request({
+          version: 1,
+          type: "abortBackendUpdate",
+          context: updateContext,
+        });
+        assert.equal((yield* Queue.take(f.responses)).type, "backendUpdateAborted");
+        assert.equal(f.counts().cleared, 1);
+      }),
+    ),
+);
+it.effect("once shutdown begins even matching committed abort cannot reopen admission", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const f = yield* updateFixture;
+      yield* f.coordinator.request({
+        version: 1,
+        type: "prepareBackendUpdate",
+        context: updateContext,
+      });
+      yield* Queue.take(f.responses);
+      yield* f.coordinator.request({
+        version: 1,
+        type: "commitBackendUpdate",
+        context: updateContext,
+      });
+      yield* Queue.take(f.responses);
+      f.coordinator.beginShutdown();
+      yield* f.coordinator.request({
+        version: 1,
+        type: "abortBackendUpdate",
+        context: updateContext,
+      });
+      assert.equal((yield* Queue.take(f.responses)).type, "backendUpdateRefused");
+      assert.isTrue(f.gate.isHeld());
+      assert.equal(f.counts().cleared, 0);
+    }),
+  ),
+);
+it.effect(
+  "busy or strict persistence failure refuses before any stop and failed cleanup stays held",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* updateFixture;
+        f.setBusy(true);
+        yield* f.coordinator.request({
+          version: 1,
+          type: "prepareBackendUpdate",
+          context: updateContext,
+        });
+        assert.match(JSON.stringify(yield* Queue.take(f.responses)), /busy/);
+        assert.isFalse(f.gate.isHeld());
+        assert.equal(f.counts().prepared, 0);
+        const g = yield* updateFixture;
+        g.failPreparation();
+        g.failCleanup();
+        yield* g.coordinator.request({
+          version: 1,
+          type: "prepareBackendUpdate",
+          context: updateContext,
+        });
+        assert.match(JSON.stringify(yield* Queue.take(g.responses)), /persistence-failed/);
+        assert.isTrue(g.gate.isHeld());
+      }),
+    ),
+);
+it.effect(
+  "user control revision or changed validation refuses commit without reopening writers",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* updateFixture;
+        yield* f.coordinator.request({
+          version: 1,
+          type: "prepareBackendUpdate",
+          context: updateContext,
+        });
+        yield* Queue.take(f.responses);
+        f.gate.noteControl();
+        yield* f.coordinator.request({
+          version: 1,
+          type: "commitBackendUpdate",
+          context: updateContext,
+        });
+        assert.equal((yield* Queue.take(f.responses)).type, "backendUpdateRefused");
+        assert.isTrue(f.gate.isHeld());
+        yield* f.coordinator.request({
+          version: 1,
+          type: "abortBackendUpdate",
+          context: updateContext,
+        });
+        assert.equal((yield* Queue.take(f.responses)).type, "backendUpdateAborted");
+      }),
+    ),
+);
+it.effect(
+  "uncommitted expiry clears only owned preparation then revokes and releases admission",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const f = yield* updateFixture;
+        yield* f.coordinator.request({
+          version: 1,
+          type: "prepareBackendUpdate",
+          context: updateContext,
+        });
+        yield* Queue.take(f.responses);
+        yield* TestClock.adjust("21 seconds");
+        assert.equal((yield* Queue.take(f.responses)).type, "backendUpdateRevoked");
+        assert.isFalse(f.gate.isHeld());
+        assert.equal(f.counts().cleared, 1);
+      }),
+    ),
 );

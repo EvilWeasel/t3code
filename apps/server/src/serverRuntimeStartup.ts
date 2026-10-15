@@ -1,3 +1,12 @@
+import type {
+  DesktopBackendUpdateBinding,
+  DesktopBackendUpdateRequest,
+  DesktopBackendUpdateResponse,
+} from "@t3tools/contracts";
+import * as Semaphore from "effect/Semaphore";
+import * as Result from "effect/Result";
+import * as DesktopTelemetryReceiver from "./resourceTelemetry/DesktopTelemetryReceiver.ts";
+import * as EffectOutbox from "./orchestration-v2/EffectOutbox.ts";
 import {
   CommandId,
   DEFAULT_MODEL,
@@ -142,6 +151,163 @@ export const makeCommandGate = Effect.gen(function* () {
       }),
   } satisfies CommandGate;
 });
+
+/** Owns a single bootstrap-FD reservation; committed holds survive timeout/disconnect. */
+export const makeBackendUpdateCoordinator = (input: {
+  environmentId: string;
+  bootId: string;
+  gate: ProviderRuntimeRecovery.BackendUpdateGate;
+  prepare: Effect.Effect<ProviderRuntimeRecovery.BackendUpdatePreparedContinuations, unknown>;
+  validate: Effect.Effect<boolean, unknown>;
+  clear: Effect.Effect<void, unknown>;
+  busy: Effect.Effect<boolean, unknown>;
+  wake: Effect.Effect<void>;
+  send: (response: DesktopBackendUpdateResponse) => Effect.Effect<void>;
+  now: Effect.Effect<number>;
+}) =>
+  Effect.gen(function* () {
+    const scope = yield* Effect.scope;
+    const mutex = yield* Semaphore.make(1);
+    let shuttingDown = false;
+    let lastGeneration = -1;
+    let held:
+      | {
+          context: DesktopBackendUpdateBinding;
+          phase: "prepared" | "committed";
+          runIds: ReadonlyArray<string>;
+          revision: number;
+        }
+      | undefined;
+    const same = (a: DesktopBackendUpdateBinding, b: DesktopBackendUpdateBinding) =>
+      a.environmentId === b.environmentId &&
+      a.bootId === b.bootId &&
+      a.requestId === b.requestId &&
+      a.targetVersion === b.targetVersion &&
+      a.admissionGeneration === b.admissionGeneration &&
+      a.expiresAt === b.expiresAt;
+    const send = (
+      context: DesktopBackendUpdateBinding,
+      type: Exclude<DesktopBackendUpdateResponse["type"], "backendUpdateHello">,
+      reason: Exclude<DesktopBackendUpdateResponse, { type: "backendUpdateHello" }>["reason"],
+      runIds: ReadonlyArray<string> = [],
+    ) => input.send({ version: 1, type, context, reason, persistedRunIds: runIds });
+    const release = Effect.gen(function* () {
+      yield* input.clear;
+      held = undefined;
+      yield* input.gate.release;
+      yield* input.wake;
+    });
+    let lastAborted: DesktopBackendUpdateBinding | undefined;
+    const refuse = (
+      context: DesktopBackendUpdateBinding,
+      reason: Exclude<DesktopBackendUpdateResponse, { type: "backendUpdateHello" }>["reason"],
+    ) => send(context, "backendUpdateRefused", reason);
+    const request = (message: DesktopBackendUpdateRequest) =>
+      mutex.withPermits(1)(
+        Effect.gen(function* () {
+          const c = message.context;
+          if (c.environmentId !== input.environmentId || c.bootId !== input.bootId || shuttingDown)
+            return yield* refuse(c, "stale");
+          if (message.type === "abortBackendUpdate") {
+            if (!held && lastAborted && same(lastAborted, c))
+              return yield* send(c, "backendUpdateAborted", "aborted");
+            if (!held || !same(held.context, c)) return yield* refuse(c, "stale");
+            const cleared = yield* release.pipe(Effect.result);
+            if (Result.isFailure(cleared)) return yield* refuse(c, "persistence-failed");
+            lastAborted = c;
+            return yield* send(c, "backendUpdateAborted", "aborted");
+          }
+          if (message.type === "commitBackendUpdate") {
+            if (!held || !same(held.context, c)) return yield* refuse(c, "stale");
+            if (held.phase === "committed")
+              return yield* send(c, "backendUpdateCommitted", "ready", held.runIds);
+            const valid = yield* input.validate.pipe(Effect.orElseSucceed(() => false));
+            if (
+              (yield* input.now) >= c.expiresAt ||
+              held.revision !== input.gate.revision() ||
+              !valid
+            )
+              return yield* refuse(c, "stale");
+            held.phase = "committed";
+            return yield* send(c, "backendUpdateCommitted", "ready", held.runIds);
+          }
+          if (held)
+            return yield* same(held.context, c)
+              ? send(
+                  c,
+                  held.phase === "committed" ? "backendUpdateCommitted" : "backendUpdatePrepared",
+                  "ready",
+                  held.runIds,
+                )
+              : refuse(c, "busy");
+          const now = yield* input.now;
+          if (
+            c.expiresAt <= now ||
+            c.expiresAt > now + 30_000 ||
+            c.admissionGeneration <= lastGeneration
+          )
+            return yield* refuse(c, "stale");
+          lastGeneration = c.admissionGeneration;
+          const prepared = yield* Effect.gen(function* () {
+            const revision = yield* input.gate.hold.pipe(Effect.timeout("5 seconds"));
+            if (input.gate.pendingNative() > 0 || (yield* input.busy))
+              return yield* Effect.fail("busy");
+            const proof = yield* input.prepare;
+            if (revision !== input.gate.revision()) return yield* Effect.fail("stale");
+            if ((yield* input.now) >= c.expiresAt) return yield* Effect.fail("expired");
+            held = { context: c, phase: "prepared", runIds: proof.runIds, revision };
+            return held;
+          }).pipe(Effect.result);
+          if (Result.isFailure(prepared)) {
+            const cleaned = yield* release.pipe(Effect.result);
+            // Failed cleanup deliberately retains the admission hold; no false success.
+            return yield* refuse(
+              c,
+              Result.isFailure(cleaned)
+                ? "persistence-failed"
+                : prepared.failure === "busy"
+                  ? "busy"
+                  : prepared.failure === "stale"
+                    ? "stale"
+                    : prepared.failure === "expired"
+                      ? "expired"
+                      : prepared.failure instanceof
+                            ProviderRuntimeRecovery.ProviderRuntimeRecoveryError &&
+                          prepared.failure.cause === "optout"
+                        ? "optout"
+                        : "unsupported",
+            );
+          }
+          yield* send(c, "backendUpdatePrepared", "ready", prepared.success.runIds);
+          yield* Effect.gen(function* () {
+            yield* Effect.sleep(Math.max(0, c.expiresAt - (yield* input.now)));
+            yield* mutex.withPermits(1)(
+              Effect.gen(function* () {
+                if (held?.phase !== "prepared" || !same(held.context, c)) return;
+                const cleared = yield* release.pipe(Effect.result);
+                yield* send(
+                  c,
+                  "backendUpdateRevoked",
+                  Result.isFailure(cleared) ? "persistence-failed" : "expired",
+                );
+              }),
+            );
+          }).pipe(Effect.forkIn(scope));
+        }),
+      );
+    return {
+      request,
+      beginShutdown: () => {
+        shuttingDown = true;
+      },
+      disconnected: mutex.withPermits(1)(
+        Effect.gen(function* () {
+          if (held?.phase === "committed" || shuttingDown) return;
+          yield* release.pipe(Effect.ignore);
+        }),
+      ),
+    };
+  });
 
 const recordStartupHeartbeat = Effect.gen(function* () {
   const analytics = yield* AnalyticsService.AnalyticsService;
@@ -431,9 +597,48 @@ const make = (options?: StartupOptions) =>
     const commandGate = yield* makeCommandGate;
     const httpListening = yield* Deferred.make<void>();
     const effectWorkerFiber = yield* Ref.make<Fiber.Fiber<void, never> | null>(null);
+    const updateGate = yield* ProviderRuntimeRecovery.makeBackendUpdateGate;
+    orchestrator.setUpdateAdmissionGate?.(updateGate);
+    providerSessions.setUpdateAdmissionGate?.(updateGate);
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    outbox.setUpdateAdmissionGate?.(updateGate);
+    const receiver = yield* DesktopTelemetryReceiver.DesktopTelemetryReceiver;
+    const bootId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+    const environmentId = yield* serverEnvironment.getEnvironmentId;
+    const unavailable = Effect.fail("unsupported");
+    const coordinator = yield* makeBackendUpdateCoordinator({
+      environmentId,
+      bootId,
+      gate: updateGate,
+      prepare: providerRuntimeRecovery.prepareForUpdate ?? unavailable,
+      validate: providerRuntimeRecovery.validatePreparedUpdate ?? Effect.succeed(false),
+      clear: providerRuntimeRecovery.abortPreparedUpdate ?? unavailable,
+      busy: outbox.hasUnsettledForUpdate ?? Effect.succeed(true),
+      wake: outbox.notifyAvailable(),
+      send: (response) =>
+        receiver.sendBackendUpdateResponse?.(response).pipe(Effect.ignore) ?? Effect.void,
+      now: DateTime.now.pipe(Effect.map(DateTime.toEpochMillis)),
+    });
+    if (
+      serverConfig.mode === "desktop" &&
+      receiver.registerBackendUpdateHandler &&
+      orchestrator.setUpdateAdmissionGate &&
+      providerSessions.setUpdateAdmissionGate &&
+      outbox.setUpdateAdmissionGate
+    )
+      yield* receiver.registerBackendUpdateHandler({
+        request: (request) =>
+          commandGate.awaitCommandReady.pipe(
+            Effect.andThen(coordinator.request(request)),
+            Effect.catch(() => Effect.void),
+          ),
+        disconnected: coordinator.disconnected,
+        hello: { version: 1, type: "backendUpdateHello", environmentId, bootId },
+      });
 
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
+        coordinator.beginShutdown();
         yield* commandGate.failCommandReady(
           new ServerRuntimeStartupError({
             mode: serverConfig.mode,

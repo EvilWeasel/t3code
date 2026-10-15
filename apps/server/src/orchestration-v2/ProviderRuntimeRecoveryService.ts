@@ -13,6 +13,8 @@ import {
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import { type RunId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -47,6 +49,103 @@ export class ProviderRuntimeRecoveryError extends Schema.TaggedError<ProviderRun
   }
 }
 
+/** One process-local admission hold. Existing streams retain backpressure; no resume queue. */
+export class BackendUpdateAdmissionClosed extends Schema.TaggedError<BackendUpdateAdmissionClosed>()(
+  "BackendUpdateAdmissionClosed",
+  { reason: Schema.String },
+) {}
+export const makeBackendUpdateGate = Effect.gen(function* () {
+  const queuedNative = new WeakSet<object>();
+  let pendingNative = 0;
+  let held = false;
+  let active = 0;
+  let revision = 0;
+  let idle = Deferred.makeUnsafe<void>();
+  let opened = Deferred.makeUnsafe<void>();
+  let heldSignal = Deferred.makeUnsafe<void>();
+  const run = <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E | BackendUpdateAdmissionClosed, R> =>
+    Effect.acquireUseRelease(
+      Effect.suspend(() =>
+        held
+          ? Effect.fail(
+              new BackendUpdateAdmissionClosed({ reason: "An owned backend update is prepared." }),
+            )
+          : Effect.sync(() => {
+              active++;
+            }),
+      ),
+      () => effect,
+      () =>
+        Effect.sync(() => {
+          active--;
+          if (active === 0) Effect.runSync(Deferred.succeed(idle, undefined));
+        }),
+    );
+  const observe = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.suspend(() =>
+      held
+        ? Deferred.await(opened).pipe(Effect.andThen(observe(effect)))
+        : run(effect).pipe(Effect.catchTag("BackendUpdateAdmissionClosed", () => observe(effect))),
+    );
+  return {
+    run,
+    observe,
+    noteNativeQueued: (event: object) => {
+      if (!queuedNative.has(event)) {
+        queuedNative.add(event);
+        pendingNative++;
+      }
+    },
+    noteNativeSettled: (event: object) => {
+      if (queuedNative.delete(event)) pendingNative--;
+    },
+    pendingNative: () => pendingNative,
+    terminal: <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          revision++;
+          active++;
+        }),
+        () => effect,
+        () =>
+          Effect.sync(() => {
+            active--;
+            if (active === 0) Effect.runSync(Deferred.succeed(idle, undefined));
+          }),
+      ),
+    isHeld: () => held,
+    revision: () => revision,
+    awaitHeld: Effect.suspend(() => Deferred.await(heldSignal)),
+    noteControl: () => {
+      revision++;
+    },
+    hold: Effect.gen(function* () {
+      if (held)
+        return yield* new BackendUpdateAdmissionClosed({
+          reason: "Another update already owns admission.",
+        });
+      held = true;
+      yield* Deferred.succeed(heldSignal, undefined);
+      idle = Deferred.makeUnsafe<void>();
+      opened = Deferred.makeUnsafe<void>();
+      if (active !== 0) yield* Deferred.await(idle);
+      return revision;
+    }),
+    release: Effect.sync(() => {
+      held = false;
+      heldSignal = Deferred.makeUnsafe<void>();
+      Effect.runSync(Deferred.succeed(opened, undefined));
+    }),
+  };
+});
+export type BackendUpdateGate = Effect.Success<typeof makeBackendUpdateGate>;
+export interface BackendUpdatePreparedContinuations {
+  readonly runIds: ReadonlyArray<RunId>;
+  readonly effectIds: ReadonlyArray<string>;
+}
+
 export interface ProviderRuntimeRecoverySummary {
   readonly terminalizedRuns: number;
   readonly stoppedSessions: number;
@@ -69,6 +168,12 @@ export class ProviderRuntimeRecoveryService extends Context.Service<
     readonly reconcile: (
       trigger: "startup" | "shutdown",
     ) => Effect.Effect<ProviderRuntimeReconciliationSummary, ProviderRuntimeRecoveryError>;
+    readonly abortPreparedUpdate?: Effect.Effect<void, ProviderRuntimeRecoveryError>;
+    readonly validatePreparedUpdate?: Effect.Effect<boolean, ProviderRuntimeRecoveryError>;
+    readonly prepareForUpdate?: Effect.Effect<
+      BackendUpdatePreparedContinuations,
+      ProviderRuntimeRecoveryError
+    >;
     readonly prepareForShutdown: Effect.Effect<void, ProviderRuntimeRecoveryError>;
     readonly recover: Effect.Effect<ProviderRuntimeRecoverySummary, ProviderRuntimeRecoveryError>;
   }
@@ -777,11 +882,120 @@ export const make = Effect.gen(function* () {
     Effect.mapError((cause) => new ProviderRuntimeRecoveryError({ operation: "reconcile", cause })),
   );
 
+  let updatePrepared: Array<{ threadId: ThreadId; runId: RunId; effectId: string }> = [];
+  // Strict pre-stop path: unlike best-effort shutdown, every failure reaches the owner.
+  const prepareForUpdate = Effect.gen(function* () {
+    const currentSettings = yield* settings.getSettings;
+    if (!currentSettings.continueThreadsAfterServerUpdate)
+      return yield* new ProviderRuntimeRecoveryError({ operation: "reconcile", cause: "optout" });
+    const ids = yield* projections.getRecoveryThreadIds("runtime");
+    const selected: Array<{ threadId: ThreadId; runId: RunId }> = [];
+    for (const threadId of ids) {
+      const projection = yield* projections.getRuntimeRecoveryProjection(threadId);
+      const run = restartContinuationRun(projection, yield* DateTime.now);
+      const active =
+        nonterminalRuns(projection).length > 0 ||
+        projection.providerThreads.some(providerThreadHasPendingBackgroundTasks);
+      if (
+        active &&
+        !resolveProjectSettings(currentSettings, projection.thread.projectId).settings
+          .continueThreadsAfterServerUpdate
+      )
+        return yield* new ProviderRuntimeRecoveryError({
+          operation: "reconcile",
+          threadId,
+          cause: "optout",
+        });
+      if (active && !run)
+        return yield* new ProviderRuntimeRecoveryError({
+          operation: "reconcile",
+          threadId,
+          cause: "unsupported",
+        });
+      if (run) selected.push({ threadId, runId: run.id });
+    }
+    if (selected.length > 128)
+      return yield* new ProviderRuntimeRecoveryError({ operation: "reconcile", cause: "busy" });
+    const effectIds: string[] = [];
+    for (const { threadId, runId } of selected) {
+      const commandId = CommandId.make(`command:restart-prepare:${runId}`);
+      const id = `effect:restart-continuation:${runId}`;
+      if (yield* outbox.get(id).pipe(Effect.map((option) => option._tag === "Some")))
+        return yield* new ProviderRuntimeRecoveryError({
+          operation: "reconcile",
+          threadId,
+          cause: "busy",
+        });
+      updatePrepared.push({ threadId, runId, effectId: id });
+      yield* eventSink.writeWithEffects({
+        commandId,
+        events: [],
+        effects: [
+          {
+            id,
+            commandId,
+            threadId,
+            request: { type: "provider-runtime.continue", sourceRunId: runId },
+          },
+        ],
+      });
+      effectIds.push(id);
+    }
+    return { runIds: selected.map((item) => item.runId), effectIds };
+  }).pipe(
+    Effect.mapError((cause) =>
+      cause instanceof ProviderRuntimeRecoveryError
+        ? cause
+        : new ProviderRuntimeRecoveryError({ operation: "reconcile", cause }),
+    ),
+  );
+
+  const abortPreparedUpdate = Effect.gen(function* () {
+    if (updatePrepared.length > 0) {
+      if (!outbox.discardUpdatePreparation)
+        return yield* new ProviderRuntimeRecoveryError({
+          operation: "reconcile",
+          cause: "unsupported",
+        });
+      yield* outbox.discardUpdatePreparation(updatePrepared.map((item) => item.effectId));
+      updatePrepared = [];
+    }
+  }).pipe(
+    Effect.mapError((cause) =>
+      cause instanceof ProviderRuntimeRecoveryError
+        ? cause
+        : new ProviderRuntimeRecoveryError({ operation: "reconcile", cause }),
+    ),
+  );
+  const validatePreparedUpdate = Effect.gen(function* () {
+    const current = yield* settings.getSettings;
+    if (!current.continueThreadsAfterServerUpdate) return false;
+    for (const item of updatePrepared) {
+      const projection = yield* projections.getRuntimeRecoveryProjection(item.threadId);
+      if (
+        !resolveProjectSettings(current, projection.thread.projectId).settings
+          .continueThreadsAfterServerUpdate ||
+        restartContinuationRun(projection, yield* DateTime.now)?.id !== item.runId
+      )
+        return false;
+    }
+    return true;
+  }).pipe(
+    Effect.mapError((cause) => new ProviderRuntimeRecoveryError({ operation: "reconcile", cause })),
+  );
+
   const recover = Effect.gen(function* () {
     return (yield* reconcile("startup")) satisfies ProviderRuntimeRecoverySummary;
   });
 
-  return ProviderRuntimeRecoveryService.of({ reconcile, prepareForShutdown, recover });
+  return ProviderRuntimeRecoveryService.of({
+    reconcile,
+    prepareForShutdown,
+    prepareForUpdate,
+    abortPreparedUpdate,
+    validatePreparedUpdate,
+    recover,
+  });
 });
 
 export const layer = Layer.effect(ProviderRuntimeRecoveryService, make);

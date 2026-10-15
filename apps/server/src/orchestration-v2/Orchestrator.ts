@@ -1,3 +1,4 @@
+import type { BackendUpdateGate } from "./ProviderRuntimeRecoveryService.ts";
 import type {
   OrchestrationV2SearchThreadInput,
   OrchestrationV2SearchThreadResult,
@@ -303,6 +304,7 @@ export interface OrchestratorV2Shape {
    * records no thread event, so a waiter needs this to wake.
    */
   readonly awaitRestartContinuation: (run: OrchestrationV2Run) => Effect.Effect<void>;
+  readonly setUpdateAdmissionGate?: (gate: BackendUpdateGate) => void;
   readonly dispatch: (
     command: OrchestrationV2ServerCommand,
   ) => Effect.Effect<OrchestratorV2DispatchResult, OrchestratorV2Error>;
@@ -825,6 +827,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const projects = yield* ProjectStore.ProjectStoreV2;
   const projectionStore = yield* ProjectionStoreV2;
   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
+  let updateGate: BackendUpdateGate | undefined;
   const nextTurnItemOrdinal = (
     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
       Partial<Pick<OrchestrationV2ThreadProjection, "turnItems">>,
@@ -11228,6 +11231,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const dispatchWithReceipt = (command: OrchestrationV2ServerCommand) =>
+    Effect.suspend(() => {
+      const effect = dispatchWithReceiptUngated(command);
+      if (!updateGate) return effect;
+      if (/(?:stop|cancel|interrupt|pause|snooze)/.test(command.type)) {
+        updateGate.noteControl();
+        return effect;
+      }
+      return updateGate
+        .run(effect)
+        .pipe(
+          Effect.mapError((cause) =>
+            cause._tag === "BackendUpdateAdmissionClosed"
+              ? new OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause,
+                })
+              : cause,
+          ),
+        );
+    });
+  const dispatchWithReceiptUngated = (command: OrchestrationV2ServerCommand) =>
     Effect.gen(function* () {
       const dispatch = threadDispatch.withLock(
         commandThreadId(command),
@@ -11319,7 +11344,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             stored.event.payload.status === "cancelled" ||
             stored.event.payload.status === "rolled_back"),
       ),
-      Stream.runForEach(handleTerminalRun),
+      Stream.runForEach((stored) =>
+        updateGate ? updateGate.observe(handleTerminalRun(stored)) : handleTerminalRun(stored),
+      ),
       Effect.forkDetach,
     );
 
@@ -11466,6 +11493,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     recoverDelegatedTasks,
     recoverDelegatedTask,
     delegatedTaskResultPending,
+    setUpdateAdmissionGate: (gate) => {
+      updateGate = gate;
+    },
     restartContinuationPending: (run) =>
       awaitsRestartContinuation(run).pipe(Effect.orElseSucceed(() => false)),
     awaitRestartContinuation: (run) =>

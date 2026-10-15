@@ -53,7 +53,9 @@ export class DesktopAppUpdate extends Context.Service<
         stage: ServerSelfUpdateProgressStage,
       ) => Effect.Effect<void, ServerSelfUpdateError>,
     ) => Effect.Effect<ServerSelfUpdateResult, ServerSelfUpdateError>;
-    /** Starts the prepared install. Success stops this server, so this effect
+    /** The download token is not an admission/checkpoint proof. Desktop's canonical
+        installer must obtain every owned backend's bound prepare/commit ACK first.
+        Starts the prepared install. Success stops this server, so this effect
         returns only when installation fails or times out. */
     readonly commit: (
       requestId: string,

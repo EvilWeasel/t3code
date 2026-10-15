@@ -4,6 +4,8 @@ import * as NodeNet from "node:net";
 
 import * as NodeStream from "@effect/platform-node/NodeStream";
 import {
+  type DesktopBackendUpdateRequest,
+  type DesktopBackendUpdateResponse,
   DesktopHostTelemetryMessage,
   type DesktopHostTelemetryMessage as DesktopHostTelemetryMessageValue,
   type DesktopHostTelemetrySnapshot,
@@ -148,9 +150,21 @@ export interface DesktopTelemetryReceiverHealth {
   readonly lastError: Option.Option<string>;
 }
 
+export interface BackendUpdateHandler {
+  readonly request: (request: DesktopBackendUpdateRequest) => Effect.Effect<void>;
+  readonly disconnected: Effect.Effect<void>;
+  readonly hello: DesktopBackendUpdateResponse;
+}
+
 export class DesktopTelemetryReceiver extends Context.Service<
   DesktopTelemetryReceiver,
   {
+    readonly registerBackendUpdateHandler?: (
+      handler: BackendUpdateHandler,
+    ) => Effect.Effect<void, never, Scope.Scope>;
+    readonly sendBackendUpdateResponse?: (
+      response: DesktopBackendUpdateResponse,
+    ) => Effect.Effect<void, DesktopTelemetryControlError>;
     readonly latest: Effect.Effect<Option.Option<DesktopHostTelemetrySnapshot>>;
     readonly changes: Stream.Stream<DesktopHostTelemetrySnapshot>;
     readonly subscribe: Effect.Effect<
@@ -333,6 +347,7 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
   const config = yield* ServerConfig.ServerConfig;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const latest = yield* Ref.make(Option.none<DesktopHostTelemetrySnapshot>());
+  let backendUpdateHandler: BackendUpdateHandler | undefined;
   const receiverStartedAt = yield* DateTime.now;
   const lastContactAtMs = yield* Ref.make(
     initialDesktopTelemetryContactAt(
@@ -515,8 +530,25 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
             Ref.set(lastContactAtMs, Option.some(DateTime.toEpochMillis(now))),
           ),
         );
+        if (
+          message.type === "prepareBackendUpdate" ||
+          message.type === "abortBackendUpdate" ||
+          message.type === "commitBackendUpdate"
+        ) {
+          return (backendUpdateHandler?.request(message) ?? Effect.void).pipe(
+            Effect.forkScoped,
+            Effect.asVoid,
+          );
+        }
         if (message.type === "desktopTelemetryHello") {
           return recordContact.pipe(
+            Effect.andThen(
+              Effect.suspend(() =>
+                backendUpdateHandler
+                  ? sendControlMessage(backendUpdateHandler.hello).pipe(Effect.ignore)
+                  : Effect.void,
+              ),
+            ),
             Effect.andThen(
               updateHealth((current): DesktopTelemetryReceiverHealth => ({
                 ...current,
@@ -626,10 +658,30 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
           ),
         ),
       ),
-    ).pipe(Effect.forkScoped);
+    ).pipe(
+      Effect.ensuring(Effect.suspend(() => backendUpdateHandler?.disconnected ?? Effect.void)),
+      Effect.forkScoped,
+    );
   }
 
   return DesktopTelemetryReceiver.of({
+    sendBackendUpdateResponse: sendControlMessage,
+    registerBackendUpdateHandler: (handler) =>
+      Effect.acquireRelease(
+        Effect.gen(function* () {
+          if (backendUpdateHandler)
+            return yield* Effect.die("Backend update owner already registered");
+          backendUpdateHandler = handler;
+          yield* sendControlMessage(handler.hello).pipe(Effect.ignore);
+        }),
+        () =>
+          Effect.gen(function* () {
+            if (backendUpdateHandler === handler) {
+              yield* handler.disconnected;
+              backendUpdateHandler = undefined;
+            }
+          }),
+      ).pipe(Effect.asVoid),
     latest: Ref.get(latest),
     changes: Stream.fromPubSub(changes),
     subscribe: snapshotMutex.withPermits(1)(

@@ -1119,3 +1119,112 @@ it.effect.each(["completed", "failed", "interrupted"] as const)(
       );
     }),
 );
+
+it.effect.each(["foreground", "background", "child"] as const)(
+  "strict pre-stop records the canonical %s source without a manufactured user message",
+  (kind) =>
+    Effect.gen(function* () {
+      const base = makeProjection();
+      const projection = {
+        ...base,
+        thread:
+          kind === "child"
+            ? {
+                ...base.thread,
+                lineage: {
+                  parentThreadId: ThreadId.make("parent"),
+                  rootThreadId: ThreadId.make("parent"),
+                  relationshipToParent: "subagent",
+                },
+              }
+            : base.thread,
+        runs: kind === "background" ? [{ ...base.runs[0]!, status: "completed" }] : base.runs,
+        providerTurns:
+          kind === "background"
+            ? [{ ...base.providerTurns[0]!, status: "completed" }]
+            : base.providerTurns,
+        turnItems: kind === "background" ? [backgroundSubagent.turnItem] : base.turnItems,
+      } as OrchestrationV2ThreadProjection;
+      const writes: Parameters<EventSink.EventSinkV2["Service"]["writeWithEffects"]>[0][] = [];
+      const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getRecoveryThreadIds: () => Effect.succeed([threadId]),
+              getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+            }),
+            Layer.mock(EventSink.EventSinkV2)({
+              writeWithEffects: (input) =>
+                Effect.sync(() => {
+                  writes.push(input);
+                  return [];
+                }),
+            }),
+            IdAllocator.layer,
+            Layer.mock(EffectOutbox.EffectOutboxV2)({ get: () => Effect.succeedNone }),
+          ),
+        ),
+      );
+      const proof = yield* recovery.prepareForUpdate!;
+      assert.deepEqual(proof.runIds, [runId]);
+      assert.lengthOf(writes, 1);
+      assert.deepEqual(writes[0]!.events, []);
+      assert.deepEqual(writes[0]!.effects[0]?.request, {
+        type: "provider-runtime.continue",
+        sourceRunId: runId,
+      });
+    }),
+);
+
+it.effect.each(["global-optout", "project-optout", "completed", "paused"] as const)(
+  "strict update respects %s without preparing resurrection",
+  (scenario) =>
+    Effect.gen(function* () {
+      const base = makeProjection();
+      const projection = {
+        ...base,
+        thread:
+          scenario === "paused" ? { ...base.thread, settledOverride: "settled" } : base.thread,
+        runs: scenario === "completed" ? [{ ...base.runs[0]!, status: "completed" }] : base.runs,
+        providerTurns:
+          scenario === "completed"
+            ? [{ ...base.providerTurns[0]!, status: "completed" }]
+            : base.providerTurns,
+      } as OrchestrationV2ThreadProjection;
+      let writes = 0;
+      const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest({
+              continueThreadsAfterServerUpdate: scenario !== "global-optout",
+              ...(scenario === "project-optout"
+                ? {
+                    projectSettingsOverrides: {
+                      [base.thread.projectId]: { continueThreadsAfterServerUpdate: false },
+                    },
+                  }
+                : {}),
+            }),
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getRecoveryThreadIds: () => Effect.succeed([threadId]),
+              getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+            }),
+            Layer.mock(EventSink.EventSinkV2)({
+              writeWithEffects: () =>
+                Effect.sync(() => {
+                  writes++;
+                  return [];
+                }),
+            }),
+            IdAllocator.layer,
+            Layer.mock(EffectOutbox.EffectOutboxV2)({ get: () => Effect.succeedNone }),
+          ),
+        ),
+      );
+      if (scenario === "completed")
+        assert.deepEqual((yield* recovery.prepareForUpdate!).runIds, []);
+      else yield* recovery.prepareForUpdate!.pipe(Effect.flip);
+      assert.equal(writes, 0);
+    }),
+);
