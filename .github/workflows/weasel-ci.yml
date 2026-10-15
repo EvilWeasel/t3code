@@ -44,6 +44,8 @@ jobs:
           run-install: false
       - name: Install dependencies
         run: vp install --frozen-lockfile
+      - name: Prepare pinned Electron runtime before desktop imports
+        run: node apps/desktop/scripts/ensure-electron-runtime.mjs
       - name: Run focused source gates
         run: bash scripts/weasel/check.sh
   product_bundle:
