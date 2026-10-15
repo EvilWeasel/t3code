@@ -169,9 +169,24 @@ export type DesktopUpdateConfigureError = never;
 /** Production intentionally supplies no qualification: guest WebContents and
  * native auxiliary-window creation still lack a complete held admission fence.
  * Existing automatic downloads remain enabled independently of installation. */
+export interface DesktopUpdateRuntimeReservation {
+  /** Must inspect the live reservation, including revocation and expiry. */
+  readonly isValid: () => boolean;
+  /** Synchronously revalidate and enter commit while all creation/activity gates remain held. */
+  readonly tryCommit: () => boolean;
+}
+
 export class DesktopUpdateInstallQualification extends Context.Service<
   DesktopUpdateInstallQualification,
-  { readonly completeRuntimeCreationFence: boolean }
+  {
+    /** Acquired before inventory. The provider releases on scope exit, including interruption.
+     * A token is evidence only while every participating runtime gate remains held. */
+    readonly acquireRuntimeReservation: (request: {
+      readonly generation: string;
+      readonly targetVersion: string;
+      readonly expiresAt: number;
+    }) => Effect.Effect<Option.Option<DesktopUpdateRuntimeReservation>, never, Scope.Scope>;
+  }
 >()("@t3tools/desktop/updates/DesktopUpdates/DesktopUpdateInstallQualification") {}
 
 export const DesktopUpdateSetChannelError = Schema.Union([
@@ -868,7 +883,8 @@ export const make = Effect.gen(function* () {
   });
 
   const attemptClientOnlyInstall = Effect.gen(function* () {
-    if (Option.isNone(qualification) || !qualification.value.completeRuntimeCreationFence) return;
+    if (Option.isNone(qualification)) return;
+    const runtimeQualification = qualification.value;
     const state = yield* Ref.get(updateStateRef);
     const holdPool = pool.withUpdateInventory;
     const holdRenderers = electronWindow.withUpdateRenderers;
@@ -880,6 +896,11 @@ export const make = Effect.gen(function* () {
     const targetVersion = state.downloadedVersion;
     if (compareSemverVersions(targetVersion, state.currentVersion) <= 0) return;
     yield* holdPool((instances) => holdRenderers(Effect.scoped(Effect.gen(function* () {
+      const generation = `${targetVersion}:${yield* Clock.currentTimeMillis}`;
+      const expiresAt = (yield* Clock.currentTimeMillis) + 20_000;
+      const reservation = yield* runtimeQualification.acquireRuntimeReservation({ generation, targetVersion, expiresAt });
+      if (Option.isNone(reservation) || !reservation.value.isValid()) return;
+      const runtime = reservation.value;
       const isEmpty = Effect.forEach(instances, (instance) => instance.snapshot).pipe(
         Effect.map((snapshots) => snapshots.every((snapshot) =>
           snapshot.desiredRunning === false && snapshot.ready === false && Option.isNone(snapshot.activePid) &&
@@ -889,9 +910,8 @@ export const make = Effect.gen(function* () {
       if (!(yield* isEmpty)) return;
       const expected = yield* inventory;
       if (expected.some((renderer) => renderer.audible !== false)) return;
-      const generation = `${targetVersion}:${yield* Clock.currentTimeMillis}`;
-      const expiresAt = (yield* Clock.currentTimeMillis) + 20_000;
       for (const phase of ["prepare", "validate"] as const) {
+        if (!runtime.isValid()) return;
         const lease = { generation, targetVersion, expiresAt, phase };
         const signal = yield* Deferred.make<boolean>();
         yield* Ref.set(pendingReadiness, { lease, senders: new Set(expected.map((item) => item.id)), signal });
@@ -907,8 +927,8 @@ export const make = Effect.gen(function* () {
         return current !== undefined && renderer.id === current.id &&
           renderer.generation === current.generation && renderer.audible === current.audible;
       });
-      if (!sameInventory || !(yield* isEmpty) ||
-        (yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return;
+      if (!sameInventory || !(yield* isEmpty) || !runtime.isValid() ||
+        (yield* Clock.currentTimeMillis) >= expiresAt - 5_000 || !runtime.tryCommit()) return;
       yield* updateState((current) => ({ ...current, installLease: {
         generation, targetVersion, expiresAt, phase: "commit",
       } }));

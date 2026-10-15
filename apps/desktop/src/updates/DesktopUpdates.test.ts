@@ -53,8 +53,81 @@ describe("DesktopUpdates", () => {
     })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   });
 
+  it.effect("refuses a revoked reservation after renderer validation without stopping a backend", () => {
+    let valid = true;
+    let commits = 0;
+    return Effect.scoped(Effect.gen(function* () {
+      const released = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        clientOnlyInventory: [{ id: 7, generation: "frame-1", audible: false }],
+        runtimeReservation: { isValid: () => valid, tryCommit: () => { commits += 1; return valid; } },
+        runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
+      });
+      yield* Effect.scoped(Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        const acknowledge = updates.acknowledgeReadiness;
+        if (acknowledge === undefined) return yield* Effect.die("missing readiness service");
+        const { changes } = yield* updates.subscribe;
+        yield* Stream.runForEach(changes, (state) => {
+          const lease = state.installLease;
+          if (lease === undefined) return Effect.void;
+          return Effect.gen(function* () {
+            // A native activity/creation event revokes proof after prepare has
+            // completed, before the final renderer acknowledgement is accepted.
+            if (lease.phase === "validate") valid = false;
+            yield* acknowledge(7, { lease, ready: true });
+          });
+        }).pipe(Effect.forkScoped);
+        yield* TestClock.adjust(Duration.seconds(15));
+        harness.emit("update-downloaded", { version: "1.2.4" });
+        yield* flushCallbacks;
+        yield* TestClock.adjust(Duration.seconds(45));
+        yield* Deferred.await(released);
+        assert.equal(harness.quitAndInstalls(), 0);
+        assert.equal(harness.stopCount(), 0);
+        assert.equal(commits, 0);
+        assert.equal((yield* updates.getState).downloadedVersion, "1.2.4");
+      })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+    }));
+  });
+
+  it.effect("refuses an acquisition or final commit refusal and releases the runtime reservation", () =>
+    Effect.gen(function* () {
+      for (const refusal of ["acquire", "commit"] as const) {
+        let commits = 0;
+        let releases = 0;
+        const released = yield* Deferred.make<void>();
+        const harness = makeHarness({
+          clientOnlyInventory: [],
+          runtimeReservation: {
+            isValid: () => refusal !== "acquire",
+            tryCommit: () => { commits += 1; return false; },
+          },
+          onRuntimeReservationReleased: () => { releases += 1; },
+          runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
+        });
+        yield* Effect.scoped(Effect.gen(function* () {
+          const updates = yield* DesktopUpdates.DesktopUpdates;
+          yield* updates.configure;
+          yield* TestClock.adjust(Duration.seconds(15));
+          harness.emit("update-downloaded", { version: "1.2.4" });
+          yield* flushCallbacks;
+          yield* TestClock.adjust(Duration.seconds(45));
+          yield* Deferred.await(released);
+          assert.equal(harness.quitAndInstalls(), 0, refusal);
+          assert.equal(harness.stopCount(), 0, refusal);
+          assert.equal(commits, refusal === "commit" ? 1 : 0, refusal);
+          assert.equal(releases, 1, refusal);
+          assert.equal((yield* updates.getState).downloadedVersion, "1.2.4");
+        })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+      }
+    }),
+  );
+
   it.effect("releases a committed client window after an asynchronous installer failure without starting backends", () => {
-    const harness = makeHarness({ clientOnlyInventory: [] });
+    let released = false;
+    const harness = makeHarness({ clientOnlyInventory: [], onRuntimeReservationReleased: () => { released = true; } });
     return Effect.scoped(Effect.gen(function* () {
       const updates = yield* DesktopUpdates.DesktopUpdates;
       yield* updates.configure;
@@ -63,6 +136,7 @@ describe("DesktopUpdates", () => {
       yield* flushCallbacks;
       yield* TestClock.adjust(Duration.seconds(45));
       assert.equal(harness.quitAndInstalls(), 1);
+      assert.isFalse(released);
       const { changes } = yield* updates.subscribe;
       const recovered = yield* changes.pipe(
         Stream.filter((state) => state.errorContext === "install" && state.installLease === undefined),
@@ -71,6 +145,7 @@ describe("DesktopUpdates", () => {
       yield* flushCallbacks;
       harness.emit("error", new Error("installer failed after accepting the handoff"));
       assert.isTrue(Option.isSome(yield* Fiber.join(recovered)));
+      assert.isTrue(released);
       assert.equal(harness.stopCount(), 0);
       assert.deepEqual(harness.installSteps, ["quitAndInstall"]);
     })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));

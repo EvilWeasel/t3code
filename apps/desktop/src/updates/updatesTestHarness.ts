@@ -41,6 +41,9 @@ export interface UpdatesHarnessOptions {
   readonly clientOnlyInventory?: ReadonlyArray<{ readonly id: number; readonly generation: string; readonly audible: boolean }>;
   readonly clientOnlyInstallQualified?: boolean;
   readonly omitInstallQualification?: boolean;
+  readonly runtimeReservation?: DesktopUpdates.DesktopUpdateRuntimeReservation;
+  readonly onRuntimeReservationReleased?: () => void;
+  readonly runtimeReservationReleased?: Effect.Effect<void>;
   readonly backendSnapshot?: DesktopBackendPool.DesktopBackendInstance["snapshot"];
   /** Contents of the install record a previous run left behind. */
   readonly installRecord?: string | undefined;
@@ -273,7 +276,14 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
 
   const layer = DesktopUpdates.layer.pipe(
     Layer.provideMerge(options.omitInstallQualification ? Layer.empty : Layer.succeed(DesktopUpdates.DesktopUpdateInstallQualification, {
-      completeRuntimeCreationFence: options.clientOnlyInventory !== undefined && options.clientOnlyInstallQualified !== false,
+      acquireRuntimeReservation: () => Effect.acquireRelease(
+        Effect.sync(() => options.clientOnlyInventory === undefined || options.clientOnlyInstallQualified === false
+          ? Option.none()
+          : Option.some(options.runtimeReservation ?? { isValid: () => true, tryCommit: () => true })),
+        () => Effect.sync(() => options.onRuntimeReservationReleased?.()).pipe(
+          Effect.andThen(options.runtimeReservationReleased ?? Effect.void),
+        ),
+      ),
     })),
     Layer.provide(layerFileSystem),
     Layer.provideMerge(layerUpdater),
