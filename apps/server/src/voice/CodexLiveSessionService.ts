@@ -62,6 +62,28 @@ type LeaseRow = {
   native_sdp_received: number;
 };
 
+type ObservationCall = Parameters<
+  NonNullable<
+    Parameters<
+      ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]
+    >[0]["onObserveWork"]
+  >
+>[0];
+type ObservationCallReceipt = {
+  readonly body: string;
+  readonly result: Exit.Exit<string, LiveVoiceError>;
+};
+type Observation = {
+  readonly input: ObservationCall;
+  readonly principal: EnvironmentAuth.AuthenticatedSession;
+  readonly leaseId: string;
+  readonly generation: number;
+  readonly body: string;
+  state: "active" | "detached" | "completed" | "unknown" | "refused";
+  lastClaim: string | null;
+  delivery: "none" | "claimed" | "sent" | "unknown";
+};
+
 const leaseKey = (leaseId: string, generation: number) => `${leaseId}:${generation}`;
 const encodeModelSelection = Schema.encodeSync(Schema.fromJsonString(ModelSelection));
 const encodeRuntimePolicy = Schema.encodeSync(
@@ -134,6 +156,9 @@ export const layer: Layer.Layer<
     const serviceScope = yield* Effect.scope;
     const leaseLocks = yield* KeyedLock.make<string>();
     const readbackWorkers = new Map<string, Fiber.Fiber<void, never>>();
+    const observations = new Map<string, Observation>();
+    const observationCalls = new Map<string, Map<string, ObservationCallReceipt>>();
+    const observationWorkers = new Map<string, Fiber.Fiber<void, never>>();
     const nativeEventRuntimes = new Set<ProviderAdapter.ProviderAdapterV2SessionRuntime>();
     const active = new Map<
       string,
@@ -209,7 +234,12 @@ export const layer: Layer.Layer<
     const readbackWorkerKey = (leaseId: string, generation: number, plannerTurnId: string) =>
       `${leaseId}:${generation}:${plannerTurnId}`;
 
-    const readbackResult = (projection: OrchestrationV2ThreadProjection, runId: string) => {
+    const readbackResult = (
+      projection: OrchestrationV2ThreadProjection,
+      runId: string,
+      observedAttemptId?: string,
+      observedProviderTurnId?: string,
+    ) => {
       const run = projection.runs.find((candidate) => candidate.id === runId);
       if (
         run === undefined ||
@@ -223,8 +253,10 @@ export const layer: Layer.Layer<
       );
       if (
         attempts.length !== 1 ||
-        run.activeAttemptId !== attempts[0]!.id ||
-        attempts[0]!.providerTurnId === null
+        (run.activeAttemptId !== attempts[0]!.id &&
+          !(run.activeAttemptId === null && observedAttemptId === attempts[0]!.id)) ||
+        (attempts[0]!.providerTurnId === null &&
+          !(observedAttemptId === attempts[0]!.id && observedProviderTurnId))
       )
         return undefined;
       const resultNodeIds = new Set(
@@ -232,7 +264,7 @@ export const layer: Layer.Layer<
           .filter(
             (node) =>
               node.rootNodeId === run.rootNodeId &&
-              node.providerTurnId === attempts[0]!.providerTurnId &&
+              node.providerTurnId === (attempts[0]!.providerTurnId ?? observedProviderTurnId) &&
               node.kind === "assistant_message" &&
               node.status === "completed",
           )
@@ -244,7 +276,7 @@ export const layer: Layer.Layer<
           item.runId === runId &&
           item.nodeId !== null &&
           resultNodeIds.has(item.nodeId) &&
-          item.providerTurnId === attempts[0]!.providerTurnId &&
+          item.providerTurnId === (attempts[0]!.providerTurnId ?? observedProviderTurnId) &&
           item.status === "completed" &&
           !item.streaming,
       );
@@ -322,7 +354,10 @@ export const layer: Layer.Layer<
         const worker = Effect.gen(function* () {
           const afterSequence = yield* threads.getThreadEventSequence(input.threadId);
           const readProjection = () =>
-            threads.getProjectThread({ projectId: input.projectId, threadId: input.threadId });
+            threads.getProjectThread({
+              projectId: input.projectId,
+              threadId: input.threadId,
+            });
           const first = inspectReadback(yield* readProjection(), input.runId);
           if (first.type === "ready") {
             yield* appendDurableFinal({
@@ -687,7 +722,9 @@ export const layer: Layer.Layer<
                       : { resumeFromSession: providerSession }),
                     ...(providerThread?.nativeThreadRef?.nativeId == null
                       ? {}
-                      : { initialNativeThreadId: providerThread.nativeThreadRef.nativeId }),
+                      : {
+                          initialNativeThreadId: providerThread.nativeThreadRef.nativeId,
+                        }),
                   })
                   .pipe(
                     Effect.mapError(() => liveError("runtime_unavailable")),
@@ -744,6 +781,22 @@ export const layer: Layer.Layer<
                         }),
                     ),
                   ),
+                onObserveWork: (input) =>
+                  observeWork({
+                    ...input,
+                    principal: session,
+                    leaseId,
+                    generation,
+                  }).pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new ProviderAdapter.ProviderAdapterProtocolError({
+                          driver: ProviderDriverKind.make("codex"),
+                          detail: "Live work observation is not available.",
+                          cause,
+                        }),
+                    ),
+                  ),
                 onWorkControl: (input) =>
                   controlWork({
                     ...input,
@@ -788,7 +841,10 @@ export const layer: Layer.Layer<
               runtime,
               plannerNativeThreadId: prepared.plannerNativeThreadId,
             });
-            yield* eventHub.publish({ type: "status", session: sessionFromRow(ready) });
+            yield* eventHub.publish({
+              type: "status",
+              session: sessionFromRow(ready),
+            });
             // The adapter exposes one consuming queue per runtime. A worker per
             // lease would let an ended call steal a later call's notifications.
             if (!nativeEventRuntimes.has(runtime)) {
@@ -914,6 +970,7 @@ export const layer: Layer.Layer<
             WHERE lease_id = ${input.leaseId} AND generation = ${input.generation}
           `,
             );
+            yield* stopObservation(input.leaseId, input.generation);
             yield* stopReadbackWorkers(input.leaseId, input.generation);
             const lease = active.get(leaseKey(input.leaseId, input.generation));
             const runtime =
@@ -962,6 +1019,459 @@ export const layer: Layer.Layer<
           return eventHub.subscribe(input);
         }),
       ).pipe(Stream.mapError(toLiveError));
+
+    const observationReceipt = (observation: Observation, context?: unknown) =>
+      encodeReceipt({
+        observed: true,
+        state: observation.state,
+        target: observation.input.target,
+        progress: observation.input.progress,
+        completion: observation.input.completion,
+        speechDelivery: observation.delivery,
+        audibility: "unknown",
+        ...(context === undefined ? {} : { context }),
+      });
+
+    function stopObservation(leaseId: string, generation: number) {
+      return Effect.gen(function* () {
+        const key = leaseKey(leaseId, generation);
+        const observation = observations.get(key);
+        if (observation?.delivery === "claimed") observation.delivery = "unknown";
+        if (observation?.state === "active") observation.state = "detached";
+        const worker = observationWorkers.get(key);
+        if (worker !== undefined) yield* Fiber.interrupt(worker);
+        observationWorkers.delete(key);
+        observationCalls.delete(key);
+        observations.delete(key);
+      });
+    }
+
+    // The selector is never authority. In particular, a null attempt turn is resolved
+    // only by its exact canonical root+attempt projection, never by the latest turn.
+    function readObservation(observation: Observation, attaching = false) {
+      return Effect.gen(function* () {
+        yield* ensurePrincipal(observation.principal);
+        const target = observation.input.target;
+        const row = yield* getOwnedLease(
+          observation.principal.sessionId,
+          observation.leaseId,
+          observation.generation,
+        );
+        const environmentId = yield* environment.getEnvironmentId;
+        const runtime = active.get(leaseKey(observation.leaseId, observation.generation));
+        if (
+          row.status !== "active" ||
+          row.environment_id !== environmentId ||
+          target.environmentId !== environmentId ||
+          row.thread_id !== target.threadId ||
+          row.provider_instance_id !== target.providerInstanceId ||
+          row.principal_subject !== observation.principal.subject ||
+          row.planner_native_thread_id !== observation.input.plannerNativeThreadId ||
+          runtime?.plannerNativeThreadId !== observation.input.plannerNativeThreadId ||
+          runtime.runtime.driver !== "codex" ||
+          runtime.runtime.instanceId !== row.provider_instance_id ||
+          runtime.runtime.providerSessionId !== row.provider_session_id ||
+          !runtime.runtime.liveVoice
+        )
+          return yield* liveError("stale_lease");
+        const projection = yield* threads.getThreadProjection(
+          row.thread_id as LiveVoiceSession["threadId"],
+        );
+        const policy = yield* runtimePolicies.resolve({
+          thread: projection.thread,
+          modelSelection: projection.thread.modelSelection,
+        });
+        const instance = yield* providerInstances.getInstance(projection.thread.providerInstanceId);
+        if (
+          projection.thread.id !== target.threadId ||
+          projection.thread.providerInstanceId !== target.providerInstanceId ||
+          projection.thread.archivedAt !== null ||
+          instance?.driverKind !== "codex" ||
+          encodeModelSelection(projection.thread.modelSelection) !== row.model_selection_json ||
+          encodeRuntimePolicy(policy) !== row.runtime_policy_json
+        )
+          return yield* liveError("stale_lease");
+        const run = projection.runs.find(
+          (run) =>
+            run.id === target.runId &&
+            run.threadId === target.threadId &&
+            run.providerInstanceId === target.providerInstanceId,
+        );
+        const attempt = projection.attempts.find(
+          (attempt) =>
+            attempt.id === target.attemptId &&
+            attempt.runId === target.runId &&
+            attempt.rootNodeId === target.rootNodeId &&
+            attempt.providerInstanceId === target.providerInstanceId,
+        );
+        const terminal = run?.status === "completed";
+        if (
+          !run ||
+          !attempt ||
+          run.rootNodeId !== target.rootNodeId ||
+          run.providerThreadId !== attempt.providerThreadId ||
+          !projection.nodes.some(
+            (node) =>
+              node.id === target.rootNodeId &&
+              node.runId === target.runId &&
+              node.threadId === target.threadId &&
+              node.rootNodeId === target.rootNodeId,
+          ) ||
+          (run.activeAttemptId !== target.attemptId &&
+            !(terminal && run.activeAttemptId === null)) ||
+          projection.attempts.some(
+            (candidate) =>
+              candidate.runId === run.id && candidate.attemptOrdinal > attempt.attemptOrdinal,
+          ) ||
+          (attaching &&
+            (!["starting", "running", "waiting"].includes(run.status) ||
+              attempt.status !== "running")) ||
+          (!attaching && !["starting", "running", "waiting", "completed"].includes(run.status)) ||
+          (!terminal && attempt.status !== "running") ||
+          (terminal && attempt.status !== "completed")
+        )
+          return yield* liveError("stale_lease");
+        const turns = projection.providerTurns.filter(
+          (turn) =>
+            turn.runAttemptId === attempt.id &&
+            turn.nodeId === target.rootNodeId &&
+            turn.providerThreadId === attempt.providerThreadId,
+        );
+        const turn = turns.length === 1 ? turns[0] : undefined;
+        const providerThread = projection.providerThreads.find(
+          (thread) =>
+            thread.id === attempt.providerThreadId &&
+            thread.providerInstanceId === target.providerInstanceId &&
+            thread.appThreadId === target.threadId,
+        );
+        if (
+          !turn ||
+          (attempt.providerTurnId !== null && turn.id !== attempt.providerTurnId) ||
+          !providerThread?.providerSessionId ||
+          providerThread.driver !== "codex" ||
+          (terminal ? turn.status !== "completed" : turn.status !== "running")
+        )
+          return yield* liveError("stale_lease");
+        if (!terminal) {
+          const workRuntime = yield* providerSessions.get(providerThread.providerSessionId);
+          if (
+            Option.isNone(workRuntime) ||
+            workRuntime.value.driver !== "codex" ||
+            workRuntime.value.instanceId !== target.providerInstanceId ||
+            workRuntime.value.providerSessionId !== providerThread.providerSessionId
+          )
+            return yield* liveError("runtime_unavailable");
+        }
+        // Final evidence is allowed after the same attempt completes. No active-status gate here.
+        return {
+          row,
+          runtime: runtime.runtime,
+          projection,
+          run,
+          attempt,
+          turn,
+        };
+      }).pipe(Effect.mapError(toLiveError));
+    }
+
+    function observationContext(
+      observation: Observation,
+      projection: OrchestrationV2ThreadProjection,
+    ) {
+      const target = observation.input.target;
+      const run = projection.runs.find((run) => run.id === target.runId)!;
+      const childTasks = projection.subagents.filter(
+        (child) => child.runId === target.runId && child.threadId === target.threadId,
+      );
+      const messages = projection.messages.filter(
+        (message) =>
+          message.threadId === target.threadId &&
+          message.runId === target.runId &&
+          message.role === "assistant" &&
+          !message.streaming &&
+          projection.nodes.some(
+            (node) =>
+              node.id === message.nodeId &&
+              node.rootNodeId === target.rootNodeId &&
+              node.providerTurnId ===
+                projection.providerTurns.find(
+                  (turn) =>
+                    turn.runAttemptId === target.attemptId && turn.nodeId === target.rootNodeId,
+                )?.id,
+          ),
+      );
+      const latest = messages.slice(-1)[0];
+      return {
+        status: run.status,
+        children: {
+          total: childTasks.length,
+          completed: childTasks.filter((child) => child.status === "completed").length,
+        },
+        commentary: latest?.text.trim().slice(0, 800) ?? null,
+        // Canonical references only: no URL extraction, file read, or validity assertion.
+        references: latest
+          ? {
+              messageId: latest.id,
+              attachmentIds: latest.attachments.slice(0, 8).map((attachment) => attachment.id),
+            }
+          : null,
+      };
+    }
+
+    function deliverObservation(observation: Observation) {
+      return Effect.gen(function* () {
+        const key = leaseKey(observation.leaseId, observation.generation);
+        if (observations.get(key) !== observation || observation.state !== "active") return false;
+        const evidence = yield* readObservation(observation);
+        const context = observationContext(observation, evidence.projection);
+        const final = readbackResult(
+          evidence.projection,
+          observation.input.target.runId,
+          observation.input.target.attemptId,
+          evidence.turn.id,
+        );
+        if (evidence.run.status === "completed" && !final) {
+          if (
+            inspectReadback(evidence.projection, observation.input.target.runId).type === "blocked"
+          ) {
+            observation.state = "refused";
+            return false;
+          }
+          return true;
+        }
+        const completed = final !== undefined;
+        if (completed && !observation.input.completion) {
+          observation.state = "completed";
+          return false;
+        }
+        if (!completed && !observation.input.progress) return true;
+        // Canonical messages do not retain a commentary/final phase. Progress speaks
+        // only status/count facts; assistant text is not announced as a finding early.
+        const text = completed
+          ? final.text.trim().slice(0, 2_000)
+          : `Background work ${context.status}; ${context.children.completed} of ${context.children.total} child tasks completed.`;
+        const claim = encodeReceipt({
+          completed,
+          text,
+          ...(final
+            ? {
+                finalMessageId: final.finalMessageId,
+                references: context.references,
+              }
+            : {}),
+        });
+        if (claim === observation.lastClaim) return true;
+        // Revalidate after every async read, then claim before non-idempotent speech.
+        const fresh = yield* readObservation(observation);
+        if (
+          observations.get(key) !== observation ||
+          observation.state !== "active" ||
+          encodeReceipt(observationContext(observation, fresh.projection)) !==
+            encodeReceipt(context)
+        )
+          return true;
+        const freshFinal = readbackResult(
+          fresh.projection,
+          observation.input.target.runId,
+          observation.input.target.attemptId,
+          fresh.turn.id,
+        );
+        if (
+          final &&
+          (!freshFinal ||
+            freshFinal.finalMessageId !== final.finalMessageId ||
+            freshFinal.text !== final.text)
+        )
+          return true;
+        yield* ensurePrincipal(observation.principal);
+        const current = yield* getLease(observation.leaseId, observation.generation);
+        if (
+          current?.status !== "active" ||
+          active.get(key)?.runtime !== fresh.runtime ||
+          observations.get(key) !== observation ||
+          observation.state !== "active"
+        )
+          return false;
+        observation.lastClaim = claim;
+        observation.delivery = "claimed";
+        const speech = yield* Effect.exit(
+          fresh.runtime.liveVoice!.appendSpeech({
+            plannerNativeThreadId: observation.input.plannerNativeThreadId,
+            text,
+          }),
+        );
+        if (Exit.isFailure(speech)) {
+          observation.delivery = "unknown";
+          if (observation.state === "active") observation.state = "unknown";
+          return false;
+        }
+        observation.delivery = "sent";
+        if (completed) observation.state = "completed";
+        return !completed && observation.state === "active";
+      });
+    }
+
+    function startObservation(observation: Observation, afterSequence: number) {
+      return Effect.gen(function* () {
+        const key = leaseKey(observation.leaseId, observation.generation);
+        const worker = Effect.gen(function* () {
+          if (!(yield* deliverObservation(observation))) return;
+          yield* Stream.mergeAll(
+            (
+              ["run.updated", "subagent.updated", "checkpoint.captured", "message.updated"] as const
+            ).map((eventType) =>
+              threads.streamStoredEventsFrom({
+                threadId: observation.input.target.threadId as LiveVoiceSession["threadId"],
+                afterSequence,
+                eventType,
+              }),
+            ),
+            { concurrency: "unbounded" },
+          ).pipe(
+            Stream.filter((stored) =>
+              stored.event.type === "run.updated"
+                ? stored.event.payload.id === observation.input.target.runId
+                : "runId" in stored.event.payload &&
+                  stored.event.payload.runId === observation.input.target.runId,
+            ),
+            // Serial append backpressure coalesces queued events to the latest authoritative projection.
+            Stream.mapEffect(() => deliverObservation(observation)),
+            Stream.takeUntil((keepGoing) => !keepGoing),
+            Stream.runDrain,
+          );
+        }).pipe(
+          Effect.catchCause(() =>
+            Effect.sync(() => {
+              if (observation.state === "active") observation.state = "refused";
+            }),
+          ),
+        );
+        const fiber = yield* Effect.forkIn(worker, serviceScope);
+        observationWorkers.set(key, fiber);
+      });
+    }
+
+    function observeWork(
+      request: ObservationCall & {
+        readonly principal: EnvironmentAuth.AuthenticatedSession;
+        readonly leaseId: string;
+        readonly generation: number;
+      },
+    ) {
+      const input = Object.freeze({
+        ...request,
+        target: Object.freeze({
+          environmentId: request.target.environmentId,
+          threadId: request.target.threadId,
+          providerInstanceId: request.target.providerInstanceId,
+          runId: request.target.runId,
+          attemptId: request.target.attemptId,
+          rootNodeId: request.target.rootNodeId,
+        }),
+      });
+      return leaseLocks.withLock(
+        leaseKey(input.leaseId, input.generation),
+        Effect.gen(function* () {
+          yield* ensurePrincipal(input.principal);
+          const row = yield* getOwnedLease(
+            input.principal.sessionId,
+            input.leaseId,
+            input.generation,
+          );
+          const currentEnvironmentId = yield* environment.getEnvironmentId;
+          if (
+            row.environment_id !== currentEnvironmentId ||
+            input.target.environmentId !== currentEnvironmentId ||
+            row.thread_id !== input.target.threadId ||
+            row.provider_instance_id !== input.target.providerInstanceId ||
+            row.status !== "active" ||
+            row.planner_native_thread_id !== input.plannerNativeThreadId ||
+            row.principal_subject !== input.principal.subject ||
+            active.get(leaseKey(input.leaseId, input.generation))?.plannerNativeThreadId !==
+              input.plannerNativeThreadId ||
+            !input.plannerTurnId.trim() ||
+            !input.callId.trim()
+          )
+            return yield* liveError("stale_lease");
+          const key = leaseKey(input.leaseId, input.generation);
+          const callKey = encodeReceipt([input.plannerTurnId, input.callId]);
+          const body = encodeReceipt({
+            action: input.action,
+            target: input.target,
+            progress: input.progress,
+            completion: input.completion,
+          });
+          const calls = observationCalls.get(key) ?? new Map<string, ObservationCallReceipt>();
+          observationCalls.set(key, calls);
+          const prior = calls.get(callKey);
+          if (prior) {
+            if (prior.body !== body) return yield* liveError("dispatch_conflict");
+            if (Exit.isFailure(prior.result)) return yield* Effect.failCause(prior.result.cause);
+            return prior.result.value;
+          }
+          const existingObservation = observations.get(key);
+          if (
+            input.action === "detach" &&
+            (!existingObservation ||
+              encodeReceipt(existingObservation.input.target) !== encodeReceipt(input.target))
+          )
+            return yield* liveError("dispatch_conflict");
+          // Leave the final bounded receipt slot for explicit detach; never evict a call ID.
+          if (calls.size >= (input.action === "detach" ? 32 : 31))
+            return yield* liveError("invalid_state");
+          const result = yield* Effect.exit(
+            Effect.gen(function* () {
+              const candidate: Observation = {
+                input,
+                principal: input.principal,
+                leaseId: input.leaseId,
+                generation: input.generation,
+                body: encodeReceipt({
+                  target: input.target,
+                  progress: input.progress,
+                  completion: input.completion,
+                }),
+                state: "active",
+                lastClaim: null,
+                delivery: "none",
+              };
+              const existing = observations.get(key);
+              if (input.action === "detach") {
+                if (
+                  !existing ||
+                  encodeReceipt(existing.input.target) !== encodeReceipt(input.target)
+                )
+                  return yield* liveError("dispatch_conflict");
+                if (existing.delivery === "claimed") existing.delivery = "unknown";
+                existing.state = "detached";
+                const worker = observationWorkers.get(key);
+                if (worker) yield* Fiber.interrupt(worker);
+                observationWorkers.delete(key);
+                return observationReceipt(existing);
+              }
+              if (!input.progress && !input.completion) return yield* liveError("invalid_state");
+              const evidence = yield* readObservation(candidate, true);
+              if (existing) {
+                if (existing.body !== candidate.body) return yield* liveError("dispatch_conflict");
+                return observationReceipt(existing);
+              }
+              const afterSequence = yield* threads
+                .getThreadEventSequence(evidence.projection.thread.id)
+                .pipe(Effect.mapError(toLiveError));
+              observations.set(key, candidate);
+              yield* startObservation(candidate, afterSequence);
+              return observationReceipt(
+                candidate,
+                observationContext(candidate, evidence.projection),
+              );
+            }).pipe(Effect.mapError(toLiveError)),
+          );
+          calls.set(callKey, { body, result });
+          if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause);
+          return result.value;
+        }),
+      );
+    }
 
     function controlWork(input: {
       readonly principal: EnvironmentAuth.AuthenticatedSession;
@@ -1055,6 +1565,8 @@ export const layer: Layer.Layer<
               generation: input.generation,
               tasks: selected.map((task) => ({
                 runId: task.id,
+                rootNodeId: task.rootNodeId,
+                attemptId: task.activeAttemptId,
                 status: task.status,
                 resultReady: inspectReadback(projection, task.id).type === "ready",
                 commentary: !["preparing", "queued", "starting", "running", "waiting"].includes(
@@ -1354,9 +1866,11 @@ export const layer: Layer.Layer<
               code: "runtime_unavailable",
             });
             yield* updateStatus(row, "failed");
+            yield* stopObservation(leaseId, generation);
             return;
           case "closed":
             yield* updateStatus(row, "closed");
+            yield* stopObservation(leaseId, generation);
             yield* stopReadbackWorkers(leaseId, generation);
             active.delete(leaseKey(leaseId, generation));
             return;
@@ -1407,6 +1921,12 @@ export const layer: Layer.Layer<
       });
     }
 
-    return CodexLiveSessionService.of({ prepare, start, stop, status, subscribe });
+    return CodexLiveSessionService.of({
+      prepare,
+      start,
+      stop,
+      status,
+      subscribe,
+    });
   }),
 ).pipe(Layer.provideMerge(CodexLiveEventHub.layer));

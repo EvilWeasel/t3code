@@ -18,6 +18,7 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -80,8 +81,7 @@ it.effect.each([false, true])(
           }) => Effect.Effect<string, ProviderAdapter.ProviderAdapterV2Error>)
         | undefined;
       let plannerOptions:
-        | { serviceTier?: string | null; reasoningEffort?: string | null }
-        | undefined;
+        { serviceTier?: string | null; reasoningEffort?: string | null } | undefined;
       let controlWork: Parameters<
         ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]
       >[0]["onWorkControl"];
@@ -167,7 +167,9 @@ it.effect.each([false, true])(
                   ? {}
                   : { reasoningEffort: input.reasoningEffort }),
               };
-              return { plannerNativeThreadId: `planner-native-${plannerCalls}` };
+              return {
+                plannerNativeThreadId: `planner-native-${plannerCalls}`,
+              };
             }),
           start: () => Effect.void,
           stop: () =>
@@ -230,7 +232,10 @@ it.effect.each([false, true])(
         },
         providerThreads: [],
         providerSessions: [
-          { id: ProviderSessionId.make("provider-session-test"), providerInstanceId },
+          {
+            id: ProviderSessionId.make("provider-session-test"),
+            providerInstanceId,
+          },
         ],
       };
       durableProjection = {
@@ -259,7 +264,13 @@ it.effect.each([false, true])(
               principalLookupGate = undefined;
               gate.markStarted();
               return Effect.promise(() => gate.wait).pipe(
-                Effect.as([{ sessionId, subject: session.subject, scopes: session.scopes }]),
+                Effect.as([
+                  {
+                    sessionId,
+                    subject: session.subject,
+                    scopes: session.scopes,
+                  },
+                ]),
               );
             }
             return Effect.succeed([
@@ -307,7 +318,10 @@ it.effect.each([false, true])(
                   Effect.tap(() => Deferred.succeed(workFinished, undefined)),
                   Effect.forkChild,
                 );
-              return { delivery: "queued", run: { id: `durable-run-${sends}` } };
+              return {
+                delivery: "queued",
+                run: { id: `durable-run-${sends}` },
+              };
             }),
           dispatch: (
             command: Extract<
@@ -369,7 +383,10 @@ it.effect.each([false, true])(
         assert.equal(prepared.status, "prepared");
         assert.equal(prepared.providerSessionId, "provider-session-test");
         assert.equal(prepared.plannerNativeThreadId, "planner-native-1");
-        assert.deepEqual(plannerOptions, { serviceTier: "priority", reasoningEffort: "high" });
+        assert.deepEqual(plannerOptions, {
+          serviceTier: "priority",
+          reasoningEffort: "high",
+        });
         const duplicatePrepare = yield* service.prepare(session, {
           threadId,
           clientRequestId: "prepare-1",
@@ -822,7 +839,14 @@ it.effect.each([false, true])(
         assert.equal(spoken.length, 0, "a still-running required child blocks speech");
         assert.deepEqual(
           decodeWorkStatus(yield* control("status", "child-pending", "durable-run-1")).tasks,
-          [{ runId: "durable-run-1", status: "completed", resultReady: false, commentary: null }],
+          [
+            {
+              runId: "durable-run-1",
+              status: "completed",
+              resultReady: false,
+              commentary: null,
+            },
+          ],
         );
 
         durableProjection = {
@@ -885,7 +909,14 @@ it.effect.each([false, true])(
         assert.equal(completedWork, 1, "the held canonical job completes exactly once");
         assert.deepEqual(
           decodeWorkStatus(yield* control("status", "result-ready", "durable-run-1")).tasks,
-          [{ runId: "durable-run-1", status: "completed", resultReady: true, commentary: null }],
+          [
+            {
+              runId: "durable-run-1",
+              status: "completed",
+              resultReady: true,
+              commentary: null,
+            },
+          ],
         );
         assert.deepEqual(spoken, [
           {
@@ -1227,4 +1258,520 @@ it.effect.each([false, true])(
         Effect.provide(Layer.provideMerge(CodexLiveSessionService.layer, dependencies)),
       );
     }),
+);
+
+it.effect.each([
+  "completion",
+  "unknown",
+  "detach",
+  "end",
+  "rollover",
+  "revoked",
+  "opt-out",
+] as const)("observes an existing root without submitting work (%s)", (scenario) =>
+  Effect.gen(function* () {
+    type Observe = NonNullable<
+      Parameters<
+        ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]
+      >[0]["onObserveWork"]
+    >;
+    let observe: Observe | undefined;
+    const native = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2LiveVoiceEvent>();
+    const events = yield* PubSub.unbounded<OrchestrationV2StoredEvent>({
+      replay: 16,
+    });
+    const speech = yield* Queue.unbounded<string>();
+    const projectionReads = yield* Queue.unbounded<OrchestrationV2ThreadProjection>();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const appendSettled = yield* Deferred.make<void>();
+    let appends = 0;
+    let submissions = 0;
+    let workCancels = 0;
+    let allowed = true;
+    let sequence = 0;
+    const instanceId = ProviderInstanceId.make("codex-observer");
+    const providerSessionId = ProviderSessionId.make("observer-provider-session");
+    const session = {
+      sessionId: AuthSessionId.make("observer-principal"),
+      subject: "observer-subject",
+      method: "browser-session-cookie" as const,
+      scopes: [AuthOrchestrationOperateScope],
+    };
+    const target = {
+      environmentId: "observer-env",
+      threadId: "existing-research",
+      providerInstanceId: instanceId,
+      runId: "original-run",
+      attemptId: "original-attempt",
+      rootNodeId: "original-root",
+    };
+    const modelSelection = { instanceId, model: "test-model", options: [] };
+    const policy = {
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      cwd: "/synthetic/research",
+    } as const;
+    let projection = {
+      thread: {
+        id: target.threadId,
+        projectId: "research-project",
+        providerInstanceId: instanceId,
+        activeProviderThreadId: "work-provider-thread",
+        modelSelection,
+        archivedAt: null,
+        runtimeMode: policy.runtimeMode,
+        interactionMode: policy.interactionMode,
+        worktreePath: policy.cwd,
+      },
+      runs: [
+        {
+          id: target.runId,
+          threadId: target.threadId,
+          providerInstanceId: instanceId,
+          providerThreadId: "work-provider-thread",
+          rootNodeId: target.rootNodeId,
+          activeAttemptId: target.attemptId,
+          status: "running",
+          checkpointId: null,
+        },
+      ],
+      // Exercise the actual Heph-shaped null turn row; resolve only its exact canonical attempt/root turn.
+      attempts: [
+        {
+          id: target.attemptId,
+          runId: target.runId,
+          rootNodeId: target.rootNodeId,
+          providerInstanceId: instanceId,
+          providerThreadId: "work-provider-thread",
+          providerTurnId: null,
+          attemptOrdinal: 1,
+          status: "running",
+        },
+      ],
+      providerThreads: [
+        {
+          id: "work-provider-thread",
+          appThreadId: target.threadId,
+          providerInstanceId: instanceId,
+          driver: "codex",
+          providerSessionId,
+        },
+      ],
+      providerTurns: [
+        {
+          id: "work-turn",
+          providerThreadId: "work-provider-thread",
+          runAttemptId: target.attemptId,
+          nodeId: target.rootNodeId,
+          status: "running",
+        },
+      ],
+      nodes: [
+        {
+          id: target.rootNodeId,
+          threadId: target.threadId,
+          runId: target.runId,
+          rootNodeId: target.rootNodeId,
+          providerTurnId: "work-turn",
+          kind: "provider_turn",
+          status: "running",
+        },
+        {
+          id: "research-commentary",
+          threadId: target.threadId,
+          runId: target.runId,
+          rootNodeId: target.rootNodeId,
+          providerTurnId: "work-turn",
+          kind: "assistant_message",
+          status: "completed",
+        },
+      ],
+      messages: [
+        {
+          id: "research-message",
+          threadId: target.threadId,
+          runId: target.runId,
+          nodeId: "research-commentary",
+          role: "assistant",
+          text: "Grounded finding A",
+          streaming: false,
+          attachments: [
+            {
+              type: "file",
+              id: "canonical-report",
+              name: "report.txt",
+              mimeType: "text/plain",
+              sizeBytes: 10,
+            },
+          ],
+        },
+      ],
+      subagents: [1, 2].map((n) => ({
+        id: `existing-child-${n}`,
+        threadId: target.threadId,
+        runId: target.runId,
+        parentNodeId: target.rootNodeId,
+        status: "running",
+      })),
+      checkpoints: [],
+      turnItems: [],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const runtime = {
+      instanceId,
+      providerSessionId,
+      driver: "codex",
+      liveVoice: {
+        events: Stream.fromQueue(native),
+        preparePlanner: (
+          input: Parameters<ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]>[0],
+        ) =>
+          Effect.sync(() => {
+            observe = input.onObserveWork;
+            return { plannerNativeThreadId: "observer-planner" };
+          }),
+        start: () => Effect.void,
+        stop: () => Effect.void,
+        appendSpeech: ({ text }: { text: string }) =>
+          Effect.gen(function* () {
+            appends += 1;
+            if (appends === 1) {
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+            }
+            if (scenario === "unknown")
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver: ProviderDriverKind.make("codex"),
+                detail: "Synthetic uncertain speech acknowledgement",
+              });
+            yield* Queue.offer(speech, text);
+          }).pipe(Effect.ensuring(Deferred.succeed(appendSettled, undefined))),
+      },
+    } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+    const dependencies = Layer.mergeAll(
+      NodeSqliteClient.layer({ filename: ":memory:" }),
+      NodeCrypto.layer,
+      Layer.succeed(SessionStore.SessionStore, {
+        listActive: () => Effect.succeed(allowed ? [session] : []),
+      } as unknown as SessionStore.SessionStore["Service"]),
+      Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
+        getEnvironmentId: Effect.succeed(target.environmentId as never),
+      }),
+      Layer.succeed(RuntimePolicy.RuntimePolicyV2, {
+        resolve: () => Effect.succeed(policy),
+      }),
+      Layer.succeed(ProviderSessionManager.ProviderSessionManagerV2, {
+        get: () => Effect.succeed(Option.some(runtime)),
+      } as unknown as ProviderSessionManager.ProviderSessionManagerV2Shape),
+      Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+        getInstance: () => Effect.succeed({ driverKind: "codex" }),
+      } as unknown as ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]),
+      Layer.succeed(ThreadManagementService.ThreadManagementService, {
+        getThreadProjection: () =>
+          Effect.gen(function* () {
+            const snapshot = projection;
+            yield* Queue.offer(projectionReads, snapshot);
+            return snapshot;
+          }),
+        getProjectThread: () => Effect.succeed(projection),
+        getThreadEventSequence: () => Effect.succeed(sequence),
+        streamStoredEventsFrom: (input: { eventType?: string; afterSequence: number }) =>
+          Stream.fromPubSub(events).pipe(
+            Stream.filter(
+              (stored) =>
+                stored.sequence > input.afterSequence && stored.event.type === input.eventType,
+            ),
+          ),
+        sendToThread: () =>
+          Effect.sync(() => {
+            submissions += 1;
+            throw new Error("Observer must never submit work");
+          }),
+        dispatch: () =>
+          Effect.sync(() => {
+            workCancels += 1;
+            throw new Error("Observer must never dispatch a work command");
+          }),
+      } as unknown as ThreadManagementService.ThreadManagementServiceShape),
+    );
+    yield* Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      const service = yield* CodexLiveSessionService.CodexLiveSessionService;
+      const lease = yield* service.prepare(session, {
+        threadId: target.threadId as never,
+        clientRequestId: "observe-prepare",
+      });
+      const statuses = yield* Queue.unbounded<LiveVoiceEvent>();
+      yield* service.subscribe(session, lease).pipe(
+        Stream.runForEach((event) => Queue.offer(statuses, event)),
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* service.start(session, {
+        ...lease,
+        offerSdp: "v=0\r\n",
+        clientRequestId: "observe-start",
+      });
+      yield* Queue.offer(native, {
+        type: "sdp",
+        plannerNativeThreadId: "observer-planner",
+        sdp: "v=0\r\nanswer",
+      });
+      yield* Queue.offer(native, {
+        type: "started",
+        plannerNativeThreadId: "observer-planner",
+        realtimeSessionId: `${lease.leaseId}:${lease.generation}`,
+      });
+      yield* Stream.fromQueue(statuses).pipe(
+        Stream.filter((event) => event.type === "status" && event.session.status === "active"),
+        Stream.runHead,
+      );
+      assert.isDefined(observe);
+      const request = {
+        plannerNativeThreadId: "observer-planner",
+        plannerTurnId: "conversation-1",
+        callId: "observe-call",
+        action: "attach" as const,
+        target,
+        progress: scenario !== "opt-out",
+        completion: true,
+      };
+      const receipt = yield* observe!(request);
+      assert.equal(yield* observe!(request), receipt, "same call/body admission is idempotent");
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(observe!({ ...request, completion: false }))),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            observe!({
+              ...request,
+              callId: "foreign",
+              target: { ...target, environmentId: "foreign" },
+            }),
+          ),
+        ),
+      );
+      assert.isTrue(
+        Exit.isFailure(
+          yield* Effect.exit(
+            observe!({
+              ...request,
+              callId: "stale-planner",
+              plannerNativeThreadId: "foreign-planner",
+            }),
+          ),
+        ),
+      );
+      const publish = () =>
+        PubSub.publish(events, {
+          sequence: ++sequence,
+          commandId: null,
+          event: { type: "run.updated", payload: projection.runs[0] },
+        } as unknown as OrchestrationV2StoredEvent);
+      if (scenario === "opt-out") {
+        assert.equal(appends, 0, "progress opt-out does not append bootstrap speech");
+        yield* observe!({ ...request, callId: "detach", action: "detach" });
+      } else {
+        yield* Deferred.await(entered);
+        const reconnected = yield* service.status(session, lease);
+        assert.equal(
+          reconnected.leaseId,
+          lease.leaseId,
+          "same-lease status/reconnect preserves observer",
+        );
+        if (scenario === "end") {
+          const children = projection.subagents;
+          yield* service.stop(session, {
+            ...lease,
+            clientRequestId: "pending-speech-end",
+          });
+          assert.strictEqual(projection.subagents, children);
+          yield* Deferred.succeed(release, undefined);
+          assert.equal(appends, 1, "End retires pending output without restarting work");
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(observe!({ ...request, callId: "after-end" }))),
+          );
+        } else if (scenario === "detach") {
+          yield* observe!({ ...request, callId: "detach", action: "detach" });
+          yield* Deferred.succeed(release, undefined);
+          assert.equal(appends, 1);
+          yield* observe!({ ...request, callId: "after-detach" });
+          assert.equal(
+            appends,
+            1,
+            "a detached observer is not resurrected by another attach receipt",
+          );
+        } else if (scenario === "unknown") {
+          yield* Deferred.succeed(release, undefined);
+          yield* Deferred.await(appendSettled);
+          yield* Effect.yieldNow;
+          const unknown = decodeJson(
+            yield* observe!({ ...request, callId: "after-uncertain-append" }),
+          );
+          assert.equal((unknown as { state: string }).state, "unknown");
+          yield* publish();
+          assert.equal(appends, 1, "uncertain speech is never automatically retried");
+        } else {
+          projection = {
+            ...projection,
+            messages: projection.messages.map((message) => ({
+              ...message,
+              text: "Grounded finding B",
+            })),
+            subagents: projection.subagents.map((child, index) => ({
+              ...child,
+              status: index === 0 ? ("completed" as const) : ("running" as const),
+            })),
+          };
+          yield* publish();
+          yield* publish();
+          yield* Deferred.succeed(release, undefined);
+          assert.include(yield* Queue.take(speech), "0 of 2 child tasks completed");
+          if (scenario === "rollover" || scenario === "revoked") {
+            if (scenario === "rollover")
+              projection = {
+                ...projection,
+                runs: projection.runs.map((run) => ({
+                  ...run,
+                  activeAttemptId: "replacement-attempt" as never,
+                })),
+              };
+            else allowed = false;
+            yield* publish();
+            assert.isTrue(
+              Exit.isFailure(
+                yield* Effect.exit(observe!({ ...request, callId: "refused-current" })),
+              ),
+            );
+          } else {
+            assert.include(yield* Queue.take(speech), "1 of 2 child tasks completed");
+            projection = {
+              ...projection,
+              runs: projection.runs.map((run) => ({
+                ...run,
+                status: "completed" as const,
+                activeAttemptId: null,
+                checkpointId: "final-checkpoint" as never,
+              })),
+              attempts: projection.attempts.map((attempt) => ({
+                ...attempt,
+                status: "completed" as const,
+              })),
+              providerTurns: projection.providerTurns.map((turn) => ({
+                ...turn,
+                status: "completed" as const,
+              })),
+              nodes: [
+                ...projection.nodes,
+                {
+                  id: "final-node",
+                  threadId: target.threadId,
+                  runId: target.runId,
+                  rootNodeId: target.rootNodeId,
+                  providerTurnId: "work-turn",
+                  kind: "assistant_message",
+                  status: "completed",
+                } as never,
+              ],
+              messages: [
+                ...projection.messages,
+                {
+                  id: "final-message",
+                  threadId: target.threadId,
+                  runId: target.runId,
+                  nodeId: "final-node",
+                  role: "assistant",
+                  text: "Final grounded report [source](https://example.test/source)",
+                  streaming: false,
+                  attachments: projection.messages[0]!.attachments,
+                } as never,
+              ],
+              turnItems: [
+                {
+                  type: "assistant_message",
+                  id: "final-item",
+                  runId: target.runId,
+                  nodeId: "final-node",
+                  providerTurnId: "work-turn",
+                  messageId: "final-message",
+                  ordinal: 2,
+                  status: "completed",
+                  streaming: false,
+                  text: "Final grounded report [source](https://example.test/source)",
+                } as never,
+              ],
+              checkpoints: [],
+            };
+            const childrenPending = projection;
+            yield* publish();
+            yield* Stream.fromQueue(projectionReads).pipe(
+              Stream.filter((snapshot) => snapshot === childrenPending),
+              Stream.runHead,
+            );
+            assert.equal(appends, 2, "terminal root alone does not bypass unfinished children");
+            projection = {
+              ...projection,
+              subagents: projection.subagents.map((child) => ({
+                ...child,
+                status: "completed" as const,
+              })),
+            };
+            const checkpointPending = projection;
+            yield* publish();
+            yield* Stream.fromQueue(projectionReads).pipe(
+              Stream.filter((snapshot) => snapshot === checkpointPending),
+              Stream.runHead,
+            );
+            assert.equal(appends, 2, "completed children do not bypass the missing checkpoint");
+            projection = {
+              ...projection,
+              checkpoints: [
+                {
+                  id: "final-checkpoint",
+                  runId: target.runId,
+                  status: "ready",
+                } as never,
+              ],
+            };
+            yield* publish();
+            assert.equal(
+              yield* Queue.take(speech),
+              "Final grounded report [source](https://example.test/source)",
+            );
+            assert.equal(
+              appends,
+              3,
+              "two coalesced progress updates and one child/checkpoint-gated final",
+            );
+            yield* observe!(request);
+            assert.equal(appends, 3, "duplicate attach does not replay final speech");
+          }
+        }
+      }
+      allowed = true;
+      const childrenBeforeEnd = projection.subagents.map((child) => ({
+        id: child.id,
+        status: child.status,
+      }));
+      if (scenario !== "end")
+        yield* service.stop(session, {
+          ...lease,
+          clientRequestId: "observer-end",
+        });
+      assert.deepEqual(
+        projection.subagents.map((child) => ({
+          id: child.id,
+          status: child.status,
+        })),
+        childrenBeforeEnd,
+      );
+      assert.equal(submissions, 0);
+      assert.equal(workCancels, 0);
+      const intents = yield* sql<{
+        count: number;
+      }>`SELECT COUNT(*) AS count FROM codex_live_voice_intents`;
+      assert.equal(intents[0]!.count, 0, "observing an old root creates no durable work intent");
+    }).pipe(Effect.provide(Layer.provideMerge(CodexLiveSessionService.layer, dependencies)));
+  }),
 );
