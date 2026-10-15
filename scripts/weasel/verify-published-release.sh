@@ -1,6 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+verify_cli_checksums() {
+  node --experimental-strip-types --input-type=module - \
+    "$script_dir/../../packages/shared/src/cliRelease.ts" "$1" "$2" <<'NODE'
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const [modulePath, version, checksumsPath] = process.argv.slice(2);
+const { parseChecksums, cliArchiveFileName } = await import(pathToFileURL(modulePath).href);
+const checksums = parseChecksums(readFileSync(checksumsPath, "utf8"));
+for (const platform of ["linux-x64", "win32-x64"]) {
+  const name = cliArchiveFileName(version, platform);
+  if (!/^[0-9a-f]{64}$/.test(checksums.get(name) ?? "")) {
+    throw new Error(`Legacy CLI consumer cannot find ${name} in SHA256SUMS`);
+  }
+}
+NODE
+}
+
+if [[ "${1:-}" == --check-cli-checksums ]]; then
+  [[ $# -eq 3 ]] || exit 2
+  verify_cli_checksums "$2" "$3"
+  exit 0
+fi
+if [[ "${1:-}" == --write-checksums ]]; then
+  [[ $# -eq 3 && -d "$3" ]] || exit 2
+  version="$2"
+  assets_dir="$(cd "$3" && pwd)"
+  mapfile -d '' -t payload < <(find "$assets_dir" -maxdepth 1 -type f \
+    ! -name SHA256SUMS ! -name RELEASE-RECEIPT.txt -printf '%f\0' | LC_ALL=C sort -z)
+  [[ ${#payload[@]} -gt 0 ]] || exit 1
+  checksum_tmp="$(mktemp)"
+  trap 'rm -f "$checksum_tmp"' EXIT
+  (cd "$assets_dir" && sha256sum -- "${payload[@]}") > "$checksum_tmp"
+  verify_cli_checksums "$version" "$checksum_tmp"
+  mv -f "$checksum_tmp" "$assets_dir/SHA256SUMS"
+  exit 0
+fi
+
 if [[ $# -ne 4 ]]; then
   echo "Usage: $0 <tag> <source-sha> <version> <expected-assets-dir>" >&2
   exit 2
@@ -60,6 +98,8 @@ actual_names="$(find "$download_dir" -maxdepth 1 -type f -printf '%f\n' | sort)"
 
 cmp -s "$expected_dir/SHA256SUMS" "$download_dir/SHA256SUMS" ||
   fail "published SHA256SUMS differs from this run's assets"
+verify_cli_checksums "$version" "$download_dir/SHA256SUMS" ||
+  fail "published checksums are incompatible with the legacy CLI installer"
 (cd "$download_dir" && sha256sum --check --strict SHA256SUMS >/dev/null) ||
   fail "published payload checksum verification failed"
 

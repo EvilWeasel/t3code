@@ -59,6 +59,7 @@ focused_tests=(
   apps/server/src/auth/fleet.test.ts
   apps/server/src/auth/http.test.ts
   packages/shared/src/cliRelease.test.ts
+  packages/provider-core/src/server/maintenanceResolver.test.ts
   apps/server/src/cli/update.test.ts
   apps/server/src/cloud/selfUpdate.test.ts
   apps/server/src/environment/ServerEnvironment.test.ts

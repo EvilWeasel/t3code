@@ -35,7 +35,18 @@ for asset in \
   "t3-$version-win32-x64.zip"; do
   printf 'fixture payload: %s\n' "$asset" > "$fixture_assets/$asset"
 done
-(cd "$fixture_assets" && sha256sum ./* > SHA256SUMS)
+bash "$repo_root/scripts/weasel/verify-published-release.sh" --write-checksums "$version" "$fixture_assets"
+cp "$fixture_assets/SHA256SUMS" "$test_root/fresh-checksums"
+printf 'old receipt must not hash itself\n' > "$fixture_assets/RELEASE-RECEIPT.txt"
+bash "$repo_root/scripts/weasel/verify-published-release.sh" --write-checksums "$version" "$fixture_assets"
+cmp "$test_root/fresh-checksums" "$fixture_assets/SHA256SUMS"
+rm "$fixture_assets/RELEASE-RECEIPT.txt"
+sed 's/  /  .\//' "$fixture_assets/SHA256SUMS" > "$test_root/dot-prefix-checksums"
+if bash "$repo_root/scripts/weasel/verify-published-release.sh" --check-cli-checksums \
+  "$version" "$test_root/dot-prefix-checksums" >/dev/null 2>&1; then
+  echo "Legacy CLI consumer accepted dot-prefixed archive names." >&2
+  exit 1
+fi
 
 payload_digests='[]'
 for file in "$fixture_assets"/*; do
