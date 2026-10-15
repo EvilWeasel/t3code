@@ -1759,7 +1759,7 @@ it.effect("strictly decodes only new diagnostic control messages before delivery
         },
       },
     } as const;
-    const encodeRaw = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+    const encodeRaw = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
     const messages = [
       { ...peer, rawSettings: "refused" },
       peer,
@@ -1778,8 +1778,12 @@ it.effect("strictly decodes only new diagnostic control messages before delivery
           makeProcess({
             getOutputFd: (fd) =>
               fd === 5
-                ? Stream.fromIterable(
-                    messages.map((message) => new TextEncoder().encode(encodeRaw(message) + "\n")),
+                ? Stream.fromIterable(messages).pipe(
+                    Stream.mapEffect((message) =>
+                      encodeRaw(message).pipe(
+                        Effect.map((line) => new TextEncoder().encode(line + "\n")),
+                      ),
+                    ),
                   )
                 : Stream.empty,
             exitCode: Deferred.await(exit).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
@@ -1789,6 +1793,7 @@ it.effect("strictly decodes only new diagnostic control messages before delivery
     );
     const running = yield* DesktopBackendManager.runBackendProcess({
       ...baseConfig,
+      desktopTelemetryStream: Stream.empty,
       onDesktopTelemetryControl: (message) =>
         Effect.sync(() => {
           observed.push(message);
