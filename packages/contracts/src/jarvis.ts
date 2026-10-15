@@ -6,12 +6,14 @@ const strictStruct = <const Fields extends Schema.Struct.Fields>(fields: Fields)
   const keys = new Set(Object.keys(fields));
   return Schema.StructWithRest(Schema.Struct(fields), [
     Schema.Record(Schema.String, Schema.Unknown),
-  ]).check(
-    Schema.makeFilter((value) => Object.keys(value).every((key) => keys.has(key)), {
-      expected: "only canonical Jarvis request fields",
-      toJsonSchema: () => [{ additionalProperties: false }, true],
-    }),
-  );
+  ])
+    .check(
+      Schema.makeFilter((value) => Object.keys(value).every((key) => keys.has(key)), {
+        expected: "only canonical Jarvis request fields",
+        toJsonSchema: () => [{ additionalProperties: false }, true],
+      }),
+    )
+    .pipe(Schema.decodeTo(Schema.Struct(fields)));
 };
 
 // Canonical Jarvis engine/api/mod.rs at 18bb46c81323d4ac3a1f40e0065a63a0a65e9637.

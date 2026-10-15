@@ -196,9 +196,13 @@ const make = Effect.gen(function* () {
           const { response, next } = yield* connect(request).pipe(
             Effect.timeoutOrElse({ duration: 35_000, orElse: () => Effect.fail(unknownOutcome()) }),
           );
-          if ("error" in response) return Stream.make(response);
+          const ack: Stream.Stream<
+            JarvisNativeResponse | JarvisNativeNotification,
+            JarvisTransportError
+          > = Stream.make(response);
+          if ("error" in response) return ack;
           return Stream.concat(
-            Stream.make(response),
+            ack,
             Stream.fromEffectRepeat(
               next.pipe(
                 Effect.flatMap(Schema.decodeUnknownEffect(JarvisNativeNotification)),
