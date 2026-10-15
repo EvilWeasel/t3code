@@ -386,6 +386,16 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
   const commandPaths = [context.resolvedCommandPath, context.realCommandPath];
   const packageName = definition.npmPackageName;
 
+  // Nix owns the immutable executable even when a profile or a native-looking
+  // symlink exposes it. A self-updater cannot update that selected installation.
+  if (
+    commandPaths.some((commandPath) =>
+      /^\/nix\/store\/[0-9abcdfghijklmnpqrsvwxyz]{32}-[^/]+\//.test(commandPath),
+    )
+  ) {
+    return manual;
+  }
+
   const nativeUpdate = definition.nativeUpdate;
   const native = nativeUpdate
     ? makeProviderMaintenanceCapabilities({

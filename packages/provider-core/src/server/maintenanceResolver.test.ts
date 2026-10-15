@@ -797,6 +797,65 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       }),
   );
 
+  it.effect("keeps Nix-owned executables out of native and npm self-updaters", () =>
+    Effect.gen(function* () {
+      const store = "/nix/store/pw2kq99s5sq6vfgrb258p9y4j22w8xd6-provider-1.0.0";
+      const definition = {
+        provider: driver("nativePackageTool"),
+        npmPackageName: "@example/native-package-tool",
+        nativeUpdate: {
+          args: ["update"],
+          isCommandPath: isNativeTestCommandPath("/.local/bin/native-package-tool"),
+        },
+      };
+      for (const [resolvedCommandPath, realCommandPath] of [
+        [`${store}/bin/tool`, `${store}/bin/tool`],
+        ["/run/current-system/sw/bin/tool", `${store}/bin/tool`],
+        ["/etc/profiles/per-user/test/bin/tool", `${store}/bin/tool`],
+        ["/home/test/.nix-profile/bin/tool", `${store}/bin/tool`],
+        ["/home/test/.local/bin/native-package-tool", `${store}/bin/tool`],
+        [
+          "/home/test/.npm-global/bin/tool",
+          `${store}/lib/node_modules/@example/native-package-tool/bin/tool.js`,
+        ],
+      ] as const) {
+        const capabilities = yield* resolvePackageManagedProviderMaintenance(definition, {
+          binaryPath: resolvedCommandPath,
+          resolvedCommandPath,
+          realCommandPath,
+          env: {},
+          platform: "linux",
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn));
+        expect(capabilities.update).toBeNull();
+        expect(makeTargetedProviderUpdateAction(capabilities, "2.0.0")).toBeNull();
+      }
+    }),
+  );
+
+  it.effect("does not treat unrelated paths containing nix or profile names as Nix ownership", () =>
+    Effect.gen(function* () {
+      const definition = {
+        provider: driver("packageTool"),
+        npmPackageName: "@example/package-tool",
+        nativeUpdate: { args: ["update"] },
+      };
+      for (const commandPath of [
+        "/opt/nix/store/tool/bin/tool",
+        "/home/test/.nix-profile/bin/tool",
+        "/home/test/tools/nix-provider/bin/tool",
+      ]) {
+        const capabilities = yield* resolvePackageManagedProviderMaintenance(definition, {
+          binaryPath: commandPath,
+          resolvedCommandPath: commandPath,
+          realCommandPath: "/home/test/tools/provider/bin/tool",
+          env: {},
+          platform: "linux",
+        }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn));
+        expect(capabilities.update).toMatchObject({ executable: commandPath, args: ["update"] });
+      }
+    }),
+  );
+
   it.effect.skipIf(!symlinksSupported)("updates Yarn global installs with yarn", () =>
     Effect.gen(function* () {
       const tempDir = yield* makeTempDir("t3-yarn-capabilities");
