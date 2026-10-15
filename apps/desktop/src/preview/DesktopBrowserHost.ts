@@ -65,7 +65,11 @@ export interface DesktopBrowserConnection {
 
 export interface NativePrivateEntryLease {
   current(): boolean;
-  release(): Promise<void>;
+  release(): Promise<NativePrivateEntryResume>;
+}
+/** Local authority to resume after field verification; never crosses the wire. */
+export interface NativePrivateEntryResume {
+  current(): boolean;
 }
 interface LeaseState {
   readonly requestId: string;
@@ -86,6 +90,7 @@ interface AttachedTab {
   relay: CdpRelayConnection | null;
   attachment: DesktopBrowserPrivateEntryAttachment | null;
   lease: LeaseState | null;
+  releasedLease: LeaseState | null;
   pending: PendingControl | null;
   readonly cancelled: Set<string>;
   /** Where the server wants this tab's downloads; null keeps Electron's own handling. */
@@ -199,6 +204,7 @@ export const make = Effect.gen(function* () {
       });
   };
   const invalidate = (tab: AttachedTab) => {
+    tab.releasedLease = null;
     if (tab.pending) {
       const pending = tab.pending;
       tab.pending = null;
@@ -222,6 +228,7 @@ export const make = Effect.gen(function* () {
         reject(unavailable());
         return;
       }
+      tab.releasedLease = null;
       const timer = setTimeout(() => {
         if (tab.pending?.request !== message) return;
         tab.pending = null;
@@ -238,28 +245,45 @@ export const make = Effect.gen(function* () {
       };
       emit(message);
     });
-  const leaseHandle = (tab: AttachedTab, lease: LeaseState): NativePrivateEntryLease => ({
-    current: () => isCurrentAttachment(tab) && tab.lease === lease && lease.active,
-    async release() {
-      if (
-        !isCurrentAttachment(tab) ||
-        tab.lease !== lease ||
-        !lease.active ||
-        !tab.attachment ||
-        tab.pending
-      )
-        throw unavailable();
-      // A release is a distinct request; the ACK must echo this request and the OLD lease generation.
-      await request(tab, {
-        type: "private-entry-release",
-        ...tab.key,
-        ...tab.attachment,
-        requestId: NodeCrypto.randomUUID(),
-        leaseId: lease.leaseId,
-        generation: lease.generation,
-      });
-    },
-  });
+  const leaseHandle = (tab: AttachedTab, lease: LeaseState): NativePrivateEntryLease => {
+    const connection = activeConnection;
+    const attachment = tab.attachment;
+    return {
+      current: () => isCurrentAttachment(tab) && tab.lease === lease && lease.active,
+      async release() {
+        if (
+          !isCurrentAttachment(tab) ||
+          activeConnection !== connection ||
+          tab.attachment !== attachment ||
+          tab.lease !== lease ||
+          !lease.active ||
+          !attachment ||
+          tab.pending
+        )
+          throw unavailable();
+        // The new operation ID is ACKed with the OLD released lease/generation.
+        await request(tab, {
+          type: "private-entry-release",
+          ...tab.key,
+          ...attachment,
+          requestId: NodeCrypto.randomUUID(),
+          leaseId: lease.leaseId,
+          generation: lease.generation,
+        });
+        const resume: NativePrivateEntryResume = {
+          current: () =>
+            activeConnection === connection &&
+            tab.attachment === attachment &&
+            isCurrentAttachment(tab) &&
+            tab.releasedLease === lease &&
+            tab.lease === null &&
+            tab.pending === null,
+        };
+        if (!resume.current()) throw unavailable();
+        return resume;
+      },
+    };
+  };
   const acquirePrivateEntry = async (source: Electron.WebContents) => {
     const tab = attachedFor(source);
     if (
@@ -332,6 +356,7 @@ export const make = Effect.gen(function* () {
       tab.lease = lease;
       pending.accept(leaseHandle(tab, lease));
     } else if (incomingRelease) {
+      tab.releasedLease = tab.lease;
       if (tab.lease) tab.lease.active = false;
       tab.lease = null;
       pending.accept();
@@ -439,6 +464,7 @@ export const make = Effect.gen(function* () {
       attachment: channelEpoch ? { channelEpoch, attachmentId: NodeCrypto.randomUUID() } : null,
       pending: null,
       lease: null,
+      releasedLease: null,
       cancelled: new Set(),
       downloadDirectory: null,
       pendingDownloadGuid: null,

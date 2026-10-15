@@ -339,6 +339,8 @@ const withAutofillManager = <A>(
     peer: {
       connection: DesktopBrowserHost.DesktopBrowserConnection;
       releases: Queue.Queue<unknown>;
+      cdp: Queue.Queue<string>;
+      host: DesktopBrowserHost.DesktopBrowserHost["Service"];
       revoke: Effect.Effect<void>;
     },
   ) => Effect.Effect<A, PreviewManager.PreviewManagerError, Scope.Scope>,
@@ -348,6 +350,7 @@ const withAutofillManager = <A>(
     Effect.gen(function* () {
       const ready = yield* Deferred.make<void>();
       const releases = yield* Queue.unbounded<unknown>();
+      const cdp = yield* Queue.unbounded<string>();
       const connection = host.createConnection();
       let grant:
         | {
@@ -364,6 +367,10 @@ const withAutofillManager = <A>(
         Stream.runForEach((line) =>
           Effect.gen(function* () {
             const message = JSON.parse(new TextDecoder().decode(line)) as Record<string, unknown>;
+            if (message.type === "cdp" && typeof message.message === "string") {
+              yield* Queue.offer(cdp, message.message);
+              return;
+            }
             if (message.type === "attached") {
               yield* Deferred.succeed(ready, undefined);
               return;
@@ -402,6 +409,8 @@ const withAutofillManager = <A>(
       return yield* use(manager, ready, {
         connection,
         releases,
+        cdp,
+        host,
         revoke: Effect.suspend(() =>
           grant
             ? connection.handleCommandLine(
@@ -2853,6 +2862,129 @@ describe("PreviewManager", () => {
       ),
   );
 
+  for (const mutation of ["refill", "replace", "replacement-channel", "unchanged"] as const) {
+    effectIt.effect(
+      `verifies retained empty fields and original released connection after ACK: ${mutation}`,
+      () =>
+        withAutofillManager(
+          (manager, ready, peer) =>
+            Effect.gen(function* () {
+              const { document, a, run } = makeAutofillDomFixture();
+              document.activeElement = a.username;
+              const verifyStarted = Promise.withResolvers<void>();
+              const verifyContinue = Promise.withResolvers<void>();
+              const preview = makeFaviconWebContents({ url: "https://example.com/login" });
+              const frame = {
+                origin: "https://example.com",
+                isDestroyed: () => false,
+              } as Electron.WebFrameMain;
+              const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
+                mainFrame: frame,
+                isFocused: () => true,
+                session: { getStoragePath: () => "/synthetic/profile-a" },
+                executeJavaScriptInIsolatedWorld: async (
+                  _world: number,
+                  scripts: readonly { code: string }[],
+                ) => {
+                  if (scripts[0]!.code === PreviewManager.protonPassAutofillScripts.verifyClear) {
+                    verifyStarted.resolve();
+                    await verifyContinue.promise;
+                  }
+                  return run(scripts[0]!.code);
+                },
+                insertText: async (value: string) => {
+                  if (document.activeElement) document.activeElement.value = value;
+                },
+              });
+              fromId.mockReturnValue(wc);
+              yield* manager.createTab("private_tab", {
+                serverTab: { threadId: "unit-thread", tabId: "unit-tab" },
+              });
+              yield* manager.registerWebview("private_tab", 42);
+              yield* Deferred.await(ready);
+              const target = yield* manager.getAutofillTarget(wc, frame);
+              if (!target) throw new Error("Missing target");
+              yield* Effect.promise(() => target.enterPrivate());
+              yield* Effect.promise(() => target.fill("fake-user", "fake-password"));
+              const clearing = yield* Effect.tryPromise(() => target.clearAndResume()).pipe(
+                Effect.exit,
+                Effect.forkScoped,
+              );
+              const release = yield* Queue.take(peer.releases);
+              expect(a.username.value).toBe("");
+              expect(a.password.value).toBe("");
+              let replacement: ReturnType<typeof a.replacePassword> | undefined;
+              if (mutation === "refill") a.password.value = "fake-restored-password";
+              if (mutation === "replace") {
+                replacement = a.replacePassword();
+                replacement.value = "fake-restored-password";
+              }
+              yield* peer.connection.handleCommandLine(
+                JSON.stringify({ ...(release as object), type: "private-entry-released" }),
+              );
+              yield* Effect.promise(() => verifyStarted.promise);
+              let commandConnection = peer.connection;
+              const replacementMessages = yield* Queue.unbounded<string>();
+              if (mutation === "replacement-channel") {
+                yield* peer.connection.closed;
+                commandConnection = peer.host.createConnection();
+                yield* commandConnection.events.pipe(
+                  Stream.runForEach((bytes) =>
+                    Queue.offer(replacementMessages, new TextDecoder().decode(bytes)),
+                  ),
+                  Effect.forkScoped,
+                );
+                const attached = yield* Queue.take(replacementMessages);
+                expect(JSON.parse(attached).type).toBe("attached");
+                expect(peer.host.canRequestPrivateEntry(wc)).toBe(true);
+              }
+              verifyContinue.resolve();
+              const outcome = yield* Fiber.join(clearing);
+              if (mutation === "unchanged") {
+                expect(Exit.isSuccess(outcome)).toBe(true);
+                expect(peer.host.isPrivateEntry(wc)).toBe(false);
+                expect(run(PreviewManager.protonPassAutofillScripts.verifyClear)).toBe(true);
+              } else {
+                expect(Exit.isFailure(outcome)).toBe(true);
+                expect(peer.host.isPrivateEntry(wc)).toBe(true);
+                expect(
+                  Exit.isFailure(yield* Effect.exit(manager.captureScreenshot("private_tab"))),
+                ).toBe(true);
+                yield* commandConnection.handleCommandLine(
+                  JSON.stringify({
+                    type: "cdp",
+                    threadId: "unit-thread",
+                    tabId: "unit-tab",
+                    message: JSON.stringify({ id: 777, method: "DOM.getDocument" }),
+                  }),
+                );
+                const response =
+                  mutation === "replacement-channel"
+                    ? (JSON.parse(yield* Queue.take(replacementMessages)) as { message: string })
+                        .message
+                    : yield* Queue.take(peer.cdp);
+                expect(JSON.parse(response)).toMatchObject({ id: 777, error: { code: -32000 } });
+                if (mutation === "refill") {
+                  expect(a.password.value).toBe("fake-restored-password");
+                  expect(run(PreviewManager.protonPassAutofillScripts.verifyClear)).toBe(false);
+                  const retry = yield* manager.getAutofillTarget(wc, frame);
+                  if (!retry) throw new Error("Missing explicit retry target");
+                  yield* Effect.promise(() => retry.clearAndResume());
+                  expect(peer.host.isPrivateEntry(wc)).toBe(false);
+                  expect(a.password.value).toBe("");
+                  expect(yield* Queue.size(peer.releases)).toBe(0);
+                }
+                if (mutation === "replace") {
+                  expect(replacement?.value).toBe("fake-restored-password");
+                  expect(run(PreviewManager.protonPassAutofillScripts.verifyClear)).toBe(false);
+                }
+              }
+            }),
+          { holdRelease: true },
+        ),
+    );
+  }
+
   effectIt.effect("a refused authoritative acquire prevents even the selected provider read", () =>
     withAutofillManager(
       (manager, ready) =>
@@ -5147,6 +5279,8 @@ it("refuses a different form until isolated bookkeeping clears the original reve
   document.activeElement = b.username;
   expect(run(PreviewManager.protonPassAutofillScripts.prepare)).toBe(false);
   expect(run(PreviewManager.protonPassAutofillScripts.clear)).toBe(true);
+  expect(run(PreviewManager.protonPassAutofillScripts.prepare)).toBe(false);
+  expect(run(PreviewManager.protonPassAutofillScripts.verifyClear)).toBe(true);
   expect(a.username.value).toBe("");
   expect(a.password.value).toBe("");
   expect(run(PreviewManager.protonPassAutofillScripts.prepare)).toBe(true);

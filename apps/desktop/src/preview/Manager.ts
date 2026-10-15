@@ -551,8 +551,12 @@ export const protonPassAutofillScripts = {
     if (!users.length) users = [...form.querySelectorAll('input[type="text"],input:not([type])')].filter(input => !input.disabled && input.getClientRects().length);
     if (passwords.length !== 1 || users.length !== 1 || ![passwords[0], users[0]].includes(active)) return false;
     const previous = globalThis.__morrowbyteProtonFields;
-    if (previous && (previous.username !== users[0] || previous.password !== passwords[0])) return false;
-    globalThis.__morrowbyteProtonFields ??= { username: users[0], password: passwords[0] };
+    if (previous && (previous.username !== users[0] || previous.password !== passwords[0])) {
+      if (!previous.cleared || !previous.username.isConnected || !previous.password.isConnected ||
+        previous.username.ownerDocument !== document || previous.password.ownerDocument !== document ||
+        previous.username.value !== '' || previous.password.value !== '') return false;
+    }
+    globalThis.__morrowbyteProtonFields = { username: users[0], password: passwords[0], cleared: false };
     return true;
   })()`,
   focusUsername: `(() => { const fields = globalThis.__morrowbyteProtonFields; const field = fields?.username; if (!(field instanceof HTMLInputElement) || !field.isConnected || field.disabled || field.form !== fields.password.form) return false; field.focus(); field.select(); return document.activeElement === field; })()`,
@@ -560,6 +564,7 @@ export const protonPassAutofillScripts = {
   clear: `(() => {
     const fields = globalThis.__morrowbyteProtonFields;
     if (fields) {
+      fields.cleared = false;
       const livePair = () => {
         const { username, password } = fields;
         const form = username?.form;
@@ -574,7 +579,22 @@ export const protonPassAutofillScripts = {
       setter.call(fields.username, ''); setter.call(fields.password, '');
       if (!livePair() || fields.username.value !== '' || fields.password.value !== '') return false;
     }
-    delete globalThis.__morrowbyteProtonFields;
+    return true;
+  })()`,
+  verifyClear: `(() => {
+    const fields = globalThis.__morrowbyteProtonFields;
+    if (!fields) return true;
+    const { username, password } = fields;
+    const form = username?.form;
+    fields.cleared = false;
+    if (!(username instanceof HTMLInputElement) || !(password instanceof HTMLInputElement) ||
+      username === password || !username.isConnected || !password.isConnected ||
+      username.ownerDocument !== document || password.ownerDocument !== document ||
+      !form || !form.isConnected || form.ownerDocument !== document || password.form !== form ||
+      !form.contains(username) || !form.contains(password) ||
+      username.value !== '' || password.value !== '') return false;
+    // Keep references even across the native continuation. Only the next prepare may replace them.
+    fields.cleared = true;
     return true;
   })()`,
 };
@@ -622,6 +642,7 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     Electron.WebContents,
     {
       lease: DesktopBrowserHost.NativePrivateEntryLease;
+      resume?: DesktopBrowserHost.NativePrivateEntryResume;
       documentEpoch: number;
       origin: string;
       partition: string;
@@ -3642,12 +3663,17 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
           const reservation = privateReservations.get(wc);
           if (!reservation) throw new AutofillUnavailable();
           // Fields are verified empty before asking the authority to release its reservation.
-          await reservation.lease.release();
+          // A refused post-ACK verification may be explicitly retried on this same released connection.
+          reservation.resume ??= await reservation.lease.release();
+          const resume = reservation.resume;
+          if (!resume.current()) throw new AutofillUnavailable();
+          if ((await execute(protonPassAutofillScripts.verifyClear)) !== true)
+            throw new AutofillUnavailable();
           if (
             !documentCurrent() ||
             trackedDocument.generation !== clearingGeneration ||
             privateReservations.get(wc) !== reservation ||
-            !browserHost.canRequestPrivateEntry(wc) ||
+            !resume.current() ||
             !browserHost.isPrivateEntry(wc)
           )
             throw new AutofillUnavailable();

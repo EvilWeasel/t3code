@@ -135,10 +135,18 @@ describe("DesktopBrowserHost", () => {
         yield* backend.connection.handleCommandLine(
           encodeJson({ ...request, type: "private-entry-released" }),
         );
-        yield* Fiber.join(releasing);
+        const resume = yield* Fiber.join(releasing);
+        expect(resume.current()).toBe(true);
         expect(lease.current()).toBe(false);
         // ACK alone never opens privacy; only Manager's verified clear can do so.
         expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
+        yield* backend.connection.closed;
+        const replacement = yield* connect(host);
+        yield* Queue.take(replacement.messages);
+        expect(host.canRequestPrivateEntry(debuggee.tab.webContents)).toBe(true);
+        expect(resume.current()).toBe(false);
+        yield* backend.connection.closed;
+        expect(resume.current()).toBe(false);
       }).pipe(Effect.scoped),
   );
 
