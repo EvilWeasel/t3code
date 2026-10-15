@@ -66,6 +66,18 @@ type LiveVoiceAvailability = {
   readonly threadId: ThreadId | null;
   readonly providerInstanceId: string | null;
   readonly reason: string | null;
+  readonly facts: Readonly<{
+    driver: "codex" | "other" | "unknown";
+    setupMode: "managed" | "existing" | "missing" | "invalid" | "unknown";
+    providerEnabled: boolean | null;
+    providerAvailable: boolean | null;
+    projectOverride: "enabled" | "disabled" | "unset" | "unknown";
+    catalogState: "pending" | "ready" | "failed" | "scope-mismatch";
+    settingsKnown: boolean;
+    permissionState: "known" | "pending" | "unavailable";
+    canOperate: boolean | null;
+    selectionCurrent: boolean;
+  }>;
 };
 
 /** Only cached facts for the selected destination may qualify its voice control. */
@@ -86,6 +98,7 @@ export function resolveLiveVoiceAvailability(input: {
     readonly isAvailable: boolean;
   } | null;
   readonly instanceConfigured: boolean;
+  readonly projectOverride?: boolean | undefined;
   readonly config: unknown;
 }): LiveVoiceAvailability {
   let reason: string | null = null;
@@ -125,12 +138,141 @@ export function resolveLiveVoiceAvailability(input: {
       "This Codex provider uses an existing installation. Live voice requires managed setup.";
   else if (input.config.setupMode !== "managed")
     reason = "Codex setup mode is invalid. Check its setup in Settings.";
-  return {
+  const catalogMatches = input.catalogEnvironmentId === input.environmentId;
+  const catalogReady = catalogMatches && input.configState === "ready";
+  const settingsReady = catalogReady && input.settingsKnown;
+  const setupMode = !settingsReady
+    ? "unknown"
+    : input.config === null || input.config === undefined
+      ? "missing"
+      : typeof input.config !== "object"
+        ? "invalid"
+        : !("setupMode" in input.config)
+          ? "missing"
+          : input.config.setupMode === "managed" || input.config.setupMode === "existing"
+            ? input.config.setupMode
+            : "invalid";
+  return Object.freeze({
     environmentId: input.environmentId,
     threadId: input.threadId,
     providerInstanceId: input.providerInstanceId,
     reason,
-  };
+    facts: Object.freeze({
+      driver:
+        !catalogReady || !input.provider
+          ? "unknown"
+          : input.provider.driverKind === "codex"
+            ? "codex"
+            : "other",
+      setupMode,
+      providerEnabled: catalogReady ? (input.provider?.enabled ?? null) : null,
+      providerAvailable: catalogReady ? (input.provider?.isAvailable ?? null) : null,
+      projectOverride: !settingsReady
+        ? "unknown"
+        : input.projectOverride === undefined
+          ? "unset"
+          : input.projectOverride
+            ? "enabled"
+            : "disabled",
+      catalogState:
+        input.configState !== "ready"
+          ? input.configState
+          : catalogMatches
+            ? "ready"
+            : "scope-mismatch",
+      settingsKnown: settingsReady,
+      permissionState: input.permissionState,
+      canOperate: input.permissionState === "known" ? input.canOperate : null,
+      selectionCurrent: catalogReady && input.selectionCurrent,
+    }),
+  });
+}
+
+/** The actual rendered gate, also usable by a future explicitly requested diagnostic producer. */
+export function resolveLiveVoiceControlGate(input: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId | null;
+  readonly providerInstanceId: string | null;
+  readonly availability: LiveVoiceAvailability;
+  readonly eligible: boolean;
+  readonly phase: LiveVoiceState["phase"];
+  readonly RTCPeerConnection?: unknown;
+  readonly getUserMedia?: unknown;
+}) {
+  const availabilityMatchesTarget =
+    input.availability.environmentId === input.environmentId &&
+    input.availability.threadId === input.threadId &&
+    input.availability.providerInstanceId === input.providerInstanceId;
+  const targetPresent = Boolean(
+    input.threadId && input.providerInstanceId && availabilityMatchesTarget,
+  );
+  const supported = isLiveVoiceSupported({
+    provider: "codex",
+    setupMode: "managed",
+    RTCPeerConnection: input.RTCPeerConnection,
+    getUserMedia: input.getUserMedia,
+  });
+  const webRtcAvailable = typeof input.RTCPeerConnection === "function";
+  const microphoneApiAvailable = typeof input.getUserMedia === "function";
+  const active =
+    input.phase === "live" || input.phase === "playback-blocked" || input.phase === "reconnecting";
+  const busy =
+    input.phase === "preparing" ||
+    input.phase === "prepared" ||
+    input.phase === "connecting" ||
+    input.phase === "stopping";
+  const eligible = input.eligible && input.availability.reason === null;
+  const canStart = eligible && targetPresent && supported && !busy && !active;
+  const reason = !availabilityMatchesTarget
+    ? "Waiting for this environment's voice availability to update."
+    : !webRtcAvailable
+      ? "This browser does not provide WebRTC. Use a browser with WebRTC support."
+      : !microphoneApiAvailable
+        ? "Microphone access is unavailable in this browser context. Open the app in a trusted secure context."
+        : (input.availability.reason ??
+          (!targetPresent
+            ? "Open a thread for a voice call"
+            : !input.eligible
+              ? "Live voice is unavailable for this thread. Check the selected provider and permissions."
+              : null));
+  return Object.freeze({
+    environmentId: input.environmentId,
+    threadId: input.threadId,
+    providerInstanceId: input.providerInstanceId,
+    phase: input.phase,
+    targetPresent,
+    active,
+    busy,
+    webRtcAvailable,
+    microphoneApiAvailable,
+    canStart,
+    reason,
+    facts: availabilityMatchesTarget ? input.availability.facts : null,
+  });
+}
+
+type LiveVoiceDiagnosticModel = Readonly<{
+  epoch: number;
+  revision: number;
+  gate: ReturnType<typeof resolveLiveVoiceControlGate>;
+}>;
+
+/** Pure model only. No production caller until the explicit request/bridge contract is frozen. */
+export function advanceLiveVoiceDiagnosticModel(
+  previous: LiveVoiceDiagnosticModel | null,
+  gate: LiveVoiceDiagnosticModel["gate"],
+): LiveVoiceDiagnosticModel {
+  if (previous === null) return Object.freeze({ epoch: 1, revision: 1, gate });
+  const sameContext =
+    previous.gate.environmentId === gate.environmentId &&
+    previous.gate.threadId === gate.threadId &&
+    previous.gate.providerInstanceId === gate.providerInstanceId;
+  if (sameContext && JSON.stringify(previous.gate) === JSON.stringify(gate)) return previous;
+  return Object.freeze({
+    epoch: sameContext ? previous.epoch : previous.epoch + 1,
+    revision: sameContext ? previous.revision + 1 : 1,
+    gate,
+  });
 }
 
 type VoiceEventBridge = {
@@ -249,19 +391,27 @@ export function LiveVoiceControl(props: {
     lease: null,
     error: null,
   });
-  const availabilityMatchesTarget =
-    props.availability.environmentId === props.environmentId &&
-    props.availability.threadId === props.threadId &&
-    props.availability.providerInstanceId === props.providerInstanceId;
+  const gate = resolveLiveVoiceControlGate({
+    environmentId: props.environmentId,
+    threadId: props.threadId,
+    providerInstanceId: props.providerInstanceId,
+    availability: props.availability,
+    eligible: props.eligible,
+    phase: state.phase,
+    RTCPeerConnection: typeof RTCPeerConnection === "undefined" ? undefined : RTCPeerConnection,
+    getUserMedia:
+      typeof navigator === "undefined" ? undefined : navigator.mediaDevices?.getUserMedia,
+  });
+  const { active, busy, canStart, reason: unavailableNotice, targetPresent } = gate;
   const target = useMemo<LiveVoiceTarget | null>(() => {
-    if (!props.threadId || !props.providerInstanceId || !availabilityMatchesTarget) return null;
+    if (!props.threadId || !props.providerInstanceId || !targetPresent) return null;
     return {
       environmentId: props.environmentId,
       threadId: props.threadId,
       provider: "codex",
       providerInstanceId: props.providerInstanceId,
     };
-  }, [availabilityMatchesTarget, props.environmentId, props.providerInstanceId, props.threadId]);
+  }, [targetPresent, props.environmentId, props.providerInstanceId, props.threadId]);
   const bridge = useMemo(() => createVoiceEventBridge(), []);
   const signaling = useMemo<LiveVoiceSignalingAdapter>(
     () => ({
@@ -319,35 +469,6 @@ export function LiveVoiceControl(props: {
     void controller.contextChanged(target);
   }, [controller, target]);
 
-  const supported = isLiveVoiceSupported({
-    provider: "codex",
-    setupMode: "managed",
-    RTCPeerConnection: typeof RTCPeerConnection === "undefined" ? undefined : RTCPeerConnection,
-    getUserMedia:
-      typeof navigator === "undefined" ? undefined : navigator.mediaDevices?.getUserMedia,
-  });
-  const active =
-    state.phase === "live" || state.phase === "playback-blocked" || state.phase === "reconnecting";
-  const busy =
-    state.phase === "preparing" ||
-    state.phase === "prepared" ||
-    state.phase === "connecting" ||
-    state.phase === "stopping";
-  const eligible = props.eligible && props.availability.reason === null;
-  const canStart = eligible && target !== null && supported && !busy && !active;
-  const unavailableNotice = !availabilityMatchesTarget
-    ? "Waiting for this environment's voice availability to update."
-    : typeof RTCPeerConnection !== "function"
-      ? "This browser does not provide WebRTC. Use a browser with WebRTC support."
-      : typeof navigator === "undefined" ||
-          typeof navigator.mediaDevices?.getUserMedia !== "function"
-        ? "Microphone access is unavailable in this browser context. Open the app in a trusted secure context."
-        : (props.availability.reason ??
-          (!target
-            ? "Open a thread for a voice call"
-            : !props.eligible
-              ? "Live voice is unavailable for this thread. Check the selected provider and permissions."
-              : null));
   const statusText =
     state.phase === "preparing"
       ? "Preparing restricted voice session…"

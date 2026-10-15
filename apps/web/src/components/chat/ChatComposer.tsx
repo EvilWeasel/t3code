@@ -2275,6 +2275,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       liveVoiceSelection.unavailableProviderInstanceId !== undefined,
     provider: liveVoiceProvider,
     instanceConfigured: liveVoiceInstanceSettings !== undefined,
+    projectOverride:
+      activeProjectId && liveVoiceProvider
+        ? liveVoiceConfig?.settings.projectSettingsOverrides[activeProjectId]?.providerInstances?.[
+            liveVoiceProvider.instanceId
+          ]?.enabled
+        : undefined,
     config: liveVoiceInstanceSettings?.config,
   });
   const selectedCodexConfig = liveVoiceInstanceSettings?.config;

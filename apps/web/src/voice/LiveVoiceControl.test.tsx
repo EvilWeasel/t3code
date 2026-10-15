@@ -36,9 +36,11 @@ vi.mock("../state/use-atom-command", () => ({
 
 import {
   deriveLiveVoiceProviderEntries,
+  advanceLiveVoiceDiagnosticModel,
   LiveVoiceControl,
   resolveLiveVoiceAvailability,
   resolveLiveVoiceConfigState,
+  resolveLiveVoiceControlGate,
 } from "./LiveVoiceControl";
 import { TooltipProvider } from "~/components/ui/tooltip";
 import { resolveComposerProviderSelection } from "../components/ChatView.logic";
@@ -127,6 +129,143 @@ function expectPassive() {
   expect(getUserMedia).not.toHaveBeenCalled();
   expect(peer).not.toHaveBeenCalled();
 }
+
+function gateFor(
+  input: AvailabilityInput,
+  phase: Parameters<typeof resolveLiveVoiceControlGate>[0]["phase"] = "idle",
+) {
+  return resolveLiveVoiceControlGate({
+    environmentId: input.environmentId,
+    threadId: input.threadId,
+    providerInstanceId: input.providerInstanceId,
+    availability: resolveLiveVoiceAvailability(input),
+    eligible: true,
+    phase,
+    RTCPeerConnection: peer,
+    getUserMedia,
+  });
+}
+
+describe("Live voice diagnostic producer model (transport absent)", () => {
+  it("uses the rendered gate unchanged and freezes only sanitized data", async () => {
+    const input = { ...loaded, config: { setupMode: "managed", privateKey: "must-not-copy" } };
+    const gate = gateFor(input);
+    const model = advanceLiveVoiceDiagnosticModel(null, gate);
+    await render(input);
+    expect(model.gate).toBe(gate);
+    expect(model.gate.canStart).toBe(!startButton().disabled);
+    expect(model.gate.reason).toBeNull();
+    expect(model.gate.facts).toMatchObject({ driver: "codex", setupMode: "managed" });
+    expect(Object.isFrozen(model)).toBe(true);
+    expect(Object.isFrozen(model.gate)).toBe(true);
+    expect(Object.isFrozen(model.gate.facts)).toBe(true);
+    expect(JSON.stringify(model)).not.toContain("privateKey");
+    expect(JSON.stringify(model)).not.toContain("must-not-copy");
+    expect(() => Object.assign(model.gate, { canStart: false })).toThrow(TypeError);
+    expectPassive();
+  });
+
+  it("keeps stable revision for identical sanitized facts and increments on actual gate changes", async () => {
+    const first = advanceLiveVoiceDiagnosticModel(null, gateFor(loaded));
+    const unchanged = advanceLiveVoiceDiagnosticModel(
+      first,
+      gateFor({
+        ...loaded,
+        config: { setupMode: "managed", ignoredPrivateField: "not-observed" },
+      }),
+    );
+    expect(unchanged).toBe(first);
+    const denied = { ...loaded, canOperate: false };
+    const next = advanceLiveVoiceDiagnosticModel(first, gateFor(denied));
+    expect(next.epoch).toBe(first.epoch);
+    expect(next.revision).toBe(first.revision + 1);
+    await render(denied);
+    expect(next.gate.canStart).toBe(!startButton().disabled);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(next.gate.reason);
+    expect(next.gate.facts?.canOperate).toBe(false);
+    const busy = advanceLiveVoiceDiagnosticModel(first, gateFor(loaded, "preparing"));
+    expect(busy.gate.canStart).toBe(false);
+    expect(busy.gate.busy).toBe(true);
+    expect(busy.revision).toBe(first.revision + 1);
+    expectPassive();
+  });
+
+  it("advances context epoch on environment/thread/provider changes and never revives an old epoch", () => {
+    const first = advanceLiveVoiceDiagnosticModel(null, gateFor(loaded));
+    const b = advanceLiveVoiceDiagnosticModel(
+      first,
+      gateFor({
+        ...loaded,
+        environmentId: environmentB,
+        catalogEnvironmentId: environmentB,
+      }),
+    );
+    expect(b.epoch).toBe(first.epoch + 1);
+    expect(b.revision).toBe(1);
+    const back = advanceLiveVoiceDiagnosticModel(b, gateFor(loaded));
+    expect(back.epoch).toBe(b.epoch + 1);
+    const otherThread = advanceLiveVoiceDiagnosticModel(
+      back,
+      gateFor({
+        ...loaded,
+        threadId: ThreadId.make("other-thread"),
+      }),
+    );
+    const otherProvider = advanceLiveVoiceDiagnosticModel(
+      otherThread,
+      gateFor({
+        ...loaded,
+        threadId: ThreadId.make("other-thread"),
+        providerInstanceId: "codex-custom",
+      }),
+    );
+    expect(otherThread.epoch).toBe(back.epoch + 1);
+    expect(otherProvider.epoch).toBe(otherThread.epoch + 1);
+    const staleGate = resolveLiveVoiceControlGate({
+      environmentId: environmentB,
+      threadId: thread,
+      providerInstanceId: "codex",
+      availability: resolveLiveVoiceAvailability(loaded),
+      eligible: true,
+      phase: "idle",
+      RTCPeerConnection: peer,
+      getUserMedia,
+    });
+    expect(staleGate.canStart).toBe(false);
+    expect(staleGate.facts).toBeNull();
+    expectPassive();
+  });
+
+  it("withholds stale catalog facts and keeps provider/config metadata enumerated", () => {
+    const failed = gateFor({ ...loaded, configState: "failed" });
+    expect(failed.facts).toMatchObject({
+      driver: "unknown",
+      setupMode: "unknown",
+      providerEnabled: null,
+      catalogState: "failed",
+    });
+    const pending = gateFor({ ...loaded, permissionState: "pending", canOperate: false });
+    expect(pending.facts?.canOperate).toBeNull();
+    const override = gateFor({
+      ...loaded,
+      projectOverride: false,
+      provider: { ...loaded.provider!, enabled: false },
+    });
+    expect(override.facts).toMatchObject({ projectOverride: "disabled", providerEnabled: false });
+    const unsupported = advanceLiveVoiceDiagnosticModel(
+      null,
+      gateFor({
+        ...loaded,
+        provider: { ...loaded.provider!, driverKind: "private-driver-name" },
+        config: { setupMode: "private-invalid-mode" },
+      }),
+    );
+    expect(unsupported.gate.facts).toMatchObject({ driver: "other", setupMode: "invalid" });
+    expect(JSON.stringify(unsupported)).not.toContain("private-driver-name");
+    expect(JSON.stringify(unsupported)).not.toContain("private-invalid-mode");
+    expectPassive();
+  });
+});
 
 describe("LiveVoiceControl passive availability", () => {
   it("keeps the production voice fallback identical to the composer for a stale request and custom-first wire order", async () => {
