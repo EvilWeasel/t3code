@@ -22,6 +22,7 @@ import * as Passkeys from "../../src/preview/Passkeys.ts";
 
 const hash = (value: NodeJS.ArrayBufferView | string) =>
   Crypto.createHash("sha256").update(value).digest("hex");
+type Scenario = "single-focus" | "second-focus-before-close";
 const args = new Map<string, string>();
 for (let i = 2; i < process.argv.length; i += 2) {
   const name = process.argv[i];
@@ -29,15 +30,17 @@ for (let i = 2; i < process.argv.length; i += 2) {
   if (
     !name ||
     !value ||
-    !["--output", "--temporary", "--binding", "--repo"].includes(name) ||
+    !["--output", "--temporary", "--binding", "--repo", "--scenario"].includes(name) ||
     args.has(name) ||
-    !Path.isAbsolute(value)
+    (name === "--scenario"
+      ? !["single-focus", "second-focus-before-close"].includes(value)
+      : !Path.isAbsolute(value))
   )
     throw new Error("Invalid focus child arguments");
   args.set(name, value);
 }
 if (
-  args.size !== 4 ||
+  args.size !== 5 ||
   process.platform !== "linux" ||
   process.getuid?.() === 0 ||
   process.env.GITHUB_ACTIONS !== "true" ||
@@ -45,6 +48,7 @@ if (
   process.env.MORROWBYTE_RUNNER_PROFILE !== "blacksmith-8vcpu-ubuntu-2404"
 )
   throw new Error("Focus job required");
+const scenario = args.get("--scenario")! as Scenario;
 const output = args.get("--output")!;
 const temporary = args.get("--temporary")!;
 const repo = args.get("--repo")!;
@@ -60,6 +64,7 @@ const binding = JSON.parse(FS.readFileSync(args.get("--binding")!, "utf8")) as {
   assertedRunnerProfile: string;
   runnerAttestation: string;
   privateDisplayBound: boolean;
+  scenario: Scenario;
 };
 type Stage =
   | "startup"
@@ -80,6 +85,8 @@ type Stage =
   | "focus-transport"
   | "server-focus"
   | "identity"
+  | "negative-second-focus"
+  | "final-observation"
   | "complete";
 type Failure =
   | "runtime"
@@ -137,7 +144,17 @@ const checks = Object.fromEntries(required.map((key) => [key, "UNKNOWN_REQUIRED"
 const receipt = {
   scope: "FOCUS_PREREQUISITE_ONLY",
   autofill: "NOT_EXERCISED",
+  scenario,
   binding,
+  observation: {
+    cutoff: "WORLD1005_CLOSE_TASK",
+    afterCutoff: "FUTURE_EVENTS_NOT_CLAIMED",
+    inlineClosed: false,
+    domClosed: false,
+    closed: false,
+    validationComplete: false,
+  },
+  negative: { secondFocusIssued: false, secondFocusCompleted: false, qualified: false },
   runtime: {
     electron: process.versions.electron ?? "",
     executable: FS.realpathSync(process.execPath),
@@ -163,6 +180,7 @@ const receipt = {
   inline: {
     scriptRan: false,
     listenerReady: false,
+    closed: false,
     fieldPresent: false,
     readyAttempted: false,
     readyAck: false,
@@ -175,6 +193,7 @@ const receipt = {
   },
   dom: {
     ready: false,
+    closed: false,
     documentSame: false,
     fieldSame: false,
     connected: false,
@@ -333,7 +352,45 @@ async function finish() {
     !receipt.diagnosticsWriteFailed &&
     receipt.cleanup === "complete" &&
     receipt.blockedNetwork === 0 &&
+    scenario === "single-focus" &&
+    receipt.observation.closed &&
+    receipt.observation.validationComplete &&
     required.every((key) => checks[key] === "PASS");
+  const unaffected: readonly Check[] = [
+    "runtime",
+    "guest",
+    "inlineListener",
+    "readyTransport",
+    "observer",
+    "baseline",
+    "os",
+    "electronFocus",
+    "focusTransport",
+    "identity",
+  ];
+  receipt.negative.qualified =
+    scenario === "second-focus-before-close" &&
+    receipt.firstFailure === "dom-event" &&
+    receipt.negative.secondFocusIssued &&
+    receipt.negative.secondFocusCompleted &&
+    receipt.observation.closed &&
+    receipt.observation.validationComplete &&
+    receipt.dom.closed &&
+    receipt.inline.closed &&
+    receipt.dom.count === 2 &&
+    receipt.inline.focusCount === 2 &&
+    receipt.dom.eventExact &&
+    receipt.inline.eventExact &&
+    receipt.loopback.readyCount === 1 &&
+    receipt.loopback.focusCount === 2 &&
+    receipt.loopback.correlationRejected === 0 &&
+    checks.domEvent === "FAIL" &&
+    checks.inlineEvent === "FAIL" &&
+    checks.loopbackFocus === "FAIL" &&
+    unaffected.every((key) => checks[key] === "PASS") &&
+    !receipt.diagnosticsWriteFailed &&
+    receipt.blockedNetwork === 0 &&
+    receipt.cleanup === "complete";
   if (!write(false, false)) write(false, false);
   app.exit(receipt.passed ? 0 : 1);
 }
@@ -357,11 +414,12 @@ const loginHtml =
   () => `<!doctype html><meta charset="utf-8"><input id="focus-target" type="text" autocomplete="off"><script nonce="fixture">
 (() => {
  const field=document.getElementById('focus-target');
- const s=globalThis.__focusPrerequisite={scriptRan:true,listenerReady:false,readyAttempted:false,readyAck:false,readyFailed:false,focusCount:0,eventExact:false,focusAttempted:false,focusAck:false,focusFailed:false};
+ const s=globalThis.__focusPrerequisite={scriptRan:true,listenerReady:false,closed:false,readyAttempted:false,readyAck:false,readyFailed:false,focusCount:0,eventExact:false,focusAttempted:false,focusAck:false,focusFailed:false};
  const send=name=>fetch('/'+name+'?instance=${instance}',{method:'POST'}).then(r=>r.status===204).catch(()=>false);
  field.addEventListener('focus',event=>{
-  s.focusCount=Math.min(2,s.focusCount+1);s.eventExact=event.target===field&&event.currentTarget===field&&field.ownerDocument===document;
-  s.focusAttempted=true;s.focusPromise=send('focused').then(ok=>{s.focusAck=ok;s.focusFailed=!ok;return ok});
+  if(s.closed)return;
+  s.focusCount=Math.min(3,s.focusCount+1);s.eventExact=event.target===field&&event.currentTarget===field&&field.ownerDocument===document;
+  s.focusAttempted=true;s.focusAck=false;s.focusFailed=false;s.focusPromise=send('focused').then(ok=>{s.focusAck=ok;s.focusFailed=!ok;return ok});
  });
  s.listenerReady=true;s.readyAttempted=true;
  s.readyPromise=send('ready').then(ok=>{s.readyAck=ok;s.readyFailed=!ok;return ok});
@@ -379,20 +437,34 @@ async function serve() {
           2,
           receipt.loopback.correlationRejected + 1,
         );
+        checks.loopbackFocus = "FAIL";
+        if (receipt.observation.validationComplete) {
+          latch("loopback-focus");
+          void finish();
+        }
         response.writeHead(400);
         response.end();
         return;
       }
       if (url.pathname === "/ready") {
-        receipt.loopback.readyCount = Math.min(2, receipt.loopback.readyCount + 1);
+        receipt.loopback.readyCount = Math.min(3, receipt.loopback.readyCount + 1);
         readyReceived.resolve();
       } else {
-        receipt.loopback.focusCount = Math.min(2, receipt.loopback.focusCount + 1);
+        receipt.loopback.focusCount = Math.min(3, receipt.loopback.focusCount + 1);
         focusReceived.resolve();
       }
+      if (receipt.loopback.readyCount > 1) checks.readyTransport = "FAIL";
+      if (receipt.loopback.focusCount > 1) checks.loopbackFocus = "FAIL";
       write(true);
       response.writeHead(204);
       response.end();
+      if (
+        receipt.observation.validationComplete &&
+        (receipt.loopback.readyCount > 1 || receipt.loopback.focusCount > 1)
+      ) {
+        latch(receipt.loopback.readyCount > 1 ? "ready-transport" : "loopback-focus");
+        void finish();
+      }
       return;
     }
     response.setHeader(
@@ -517,6 +589,7 @@ async function focusOs(owner: BrowserWindow) {
 const inlineCodec = Schema.Struct({
   scriptRan: Schema.Boolean,
   listenerReady: Schema.Boolean,
+  closed: Schema.Boolean,
   fieldPresent: Schema.Boolean,
   readyAttempted: Schema.Boolean,
   readyAck: Schema.Boolean,
@@ -529,6 +602,7 @@ const inlineCodec = Schema.Struct({
 });
 const domCodec = Schema.Struct({
   ready: Schema.Boolean,
+  closed: Schema.Boolean,
   documentSame: Schema.Boolean,
   fieldSame: Schema.Boolean,
   connected: Schema.Boolean,
@@ -539,17 +613,21 @@ const domCodec = Schema.Struct({
 });
 const decodeInline = Schema.decodeUnknownSync(inlineCodec);
 const decodeDom = Schema.decodeUnknownSync(domCodec);
-const inlineScript = `(() => {const s=globalThis.__focusPrerequisite;return {
+const inlineScript = (
+  close = false,
+) => `(() => {const s=globalThis.__focusPrerequisite;if(s&&${close})s.closed=true;return {closed:s?.closed===true,
  scriptRan:s?.scriptRan===true,listenerReady:s?.listenerReady===true,fieldPresent:document.getElementById('focus-target') instanceof HTMLInputElement,
  readyAttempted:s?.readyAttempted===true,readyAck:s?.readyAck===true,readyFailed:s?.readyFailed===true,
- focusCount:Number.isInteger(s?.focusCount)?Math.min(2,s.focusCount):0,eventExact:s?.eventExact===true,
+ focusCount:Number.isInteger(s?.focusCount)?Math.min(3,s.focusCount):0,eventExact:s?.eventExact===true,
  focusAttempted:s?.focusAttempted===true,focusAck:s?.focusAck===true,focusFailed:s?.focusFailed===true};})()`;
 const armObserver = `(() => {const field=document.getElementById('focus-target');if(globalThis.__focusObserver || !(field instanceof HTMLInputElement))return false;
- const s=globalThis.__focusObserver={document,field,count:0,eventExact:false};
- field.addEventListener('focus',e=>{s.count=Math.min(2,s.count+1);s.eventExact=e.target===s.field&&e.currentTarget===s.field&&s.field.ownerDocument===s.document;},true);return true;})()`;
-const domScript = `(() => {const s=globalThis.__focusObserver;return {ready:!!s,documentSame:s?.document===document,
+ const s=globalThis.__focusObserver={document,field,count:0,eventExact:false,closed:false};
+ field.addEventListener('focus',e=>{if(s.closed)return;s.count=Math.min(3,s.count+1);s.eventExact=e.target===s.field&&e.currentTarget===s.field&&s.field.ownerDocument===s.document;},true);return true;})()`;
+const domScript = (
+  close = false,
+) => `(() => {const s=globalThis.__focusObserver;if(s&&${close})s.closed=true;return {ready:!!s,closed:s?.closed===true,documentSame:s?.document===document,
  fieldSame:s?.field===document.getElementById('focus-target'),connected:s?.field?.isConnected===true,
- empty:s?.field?.value==='',active:!!s&&document.activeElement===s.field,count:Number.isInteger(s?.count)?Math.min(2,s.count):0,eventExact:s?.eventExact===true};})()`;
+ empty:s?.field?.value==='',active:!!s&&document.activeElement===s.field,count:Number.isInteger(s?.count)?Math.min(3,s.count):0,eventExact:s?.eventExact===true};})()`;
 
 async function exercise(
   manager: Manager.PreviewManager["Service"],
@@ -637,13 +715,13 @@ async function exercise(
     )
       stop("identity");
   };
-  const inline = async () => {
+  const inline = async (close = false) => {
     identity();
-    const raw: unknown = await wc.executeJavaScript(inlineScript);
+    const raw: unknown = await wc.executeJavaScript(inlineScript(close));
     identity();
     try {
       const value = decodeInline(raw);
-      if (!Number.isInteger(value.focusCount) || value.focusCount < 0 || value.focusCount > 2)
+      if (!Number.isInteger(value.focusCount) || value.focusCount < 0 || value.focusCount > 3)
         stop("inline-listener-readiness");
       Object.assign(receipt.inline, value);
     } catch {
@@ -652,13 +730,15 @@ async function exercise(
     write(true);
     running();
   };
-  const dom = async () => {
+  const dom = async (close = false) => {
     identity();
-    const raw: unknown = await wc.executeJavaScriptInIsolatedWorld(1005, [{ code: domScript }]);
+    const raw: unknown = await wc.executeJavaScriptInIsolatedWorld(1005, [
+      { code: domScript(close) },
+    ]);
     identity();
     try {
       const value = decodeDom(raw);
-      if (!Number.isInteger(value.count) || value.count < 0 || value.count > 2)
+      if (!Number.isInteger(value.count) || value.count < 0 || value.count > 3)
         stop("observer-readiness");
       Object.assign(receipt.dom, value);
     } catch {
@@ -792,20 +872,107 @@ async function exercise(
   );
   await focusReceived.promise;
   identity();
-  stage("identity");
+  if (scenario === "second-focus-before-close") {
+    stage("negative-second-focus");
+    receipt.negative.secondFocusIssued = true;
+    write(true);
+    running();
+    const second: unknown = await wc.executeJavaScript(
+      "(()=>{const f=document.getElementById('focus-target');f.blur();f.focus();return document.activeElement===f})()",
+    );
+    identity();
+    receipt.negative.secondFocusCompleted = second === true;
+  }
+  stage("final-observation");
+  // Inline closes first; world1005 continues to witness events until its own close task.
+  await inline(true);
+  identity();
+  receipt.observation.inlineClosed = receipt.inline.closed;
+  await dom(true);
+  identity();
+  receipt.observation.domClosed = receipt.dom.closed;
+  // The inline observer is closed, so this is its stable final fetch, not a moving Promise slot.
+  const finalFocusAck: unknown = await wc.executeJavaScript(
+    "globalThis.__focusPrerequisite.focusPromise",
+  );
+  identity();
+  await inline();
   await dom();
   identity();
-  requireCheck(
-    "identity",
-    receipt.dom.documentSame &&
-      receipt.dom.fieldSame &&
-      receipt.dom.connected &&
-      receipt.dom.empty &&
-      receipt.dom.active &&
-      receipt.identity.ownerFocused &&
-      receipt.identity.guestFocused,
-    "identity",
-  );
+  receipt.observation.closed =
+    receipt.observation.inlineClosed &&
+    receipt.observation.domClosed &&
+    receipt.inline.closed &&
+    receipt.dom.closed;
+  const finalChecks: readonly [Check, boolean, Failure][] = [
+    [
+      "inlineListener",
+      receipt.inline.scriptRan &&
+        receipt.inline.listenerReady &&
+        receipt.inline.fieldPresent &&
+        receipt.inline.closed,
+      "inline-listener-readiness",
+    ],
+    [
+      "readyTransport",
+      readyAck === true &&
+        receipt.inline.readyAck &&
+        !receipt.inline.readyFailed &&
+        receipt.loopback.readyCount === 1,
+      "ready-transport",
+    ],
+    [
+      "baseline",
+      receipt.baseline.inactive &&
+        receipt.baseline.domCount === 0 &&
+        receipt.baseline.inlineCount === 0,
+      "baseline",
+    ],
+    [
+      "domEvent",
+      receipt.observation.closed &&
+        active === true &&
+        receipt.dom.ready &&
+        receipt.dom.count === 1 &&
+        receipt.dom.eventExact,
+      "dom-event",
+    ],
+    [
+      "inlineEvent",
+      receipt.inline.focusCount === 1 && receipt.inline.eventExact && receipt.inline.focusAttempted,
+      "inline-event",
+    ],
+    [
+      "focusTransport",
+      finalFocusAck === true && receipt.inline.focusAck && !receipt.inline.focusFailed,
+      "focus-transport",
+    ],
+    [
+      "loopbackFocus",
+      receipt.loopback.readyCount === 1 &&
+        receipt.loopback.focusCount === 1 &&
+        receipt.loopback.correlationRejected === 0,
+      "loopback-focus",
+    ],
+    [
+      "identity",
+      receipt.dom.documentSame &&
+        receipt.dom.fieldSame &&
+        receipt.dom.connected &&
+        receipt.dom.empty &&
+        receipt.dom.active &&
+        receipt.identity.ownerFocused &&
+        receipt.identity.guestFocused,
+      "identity",
+    ],
+  ];
+  // Replace every affected flag before failing, so a late contradiction cannot leave stale PASSs.
+  for (const [key, valid] of finalChecks) checks[key] = valid ? "PASS" : "FAIL";
+  receipt.observation.validationComplete = true;
+  write(true);
+  running();
+  const failed = finalChecks.find(([, valid]) => !valid);
+  if (failed) stop(failed[2]);
   stage("complete");
 }
 async function main() {
@@ -820,6 +987,7 @@ async function main() {
       process.env.GITHUB_SHA === binding.source &&
       process.env.GITHUB_RUN_ID === binding.runId &&
       binding.privateDisplayBound &&
+      binding.scenario === scenario &&
       binding.assertedRunnerProfile === "blacksmith-8vcpu-ubuntu-2404",
     "runtime",
   );

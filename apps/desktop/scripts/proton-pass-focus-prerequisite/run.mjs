@@ -16,15 +16,17 @@ async function launch() {
     const key = args[index];
     const value = args[index + 1];
     if (
-      !["--electron", "--entry", "--output"].includes(key) ||
+      !["--electron", "--entry", "--output", "--scenario"].includes(key) ||
       options[key] ||
       !value ||
-      !NodePath.isAbsolute(value)
+      (key === "--scenario"
+        ? !["single-focus", "second-focus-before-close"].includes(value)
+        : !NodePath.isAbsolute(value))
     )
       throw new Error("Invalid fixture arguments");
-    options[key] = NodePath.resolve(value);
+    options[key] = key === "--scenario" ? value : NodePath.resolve(value);
   }
-  if (Object.keys(options).length !== 3)
+  if (!["--electron", "--entry", "--output"].every((key) => options[key]))
     throw new Error("Require --electron --entry --output absolute paths");
   if (
     process.platform !== "linux" ||
@@ -36,6 +38,7 @@ async function launch() {
     throw new Error(
       "Explicit Blacksmith focus job and non-root Linux required (workflow attestation external)",
     );
+  const scenario = options["--scenario"] ?? "single-focus";
   const runnerTemp = NodeFS.realpathSync(process.env.RUNNER_TEMP ?? "");
   for (const key of ["--entry", "--output"])
     if (!options[key].startsWith(`${runnerTemp}/`))
@@ -136,6 +139,7 @@ async function launch() {
     lockSha256: hash(NodeFS.readFileSync(NodePath.join(repo, "pnpm-lock.yaml"))),
     runId: process.env.GITHUB_RUN_ID,
     scope: "FOCUS_PREREQUISITE_ONLY",
+    scenario,
     autofill: "NOT_EXERCISED",
     assertedRunnerProfile: process.env.MORROWBYTE_RUNNER_PROFILE,
     runnerAttestation: "CALLER_ASSERTION_ONLY_REQUIRES_INTEGRATION_WORKFLOW_JOB_EVIDENCE",
@@ -196,6 +200,8 @@ async function launch() {
       bindingFile,
       "--repo",
       repo,
+      "--scenario",
+      scenario,
     ],
     {
       env: environment,
@@ -257,16 +263,22 @@ async function launch() {
   } catch {
     /* Missing final receipt is failure even for child exit 0. */
   }
-  const passed =
-    exitCode === 0 &&
+  const boundAndClean =
     !signal &&
     !timedOut &&
     temporaryRemoved &&
     !cleanupTimedOut &&
     fixture?.scope === "FOCUS_PREREQUISITE_ONLY" &&
     fixture?.autofill === "NOT_EXERCISED" &&
-    fixture?.passed === true &&
+    fixture?.scenario === scenario &&
+    fixture?.binding?.scenario === scenario &&
     fixture?.phase === "final" &&
+    fixture?.cleanup === "complete" &&
+    fixture?.diagnosticsWriteFailed === false &&
+    fixture?.observation?.closed === true &&
+    fixture?.observation?.validationComplete === true &&
+    fixture?.inline?.closed === true &&
+    fixture?.dom?.closed === true &&
     fixture?.runtime?.electron === "44.4.5" &&
     fixture?.runtime?.executable === executable &&
     fixture?.runtime?.sha256 === binding.executableSha256 &&
@@ -274,6 +286,57 @@ async function launch() {
     fixture?.binding?.lockSha256 === binding.lockSha256 &&
     fixture?.binding?.runId === binding.runId &&
     fixture?.binding?.entrySha256 === binding.entrySha256;
+  const unaffectedChecks = [
+    "runtime",
+    "guest",
+    "inlineListener",
+    "readyTransport",
+    "observer",
+    "baseline",
+    "os",
+    "electronFocus",
+    "focusTransport",
+    "identity",
+  ];
+  const expectedRejection =
+    scenario === "second-focus-before-close" &&
+    exitCode === 1 &&
+    fixture?.passed === false &&
+    fixture?.firstFailure === "dom-event" &&
+    fixture?.negative?.qualified === true &&
+    fixture?.negative?.secondFocusIssued === true &&
+    fixture?.negative?.secondFocusCompleted === true &&
+    fixture?.dom?.count === 2 &&
+    fixture?.dom?.eventExact === true &&
+    fixture?.inline?.focusCount === 2 &&
+    fixture?.inline?.eventExact === true &&
+    fixture?.loopback?.readyCount === 1 &&
+    fixture?.loopback?.focusCount === 2 &&
+    fixture?.loopback?.correlationRejected === 0 &&
+    fixture?.blockedNetwork === 0 &&
+    ["domEvent", "inlineEvent", "loopbackFocus"].every(
+      (key) => fixture?.checks?.[key] === "FAIL",
+    ) &&
+    unaffectedChecks.every((key) => fixture?.checks?.[key] === "PASS");
+  const positive =
+    scenario === "single-focus" &&
+    exitCode === 0 &&
+    fixture?.passed === true &&
+    fixture?.firstFailure === null &&
+    [...unaffectedChecks, "domEvent", "inlineEvent", "loopbackFocus"].every(
+      (key) => fixture?.checks?.[key] === "PASS",
+    ) &&
+    fixture?.dom?.count === 1 &&
+    fixture?.inline?.focusCount === 1 &&
+    fixture?.loopback?.readyCount === 1 &&
+    fixture?.loopback?.focusCount === 1 &&
+    fixture?.loopback?.correlationRejected === 0;
+  const passed = boundAndClean && (positive || expectedRejection);
+  const qualificationOutcome = passed
+    ? expectedRejection
+      ? "EXPECTED_SECOND_EVENT_REJECTED"
+      : "SINGLE_FOCUS_OBSERVED"
+    : "FAILED_QUALIFICATION";
   NodeFS.writeSync(
     log,
     JSON.stringify({
@@ -291,6 +354,7 @@ async function launch() {
       {
         ...binding,
         passed,
+        qualificationOutcome,
         exitCode,
         signal,
         timedOut,
