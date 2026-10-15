@@ -259,6 +259,21 @@ try {
   const address = server.address();
   NodeAssert.ok(address && typeof address === "object");
   origin = `http://127.0.0.1:${address.port}`;
+  const nonces = { encoded: NodeCrypto.randomUUID(), multipart: NodeCrypto.randomUUID() };
+  const preload = NodePath.join(temporary, "native-post-attestation.cjs");
+  // No contextBridge or page API: only a one-shot challenge on this owned synthetic session.
+  const preloadSource = `const { ipcRenderer } = require('electron');
+const origin = ${JSON.stringify(origin)};
+const nonces = ${JSON.stringify(nonces)};
+let reported = false;
+ipcRenderer.on('morrowbyte-native-post-challenge', (_event, nonce) => {
+  const kind = location.pathname === '/return/encoded' ? 'encoded' : location.pathname === '/return/multipart' ? 'multipart' : null;
+  if (reported || !process.isMainFrame || location.origin !== origin || !kind || nonce !== nonces[kind]) return;
+  reported = true;
+  ipcRenderer.send('morrowbyte-native-post-report', { nonce, contextIsolation: process.contextIsolated === true, sandbox: process.sandboxed === true });
+});`;
+  await NodeFSP.writeFile(preload, preloadSource);
+  receipt.preloadSha256 = hash(Buffer.from(preloadSource));
   const env = Object.fromEntries(
     [
       "PATH",
@@ -285,6 +300,8 @@ try {
     MORROWBYTE_NATIVE_POST_TEMP: temporary,
     MORROWBYTE_NATIVE_POST_OUTPUT: output,
     MORROWBYTE_NATIVE_POST_ORIGIN: origin,
+    MORROWBYTE_NATIVE_POST_NONCE_ENCODED: nonces.encoded,
+    MORROWBYTE_NATIVE_POST_NONCE_MULTIPART: nonces.multipart,
   });
   failureCode = "electron-spawn-or-exit-failed";
   log = await NodeFSP.open(NodePath.join(output, "electron.log"), "w");
@@ -323,10 +340,13 @@ try {
       "sameSession",
       "contextIsolation",
       "sandbox",
+      "requireAbsent",
+      "processAbsent",
     ])
       NodeAssert.equal(entry[key], true);
     NodeAssert.equal(entry.nodeIntegration, false);
     NodeAssert.equal(entry.openerPolicy, "explicit-rel-opener");
+    NodeAssert.equal(entry.hardeningAttestation, "session-preload-native-process");
   }
   failureCode = "http-evidence-invalid";
   NodeAssert.deepEqual(
