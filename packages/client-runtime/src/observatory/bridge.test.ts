@@ -39,6 +39,7 @@ import {
   createObservatoryProjectionBridge,
   type ObservatoryConnection,
 } from "./bridge.ts";
+import type { ObservatorySourceStatus } from "./native.ts";
 const environmentId = EnvironmentId.make("one");
 const allowed: AuthSessionState = {
   authenticated: true,
@@ -156,7 +157,42 @@ vi.mock("../state/threads.ts", async (importOriginal) => ({
 const sessionResults = Atom.family((_id: EnvironmentId) =>
   Atom.make<AsyncResult.AsyncResult<AuthSessionState, string>>(AsyncResult.initial()),
 );
+type FixtureScopeName = "first" | "grant-restored" | "auth-restored" | "reconnected";
+type StreamBoundary = "shell-release" | "shell-failure" | "detail-release" | "detail-failure";
+type MainStage =
+  | "initial-synchronizing"
+  | "first-scope-pending"
+  | "first-shell"
+  | "first-detail"
+  | "current-pair"
+  | "detail-synchronizing"
+  | "detail-restored"
+  | "first-detail-closed"
+  | "detail-failure-hidden"
+  | "grant-denied"
+  | "first-shell-closed"
+  | "grant-restored-shell"
+  | "grant-restored-detail"
+  | "auth-denied"
+  | "grant-restored-shell-closed"
+  | "auth-restored-shell"
+  | "reconnect-synchronizing"
+  | "auth-restored-shell-closed"
+  | "reconnected-shell"
+  | "reconnected-detail"
+  | "reconnected-shell-closed"
+  | "final-failure-hidden";
+type DiagnosticStage = MainStage | `${FixtureScopeName}:${StreamBoundary}`;
+type TraceAwait = <A, E, R>(
+  stage: DiagnosticStage,
+  effect: Effect.Effect<A, E, R>,
+) => Effect.Effect<A, E, R>;
+
 interface StreamScope {
+  readonly trace: <A, E, R>(
+    boundary: StreamBoundary,
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E, R>;
   readonly shell: SubscriptionRef.SubscriptionRef<EnvironmentShellState>;
   readonly detail: SubscriptionRef.SubscriptionRef<EnvironmentThreadState>;
   readonly releaseShell: Deferred.Deferred<void>;
@@ -185,18 +221,20 @@ function streamShellFactory<R, E>(runtime: Atom.AtomRuntime<R, E>) {
   fixture.current = scope;
   const atom = runtime.atom(
     Stream.unwrap(
-      Deferred.await(scope.releaseShell).pipe(
-        Effect.as(
-          Stream.merge(
-            SubscriptionRef.changes(scope.shell),
-            Stream.fromEffect(
-              Deferred.await(scope.failShell).pipe(
-                Effect.andThen(Effect.fail("controlled shell failure")),
+      scope
+        .trace("shell-release", Deferred.await(scope.releaseShell))
+        .pipe(
+          Effect.as(
+            Stream.merge(
+              SubscriptionRef.changes(scope.shell),
+              Stream.fromEffect(
+                scope
+                  .trace("shell-failure", Deferred.await(scope.failShell))
+                  .pipe(Effect.andThen(Effect.fail("controlled shell failure"))),
               ),
             ),
           ),
         ),
-      ),
     ).pipe(Stream.ensuring(Deferred.succeed(scope.shellClosed, undefined))),
   );
   scope.readShell = (registry) => registry.get(atom);
@@ -207,26 +245,33 @@ function streamDetailFactory<R, E>(runtime: Atom.AtomRuntime<R, E>) {
   if (!scope) throw new Error("Missing paired detail scope in controlled stream fixture");
   const atom = runtime.atom(
     Stream.unwrap(
-      Deferred.await(scope.releaseDetail).pipe(
-        Effect.as(
-          Stream.merge(
-            SubscriptionRef.changes(scope.detail),
-            Stream.fromEffect(
-              Deferred.await(scope.failDetail).pipe(
-                Effect.andThen(Effect.fail("controlled detail failure")),
+      scope
+        .trace("detail-release", Deferred.await(scope.releaseDetail))
+        .pipe(
+          Effect.as(
+            Stream.merge(
+              SubscriptionRef.changes(scope.detail),
+              Stream.fromEffect(
+                scope
+                  .trace("detail-failure", Deferred.await(scope.failDetail))
+                  .pipe(Effect.andThen(Effect.fail("controlled detail failure"))),
               ),
             ),
           ),
         ),
-      ),
     ).pipe(Stream.ensuring(Deferred.succeed(scope.detailClosed, undefined))),
   );
   scope.readDetail = (registry) => registry.get(atom);
   return { stateAtom: (_id: EnvironmentId, _thread: typeof v2ThreadId) => atom };
 }
-const makeStreamScope = (title: string): Effect.Effect<StreamScope> =>
+const makeStreamScope = (
+  title: string,
+  name: FixtureScopeName,
+  traceAwait: TraceAwait,
+): Effect.Effect<StreamScope> =>
   Effect.gen(function* () {
     return {
+      trace: (boundary, effect) => traceAwait(`${name}:${boundary}`, effect),
       shell: yield* SubscriptionRef.make<EnvironmentShellState>({
         status: "live",
         snapshot: Option.some({
@@ -252,14 +297,63 @@ const makeStreamScope = (title: string): Effect.Effect<StreamScope> =>
 
 effectIt.effect(
   "production adapter consumes ongoing current streams and refuses stale scopes and Failure.previousSuccess",
-  () =>
-    Effect.scoped(
+  (testContext) => {
+    const diagnostic: {
+      enteredStage: MainStage | null;
+      completedStage: MainStage | null;
+      fixtureOpenedCount: number | null;
+      lastObserved: {
+        sourceStatus: ObservatorySourceStatus | "UNKNOWN";
+        generation: number | null;
+        hasSelection: boolean | null;
+        hasDetail: boolean | null;
+      };
+    } = {
+      enteredStage: null,
+      completedStage: null,
+      fixtureOpenedCount: null,
+      lastObserved: {
+        sourceStatus: "UNKNOWN",
+        generation: null,
+        hasSelection: null,
+        hasDetail: null,
+      },
+    };
+    const enteredAwaits = new Set<DiagnosticStage>();
+    const completedAwaits = new Set<DiagnosticStage>();
+    const isMainStage = (stage: DiagnosticStage): stage is MainStage => !stage.includes(":");
+    const traceAwait: TraceAwait = (stage, effect) =>
+      Effect.suspend(() => {
+        enteredAwaits.add(stage);
+        if (isMainStage(stage)) diagnostic.enteredStage = stage;
+        return effect.pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              completedAwaits.add(stage);
+              if (isMainStage(stage)) diagnostic.completedStage = stage;
+            }),
+          ),
+        );
+      });
+    // Pinned Vitest TestContext hook; registration precedes all asynchronous work.
+    // It reads this sanitized record only, never the registry or the failure object.
+    testContext.onTestFailed(() => {
+      console.error("observatory-stream-diagnostic", {
+        ...diagnostic,
+        enteredAwaits: [...enteredAwaits],
+        completedAwaits: [...completedAwaits],
+        // No existing test read exposes the Layer runtime result. Do not infer it
+        // from a shell/detail stream result or add a diagnostic-only Atom read.
+        runtimeAsyncResultTag: "UNKNOWN",
+      });
+    });
+    return Effect.scoped(
       Effect.gen(function* () {
         const controlled = yield* Effect.all({
-          first: makeStreamScope("First live"),
-          restored: makeStreamScope("Grant restored"),
-          authRestored: makeStreamScope("Auth restored"),
-          reconnected: makeStreamScope("Reconnected"),
+          first: makeStreamScope("First live", "first", traceAwait),
+          restored: makeStreamScope("Grant restored", "grant-restored", traceAwait),
+          authRestored: makeStreamScope("Auth restored", "auth-restored", traceAwait),
+          reconnected: makeStreamScope("Reconnected", "reconnected", traceAwait),
         });
         streamScopes = {
           values: [
@@ -339,20 +433,37 @@ effectIt.effect(
         );
         const unmount = registry.mount(view.snapshotAtom);
         yield* Effect.addFinalizer(() => Effect.sync(unmount));
-        const waitFor = (predicate: (value: Atom.Type<typeof view.snapshotAtom>) => boolean) =>
-          Effect.callback<void>((resume) => {
-            const stop = registry.subscribe(
-              view.snapshotAtom,
-              (value) => {
-                if (predicate(value)) resume(Effect.void);
-              },
-              { immediate: true },
-            );
-            return Effect.sync(stop);
-          });
+        const waitFor = (
+          stage: MainStage,
+          predicate: (value: Atom.Type<typeof view.snapshotAtom>) => boolean,
+        ) =>
+          traceAwait(
+            stage,
+            Effect.callback<void>((resume) => {
+              const stop = registry.subscribe(
+                view.snapshotAtom,
+                (value) => {
+                  diagnostic.fixtureOpenedCount =
+                    streamScopes?.opened ?? diagnostic.fixtureOpenedCount;
+                  diagnostic.lastObserved = {
+                    sourceStatus: value.sources[0]?.status ?? "UNKNOWN",
+                    generation: value.selection?.source.generation ?? null,
+                    hasSelection: value.selection !== null,
+                    hasDetail: value.selection === null ? null : value.selection.detail !== null,
+                  };
+                  if (predicate(value)) resume(Effect.void);
+                },
+                { immediate: true },
+              );
+              return Effect.sync(stop);
+            }),
+          );
         const select = () =>
           registry.set(view.selectedAtom, { environmentId, threadId: v2ThreadId });
-        yield* waitFor((value) => value.sources[0]?.status === "synchronizing");
+        yield* waitFor(
+          "initial-synchronizing",
+          (value) => value.sources[0]?.status === "synchronizing",
+        );
         expect(streamScopes?.opened).toBe(0);
         yield* SubscriptionRef.set(session, Option.some(firstSession));
         yield* SubscriptionRef.update(connection, (state): SupervisorConnectionState => ({
@@ -360,12 +471,13 @@ effectIt.effect(
           phase: "connected",
         }));
         yield* waitFor(
+          "first-scope-pending",
           (value) => value.sources[0]?.status === "synchronizing" && streamScopes?.opened === 1,
         );
         expect(registry.get(view.snapshotAtom).nodes).toEqual([]);
         const first = controlled.first;
         yield* Deferred.succeed(first.releaseShell, undefined);
-        yield* waitFor((value) => value.nodes[0]?.title === "First live");
+        yield* waitFor("first-shell", (value) => value.nodes[0]?.title === "First live");
         const initialShell = first.readShell?.(registry);
         expect(initialShell?._tag).toBe("Success");
         expect(initialShell?.waiting).toBe(true);
@@ -373,6 +485,7 @@ effectIt.effect(
         expect(registry.get(view.snapshotAtom).selection?.detail).toBeNull();
         yield* Deferred.succeed(first.releaseDetail, undefined);
         yield* waitFor(
+          "first-detail",
           (value) => value.selection?.detail?.projection.thread.title === "First live",
         );
         expect(first.readDetail?.(registry).waiting).toBe(true);
@@ -391,6 +504,7 @@ effectIt.effect(
           })),
         }));
         yield* waitFor(
+          "current-pair",
           (value) =>
             value.nodes[0]?.title === "Current emission" &&
             value.selection?.detail?.projection.thread.title === "Current detail",
@@ -399,17 +513,24 @@ effectIt.effect(
           ...state,
           status: "synchronizing",
         }));
-        yield* waitFor((value) => value.selection !== null && value.selection.detail === null);
+        yield* waitFor(
+          "detail-synchronizing",
+          (value) => value.selection !== null && value.selection.detail === null,
+        );
         yield* SubscriptionRef.update(first.detail, (state): EnvironmentThreadState => ({
           ...state,
           status: "live",
         }));
         yield* waitFor(
+          "detail-restored",
           (value) => value.selection?.detail?.projection.thread.title === "Current detail",
         );
         yield* Deferred.succeed(first.failDetail, undefined);
-        yield* Deferred.await(first.detailClosed);
-        yield* waitFor((value) => value.selection !== null && value.selection.detail === null);
+        yield* traceAwait("first-detail-closed", Deferred.await(first.detailClosed));
+        yield* waitFor(
+          "detail-failure-hidden",
+          (value) => value.selection !== null && value.selection.detail === null,
+        );
         const failedDetail = first.readDetail?.(registry);
         expect(failedDetail?._tag).toBe("Failure");
         expect(
@@ -420,12 +541,13 @@ effectIt.effect(
           AsyncResult.success({ ...allowed, scopes: [], permissions: [] }),
         );
         yield* waitFor(
+          "grant-denied",
           (value) =>
             value.nodes.length === 0 &&
             value.selection === null &&
             value.sources[0]?.status === "denied",
         );
-        yield* Deferred.await(first.shellClosed);
+        yield* traceAwait("first-shell-closed", Deferred.await(first.shellClosed));
         yield* SubscriptionRef.update(first.shell, (state) => ({
           ...state,
           snapshot: Option.map(state.snapshot, (snapshot) => ({
@@ -436,11 +558,15 @@ effectIt.effect(
         registry.set(sessionResults(environmentId), AsyncResult.success(allowed));
         const restored = controlled.restored;
         yield* Deferred.succeed(restored.releaseShell, undefined);
-        yield* waitFor((value) => value.nodes[0]?.title === "Grant restored");
+        yield* waitFor(
+          "grant-restored-shell",
+          (value) => value.nodes[0]?.title === "Grant restored",
+        );
         expect(registry.get(view.snapshotAtom).selection).toBeNull();
         select();
         yield* Deferred.succeed(restored.releaseDetail, undefined);
         yield* waitFor(
+          "grant-restored-detail",
           (value) => value.selection?.detail?.projection.thread.title === "Grant restored",
         );
         registry.set(
@@ -450,25 +576,27 @@ effectIt.effect(
           }),
         );
         yield* waitFor(
+          "auth-denied",
           (value) =>
             value.nodes.length === 0 &&
             value.selection === null &&
             value.sources[0]?.status === "denied",
         );
-        yield* Deferred.await(restored.shellClosed);
+        yield* traceAwait("grant-restored-shell-closed", Deferred.await(restored.shellClosed));
         registry.set(sessionResults(environmentId), AsyncResult.success(allowed));
         const authRestored = controlled.authRestored;
         yield* Deferred.succeed(authRestored.releaseShell, undefined);
-        yield* waitFor((value) => value.nodes[0]?.title === "Auth restored");
+        yield* waitFor("auth-restored-shell", (value) => value.nodes[0]?.title === "Auth restored");
         yield* SubscriptionRef.update(connection, (state): SupervisorConnectionState => ({
           ...state,
           phase: "connecting",
           generation: 2,
         }));
         yield* waitFor(
+          "reconnect-synchronizing",
           (value) => value.nodes.length === 0 && value.sources[0]?.status === "synchronizing",
         );
-        yield* Deferred.await(authRestored.shellClosed);
+        yield* traceAwait("auth-restored-shell-closed", Deferred.await(authRestored.shellClosed));
         yield* SubscriptionRef.set(session, Option.some({ ...firstSession }));
         yield* SubscriptionRef.update(connection, (state): SupervisorConnectionState => ({
           ...state,
@@ -477,6 +605,7 @@ effectIt.effect(
         const reconnected = controlled.reconnected;
         yield* Deferred.succeed(reconnected.releaseShell, undefined);
         yield* waitFor(
+          "reconnected-shell",
           (value) =>
             value.nodes[0]?.title === "Reconnected" &&
             value.sources[0]?.environmentId === environmentId,
@@ -485,6 +614,7 @@ effectIt.effect(
         select();
         yield* Deferred.succeed(reconnected.releaseDetail, undefined);
         yield* waitFor(
+          "reconnected-detail",
           (value) => value.selection?.detail?.projection.thread.title === "Reconnected",
         );
         expect(registry.get(view.snapshotAtom).selection?.source.generation).toBe(2);
@@ -499,13 +629,17 @@ effectIt.effect(
           "Reconnected",
         );
         yield* Deferred.succeed(reconnected.failShell, undefined);
-        yield* Deferred.await(reconnected.shellClosed);
-        yield* waitFor((value) => value.nodes.length === 0 && value.selection === null);
+        yield* traceAwait("reconnected-shell-closed", Deferred.await(reconnected.shellClosed));
+        yield* waitFor(
+          "final-failure-hidden",
+          (value) => value.nodes.length === 0 && value.selection === null,
+        );
         const failedShell = reconnected.readShell?.(registry);
         expect(failedShell?._tag).toBe("Failure");
         expect(failedShell?._tag === "Failure" && Option.isSome(failedShell.previousSuccess)).toBe(
           true,
         );
       }),
-    ),
+    );
+  },
 );
