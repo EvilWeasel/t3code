@@ -4,6 +4,20 @@ set -euo pipefail
 bash scripts/weasel/test.sh
 python3 packaging/nixos/test-updater.py
 
+upstream_sync_sources=(
+  scripts/weasel/sync-upstream-main.sh
+  scripts/weasel/test-sync-upstream-main.sh
+  scripts/weasel/test-sync-upstream-coordinator.py
+)
+for sync_source in "${upstream_sync_sources[@]}"; do
+  if [[ ! -f "$sync_source" ]]; then
+    echo "Required upstream main sync gate is missing: $sync_source" >&2
+    exit 1
+  fi
+done
+bash scripts/weasel/test-sync-upstream-main.sh
+python3 scripts/weasel/test-sync-upstream-coordinator.py
+
 vp_cmd() {
   if command -v vp >/dev/null 2>&1; then
     vp "$@"
