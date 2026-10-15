@@ -1262,6 +1262,9 @@ it.effect.each([false, true])(
 
 it.effect.each([
   "completion",
+  "runtime-replaced",
+  "terminal-replaced",
+  "native-closed",
   "unknown",
   "detach",
   "end",
@@ -1285,6 +1288,7 @@ it.effect.each([
     const entered = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
     const appendSettled = yield* Deferred.make<void>();
+    const replacementRead = yield* Deferred.make<void>();
     let appends = 0;
     let submissions = 0;
     let workCancels = 0;
@@ -1448,6 +1452,21 @@ it.effect.each([
           }).pipe(Effect.ensuring(Deferred.succeed(appendSettled, undefined))),
       },
     } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+    let workRuntime: Option.Option<ProviderAdapter.ProviderAdapterV2SessionRuntime> =
+      Option.some(runtime);
+    const decodeObserverReceipt = Schema.decodeSync(
+      Schema.fromJsonString(
+        Schema.Struct({
+          state: Schema.String,
+          claimedFinalReferences: Schema.NullOr(
+            Schema.Struct({
+              messageId: Schema.String,
+              attachmentIds: Schema.Array(Schema.String),
+            }),
+          ),
+        }),
+      ),
+    );
     const dependencies = Layer.mergeAll(
       NodeSqliteClient.layer({ filename: ":memory:" }),
       NodeCrypto.layer,
@@ -1461,7 +1480,14 @@ it.effect.each([
         resolve: () => Effect.succeed(policy),
       }),
       Layer.succeed(ProviderSessionManager.ProviderSessionManagerV2, {
-        get: () => Effect.succeed(Option.some(runtime)),
+        get: () =>
+          Effect.sync(() => workRuntime).pipe(
+            Effect.tap((current) =>
+              Option.isSome(current) && current.value !== runtime
+                ? Deferred.succeed(replacementRead, undefined)
+                : Effect.void,
+            ),
+          ),
       } as unknown as ProviderSessionManager.ProviderSessionManagerV2Shape),
       Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
         getInstance: () => Effect.succeed({ driverKind: "codex" }),
@@ -1580,7 +1606,45 @@ it.effect.each([
           lease.leaseId,
           "same-lease status/reconnect preserves observer",
         );
-        if (scenario === "end") {
+        if (scenario === "native-closed") {
+          const children = projection.subagents;
+          yield* Queue.offer(native, { type: "closed", plannerNativeThreadId: "observer-planner" });
+          yield* Stream.fromQueue(statuses).pipe(
+            Stream.filter((event) => event.type === "status" && event.session.status === "closed"),
+            Stream.runHead,
+          );
+          yield* Deferred.await(appendSettled);
+          yield* Deferred.succeed(release, undefined);
+          yield* publish();
+          assert.strictEqual(projection.subagents, children);
+          assert.equal(appends, 1, "native close retires pending observer speech");
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(observe!({ ...request, callId: "after-native-close" })),
+            ),
+          );
+        } else if (scenario === "runtime-replaced") {
+          workRuntime = Option.some({ ...runtime });
+          assert.notStrictEqual(Option.getOrThrow(workRuntime), runtime);
+          yield* Deferred.succeed(release, undefined);
+          yield* Queue.take(speech);
+          yield* publish();
+          yield* Deferred.await(replacementRead);
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(observe!({ ...request, callId: "replacement-incarnation" })),
+            ),
+          );
+          assert.equal(
+            yield* observe!(request),
+            receipt,
+            "withheld/replayed native reply retains the ORIGINAL committed admission result",
+          );
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(observe!({ ...request, completion: false }))),
+          );
+          assert.equal(appends, 1, "same-ID replacement cannot authorize further speech");
+        } else if (scenario === "end") {
           const children = projection.subagents;
           yield* service.stop(session, {
             ...lease,
@@ -1610,6 +1674,14 @@ it.effect.each([
             yield* observe!({ ...request, callId: "after-uncertain-append" }),
           );
           assert.equal((unknown as { state: string }).state, "unknown");
+          assert.equal(
+            yield* observe!(request),
+            receipt,
+            "lost adapter reply never replaces the original call/body outcome",
+          );
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(observe!({ ...request, completion: false }))),
+          );
           yield* publish();
           assert.equal(appends, 1, "uncertain speech is never automatically retried");
         } else {
@@ -1675,7 +1747,6 @@ it.effect.each([
                 } as never,
               ],
               messages: [
-                ...projection.messages,
                 {
                   id: "final-message",
                   threadId: target.threadId,
@@ -1684,8 +1755,17 @@ it.effect.each([
                   role: "assistant",
                   text: "Final grounded report [source](https://example.test/source)",
                   streaming: false,
-                  attachments: projection.messages[0]!.attachments,
+                  attachments: [
+                    { ...projection.messages[0]!.attachments[0]!, id: "exact-final-artifact" },
+                  ],
                 } as never,
+                // An unrelated completed same-attempt note comes LAST in array order.
+                // It is not the final turn item and must never supply final references.
+                ...projection.messages.map((message) => ({
+                  ...message,
+                  text: "Unphased nonfinal note after the final in array order",
+                  attachments: [{ ...message.attachments[0]!, id: "unrelated-note-artifact" }],
+                })),
               ],
               turnItems: [
                 {
@@ -1703,6 +1783,8 @@ it.effect.each([
               ],
               checkpoints: [],
             };
+            workRuntime =
+              scenario === "terminal-replaced" ? Option.some({ ...runtime }) : Option.none();
             const childrenPending = projection;
             yield* publish();
             yield* Stream.fromQueue(projectionReads).pipe(
@@ -1710,42 +1792,67 @@ it.effect.each([
               Stream.runHead,
             );
             assert.equal(appends, 2, "terminal root alone does not bypass unfinished children");
-            projection = {
-              ...projection,
-              subagents: projection.subagents.map((child) => ({
-                ...child,
-                status: "completed" as const,
-              })),
-            };
-            const checkpointPending = projection;
-            yield* publish();
-            yield* Stream.fromQueue(projectionReads).pipe(
-              Stream.filter((snapshot) => snapshot === checkpointPending),
-              Stream.runHead,
-            );
-            assert.equal(appends, 2, "completed children do not bypass the missing checkpoint");
-            projection = {
-              ...projection,
-              checkpoints: [
+            if (scenario === "terminal-replaced") {
+              assert.isTrue(
+                Exit.isFailure(
+                  yield* Effect.exit(observe!({ ...request, callId: "terminal-replacement" })),
+                ),
+              );
+              assert.equal(yield* observe!(request), receipt);
+              assert.equal(appends, 2, "terminal replacement also cannot become authority");
+            } else {
+              projection = {
+                ...projection,
+                subagents: projection.subagents.map((child) => ({
+                  ...child,
+                  status: "completed" as const,
+                })),
+              };
+              const checkpointPending = projection;
+              yield* publish();
+              yield* Stream.fromQueue(projectionReads).pipe(
+                Stream.filter((snapshot) => snapshot === checkpointPending),
+                Stream.runHead,
+              );
+              assert.equal(appends, 2, "completed children do not bypass the missing checkpoint");
+              projection = {
+                ...projection,
+                checkpoints: [
+                  {
+                    id: "final-checkpoint",
+                    runId: target.runId,
+                    status: "ready",
+                  } as never,
+                ],
+              };
+              yield* publish();
+              assert.equal(
+                yield* Queue.take(speech),
+                "Final grounded report [source](https://example.test/source)",
+              );
+              assert.equal(
+                appends,
+                3,
+                "two coalesced progress updates and one child/checkpoint-gated final",
+              );
+              yield* observe!(request);
+              const finalReceipt = decodeObserverReceipt(
+                yield* observe!({ ...request, callId: "final-evidence" }),
+              );
+              assert.deepEqual(
+                finalReceipt.claimedFinalReferences,
                 {
-                  id: "final-checkpoint",
-                  runId: target.runId,
-                  status: "ready",
-                } as never,
-              ],
-            };
-            yield* publish();
-            assert.equal(
-              yield* Queue.take(speech),
-              "Final grounded report [source](https://example.test/source)",
-            );
-            assert.equal(
-              appends,
-              3,
-              "two coalesced progress updates and one child/checkpoint-gated final",
-            );
-            yield* observe!(request);
-            assert.equal(appends, 3, "duplicate attach does not replay final speech");
+                  messageId: "final-message",
+                  attachmentIds: ["exact-final-artifact"],
+                },
+                "final claim references follow finalMessageId, never the last message in array order",
+              );
+              assert.equal(
+                appends,
+                3,
+                "duplicate attach does not replay final speech after work runtime retirement",
+              );
+            }
           }
         }
       }
@@ -1754,7 +1861,7 @@ it.effect.each([
         id: child.id,
         status: child.status,
       }));
-      if (scenario !== "end")
+      if (scenario !== "end" && scenario !== "native-closed")
         yield* service.stop(session, {
           ...lease,
           clientRequestId: "observer-end",

@@ -79,6 +79,15 @@ type Observation = {
   readonly leaseId: string;
   readonly generation: number;
   readonly body: string;
+  workBinding: {
+    readonly runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
+    readonly providerThreadId: string;
+    readonly providerTurnId: string;
+  } | null;
+  claimedFinalReferences: {
+    readonly messageId: string;
+    readonly attachmentIds: readonly string[];
+  } | null;
   state: "active" | "detached" | "completed" | "unknown" | "refused";
   lastClaim: string | null;
   delivery: "none" | "claimed" | "sent" | "unknown";
@@ -307,6 +316,12 @@ export const layer: Layer.Layer<
       return {
         attemptId: attempts[0]!.id,
         finalMessageId: finalMessages[0]!.id,
+        references: {
+          messageId: finalMessages[0]!.id,
+          attachmentIds: finalMessages[0]!.attachments
+            .slice(0, 8)
+            .map((attachment) => attachment.id),
+        },
         text: finalMessages[0]!.text,
       };
     };
@@ -1029,6 +1044,7 @@ export const layer: Layer.Layer<
         completion: observation.input.completion,
         speechDelivery: observation.delivery,
         audibility: "unknown",
+        claimedFinalReferences: observation.claimedFinalReferences,
         ...(context === undefined ? {} : { context }),
       });
 
@@ -1152,17 +1168,26 @@ export const layer: Layer.Layer<
           (terminal ? turn.status !== "completed" : turn.status !== "running")
         )
           return yield* liveError("stale_lease");
-        if (!terminal) {
-          const workRuntime = yield* providerSessions.get(providerThread.providerSessionId);
-          if (
-            Option.isNone(workRuntime) ||
-            workRuntime.value.driver !== "codex" ||
-            workRuntime.value.instanceId !== target.providerInstanceId ||
-            workRuntime.value.providerSessionId !== providerThread.providerSessionId
-          )
-            return yield* liveError("runtime_unavailable");
-        }
-        // Final evidence is allowed after the same attempt completes. No active-status gate here.
+        const workRuntime = yield* providerSessions.get(providerThread.providerSessionId);
+        const binding = observation.workBinding;
+        if (
+          (Option.isNone(workRuntime) && (!terminal || attaching)) ||
+          (Option.isSome(workRuntime) &&
+            (workRuntime.value.driver !== "codex" ||
+              workRuntime.value.instanceId !== target.providerInstanceId ||
+              workRuntime.value.providerSessionId !== providerThread.providerSessionId)) ||
+          (!attaching &&
+            (binding === null ||
+              binding.providerThreadId !== providerThread.id ||
+              binding.providerTurnId !== turn.id ||
+              binding.runtime.providerSessionId !== providerThread.providerSessionId ||
+              (Option.isSome(workRuntime) && workRuntime.value !== binding.runtime)))
+        )
+          return yield* liveError("runtime_unavailable");
+        // Retirement permits the same terminal evidence, never a replacement incarnation.
+        // Attach always has a live runtime; subsequent reads retain that exact object.
+        const capturedRuntime = Option.getOrUndefined(workRuntime) ?? binding?.runtime;
+        if (capturedRuntime === undefined) return yield* liveError("runtime_unavailable");
         return {
           row,
           runtime: runtime.runtime,
@@ -1170,6 +1195,11 @@ export const layer: Layer.Layer<
           run,
           attempt,
           turn,
+          workBinding: {
+            runtime: capturedRuntime,
+            providerThreadId: providerThread.id,
+            providerTurnId: turn.id,
+          },
         };
       }).pipe(Effect.mapError(toLiveError));
     }
@@ -1256,7 +1286,7 @@ export const layer: Layer.Layer<
           ...(final
             ? {
                 finalMessageId: final.finalMessageId,
-                references: context.references,
+                references: final.references,
               }
             : {}),
         });
@@ -1280,7 +1310,8 @@ export const layer: Layer.Layer<
           final &&
           (!freshFinal ||
             freshFinal.finalMessageId !== final.finalMessageId ||
-            freshFinal.text !== final.text)
+            freshFinal.text !== final.text ||
+            encodeReceipt(freshFinal.references) !== encodeReceipt(final.references))
         )
           return true;
         yield* ensurePrincipal(observation.principal);
@@ -1293,6 +1324,7 @@ export const layer: Layer.Layer<
         )
           return false;
         observation.lastClaim = claim;
+        observation.claimedFinalReferences = final?.references ?? null;
         observation.delivery = "claimed";
         const speech = yield* Effect.exit(
           fresh.runtime.liveVoice!.appendSpeech({
@@ -1432,6 +1464,8 @@ export const layer: Layer.Layer<
                   completion: input.completion,
                 }),
                 state: "active",
+                workBinding: null,
+                claimedFinalReferences: null,
                 lastClaim: null,
                 delivery: "none",
               };
@@ -1450,11 +1484,13 @@ export const layer: Layer.Layer<
                 return observationReceipt(existing);
               }
               if (!input.progress && !input.completion) return yield* liveError("invalid_state");
-              const evidence = yield* readObservation(candidate, true);
               if (existing) {
                 if (existing.body !== candidate.body) return yield* liveError("dispatch_conflict");
+                yield* readObservation(existing);
                 return observationReceipt(existing);
               }
+              const evidence = yield* readObservation(candidate, true);
+              candidate.workBinding = evidence.workBinding;
               const afterSequence = yield* threads
                 .getThreadEventSequence(evidence.projection.thread.id)
                 .pipe(Effect.mapError(toLiveError));
