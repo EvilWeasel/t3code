@@ -1,4 +1,5 @@
 import * as Effect from "effect/Effect";
+import * as Data from "effect/Data";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
@@ -15,6 +16,10 @@ import * as ManagedRelay from "../relay/managedRelay.ts";
 import { executeAuthenticatedEnvironmentHttpRequest } from "./environmentHttpAuth.ts";
 import type { VoiceTranscriptionSettingsInput } from "@t3tools/contracts";
 
+export class VoiceSettingsStorageUnavailable extends Data.TaggedError(
+  "VoiceSettingsStorageUnavailable",
+)<{}> {}
+
 export const requestEnvironmentVoiceSettings = (input: {
   readonly prepared: PreparedConnection;
   readonly signer: Option.Option<ManagedRelay.ManagedRelayDpopSigner["Service"]>;
@@ -23,16 +28,27 @@ export const requestEnvironmentVoiceSettings = (input: {
   >;
   readonly update?: typeof VoiceTranscriptionSettingsInput.Type;
 }) =>
-  executeAuthenticatedEnvironmentHttpRequest({
-    ...input,
-    group: "voice",
-    method: input.update ? "PUT" : "GET",
-    timeoutMs: 15_000,
-    url: (urls) => urls.voiceSettings(),
-    request: ({ client, headers }) =>
-      input.update
-        ? client.updateVoiceSettings({ payload: input.update, headers })
-        : client.voiceSettings({ headers }),
+  Effect.gen(function* () {
+    const request = (update?: typeof VoiceTranscriptionSettingsInput.Type) =>
+      executeAuthenticatedEnvironmentHttpRequest({
+        ...input,
+        group: "voice",
+        method: update ? "PUT" : "GET",
+        timeoutMs: 15_000,
+        url: (urls) => urls.voiceSettings(),
+        request: ({ client, headers }) =>
+          update
+            ? client.updateVoiceSettings({ payload: update, headers })
+            : client.voiceSettings({ headers }),
+      });
+    if (input.update?.apiKey?.trim()) {
+      // Enforce this at the transport boundary, even if an older/remounted UI
+      // still offers Save. Never send a new key to a plaintext-storage backend.
+      const current = yield* request();
+      if (current.supportsEncryptedApiKeyStorage !== true)
+        return yield* new VoiceSettingsStorageUnavailable();
+    }
+    return yield* request(input.update);
   });
 
 const TRANSCRIPTION_RESPONSE = Schema.Struct({ transcript: Schema.String });

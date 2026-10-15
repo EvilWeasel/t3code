@@ -9,7 +9,10 @@ import {
   type PreparedConnection,
 } from "../connection/model.ts";
 import * as RpcHttp from "../rpc/http.ts";
-import { transcribeEnvironmentVoiceRecording } from "./voiceTranscriptionHttp.ts";
+import {
+  requestEnvironmentVoiceSettings,
+  transcribeEnvironmentVoiceRecording,
+} from "./voiceTranscriptionHttp.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-voice-test"),
@@ -25,6 +28,145 @@ const PREPARED: PreparedConnection = {
   httpAuthorization: { _tag: "Bearer", token: "environment-session-token" },
   target: TARGET,
 };
+
+const SETTINGS = {
+  provider: "openai-api" as const,
+  instanceId: null,
+  model: "gpt-transcribe",
+  apiKeyConfigured: false,
+  apiKeySource: "none" as const,
+  available: false,
+  message: "Add a key on this environment.",
+  instances: [],
+};
+
+const jsonBody = (body: unknown) =>
+  JSON.parse(body instanceof Uint8Array ? new TextDecoder().decode(body) : String(body));
+
+describe("requestEnvironmentVoiceSettings", () => {
+  it.effect("checks the selected destination's encrypted storage before sending a new key", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ url: string; method: string; headers: Headers; body: unknown }> = [];
+      const fetchFn = ((url, init) => {
+        calls.push({
+          url: String(url),
+          method: init?.method ?? "GET",
+          headers: new Headers(init?.headers),
+          body: init?.body,
+        });
+        return Promise.resolve(
+          Response.json({
+            ...SETTINGS,
+            supportsEncryptedApiKeyStorage: true,
+            ...(init?.method === "PUT"
+              ? { apiKeyConfigured: true, apiKeySource: "saved", available: true }
+              : {}),
+          }),
+        );
+      }) satisfies typeof fetch;
+      const result = yield* requestEnvironmentVoiceSettings({
+        prepared: PREPARED,
+        signer: Option.none(),
+        update: {
+          provider: "openai-api",
+          instanceId: null,
+          model: "gpt-transcribe",
+          apiKey: "synthetic-key",
+        },
+      }).pipe(Effect.provide(RpcHttp.layerRemoteHttpClient(fetchFn)));
+      expect(result.apiKeyConfigured).toBe(true);
+      expect(result.available).toBe(true);
+      expect(calls.map((call) => call.method)).toEqual(["GET", "PUT"]);
+      for (const call of calls) {
+        expect(call.url).toBe("https://remote-environment.example.test/api/voice/settings");
+        expect(call.headers.get("authorization")).toBe("Bearer environment-session-token");
+      }
+      expect(calls[0]!.body).toBeUndefined();
+      expect(jsonBody(calls[1]!.body)).toMatchObject({ apiKey: "synthetic-key" });
+      expect(result).not.toHaveProperty("apiKey");
+    }),
+  );
+
+  it.effect("does not send a key to a legacy server without encryption capability", () =>
+    Effect.gen(function* () {
+      const methods: string[] = [];
+      const fetchFn = ((_url, init) => {
+        methods.push(init?.method ?? "GET");
+        expect(init?.body).toBeUndefined();
+        return Promise.resolve(Response.json(SETTINGS));
+      }) satisfies typeof fetch;
+      const failure = yield* requestEnvironmentVoiceSettings({
+        prepared: PREPARED,
+        signer: Option.none(),
+        update: {
+          provider: "openai-api",
+          instanceId: null,
+          model: "gpt-transcribe",
+          apiKey: "synthetic-key",
+        },
+      }).pipe(Effect.provide(RpcHttp.layerRemoteHttpClient(fetchFn)), Effect.flip);
+      expect(failure._tag).toBe("VoiceSettingsStorageUnavailable");
+      expect(methods).toEqual(["GET"]);
+      expect(JSON.stringify(failure)).not.toContain("synthetic-key");
+    }),
+  );
+
+  it.effect("keeps an unchanged key omitted and permits explicit removal on a legacy backend", () =>
+    Effect.gen(function* () {
+      const bodies: unknown[] = [];
+      const fetchFn = ((_url, init) => {
+        expect(init?.method).toBe("PUT");
+        bodies.push(jsonBody(init?.body));
+        return Promise.resolve(Response.json(SETTINGS));
+      }) satisfies typeof fetch;
+      for (const update of [
+        { provider: "openai-api" as const, instanceId: null, model: "gpt-transcribe" },
+        {
+          provider: "openai-api" as const,
+          instanceId: null,
+          model: "gpt-transcribe",
+          apiKey: null,
+        },
+      ]) {
+        yield* requestEnvironmentVoiceSettings({
+          prepared: PREPARED,
+          signer: Option.none(),
+          update,
+        }).pipe(Effect.provide(RpcHttp.layerRemoteHttpClient(fetchFn)));
+      }
+      expect(bodies[0]).not.toHaveProperty("apiKey");
+      expect(bodies[1]).toHaveProperty("apiKey", null);
+    }),
+  );
+
+  it.effect(
+    "preserves actual permission denial instead of turning it into provider unavailability",
+    () =>
+      Effect.gen(function* () {
+        const fetchFn = (() =>
+          Promise.resolve(
+            Response.json(
+              {
+                _tag: "EnvironmentScopeRequiredError",
+                code: "insufficient_scope",
+                requiredScope: "orchestration:operate",
+                requiredPermission: "settings:write",
+                traceId: "voice-settings-denial",
+              },
+              { status: 403 },
+            ),
+          )) satisfies typeof fetch;
+        const failure = yield* requestEnvironmentVoiceSettings({
+          prepared: PREPARED,
+          signer: Option.none(),
+          update: { provider: "openai-api", instanceId: null, model: "gpt-transcribe" },
+        }).pipe(Effect.provide(RpcHttp.layerRemoteHttpClient(fetchFn)), Effect.flip);
+        expect(failure._tag).toBe("EnvironmentScopeRequiredError");
+        if (failure._tag === "EnvironmentScopeRequiredError")
+          expect(failure.requiredPermission).toBe("settings:write");
+      }),
+  );
+});
 
 describe("transcribeEnvironmentVoiceRecording", () => {
   it.effect(
