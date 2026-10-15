@@ -4803,6 +4803,7 @@ it.effect(
           };
           const runId = allocator.derive.run({ threadId, ordinal: 1 });
           const attemptId = allocator.derive.runAttempt({ runId, attemptOrdinal: 1 });
+          const rootNodeId = allocator.derive.rootNode({ runId });
           const run: OrchestrationV2Run = {
             id: runId,
             threadId,
@@ -4811,7 +4812,7 @@ it.effect(
             modelSelection,
             providerThreadId: providerThread.id,
             userMessageId: yield* allocator.allocate.message({ threadId, ordinal: 1 }),
-            rootNodeId: null,
+            rootNodeId,
             activeAttemptId: attemptId,
             status: "running",
             queuePosition: null,
@@ -4832,6 +4833,27 @@ it.effect(
                 occurredAt: now,
                 payload: run,
               },
+              {
+                id: yield* allocator.allocate.event({ threadId }),
+                type: "run-attempt.created",
+                providerInstanceId: modelSelection.instanceId,
+                threadId,
+                runId,
+                occurredAt: now,
+                payload: {
+                  id: attemptId,
+                  runId,
+                  attemptOrdinal: 1,
+                  rootNodeId,
+                  providerInstanceId: modelSelection.instanceId,
+                  providerThreadId: providerThread.id,
+                  providerTurnId: null,
+                  reason: "initial",
+                  status: "running",
+                  startedAt: now,
+                  completedAt: null,
+                },
+              },
             ],
           });
           const turn = {
@@ -4840,7 +4862,7 @@ it.effect(
               nativeTurnId: "ordered-cut-turn",
             }),
             providerThreadId: providerThread.id,
-            nodeId: allocator.derive.rootNode({ runId }),
+            nodeId: rootNodeId,
             runAttemptId: attemptId,
             nativeTurnRef: null,
             ordinal: 1,
@@ -4862,11 +4884,15 @@ it.effect(
             driver: CODEX_DRIVER,
             providerTurn: turn,
           });
-          assert.equal(
-            restartContinuationRun(yield* projections.getRuntimeRecoveryProjection(threadId), now)
-              ?.id,
-            runId,
-          );
+          const initial = yield* projections.getRuntimeRecoveryProjection(threadId);
+          const persistedAttempt = initial.attempts.find((attempt) => attempt.id === attemptId);
+          assert.equal(persistedAttempt?.runId, runId);
+          assert.equal(persistedAttempt?.rootNodeId, rootNodeId);
+          assert.equal(persistedAttempt?.providerThreadId, providerThread.id);
+          const persistedTurn = initial.providerTurns.find((candidate) => candidate.id === turn.id);
+          assert.equal(persistedTurn?.runAttemptId, attemptId);
+          assert.equal(persistedTurn?.status, "running");
+          assert.equal(restartContinuationRun(initial, now)?.id, runId);
           const terminalEvent = {
             type: "turn.terminal" as const,
             driver: CODEX_DRIVER,
@@ -4971,9 +4997,13 @@ it.effect(
           yield* Deferred.await(drained);
           yield* Deferred.await(terminalSettled);
           assert.equal(gate.pendingNative(), 0);
-          const final = yield* projections.getRuntimeRecoveryProjection(threadId);
-          assert.equal(final.providerTurns[0]?.status, "completed");
+          const final = yield* projections.getThreadProjection(threadId);
+          const completedTurn = final.providerTurns.find((candidate) => candidate.id === turn.id);
+          assert.equal(completedTurn?.runAttemptId, attemptId);
+          assert.equal(completedTurn?.status, "completed");
           assert.isUndefined(restartContinuationRun(final, now));
+          const recovery = yield* projections.getRuntimeRecoveryProjection(threadId);
+          assert.isUndefined(restartContinuationRun(recovery, now));
         }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
       }),
     ),
