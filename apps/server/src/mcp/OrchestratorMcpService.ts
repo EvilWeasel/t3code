@@ -962,13 +962,13 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const commandId = stableCommandId({ scope, operation, requestKey: clientRequestId });
       const retry = yield* threadManagement.hasReceipt(commandId);
+      const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(
+        canonicalValue(input),
+      ).pipe(
+        Effect.mapError(() => failure("invalid_request", "Could not encode the external request.")),
+      );
       const bytes = yield* crypto
-        .digest(
-          "SHA-256",
-          new TextEncoder().encode(
-            Schema.encodeSync(Schema.UnknownFromJsonString)(canonicalValue(input)),
-          ),
-        )
+        .digest("SHA-256", new TextEncoder().encode(encoded))
         .pipe(
           Effect.mapError(() =>
             failure("orchestration_error", "Could not bind the external request."),

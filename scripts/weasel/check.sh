@@ -98,6 +98,7 @@ for execution_test in "${execution_tests[@]}"; do
 done
 native_integration_tests=(
   packages/contracts/src/orchestratorMcp.test.ts
+  packages/contracts/src/jarvis.test.ts
   apps/server/src/mcp/OrchestratorMcpService.test.ts
   apps/server/src/mcp/OrchestratorMcpToolkit.integration.test.ts
 )
