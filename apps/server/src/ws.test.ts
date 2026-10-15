@@ -2,6 +2,15 @@ import { readMainRendererDiagnosticsForTarget } from "./ws.ts";
 import { assert, it } from "@effect/vitest";
 import {
   ORCHESTRATION_PROTOCOL_VERSION,
+  WS_METHODS,
+  WsRpcGroup,
+  AuthOrchestrationReadScope,
+  AgentObservatoryReadError,
+  AgentObservatoryNativeRosterPage,
+  type AgentObservatoryRead,
+  type AgentObservatorySubscribeInput,
+  type AgentObservatoryReadNativeRosterInput,
+  type AgentObservatorySubscribeNativeRosterInput,
   ProjectId,
   ThreadId,
   type OrchestrationV2StoredEvent,
@@ -21,6 +30,10 @@ import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as RpcTest from "effect/rpc/RpcTest";
+import * as Schema from "effect/Schema";
+import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
+import { AgentObservatoryRefusal } from "./observatory/AgentObservatoryPorts.ts";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -33,6 +46,7 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ProjectEnrichment from "./project/ProjectEnrichmentService.ts";
 import * as ProjectService from "./project/ProjectService.ts";
 import {
+  agentObservatoryReadHandlers,
   hasCompatibleOrchestrationProtocol,
   resolveAvailableEditorsForConfig,
   shouldUseBoundedThreadSnapshot,
@@ -413,4 +427,136 @@ it.effect(
       );
       assert.equal(connections, 1);
     }),
+);
+
+it.effect(
+  "delegates registered observatory unary and streams to the same read service without write authority",
+  () =>
+    Effect.gen(function* () {
+      type ObservatoryTag =
+        | typeof WS_METHODS.agentObservatorySubscribe
+        | typeof WS_METHODS.agentObservatoryReadNativeRoster
+        | typeof WS_METHODS.agentObservatorySubscribeNativeRoster;
+      const methods = [
+        WS_METHODS.agentObservatorySubscribe,
+        WS_METHODS.agentObservatoryReadNativeRoster,
+        WS_METHODS.agentObservatorySubscribeNativeRoster,
+      ];
+      const group = WsRpcGroup.omit(
+        ...[...WsRpcGroup.requests.keys()].filter(
+          (
+            tag,
+          ): tag is Exclude<keyof typeof RpcAuthorization.RPC_REQUIRED_SCOPES, ObservatoryTag> =>
+            !methods.some((method) => method === tag),
+        ),
+      );
+      const page = yield* Schema.decodeUnknownEffect(
+        Schema.toCodecJson(AgentObservatoryNativeRosterPage),
+      )({
+        environmentId: "destination",
+        threadIds: ["thread:a", "thread:b"],
+        source: "canonical-subagent-index",
+        coverage: "recorded-current-only",
+        throughSequence: 17,
+        status: "partial",
+        agents: [],
+        nextCursor: {
+          environmentId: "destination",
+          threadIds: ["thread:a", "thread:b"],
+          throughSequence: 17,
+          afterId: "child:last",
+        },
+      });
+      const read = {
+        environmentId: page.environmentId,
+        threadId: ThreadId.make("thread:a"),
+        status: "stale",
+        throughSequence: 11,
+        snapshot: null,
+      } satisfies AgentObservatoryRead;
+      const calls: unknown[] = [];
+      let refuse = false;
+      const service = {
+        subscribe: (input: AgentObservatorySubscribeInput) =>
+          Stream.suspend(() => {
+            calls.push({ method: "subscribe", input });
+            return refuse
+              ? Stream.fail(new AgentObservatoryRefusal({ reason: "stale_owner" }))
+              : Stream.make(read);
+          }),
+        readNativeRoster: (input: AgentObservatoryReadNativeRosterInput) =>
+          Effect.suspend(() => {
+            calls.push({ method: "readNativeRoster", input });
+            return refuse
+              ? Effect.fail(new AgentObservatoryRefusal({ reason: "revision_conflict" }))
+              : Effect.succeed(page);
+          }),
+        subscribeNativeRoster: (input: AgentObservatorySubscribeNativeRosterInput) =>
+          Stream.suspend(() => {
+            calls.push({ method: "subscribeNativeRoster", input });
+            return refuse
+              ? Stream.fail(new AgentObservatoryRefusal({ reason: "request_conflict" }))
+              : Stream.make(page);
+          }),
+      };
+      const handlers = agentObservatoryReadHandlers(service);
+      const client = yield* RpcTest.makeClient(group).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            group.toLayer(handlers),
+            RpcAuthorization.layer([AuthOrchestrationReadScope]),
+          ),
+        ),
+      );
+      const selector = {
+        threadIds: [ThreadId.make("thread:b"), ThreadId.make("thread:a")],
+        limit: 2,
+      };
+      const unary = { ...selector, cursor: page.nextCursor! };
+      assert.deepEqual(yield* client[WS_METHODS.agentObservatoryReadNativeRoster](unary), page);
+      assert.deepEqual(
+        yield* client[WS_METHODS.agentObservatorySubscribe]({ threadId: read.threadId }).pipe(
+          Stream.runCollect,
+        ),
+        [read],
+      );
+      assert.deepEqual(
+        yield* client[WS_METHODS.agentObservatorySubscribeNativeRoster](selector).pipe(
+          Stream.runCollect,
+        ),
+        [page],
+      );
+      assert.deepEqual(calls, [
+        { method: "readNativeRoster", input: unary },
+        { method: "subscribe", input: { threadId: read.threadId } },
+        { method: "subscribeNativeRoster", input: selector },
+      ]);
+      // The helper does not fabricate/normalize a page or follow nextCursor. The service owns both.
+      assert.deepEqual(
+        Object.keys(handlers).sort(),
+        [
+          WS_METHODS.agentObservatorySubscribe,
+          WS_METHODS.agentObservatoryReadNativeRoster,
+          WS_METHODS.agentObservatorySubscribeNativeRoster,
+        ].sort(),
+      );
+      refuse = true;
+      const failures = [
+        yield* client[WS_METHODS.agentObservatoryReadNativeRoster](selector).pipe(Effect.flip),
+        yield* client[WS_METHODS.agentObservatorySubscribe]({ threadId: read.threadId }).pipe(
+          Stream.runCollect,
+          Effect.flip,
+        ),
+        yield* client[WS_METHODS.agentObservatorySubscribeNativeRoster](selector).pipe(
+          Stream.runCollect,
+          Effect.flip,
+        ),
+      ];
+      for (const failure of failures) {
+        assert.instanceOf(failure, AgentObservatoryReadError);
+        assert.equal(failure.message, "Agent observatory data is unavailable.");
+        for (const field of ["reason", "cause", "owner"])
+          assert.isFalse(Object.hasOwn(failure, field));
+      }
+    }).pipe(Effect.scoped),
 );

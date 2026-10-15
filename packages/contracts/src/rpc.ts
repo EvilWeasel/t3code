@@ -1928,7 +1928,7 @@ const WsAgentObservatorySubscribeRpc = Rpc.make(WS_METHODS.agentObservatorySubsc
       decode: SchemaGetter.transformEffect((raw: unknown) =>
         Schema.decodeUnknownEffect(AgentObservatorySubscribeInput, { onExcessProperty: "error" })(
           raw,
-        ),
+        ).pipe(Effect.mapError((error) => error.issue)),
       ),
       encode: SchemaGetter.transform((value) => value),
     }),
@@ -1945,7 +1945,7 @@ const WsAgentObservatoryReadNativeRosterRpc = Rpc.make(
         decode: SchemaGetter.transformEffect((raw: unknown) =>
           Schema.decodeUnknownEffect(AgentObservatoryReadNativeRosterInput, {
             onExcessProperty: "error",
-          })(raw),
+          })(raw).pipe(Effect.mapError((error) => error.issue)),
         ),
         encode: SchemaGetter.transform((value) => value),
       }),
@@ -1962,7 +1962,7 @@ const WsAgentObservatorySubscribeNativeRosterRpc = Rpc.make(
         decode: SchemaGetter.transformEffect((raw: unknown) =>
           Schema.decodeUnknownEffect(AgentObservatorySubscribeNativeRosterInput, {
             onExcessProperty: "error",
-          })(raw),
+          })(raw).pipe(Effect.mapError((error) => error.issue)),
         ),
         encode: SchemaGetter.transform((value) => value),
       }),
