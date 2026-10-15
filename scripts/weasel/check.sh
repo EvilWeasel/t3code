@@ -95,6 +95,21 @@ for server_continuation_test in "${server_continuation_tests[@]}"; do
   fi
   focused_tests+=("$server_continuation_test")
 done
+proton_autofill_tests=(
+  apps/desktop/src/preview/ProtonPassCli.test.ts
+  apps/desktop/src/preview/ProtonPassAutofill.test.ts
+  apps/desktop/src/preview/ProtonPassAutofillMenu.test.ts
+  apps/desktop/src/preview/DesktopBrowserHost.test.ts
+  apps/desktop/src/preview/Manager.test.ts
+  apps/desktop/src/window/DesktopWindow.test.ts
+)
+for proton_autofill_test in "${proton_autofill_tests[@]}"; do
+  if [[ ! -f "$proton_autofill_test" ]]; then
+    echo "Required Proton autofill gate is missing: $proton_autofill_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$proton_autofill_test")
+done
 automatic_update_tests=(
   apps/desktop/src/backend/DesktopBackendManager.test.ts
   apps/desktop/src/backend/DesktopBackendPool.test.ts
