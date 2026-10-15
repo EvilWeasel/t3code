@@ -47,6 +47,7 @@ export interface UpdatesHarnessOptions {
   readonly backendSnapshot?: DesktopBackendPool.DesktopBackendInstance["snapshot"];
   /** Contents of the install record a previous run left behind. */
   readonly installRecord?: string | undefined;
+  readonly beforeWriteInstallRecord?: Effect.Effect<void>;
 }
 
 export function makeHarness(options: UpdatesHarnessOptions = {}) {
@@ -103,11 +104,22 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     downloadUpdate: Effect.sync(() => {
       downloadCount += 1;
     }).pipe(Effect.andThen(options.downloadUpdate ?? Effect.void)),
-    quitAndInstall: () =>
-      Effect.sync(() => {
+    quitAndInstall: ({ beforeInstall }) =>
+      Effect.try({
+        try: () => {
+          if (beforeInstall !== undefined) {
+            let admitted: boolean;
+            try { admitted = beforeInstall(); }
+            catch { throw new ElectronUpdater.ElectronUpdaterInstallAdmissionError({ reason: "probe-failed" }); }
+            if (!admitted) throw new ElectronUpdater.ElectronUpdaterInstallAdmissionError({ reason: "refused" });
+          }
+        },
+        catch: (cause) => cause instanceof ElectronUpdater.ElectronUpdaterInstallAdmissionError
+          ? cause : new ElectronUpdater.ElectronUpdaterInstallAdmissionError({ reason: "probe-failed" }),
+      }).pipe(Effect.andThen(Effect.sync(() => {
         quitAndInstallCount += 1;
         installSteps.push("quitAndInstall");
-      }).pipe(Effect.andThen(options.quitAndInstall ?? Effect.void)),
+      })), Effect.andThen(options.quitAndInstall ?? Effect.void)),
     on: (eventName, listener) =>
       Effect.acquireRelease(
         Effect.sync(() => {
@@ -262,10 +274,10 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     },
     makeDirectory: () => Effect.void,
     writeFileString: (path, data) =>
-      Effect.sync(() => {
+      (isInstallRecord(path) ? options.beforeWriteInstallRecord ?? Effect.void : Effect.void).pipe(Effect.andThen(Effect.sync(() => {
         if (isInstallRecord(path)) installRecords.set(path, data);
         else updateRestartMarkers.add(path);
-      }),
+      }))),
     remove: (path) =>
       Effect.sync(() => {
         updateRestartMarkers.delete(path);

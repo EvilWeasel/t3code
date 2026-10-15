@@ -115,6 +115,29 @@ describe("ElectronUpdater", () => {
     }).pipe(Effect.provide(ElectronUpdater.layer)),
   );
 
+  it.effect("refuses a false or throwing live guard without calling the native installer", () =>
+    Effect.gen(function* () {
+      const updater = yield* ElectronUpdater.ElectronUpdater;
+      for (const beforeInstall of [() => false, () => { throw new Error("probe unavailable"); }]) {
+        const error = yield* updater.quitAndInstall({ isSilent: true, isForceRunAfter: true, beforeInstall }).pipe(Effect.flip);
+        assert.instanceOf(error, ElectronUpdater.ElectronUpdaterInstallAdmissionError);
+        assert.equal(autoUpdaterMock.quitAndInstall.mock.calls.length, 0);
+      }
+    }).pipe(Effect.provide(ElectronUpdater.layer)),
+  );
+
+  it.effect("calls the live guard immediately before the existing native installer", () =>
+    Effect.gen(function* () {
+      const steps: string[] = [];
+      const updater = yield* ElectronUpdater.ElectronUpdater;
+      autoUpdaterMock.quitAndInstall.mockImplementationOnce(() => { steps.push("native"); });
+      yield* updater.quitAndInstall({ isSilent: true, isForceRunAfter: true,
+        beforeInstall: () => { steps.push("guard"); return true; },
+      });
+      assert.deepEqual(steps, ["guard", "native"]);
+    }).pipe(Effect.provide(ElectronUpdater.layer)),
+  );
+
   it.effect("preserves quit-and-install flags and the execution-time channel", () =>
     Effect.gen(function* () {
       const cause = new Error("quit and install failed");

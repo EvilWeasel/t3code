@@ -125,6 +125,45 @@ describe("DesktopUpdates", () => {
     }),
   );
 
+  it.effect("rechecks live proof at the installer after an asynchronous install-record write", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const recordStarted = yield* Deferred.make<void>();
+      const finishRecord = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      let valid = true;
+      const harness = makeHarness({
+        clientOnlyInventory: [],
+        runtimeReservation: { isValid: () => valid, tryCommit: () => true },
+        beforeWriteInstallRecord: Deferred.succeed(recordStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(finishRecord)),
+        ),
+        runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
+      });
+      yield* Effect.scoped(Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        const desktopState = yield* DesktopState.DesktopState;
+        yield* updates.configure;
+        yield* TestClock.adjust(Duration.seconds(15));
+        harness.emit("update-downloaded", { version: "1.2.4" });
+        yield* flushCallbacks;
+        yield* TestClock.adjust(Duration.seconds(45));
+        yield* Deferred.await(recordStarted);
+        // Actual I/O yields after tryCommit. A creator/activity event can revoke
+        // the same token before the adapter invokes its native installer.
+        valid = false;
+        yield* Deferred.succeed(finishRecord, undefined);
+        yield* Deferred.await(released);
+        assert.equal(harness.quitAndInstalls(), 0);
+        assert.equal(harness.stopCount(), 0);
+        assert.isFalse(yield* Ref.get(desktopState.quitting));
+        const state = yield* updates.getState;
+        assert.equal(state.status, "downloaded");
+        assert.equal(state.downloadedVersion, "1.2.4");
+        assert.isUndefined(state.installLease);
+      })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+    })),
+  );
+
   it.effect("releases a committed client window after an asynchronous installer failure without starting backends", () => {
     let released = false;
     const harness = makeHarness({ clientOnlyInventory: [], onRuntimeReservationReleased: () => { released = true; } });

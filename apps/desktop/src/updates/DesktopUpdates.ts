@@ -750,7 +750,7 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const installDownloadedUpdate = (expectedVersion?: string, clientOnly = false) =>
+  const installDownloadedUpdate = (expectedVersion?: string, clientOnly = false, runtime?: DesktopUpdateRuntimeReservation) =>
     Effect.scoped(
       Effect.gen(function* () {
         const actionCompletions = yield* PubSub.subscribe(finishedUpdateActions);
@@ -824,10 +824,16 @@ export const make = Effect.gen(function* () {
           yield* electronUpdater.quitAndInstall({
             isSilent: true,
             isForceRunAfter: true,
+            ...(clientOnly ? { beforeInstall: () => runtime?.isValid() === true } : {}),
           });
           return { accepted: true, completed: false, failed: false };
         }).pipe(
           Effect.catchTags({
+            ElectronUpdaterInstallAdmissionError: () => clientOnly
+              ? resetInstallAction.pipe(Effect.as({ accepted: false, completed: false, failed: false }))
+              : recoverFailedInstall("Desktop update admission was revoked before installation.").pipe(
+                Effect.as({ accepted: true, completed: false, failed: true }),
+              ),
             ElectronUpdaterQuitAndInstallError: Effect.fn("desktop.updates.handleInstallFailure")(
               function* (error) {
                 yield* recoverFailedInstall(error.message);
@@ -933,7 +939,7 @@ export const make = Effect.gen(function* () {
         generation, targetVersion, expiresAt, phase: "commit",
       } }));
       const completions = yield* PubSub.subscribe(finishedUpdateActions);
-      const result = yield* installDownloadedUpdate(targetVersion, true);
+      const result = yield* installDownloadedUpdate(targetVersion, true, runtime);
       // Keep register/unregister/start and window creation fenced until the
       // app exits. A failed installer releases through the surrounding scope.
       if (result.accepted && !result.failed) {

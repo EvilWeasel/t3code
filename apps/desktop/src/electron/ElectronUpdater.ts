@@ -68,10 +68,20 @@ export class ElectronUpdaterQuitAndInstallError extends Schema.TaggedError<Elect
   }
 }
 
+export class ElectronUpdaterInstallAdmissionError extends Schema.TaggedError<ElectronUpdaterInstallAdmissionError>()(
+  "ElectronUpdaterInstallAdmissionError",
+  { reason: Schema.Literals(["refused", "probe-failed"]) },
+) {
+  override get message(): string {
+    return "Desktop update admission is no longer valid.";
+  }
+}
+
 export const ElectronUpdaterError = Schema.Union([
   ElectronUpdaterCheckForUpdatesError,
   ElectronUpdaterDownloadUpdateError,
   ElectronUpdaterQuitAndInstallError,
+  ElectronUpdaterInstallAdmissionError,
 ]);
 export type ElectronUpdaterError = typeof ElectronUpdaterError.Type;
 
@@ -92,7 +102,8 @@ export class ElectronUpdater extends Context.Service<
     readonly quitAndInstall: (options: {
       readonly isSilent: boolean;
       readonly isForceRunAfter: boolean;
-    }) => Effect.Effect<void, ElectronUpdaterQuitAndInstallError>;
+      readonly beforeInstall?: () => boolean;
+    }) => Effect.Effect<void, ElectronUpdaterQuitAndInstallError | ElectronUpdaterInstallAdmissionError>;
     readonly on: <Args extends ReadonlyArray<unknown>>(
       eventName: string,
       listener: (...args: Args) => void,
@@ -161,11 +172,18 @@ export const make = ElectronUpdater.of({
       catch: (cause) => new ElectronUpdaterDownloadUpdateError({ channel, cause }),
     }).pipe(Effect.asVoid);
   }),
-  quitAndInstall: ({ isSilent, isForceRunAfter }) =>
+  quitAndInstall: ({ isSilent, isForceRunAfter, beforeInstall }) =>
     Effect.suspend(() => {
       const channel = currentUpdater().channel;
       return Effect.tryPromise({
         try: async () => {
+          if (beforeInstall !== undefined) {
+            let admitted: boolean;
+            try { admitted = beforeInstall(); }
+            catch { throw new ElectronUpdaterInstallAdmissionError({ reason: "probe-failed" }); }
+            if (!admitted) throw new ElectronUpdaterInstallAdmissionError({ reason: "refused" });
+          }
+          // No await between the live guard and the canonical native invocation.
           await quitAndInstallInPlace(currentUpdater(), {
             platform: process.platform,
             isPackaged: Electron.app.isPackaged,
@@ -174,7 +192,7 @@ export const make = ElectronUpdater.of({
             isForceRunAfter,
           });
         },
-        catch: (cause) =>
+        catch: (cause) => cause instanceof ElectronUpdaterInstallAdmissionError ? cause :
           new ElectronUpdaterQuitAndInstallError({
             channel,
             isSilent,
