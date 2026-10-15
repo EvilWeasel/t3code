@@ -278,7 +278,21 @@ export function advanceLiveVoiceDiagnosticModel(
     previous.gate.environmentId === gate.environmentId &&
     previous.gate.threadId === gate.threadId &&
     previous.gate.providerInstanceId === gate.providerInstanceId;
-  if (sameContext && JSON.stringify(previous.gate) === JSON.stringify(gate)) return previous;
+  const before = previous.gate;
+  const a = before.facts;
+  const b = gate.facts;
+  const sameFacts = a === b || (a !== null && b !== null &&
+    a.driver === b.driver && a.setupMode === b.setupMode &&
+    a.providerEnabled === b.providerEnabled && a.providerAvailable === b.providerAvailable &&
+    a.projectOverride === b.projectOverride && a.catalogState === b.catalogState &&
+    a.settingsKnown === b.settingsKnown && a.permissionState === b.permissionState &&
+    a.canOperate === b.canOperate && a.selectionCurrent === b.selectionCurrent);
+  if (sameContext && sameFacts && before.phase === gate.phase &&
+    before.targetPresent === gate.targetPresent && before.active === gate.active &&
+    before.busy === gate.busy && before.webRtcAvailable === gate.webRtcAvailable &&
+    before.microphoneApiAvailable === gate.microphoneApiAvailable &&
+    before.canStart === gate.canStart && before.reason === gate.reason &&
+    before.prepareFailure === gate.prepareFailure) return previous;
   return Object.freeze({
     epoch: sameContext ? previous.epoch : previous.epoch + 1,
     revision: sameContext ? previous.revision + 1 : 1,
