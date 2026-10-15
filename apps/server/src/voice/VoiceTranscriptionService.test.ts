@@ -1,4 +1,36 @@
 import { assert, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
+import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
+import * as ServerConfig from "../config.ts";
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
+import * as CodexInstallation from "../provider/CodexInstallation.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as VoiceService from "./VoiceTranscriptionService.ts";
+import { makeVoiceSettings } from "./VoiceSettings.ts";
+
+const recoveryNetwork = vi.hoisted(() => ({ calls: 0 }));
+vi.mock("effect/http/FetchHttpClient", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("effect/http/FetchHttpClient")>();
+  const Http = await import("effect/http/HttpClient");
+  const Fx = await import("effect/Effect");
+  const Layers = await import("effect/Layer");
+  return {
+    ...actual,
+    layer: Layers.succeed(
+      Http.HttpClient,
+      Http.make(() =>
+        Fx.sync(() => {
+          recoveryNetwork.calls += 1;
+        }).pipe(Fx.andThen(Fx.die("Unexpected provider HTTP call"))),
+      ),
+    ),
+  };
+});
 import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -447,3 +479,154 @@ it.effect("forces redirect rejection for provider HTTP requests", () =>
     assert.strictEqual(redirect, "error");
   }),
 );
+
+function recoveryServiceLayer(calls: { spawns: number }) {
+  const unexpected = Effect.die("Unexpected provider runtime access");
+  return VoiceService.layer.pipe(
+    Layer.provideMerge(ServerSettings.layerTest()),
+    Layer.provide(
+      Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
+        getInstance: () => Effect.succeed(undefined),
+        listInstances: Effect.succeed([]),
+        listUnavailable: Effect.succeed([]),
+        streamChanges: Stream.empty,
+        subscribeChanges: unexpected,
+      }),
+    ),
+    Layer.provide(
+      Layer.succeed(CodexInstallation.CodexInstallation, {
+        managedDirectory: "/fixture-unused-managed-runtime",
+        resolve: () => unexpected,
+        acquire: () => unexpected,
+        start: unexpected,
+        cancel: () => unexpected,
+        state: unexpected,
+        changes: Stream.empty,
+        remove: () => unexpected,
+      }),
+    ),
+    Layer.provide(
+      Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
+        getEnvironmentId: unexpected,
+      }),
+    ),
+    Layer.provide(
+      Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() =>
+          Effect.sync(() => {
+            calls.spawns += 1;
+          }).pipe(Effect.andThen(unexpected)),
+        ),
+      ),
+    ),
+    Layer.provideMerge(
+      ServerSecretStore.layer.pipe(
+        Layer.provideMerge(
+          ServerConfig.layerTest(process.cwd(), { prefix: "voice-service-recovery-" }),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+  );
+}
+
+it.effect(
+  "returns actionable settings for missing, tampered and legacy keys while transcription stays fail closed",
+  () => {
+    const calls = { spawns: 0 };
+    return Effect.gen(function* () {
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const previous = process.env.T3CODE_TRANSCRIPTION_API_KEY;
+          process.env.T3CODE_TRANSCRIPTION_API_KEY =
+            "fixture-environment-fallback-must-not-be-used";
+          return previous;
+        }),
+        (previous) =>
+          Effect.sync(() => {
+            if (previous === undefined) delete process.env.T3CODE_TRANSCRIPTION_API_KEY;
+            else process.env.T3CODE_TRANSCRIPTION_API_KEY = previous;
+          }),
+      );
+      const service = yield* VoiceService.VoiceTranscriptionService;
+      const preferences = yield* makeVoiceSettings;
+      const secrets = yield* ServerSecretStore.ServerSecretStore;
+      const settings = {
+        provider: "openai-api" as const,
+        instanceId: "retained-instance",
+        model: "retained-model",
+      };
+      const networkBefore = recoveryNetwork.calls;
+      for (const corruption of ["missing-wrapping-key", "tampered", "legacy"] as const) {
+        yield* preferences.write({ ...settings, apiKey: "fixture-private-api-key" });
+        const saved = yield* secrets.get("voice-transcription-api-key");
+        assert(Option.isSome(saved));
+        if (Option.isNone(saved)) return;
+        if (corruption === "missing-wrapping-key")
+          yield* secrets.remove("voice-transcription-wrapping-key");
+        else {
+          const invalid =
+            corruption === "legacy"
+              ? new TextEncoder().encode("fixture-opaque-legacy-key")
+              : Uint8Array.from(saved.value);
+          if (corruption === "tampered") invalid[invalid.length - 1]! ^= 1;
+          yield* secrets.set("voice-transcription-api-key", invalid);
+        }
+        const original = yield* secrets.get("voice-transcription-api-key");
+        const wrapping = yield* secrets.get("voice-transcription-wrapping-key");
+        const metadata = yield* service.getSettings;
+        assert.equal(metadata.provider, settings.provider);
+        assert.equal(metadata.instanceId, settings.instanceId);
+        assert.equal(metadata.model, settings.model);
+        assert.isFalse(metadata.available);
+        assert.isFalse(metadata.apiKeyConfigured);
+        assert.equal(metadata.apiKeySource, "saved");
+        assert.isTrue(metadata.supportsEncryptedApiKeyStorage);
+        assert.include(metadata.message ?? "", "Save the key again on this environment");
+        assert.isFalse(JSON.stringify(metadata).includes("fixture-private-api-key"));
+        const denied = yield* service
+          .transcribe({
+            bytes: new Uint8Array([1]),
+            contentType: "audio/wav",
+            fileName: "fixture.wav",
+          })
+          .pipe(Effect.result);
+        assert.equal(denied._tag, "Failure");
+        if (denied._tag === "Failure") {
+          assert.equal(denied.failure.reason, "provider_unavailable");
+          assert.equal(denied.failure.detail, "Transcription settings could not be read.");
+        }
+        assert.deepEqual(yield* secrets.get("voice-transcription-api-key"), original);
+        assert.deepEqual(yield* secrets.get("voice-transcription-wrapping-key"), wrapping);
+      }
+      assert.equal(recoveryNetwork.calls, networkBefore);
+      assert.equal(calls.spawns, 0);
+      yield* preferences.write({ ...settings, apiKey: "fixture-explicitly-replaced-key" });
+      const restored = yield* service.getSettings;
+      assert.isTrue(restored.available);
+      assert.isTrue(restored.apiKeyConfigured);
+      assert.equal(restored.apiKeySource, "saved");
+      assert.notInclude(restored.message ?? "", "cannot be read");
+    }).pipe(Effect.provide(recoveryServiceLayer(calls)), Effect.scoped);
+  },
+);
+
+it.effect("does not present unrelated preference read failures as credential recovery", () => {
+  const calls = { spawns: 0 };
+  return Effect.gen(function* () {
+    const service = yield* VoiceService.VoiceTranscriptionService;
+    const config = yield* ServerConfig.ServerConfig;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const filename = path.join(config.stateDir, "voice-transcription.json");
+    const networkBefore = recoveryNetwork.calls;
+    yield* fs.writeFileString(filename, "{invalid-json");
+    assert.equal((yield* service.getSettings.pipe(Effect.result))._tag, "Failure");
+    yield* fs.remove(filename);
+    yield* fs.makeDirectory(filename);
+    assert.equal((yield* service.getSettings.pipe(Effect.result))._tag, "Failure");
+    assert.equal(calls.spawns, 0);
+    assert.equal(recoveryNetwork.calls, networkBefore);
+  }).pipe(Effect.provide(recoveryServiceLayer(calls)), Effect.scoped);
+});

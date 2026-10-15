@@ -96,3 +96,72 @@ it.effect("rejects tampering, missing wrapping keys and plaintext without rewrit
     Effect.scoped,
   ),
 );
+
+it.effect("keeps settings metadata recoverable without repairing a missing wrapping key", () =>
+  Effect.gen(function* () {
+    const store = yield* makeVoiceSettings;
+    const secrets = yield* ServerSecretStore.ServerSecretStore;
+    const settings = { provider: "openai-api" as const, instanceId: null, model: "gpt-transcribe" };
+    yield* store.write({ ...settings, apiKey: "fixture-original" });
+    const original = yield* secrets.get("voice-transcription-api-key");
+    yield* secrets.remove("voice-transcription-wrapping-key");
+    assert.equal((yield* store.read.pipe(Effect.result))._tag, "Failure");
+    assert.deepEqual(yield* store.readForSettings, {
+      ...settings,
+      apiKey: undefined,
+      apiKeySource: "saved",
+      keyUnavailable: true,
+    });
+    assert.deepEqual(yield* secrets.get("voice-transcription-api-key"), original);
+    assert(Option.isNone(yield* secrets.get("voice-transcription-wrapping-key")));
+    yield* store.write(settings);
+    assert.equal((yield* store.read.pipe(Effect.result))._tag, "Failure");
+    assert.deepEqual(yield* secrets.get("voice-transcription-api-key"), original);
+    yield* store.write({ ...settings, apiKey: "fixture-explicit-replacement" });
+    assert.equal((yield* store.read).apiKey, "fixture-explicit-replacement");
+    assert.isFalse((yield* store.readForSettings).keyUnavailable);
+  }).pipe(
+    Effect.provide(
+      ServerSecretStore.layer.pipe(
+        Layer.provideMerge(
+          ServerConfig.layerTest(process.cwd(), { prefix: "voice-settings-recovery-" }),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+    Effect.scoped,
+  ),
+);
+
+it.effect("does not hide malformed preference files behind key recovery metadata", () =>
+  Effect.gen(function* () {
+    const store = yield* makeVoiceSettings;
+    const config = yield* ServerConfig.ServerConfig;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    yield* fs.writeFileString(
+      path.join(config.stateDir, "voice-transcription.json"),
+      "{invalid-json",
+    );
+    assert.equal((yield* store.readForSettings.pipe(Effect.result))._tag, "Failure");
+    yield* fs.writeFileString(
+      path.join(config.stateDir, "voice-transcription.json"),
+      JSON.stringify({ provider: "unsupported" }),
+    );
+    assert.equal((yield* store.readForSettings.pipe(Effect.result))._tag, "Failure");
+    const filename = path.join(config.stateDir, "voice-transcription.json");
+    yield* fs.remove(filename);
+    yield* fs.makeDirectory(filename);
+    assert.equal((yield* store.readForSettings.pipe(Effect.result))._tag, "Failure");
+  }).pipe(
+    Effect.provide(
+      ServerSecretStore.layer.pipe(
+        Layer.provideMerge(
+          ServerConfig.layerTest(process.cwd(), { prefix: "voice-settings-invalid-config-" }),
+        ),
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+    Effect.scoped,
+  ),
+);

@@ -73,9 +73,9 @@ export const makeVoiceSettings = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const lock = yield* Semaphore.make(1);
   const filename = path.join(server.stateDir, "voice-transcription.json");
-  const read = Effect.gen(function* () {
+  const readConfig = Effect.gen(function* () {
     const exists = yield* fs.exists(filename);
-    const config = exists
+    return exists
       ? yield* fs
           .readFileString(filename)
           .pipe(Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(Config))))
@@ -87,6 +87,9 @@ export const makeVoiceSettings = Effect.gen(function* () {
           instanceId: process.env.T3CODE_TRANSCRIPTION_CODEX_INSTANCE_ID ?? null,
           model: process.env.T3CODE_TRANSCRIPTION_MODEL || "gpt-transcribe",
         };
+  });
+  const read = Effect.gen(function* () {
+    const config = yield* readConfig;
     const stored = yield* secrets.get(SECRET);
     let apiKey = process.env.T3CODE_TRANSCRIPTION_API_KEY;
     if (Option.isSome(stored)) {
@@ -102,6 +105,23 @@ export const makeVoiceSettings = Effect.gen(function* () {
         : ("none" as const);
     return { ...config, apiKey, apiKeySource };
   }).pipe(Effect.withTracerEnabled(false));
+  // Settings remain recoverable without trusting or rewriting an unreadable key.
+  // Transcription continues to use the strict read above.
+  const readForSettings = read.pipe(
+    Effect.map((config) => ({ ...config, keyUnavailable: false })),
+    Effect.catchIf(
+      (error) => error instanceof VoiceSecretEncryptionError,
+      () =>
+        readConfig.pipe(
+          Effect.map((config) => ({
+            ...config,
+            apiKey: undefined,
+            apiKeySource: "saved" as const,
+            keyUnavailable: true,
+          })),
+        ),
+    ),
+  );
   const write = (input: typeof VoiceTranscriptionSettingsInput.Type) =>
     lock.withPermits(1)(
       Effect.gen(function* () {
@@ -122,5 +142,5 @@ export const makeVoiceSettings = Effect.gen(function* () {
         yield* fs.rename(`${filename}.tmp`, filename);
       }).pipe(Effect.withTracerEnabled(false)),
     );
-  return { read, write };
+  return { read, readForSettings, write };
 });

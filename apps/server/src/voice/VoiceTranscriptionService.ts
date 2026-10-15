@@ -467,7 +467,7 @@ export const layer = Layer.effect(
       ),
     );
     const getSettings = Effect.gen(function* () {
-      const config = yield* readPreferences;
+      const config = yield* preferences.readForSettings;
       const live = yield* registry.listInstances;
       const settings = yield* settingsService.getSettings;
       const candidates = live.filter((entry) => entry.driverKind === "codex" && entry.enabled);
@@ -486,9 +486,10 @@ export const layer = Layer.effect(
           instances.find((entry) => entry.id === "codex") ??
           instances[0]);
       const available =
-        config.provider === "openai-api"
+        !config.keyUnavailable &&
+        (config.provider === "openai-api"
           ? Boolean(config.apiKey)
-          : Boolean(selected?.authenticated);
+          : Boolean(selected?.authenticated));
       return {
         provider: config.provider,
         instanceId: config.instanceId,
@@ -498,8 +499,9 @@ export const layer = Layer.effect(
         apiKeySource: config.apiKeySource,
         available,
         instances,
-        message:
-          config.provider === "openai-api"
+        message: config.keyUnavailable
+          ? "The saved voice API key cannot be read. Save the key again on this environment to restore transcription. The existing key has not been changed."
+          : config.provider === "openai-api"
             ? config.apiKey
               ? "OpenAI API key configured on this environment."
               : "Add an OpenAI API key on this environment."
