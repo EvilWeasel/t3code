@@ -88,6 +88,7 @@ import {
   DispatchModeLimit,
   type DispatchModeRefusal,
 } from "../orchestration-v2/DispatchModeLimit.ts";
+import { runOutcome } from "../orchestration-v2/RestartBackgroundNote.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import { buildBoundedThreadStreamSnapshot } from "../orchestration-v2/ThreadStream.ts";
@@ -359,9 +360,9 @@ function invalidOptionSelections(
 }
 
 function taskStatusForRun(
-  run: Pick<OrchestrationV2Run, "status"> | undefined,
+  run: Pick<OrchestrationV2Run, "status" | "restartCancelledBackgroundWork"> | undefined,
 ): OrchestratorMcpDelegateTaskResult["status"] {
-  switch (run?.status) {
+  switch (run === undefined ? undefined : runOutcome(run)) {
     case "queued":
       return "queued";
     case "waiting":
@@ -1510,7 +1511,10 @@ const make = Effect.gen(function* () {
         task.result !== null
           ? task.result
           : taskResultRun !== undefined && isTerminalTaskStatus(status)
-            ? subagentResultForRun(childProjection, taskResultRun).text
+            ? subagentResultForRun(childProjection, {
+                ...taskResultRun,
+                status: runOutcome(taskResultRun),
+              }).text
             : null;
       const resultTransfers = parentProjection.contextTransfers.filter(
         (transfer) =>
@@ -1546,7 +1550,10 @@ const make = Effect.gen(function* () {
         latestTerminalSummary: canExposeTaskRunResult(terminalRun)
           ? terminalRun.id === childRun?.id
             ? derivedResult
-            : subagentResultForRun(childProjection, terminalRun).text
+            : subagentResultForRun(childProjection, {
+                ...terminalRun,
+                status: runOutcome(terminalRun),
+              }).text
           : null,
         latestTerminalResultContextTransferId: resultTransferForRun(terminalRun)?.id ?? null,
         waitTimedOut,
@@ -3027,7 +3034,7 @@ const make = Effect.gen(function* () {
         return {
           threadId: input.threadId,
           runId: result.run?.id ?? null,
-          status: result.run?.status ?? "idle",
+          status: result.run === null ? "idle" : runOutcome(result.run),
           timedOut: result.timedOut,
         } satisfies OrchestratorMcpThreadWaitResult;
       }),

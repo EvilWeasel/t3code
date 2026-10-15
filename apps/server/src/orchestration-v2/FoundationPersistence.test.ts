@@ -2084,6 +2084,52 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
     }),
   );
 
+  it.effect.each(["succeeded", "failed", "cancelled"] as const)(
+    "wakes shared settle waiters when an effect is %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const effectId = `effect:foundation-await-settled:${outcome}`;
+        yield* outbox.enqueue([
+          {
+            id: effectId,
+            commandId: CommandId.make(`command:foundation-await-settled:${outcome}`),
+            threadId: ThreadId.make(`thread:foundation-await-settled:${outcome}`),
+            request: {
+              type: "provider-runtime.continue",
+              sourceRunId: RunId.make("run:foundation-await-settled"),
+            },
+          },
+        ]);
+        const waiter = yield* outbox.awaitSettled(effectId).pipe(Effect.forkChild);
+        const sibling = yield* outbox.awaitSettled(effectId).pipe(Effect.forkChild);
+        const claimed = yield* outbox.claimNext({
+          workerId: "settle-worker",
+          leaseDurationMs: 30_000,
+        });
+        assert.isTrue(Option.isSome(claimed));
+        yield* Effect.yieldNow;
+        assert.isUndefined(waiter.pollUnsafe());
+
+        if (outcome === "succeeded") yield* outbox.succeed({ effectId, workerId: "settle-worker" });
+        else if (outcome === "failed")
+          yield* outbox.fail({ effectId, workerId: "settle-worker", error: "fixture failure" });
+        else {
+          const cancelled = yield* outbox.cancelUnsettled({
+            threadId: ThreadId.make(`thread:foundation-await-settled:${outcome}`),
+            effectTypes: ["provider-runtime.continue"],
+            reason: "fixture cancellation",
+          });
+          yield* outbox.signalCancellations(cancelled);
+        }
+        yield* Fiber.join(waiter);
+        yield* Fiber.join(sibling);
+        // A settled effect does not wait.
+        yield* outbox.awaitSettled(effectId);
+        yield* outbox.awaitSettled("effect:missing-settle-fixture");
+      }),
+  );
+
   it.effect("runs title generation beside critical work while serializing each lane", () =>
     Effect.gen(function* () {
       const outbox = yield* EffectOutbox.EffectOutboxV2;

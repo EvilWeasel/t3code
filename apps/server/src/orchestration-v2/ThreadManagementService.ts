@@ -486,6 +486,20 @@ export function latestRun(
   return projection.runs.toSorted((left, right) => right.ordinal - left.ordinal)[0];
 }
 
+/** The newest run in `run`'s restart continuation chain, or `run` itself. */
+function latestRestartContinuation(
+  runs: ReadonlyArray<OrchestrationV2Run>,
+  run: OrchestrationV2Run,
+): OrchestrationV2Run {
+  let current = run;
+  for (let hops = 0; hops < runs.length; hops++) {
+    const next = runs.find((candidate) => candidate.restartContinuationOfRunId === current.id);
+    if (next === undefined) break;
+    current = next;
+  }
+  return current;
+}
+
 export function latestActiveRun(
   projection: Pick<OrchestrationV2ThreadProjection, "runs">,
 ): OrchestrationV2Run | undefined {
@@ -844,14 +858,50 @@ const make = Effect.gen(function* () {
       if (selectedRun === undefined) {
         return { threadId: input.threadId, run: null, timedOut: false };
       }
-      if (isTerminalRunStatus(selectedRun.status)) {
-        return { threadId: input.threadId, run: selectedRun, timedOut: false };
+      // A restart cuts a run and continues it as a new run. Follow that chain,
+      // so a cut run is not the answer while its continuation is pending.
+      const outcome = (runs: ReadonlyArray<OrchestrationV2Run>) =>
+        Effect.gen(function* () {
+          const current = runs.find((candidate) => candidate.id === selectedRun.id);
+          if (current === undefined) {
+            return yield* new ThreadManagementRunNotFoundError({
+              threadId: input.threadId,
+              runId: selectedRun.id,
+            });
+          }
+          const run = latestRestartContinuation(runs, current);
+          const pending =
+            isTerminalRunStatus(run.status) &&
+            (yield* orchestrator.restartContinuationPending(run));
+          return { run, pending, settled: isTerminalRunStatus(run.status) && !pending };
+        });
+      const initial = yield* outcome(target.runs);
+      if (initial.settled) {
+        return { threadId: input.threadId, run: initial.run, timedOut: false };
       }
 
-      // Re-read the run only when the thread records a run update or its
-      // deletion, instead of polling the projection for up to an hour. Each
-      // stream keeps one event type, so transcript events never fill its buffer.
-      const wait = Stream.merge(
+      // Re-read the runs only when the thread records an update to the waited
+      // run or a continuation, or its deletion, instead of polling the
+      // projection for up to an hour. Each stream keeps one event type, so
+      // transcript events never fill its buffer. A declined continuation
+      // records no event, so its effect settling wakes the wait too.
+      const readOutcome = getProjectThreadRecords(input, ["runs"]).pipe(
+        Effect.flatMap((current) => outcome(current.runs)),
+      );
+      const afterPendingContinuations = (current: typeof initial) =>
+        Effect.gen(function* () {
+          let latest = current;
+          while (latest.pending) {
+            const waitedRunId = latest.run.id;
+            yield* orchestrator.awaitRestartContinuation(latest.run);
+            latest = yield* readOutcome;
+            // An unavailable effect read is ignored by the orchestrator. Do
+            // not turn it into a polling loop on the same still-pending run.
+            if (latest.run.id === waitedRunId) break;
+          }
+          return latest;
+        });
+      const changes = Stream.merge(
         orchestrator.streamStoredEventsFrom({
           threadId: input.threadId,
           afterSequence,
@@ -866,43 +916,30 @@ const make = Effect.gen(function* () {
         Stream.mapError(loadError),
         Stream.filter(
           (stored) =>
-            stored.event.type !== "run.updated" || stored.event.payload.id === selectedRun.id,
+            stored.event.type !== "run.updated" ||
+            stored.event.payload.id === selectedRun.id ||
+            stored.event.payload.restartContinuationOfRunId !== undefined,
         ),
-        Stream.mapEffect(() =>
-          getProjectThreadRecords(input, ["runs"], { runIds: [selectedRun.id] }).pipe(
-            Effect.flatMap((current) => {
-              const run = current.runs.find((candidate) => candidate.id === selectedRun.id);
-              return run === undefined
-                ? Effect.fail(
-                    new ThreadManagementRunNotFoundError({
-                      threadId: input.threadId,
-                      runId: selectedRun.id,
-                    }),
-                  )
-                : Effect.succeed(run);
-            }),
-          ),
-        ),
-        Stream.filter((run) => isTerminalRunStatus(run.status)),
+        Stream.mapEffect(() => readOutcome),
+      );
+      // Observe effects for every cut run, including a restart after this wait
+      // began and a declined continuation later in the same chain. A pending
+      // effect must not block newer run events that already establish outcome.
+      const wait = Stream.merge(changes, Stream.succeed(initial)).pipe(
+        Stream.mapEffect(afterPendingContinuations, { concurrency: "unbounded", unordered: true }),
+        Stream.filter((current) => current.settled),
         Stream.runHead,
         Effect.timeoutOption(Duration.millis(Math.max(1, input.timeoutMs))),
       );
       const waited = Option.flatten(yield* wait);
       if (Option.isSome(waited)) {
-        return { threadId: input.threadId, run: waited.value, timedOut: false };
-      }
-      const current = yield* getProjectThreadRecords(input, ["runs"], { runIds: [selectedRun.id] });
-      const run = current.runs.find((candidate) => candidate.id === selectedRun.id);
-      if (run === undefined) {
-        return yield* new ThreadManagementRunNotFoundError({
-          threadId: input.threadId,
-          runId: selectedRun.id,
-        });
+        return { threadId: input.threadId, run: waited.value.run, timedOut: false };
       }
       // The run may have reached a terminal status while the timeout was
       // winning the race; the final projection read decides what actually
       // happened, so only a still-active run counts as timed out.
-      return { threadId: input.threadId, run, timedOut: !isTerminalRunStatus(run.status) };
+      const final = yield* outcome((yield* getProjectThreadRecords(input, ["runs"])).runs);
+      return { threadId: input.threadId, run: final.run, timedOut: !final.settled };
     });
 
   const settleAfterRun: ThreadManagementServiceShape["settleAfterRun"] = Effect.fn(

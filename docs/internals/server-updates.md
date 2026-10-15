@@ -64,11 +64,19 @@ opt-out. The
 [v2 recovery service](../../apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts)
 requires matching durable run, provider thread, session, and native resume identity.
 Queued runs never started, so recovery holds them and continues the run they wait
-behind. A finished run qualifies only when the restart cancelled its background work;
-its continuation tells the provider what will not report back.
+behind. A settled run qualifies only when the restart cancels work the agent waits on
+(a monitor, subagent, or background task) and its session was live, so stale records
+from an older crash never wake it. Its continuation prompt is the note of what will not
+report back. A shell alone does not wake a settled run: most are dev servers nobody
+waits on, so that note waits for the next user message.
 
 Recovery retires effects tied to the lost process and records continuation intent
 in the durable outbox. That intent survives another restart before provider startup.
+On Linux, agent scopes belong to the exact server state directory. Before a replacement
+launch, that server stops its leftover agent slice; a failed stop refuses a new agent
+launch rather than duplicating it. Terminal scopes remain outside that slice so detached
+user jobs survive. This depends on the existing exclusive owner of the state directory.
+
 Continuation effects wait for activation; a slow provider must not delay the server's
 readiness or the launcher's commit boundary. Graceful shutdown captures intent before
 closing providers, then reconciles after ingestion has stopped so a late completion
@@ -77,8 +85,8 @@ cannot be overwritten by a stale cancellation.
 The [continuation handler](../../apps/server/src/orchestration-v2/RestartContinuation.ts)
 rechecks the preference, provider selection, newer user work, a stop the user requested,
 and maintenance turns such as `/compact` before dispatching. Intent and delivery both
-refuse a thread that is archived, settled, or still snoozed, a provider turn that already
-ended, and a run waiting on the user: an approval, question, or secret that was pending,
+refuse a thread that is archived, settled, or still snoozed, a cut turn whose provider
+turn already ended, and a run waiting on the user: an approval, question, or secret that was pending,
 or that recovery closed on the cut turn. Message-capable questions stay answerable, so
 they do not block. Delivery also stops after three consecutive continuations in one
 `restartContinuationOfRunId` chain, so a turn that crashes the server cannot loop. Stable
