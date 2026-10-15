@@ -47,7 +47,12 @@ jobs:
       - name: Prepare pinned Electron runtime before desktop imports
         run: node apps/desktop/scripts/ensure-electron-runtime.mjs
       - name: Run focused source gates
-        run: bash scripts/weasel/check.sh
+        env:
+          EFFECTIVE_SOURCE_SHA: ${{ inputs.qualificationSourceSha || github.sha }}
+        run: |
+          [[ "$EFFECTIVE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$EFFECTIVE_SOURCE_SHA"
+          bash scripts/weasel/check.sh
       - name: Preserve unreviewed Observatory route generation
         if: always() && github.ref_name == 'feature/agent-observatory-candidate-20261016'
         uses: actions/upload-artifact@v4
