@@ -253,5 +253,16 @@ for agent_session_test in "${agent_session_tests[@]}"; do
   fi
   focused_tests+=("$agent_session_test")
 done
+browser_tests=(
+  apps/desktop/src/preview/Manager.test.ts
+  apps/desktop/src/preview/BrowserSession.test.ts
+)
+for browser_test in "${browser_tests[@]}"; do
+  if [[ ! -f "$browser_test" ]]; then
+    echo "Required Browser POST gate is missing: $browser_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$browser_test")
+done
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)

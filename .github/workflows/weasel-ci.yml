@@ -56,8 +56,13 @@ jobs:
           apps/server/src/voice/CodexLiveSessionService.test.ts
           apps/server/src/voice/CodexLiveSessionService.ts
           packages/provider-core/src/server/ProviderAdapter.ts
+      - name: Lint native Browser POST slice
+        run: >-
+          vp lint --report-unused-disable-directives
+          apps/desktop/src/preview/Manager.ts
+          apps/desktop/src/preview/Manager.test.ts
   product_bundle:
-    needs: [check, windows_installer_guard]
+    needs: [check]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 30
