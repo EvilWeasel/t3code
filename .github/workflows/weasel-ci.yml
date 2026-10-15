@@ -35,6 +35,52 @@ jobs:
         run: vp install --frozen-lockfile
       - name: Run focused source gates
         run: bash scripts/weasel/check.sh
+  product_bundle:
+    needs: [check, windows_installer_guard]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: ${{ !startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-') }}
+          run-install: false
+      - name: Restore Namespace dependency volume
+        if: startsWith(vars.WEASEL_LINUX_RUNNER, 'namespace-')
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          cache: pnpm
+      - name: Install bundle dependencies
+        run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+      - name: Build product bundle without publishing
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev pkg-config
+          vp run build:desktop
+      - name: Bind bundle to exact source
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p product-evidence
+          printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' "$SOURCE_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > product-evidence/BUILD-RECEIPT.txt
+          sha256sum pnpm-lock.yaml >> product-evidence/BUILD-RECEIPT.txt
+          find apps/server/dist apps/desktop/dist-electron -type f -print0 | sort -z | xargs -0 sha256sum > product-evidence/SHA256SUMS
+          test -s product-evidence/SHA256SUMS
+      - name: Upload reviewable product bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-bundle-${{ github.sha }}
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+            product-evidence
+          if-no-files-found: error
+          retention-days: 7
   windows_installer_guard:
     if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
     runs-on: windows-latest
