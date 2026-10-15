@@ -109,6 +109,50 @@ type Check = (typeof required)[number];
 const checks: Record<string, "UNKNOWN_REQUIRED" | "PASS" | "FAIL"> = Object.fromEntries(
   required.map((name) => [name, "UNKNOWN_REQUIRED"]),
 );
+type FocusPhase =
+  | "idle"
+  | "blur-before"
+  | "blur-after"
+  | "owner-focus-before"
+  | "owner-focus-after"
+  | "guest-focus-before"
+  | "guest-focus-after"
+  | "windowfocus-before"
+  | "windowfocus-callback"
+  | "windowfocus-after"
+  | "key-before"
+  | "key-callback"
+  | "key-after"
+  | "field-js-before"
+  | "field-js-after"
+  | "page-event-before"
+  | "page-event-observed"
+  | "identity-before"
+  | "identity-after";
+type FatalCategory =
+  | "child-watchdog"
+  | "uncaught-exception"
+  | "unhandled-rejection"
+  | "main-rejected"
+  | "os-spawn-failed"
+  | "os-command-failed"
+  | "focus-identity-failed"
+  | "focus-operation-failed"
+  | "receipt-write-failed";
+type OsStatus = {
+  operation: "windowfocus" | "key";
+  pid: number | null;
+  window: number;
+  xid: number;
+  completed: boolean;
+  exited: boolean;
+  closed: boolean;
+  exitCode: number | null;
+  signal: "SIGTERM" | "SIGKILL" | "other" | null;
+  timedOut: boolean | null;
+  spawnFailure: boolean;
+  callbackSucceeded: boolean | null;
+};
 const receipt = {
   binding,
   runtime: {
@@ -129,24 +173,76 @@ const receipt = {
   officialExtensionSupport: "UNKNOWN",
   agentOwnerBoundary: "UNREACHABLE_PUBLIC_MANAGER_STATE",
   activeCheck: "startup",
+  focus: {
+    subphase: "idle" as FocusPhase,
+    window: null as number | null,
+    webContents: null as number | null,
+    mainFrame: null as number | null,
+    sameWindow: null as boolean | null,
+    sameWebContents: null as boolean | null,
+    sameMainFrame: null as boolean | null,
+    documentUnchanged: null as boolean | null,
+    ownerFocused: null as boolean | null,
+    guestFocused: null as boolean | null,
+    fieldIdentityMatched: null as boolean | null,
+    pageEventObserved: false,
+  },
+  os: null as OsStatus | null,
+  fatalCategory: null as FatalCategory | null,
+  fatalSubphase: null as FocusPhase | null,
+  diagnosticsWriteFailed: false,
   phase: "partial",
   cleanup: "not-started",
   fatal: false,
   passed: false,
 };
+let partialFrozen = false;
 const flush = (partial: boolean) => {
+  if (partial && partialFrozen) return;
   const name = NodePath.join(
     output,
     partial ? "fixture-receipt.partial.json" : "fixture-receipt.json",
   );
-  if (partial && NodeFS.existsSync(name)) return;
-  const fd = NodeFS.openSync(name, partial ? "wx" : "w", 0o600);
+  const pending = `${name}.tmp`;
   try {
-    NodeFS.writeFileSync(fd, JSON.stringify(receipt, null, 2));
-    NodeFS.fsyncSync(fd);
+    const fd = NodeFS.openSync(pending, "w", 0o600);
+    try {
+      NodeFS.writeFileSync(fd, JSON.stringify(receipt, null, 2));
+      NodeFS.fsyncSync(fd);
+    } finally {
+      NodeFS.closeSync(fd);
+    }
+    NodeFS.renameSync(pending, name);
+    const directory = NodeFS.openSync(output, "r");
+    try {
+      NodeFS.fsyncSync(directory);
+    } finally {
+      NodeFS.closeSync(directory);
+    }
   } finally {
-    NodeFS.closeSync(fd);
+    if (NodeFS.existsSync(pending)) NodeFS.unlinkSync(pending);
   }
+};
+const latchFatal = (category: FatalCategory) => {
+  if (receipt.fatalCategory !== null) return;
+  receipt.fatal = true;
+  receipt.passed = false;
+  receipt.fatalCategory = category;
+  receipt.fatalSubphase = receipt.focus.subphase;
+  try {
+    flush(true);
+  } catch {
+    receipt.diagnosticsWriteFailed = true;
+  }
+  partialFrozen = true;
+};
+const assertRunning = () => {
+  if (receipt.fatal || finishing) throw new Error("Fixture stopped");
+};
+const progress = (subphase: FocusPhase) => {
+  assertRunning();
+  receipt.focus.subphase = subphase;
+  flush(true);
 };
 // Own this before creating ANY windows: receipts must survive last-window destruction.
 app.on("window-all-closed", () => {});
@@ -155,21 +251,31 @@ app.setPath("sessionData", NodePath.join(temporary, "session-data"));
 const windows: BrowserWindow[] = [];
 const servers: NodeHttp.Server[] = [];
 const releases = new Set<() => void>();
+const ownedOs = new Map<NodeChildProcess.ChildProcess, Promise<void>>();
 let finishing = false;
 let watchdog: ReturnType<typeof setTimeout>;
-async function finish(fatal: boolean) {
+async function finish(fatal: boolean, category: FatalCategory = "main-rejected") {
+  if (fatal) latchFatal(category);
   if (finishing) return;
   finishing = true;
   clearTimeout(watchdog);
-  receipt.fatal = fatal;
+  receipt.fatal ||= fatal;
   receipt.cleanup = "pending";
-  flush(true);
+  try {
+    flush(true);
+  } catch {
+    receipt.diagnosticsWriteFailed = true;
+    latchFatal("receipt-write-failed");
+  }
   let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
       (async () => {
-        for (const release of releases) release();
+        const pendingOs = [...ownedOs.entries()];
+        for (const [child] of pendingOs) child.kill("SIGKILL");
         for (const window of windows) if (!window.isDestroyed()) window.destroy();
+        for (const release of releases) release();
+        await Promise.all(pendingOs.map(([, closed]) => closed));
         await Promise.all(
           servers.map(
             (server) =>
@@ -199,17 +305,21 @@ async function finish(fatal: boolean) {
     receipt.cleanup === "complete" &&
     receipt.counts.blockedNetwork === 0 &&
     required.every((name) => checks[name] === "PASS");
-  flush(false);
+  try {
+    flush(false);
+  } catch {
+    receipt.passed = false;
+  }
   app.exit(receipt.passed ? 0 : 1);
 }
 watchdog = setTimeout(() => {
-  void finish(true);
+  void finish(true, "child-watchdog");
 }, 120000);
 process.on("uncaughtException", () => {
-  void finish(true);
+  void finish(true, "uncaught-exception");
 });
 process.on("unhandledRejection", () => {
-  void finish(true);
+  void finish(true, "unhandled-rejection");
 });
 
 const deferred = <T>() => Promise.withResolvers<T>();
@@ -236,11 +346,13 @@ const check = async (id: Check, operation: () => Promise<boolean>) => {
   if (finishing) throw new Error("Finishing");
   receipt.activeCheck = id;
   try {
-    checks[id] = (await operation()) ? "PASS" : "FAIL";
+    const passed = await operation();
+    assertRunning();
+    checks[id] = passed ? "PASS" : "FAIL";
   } catch {
-    checks[id] = "FAIL";
+    if (!receipt.fatal) checks[id] = "FAIL";
   }
-  receipt.activeCheck = "between-checks";
+  if (!receipt.fatal) receipt.activeCheck = "between-checks";
 };
 const rejected = async (operation: Promise<unknown>) => {
   try {
@@ -251,29 +363,101 @@ const rejected = async (operation: Promise<unknown>) => {
   }
 };
 const os = async (window: BrowserWindow, keys: readonly string[]) => {
+  assertRunning();
   const native = window.getNativeWindowHandle();
   const xid = native.length >= 8 ? Number(native.readBigUInt64LE()) : native.readUInt32LE();
-  if (!Number.isSafeInteger(xid) || xid <= 0 || window.isDestroyed())
+  if (!Number.isSafeInteger(xid) || xid <= 0 || window.isDestroyed()) {
+    void finish(true, "focus-identity-failed");
     throw new Error("Missing owned window");
-  const call = (args: string[]) =>
+  }
+  const normalizeSignal = (signal: NodeJS.Signals | null): OsStatus["signal"] =>
+    signal === null ? null : signal === "SIGTERM" || signal === "SIGKILL" ? signal : "other";
+  const call = (operation: OsStatus["operation"], args: string[]) =>
     new Promise<void>((resolve, reject) => {
+      assertRunning();
+      const status: OsStatus = {
+        operation,
+        pid: null,
+        window: window.id,
+        xid,
+        completed: false,
+        exited: false,
+        closed: false,
+        exitCode: null,
+        signal: null,
+        // execFile's internal timeout is not observable; neither duration nor error.killed proves it.
+        timedOut: null,
+        spawnFailure: false,
+        callbackSucceeded: null,
+      };
+      receipt.os = status;
       receipt.counts.osCommands += 1;
-      NodeChildProcess.execFile(
-        "/usr/bin/xdotool",
-        args,
-        {
-          timeout: 5000,
-          env: {
-            PATH: "/usr/bin:/bin",
-            DISPLAY: process.env.DISPLAY!,
-            XAUTHORITY: process.env.XAUTHORITY!,
+      progress(operation === "windowfocus" ? "windowfocus-before" : "key-before");
+      const closed = deferred<void>();
+      let child: NodeChildProcess.ChildProcess;
+      let spawned = false;
+      try {
+        child = NodeChildProcess.execFile(
+          "/usr/bin/xdotool",
+          args,
+          {
+            timeout: 5000,
+            env: {
+              PATH: "/usr/bin:/bin",
+              DISPLAY: process.env.DISPLAY!,
+              XAUTHORITY: process.env.XAUTHORITY!,
+            },
           },
-        },
-        (error) => (error ? reject(new Error("Owned X11 input failed")) : resolve()),
-      );
+          (error) => {
+            status.completed = true;
+            status.callbackSucceeded = error === null;
+            if (!receipt.fatal && !finishing)
+              progress(operation === "windowfocus" ? "windowfocus-callback" : "key-callback");
+            if (error || receipt.fatal || finishing) {
+              if (error)
+                void finish(true, status.spawnFailure ? "os-spawn-failed" : "os-command-failed");
+              reject(new Error("Owned X11 input failed"));
+            } else resolve();
+          },
+        );
+      } catch {
+        status.spawnFailure = true;
+        void finish(true, "os-spawn-failed");
+        reject(new Error("Owned X11 spawn failed"));
+        return;
+      }
+      ownedOs.set(child, closed.promise);
+      child.once("spawn", () => {
+        spawned = true;
+        status.pid = child.pid ?? null;
+        if (receipt.fatal || finishing) child.kill("SIGKILL");
+        else flush(true);
+      });
+      child.once("error", () => {
+        status.spawnFailure = !spawned;
+        void finish(true, spawned ? "os-command-failed" : "os-spawn-failed");
+      });
+      child.once("exit", (code, signal) => {
+        status.exited = true;
+        status.exitCode = code;
+        status.signal = normalizeSignal(signal);
+        if (!receipt.fatal) flush(true);
+      });
+      child.once("close", (code, signal) => {
+        status.closed = true;
+        status.exitCode = code;
+        status.signal = normalizeSignal(signal);
+        ownedOs.delete(child);
+        closed.resolve();
+        if (!receipt.fatal) flush(true);
+      });
     });
-  await call(["windowfocus", "--sync", String(xid)]);
-  if (keys.length) await call(["key", "--clearmodifiers", ...keys]);
+  await call("windowfocus", ["windowfocus", "--sync", String(xid)]);
+  progress("windowfocus-after");
+  if (keys.length) {
+    await call("key", ["key", "--clearmodifiers", ...keys]);
+    progress("key-after");
+  }
 };
 
 let primary = "";
@@ -366,12 +550,14 @@ async function exercise(
     persistent = true,
     agentId: string | null = null,
   ) => {
+    assertRunning();
     const key = { threadId: "fixture-thread", tabId: id };
     const control = new SessionControl(agentId, () => controlChanged(key));
     nativeTabs.set(id, { control, desktop: {}, closing: false });
     const authorityAttached = event(`authority-attached-${id}`);
     const partition = await run(profiles.getPartition(profile, persistent, "profile"));
     await constrain(await run(profiles.getSession(profile, persistent, "profile")));
+    assertRunning();
     const owner = new BrowserWindow({
       width: 940,
       height: 760,
@@ -389,6 +575,7 @@ async function exercise(
     const attached = deferred<WebContents>();
     owner.webContents.once("did-attach-webview", (_event, guest) => attached.resolve(guest));
     hostPages.set(`/host-${id}`, { partition, url: `${primary}/login` });
+    assertRunning();
     const load = owner.loadURL(`${primary}/host-${id}`);
     const wc = await attached.promise;
     const ready = deferred<void>();
@@ -413,16 +600,76 @@ async function exercise(
   };
   type Guest = Awaited<ReturnType<typeof makeGuest>>;
   const focus = async (guest: Guest, field = "u") => {
-    await guest.wc.executeJavaScript("document.activeElement?.blur()");
-    const observed = event(`focus-${field}`);
-    guest.owner.focus();
-    guest.wc.focus();
-    await os(guest.owner, []);
-    const actual = await guest.wc.executeJavaScript(
-      `document.getElementById(${JSON.stringify(field)}).focus(); document.activeElement.id`,
-    );
-    await observed;
-    return actual === field && guest.wc.isFocused() && guest.owner.isFocused();
+    assertRunning();
+    const frame = guest.wc.mainFrame;
+    let navigationObserved = false;
+    const navigating = () => {
+      navigationObserved = true;
+      if (!receipt.fatal && !finishing) {
+        receipt.focus.documentUnchanged = false;
+        flush(true);
+      }
+    };
+    guest.wc.on("did-start-navigation", navigating);
+    receipt.focus.window = guest.owner.id;
+    receipt.focus.webContents = guest.wc.id;
+    receipt.focus.mainFrame = frame.routingId;
+    receipt.focus.fieldIdentityMatched = null;
+    receipt.focus.pageEventObserved = false;
+    const mark = (phase: FocusPhase) => {
+      assertRunning();
+      receipt.focus.sameWindow =
+        !guest.owner.isDestroyed() && guest.owner.id === receipt.focus.window;
+      receipt.focus.sameWebContents =
+        !guest.wc.isDestroyed() && guest.wc.id === receipt.focus.webContents;
+      receipt.focus.sameMainFrame =
+        !guest.wc.isDestroyed() && !frame.isDestroyed() && guest.wc.mainFrame === frame;
+      receipt.focus.documentUnchanged = !navigationObserved;
+      receipt.focus.ownerFocused = !guest.owner.isDestroyed() && guest.owner.isFocused();
+      receipt.focus.guestFocused = !guest.wc.isDestroyed() && guest.wc.isFocused();
+      progress(phase);
+    };
+    try {
+      mark("blur-before");
+      await guest.wc.executeJavaScript("document.activeElement?.blur()");
+      mark("blur-after");
+      const observed = event(`focus-${field}`).then(() => {
+        if (!receipt.fatal && !finishing) {
+          receipt.focus.pageEventObserved = true;
+          flush(true);
+        }
+      });
+      mark("owner-focus-before");
+      guest.owner.focus();
+      mark("owner-focus-after");
+      mark("guest-focus-before");
+      guest.wc.focus();
+      mark("guest-focus-after");
+      await os(guest.owner, []);
+      mark("field-js-before");
+      const actual = await guest.wc.executeJavaScript(
+        `document.getElementById(${JSON.stringify(field)}).focus(); document.activeElement.id`,
+      );
+      assertRunning();
+      receipt.focus.fieldIdentityMatched = actual === field;
+      mark("field-js-after");
+      mark("page-event-before");
+      await observed;
+      mark("page-event-observed");
+      mark("identity-before");
+      const valid = actual === field && guest.wc.isFocused() && guest.owner.isFocused();
+      mark("identity-after");
+      if (!valid) {
+        void finish(true, "focus-identity-failed");
+        throw new Error("Owned focus identity failed");
+      }
+      return valid;
+    } catch {
+      void finish(true, "focus-operation-failed");
+      throw new Error("Owned focus operation failed");
+    } finally {
+      guest.wc.off("did-start-navigation", navigating);
+    }
   };
   const target = async (guest: Guest) => {
     const current = await run(manager.getAutofillTarget(guest.wc, guest.wc.mainFrame));
@@ -452,12 +699,14 @@ async function exercise(
       return [{ shareId: "fixture-vault", itemId: "fixture-item", title: "Owned synthetic login" }];
     },
     async credentials(selected) {
+      assertRunning();
       if (selected.shareId !== "fixture-vault" || selected.itemId !== "fixture-item")
         throw new Error("Unexpected selected reference");
       if (!host.isPrivateEntry(activeGuest.wc)) throw new Error("Read before private gate");
       receipt.counts.credentialReads += 1;
       readStarted?.resolve();
       if (pendingRead) await pendingRead.promise;
+      assertRunning();
       return { username, password };
     },
   };
@@ -475,6 +724,7 @@ async function exercise(
     template: MenuItemConstructorOptions[],
     keys: string[],
   ) => {
+    assertRunning();
     const done = deferred<void>();
     const wrap = (items: MenuItemConstructorOptions[]): MenuItemConstructorOptions[] =>
       items.map((item) => ({
@@ -485,7 +735,9 @@ async function exercise(
               click: async (...args: Parameters<NonNullable<typeof item.click>>) => {
                 receipt.counts.nativeSelections += 1;
                 try {
+                  assertRunning();
                   await item.click!(...args);
+                  assertRunning();
                   done.resolve();
                 } catch {
                   done.reject(new Error("Native action failed"));
@@ -499,6 +751,7 @@ async function exercise(
     menu.once("menu-will-show", () => {
       void os(guest.owner, keys).catch(() => done.reject(new Error("Native menu input failed")));
     });
+    assertRunning();
     menu.popup({ window: guest.owner });
     await done.promise;
   };
@@ -506,6 +759,7 @@ async function exercise(
   let staticNotice = false;
   const menuUi = (guest: Guest) => ({
     restoreFocus() {
+      assertRunning();
       guest.owner.focus();
       guest.wc.focus();
     },
@@ -1218,4 +1472,4 @@ async function main() {
   await Effect.runPromise(program);
   await finish(false);
 }
-void main().catch(() => finish(true));
+void main().catch(() => finish(true, "main-rejected"));
