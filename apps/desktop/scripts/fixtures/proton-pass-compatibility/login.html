@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" /><title>Owned fake login</title>
+  <body>
+    <label>Fake username <input name="username" autocomplete="username" /></label>
+    <label
+      >Fake password <input name="password" type="password" autocomplete="current-password"
+    /></label>
+    <iframe title="Same-origin fake login" src="/frame?kind=same"></iframe>
+    <iframe title="Cross-origin fake login" src="__FRAME_ORIGIN__/frame?kind=cross"></iframe>
+  </body>
+</html>
