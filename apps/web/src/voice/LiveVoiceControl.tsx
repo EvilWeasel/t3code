@@ -31,6 +31,73 @@ import { randomUUID } from "~/lib/utils";
 import { LiveVoiceTranscript } from "./LiveVoiceTranscript";
 import { unwrapLiveVoiceCommand } from "./LiveVoiceCommands";
 
+type LiveVoiceAvailability = {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId | null;
+  readonly providerInstanceId: string | null;
+  readonly reason: string | null;
+};
+
+/** Only cached facts for the selected destination may qualify its voice control. */
+export function resolveLiveVoiceAvailability(input: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId | null;
+  readonly providerInstanceId: string | null;
+  readonly catalogEnvironmentId: EnvironmentId | null;
+  readonly settingsKnown: boolean;
+  readonly canOperate: boolean;
+  readonly permissionState: "known" | "pending" | "unavailable";
+  readonly selectionCurrent: boolean;
+  readonly instanceRequested: boolean;
+  readonly provider: {
+    readonly driverKind: string;
+    readonly enabled: boolean;
+    readonly isAvailable: boolean;
+  } | null;
+  readonly instanceConfigured: boolean;
+  readonly config: unknown;
+}): LiveVoiceAvailability {
+  let reason: string | null = null;
+  if (!input.threadId) reason = "Open an existing thread to start Live voice.";
+  else if (input.catalogEnvironmentId !== input.environmentId)
+    reason = "Waiting for this environment's provider information.";
+  else if (!input.settingsKnown) reason = "Waiting for this environment's provider settings.";
+  else if (input.permissionState === "pending")
+    reason = "Waiting for this environment's thread permissions.";
+  else if (input.permissionState === "unavailable")
+    reason = "Thread permissions could not be verified. Reconnect this environment.";
+  else if (!input.canOperate) reason = "You need permission to operate this thread.";
+  else if (!input.provider)
+    reason = input.instanceRequested
+      ? "The selected provider instance is missing from this environment. Choose a configured provider."
+      : "Configure a Codex provider in this environment's Settings.";
+  else if (!input.provider.enabled)
+    reason = "Enable the selected provider for this project in Settings.";
+  else if (!input.provider.isAvailable)
+    reason = "The selected provider is unavailable. Check its setup in Settings.";
+  else if (input.provider.driverKind !== "codex")
+    reason = "Select a managed Codex provider to use Live voice.";
+  else if (!input.selectionCurrent || !input.providerInstanceId)
+    reason = "Waiting for this thread's provider selection to update.";
+  else if (!input.instanceConfigured)
+    reason = "The selected Codex instance has no saved settings. Complete its setup in Settings.";
+  else if (input.config === null || input.config === undefined)
+    reason = "Codex setup mode is missing. Complete its setup in Settings.";
+  else if (typeof input.config !== "object" || !("setupMode" in input.config))
+    reason = "Codex setup mode is invalid or missing. Check its setup in Settings.";
+  else if (input.config.setupMode === "existing")
+    reason =
+      "This Codex provider uses an existing installation. Live voice requires managed setup.";
+  else if (input.config.setupMode !== "managed")
+    reason = "Codex setup mode is invalid. Check its setup in Settings.";
+  return {
+    environmentId: input.environmentId,
+    threadId: input.threadId,
+    providerInstanceId: input.providerInstanceId,
+    reason,
+  };
+}
+
 type VoiceEventBridge = {
   readonly subscribe: LiveVoiceSignalingAdapter["subscribe"];
   readonly publish: (
@@ -119,7 +186,7 @@ export function LiveVoiceControl(props: {
   readonly threadId: ThreadId | null;
   readonly providerInstanceId: string | null;
   readonly eligible: boolean;
-  readonly unavailableReason: string;
+  readonly availability: LiveVoiceAvailability;
 }) {
   const hintId = useId();
   const prepare = useAtomCommand(liveVoiceEnvironment.prepare, {
@@ -147,15 +214,19 @@ export function LiveVoiceControl(props: {
     lease: null,
     error: null,
   });
+  const availabilityMatchesTarget =
+    props.availability.environmentId === props.environmentId &&
+    props.availability.threadId === props.threadId &&
+    props.availability.providerInstanceId === props.providerInstanceId;
   const target = useMemo<LiveVoiceTarget | null>(() => {
-    if (!props.threadId || !props.providerInstanceId) return null;
+    if (!props.threadId || !props.providerInstanceId || !availabilityMatchesTarget) return null;
     return {
       environmentId: props.environmentId,
       threadId: props.threadId,
       provider: "codex",
       providerInstanceId: props.providerInstanceId,
     };
-  }, [props.environmentId, props.providerInstanceId, props.threadId]);
+  }, [availabilityMatchesTarget, props.environmentId, props.providerInstanceId, props.threadId]);
   const bridge = useMemo(() => createVoiceEventBridge(), []);
   const signaling = useMemo<LiveVoiceSignalingAdapter>(
     () => ({
@@ -227,14 +298,21 @@ export function LiveVoiceControl(props: {
     state.phase === "prepared" ||
     state.phase === "connecting" ||
     state.phase === "stopping";
-  const canStart = props.eligible && target !== null && supported && !busy && !active;
-  const unavailableNotice = !supported
-    ? "Live voice needs browser WebRTC and microphone access."
-    : !target
-      ? "Open a thread for a voice call"
-      : !props.eligible
-        ? props.unavailableReason
-        : null;
+  const eligible = props.eligible && props.availability.reason === null;
+  const canStart = eligible && target !== null && supported && !busy && !active;
+  const unavailableNotice = !availabilityMatchesTarget
+    ? "Waiting for this environment's voice availability to update."
+    : typeof RTCPeerConnection !== "function"
+      ? "This browser does not provide WebRTC. Use a browser with WebRTC support."
+      : typeof navigator === "undefined" ||
+          typeof navigator.mediaDevices?.getUserMedia !== "function"
+        ? "Microphone access is unavailable in this browser context. Open the app in a trusted secure context."
+        : (props.availability.reason ??
+          (!target
+            ? "Open a thread for a voice call"
+            : !props.eligible
+              ? "Live voice is unavailable for this thread. Check the selected provider and permissions."
+              : null));
   const statusText =
     state.phase === "preparing"
       ? "Preparing restricted voice session…"
@@ -261,8 +339,8 @@ export function LiveVoiceControl(props: {
     [controller, state.outputMuted],
   );
   const onStart = useCallback(() => {
-    if (target) void controller.start(target);
-  }, [controller, target]);
+    if (canStart && target) void controller.start(target);
+  }, [canStart, controller, target]);
 
   return (
     <div className="flex items-center gap-1" data-live-voice-phase={state.phase}>
@@ -275,6 +353,11 @@ export function LiveVoiceControl(props: {
       ) : null}
       {!active && !busy ? (
         <>
+          {unavailableNotice ? (
+            <span role="status" className="max-w-64 text-xs text-muted-foreground">
+              {unavailableNotice}
+            </span>
+          ) : null}
           {state.phase === "error" ? (
             <span role="status" className="text-xs text-destructive">
               {statusText}

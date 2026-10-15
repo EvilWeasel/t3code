@@ -272,7 +272,10 @@ import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerImageThumbnail } from "./ComposerImageThumbnail";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { VoiceDictationControl } from "../../voice/VoiceDictationControl";
-import { LiveVoiceControl } from "../../voice/LiveVoiceControl";
+import { LiveVoiceControl, resolveLiveVoiceAvailability } from "../../voice/LiveVoiceControl";
+import { useAtomValue } from "@effect/atom-react";
+import { AsyncResult } from "effect/reactivity";
+import * as Option from "effect/Option";
 import { transcribeVoiceRecording } from "../../voice/transcriptionClient";
 import { readCodexSetupMode } from "../settings/CodexSetupSection.logic";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
@@ -1142,7 +1145,7 @@ import { useDelayedStatus } from "../../hooks/useDelayedStatus";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { usePanelAnimationSettings } from "../../panelAnimations";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { readEnvironmentScope } from "../../state/session";
+import { environmentSession, readEnvironmentScope, useEnvironmentScope } from "../../state/session";
 import { serverEnvironment } from "../../state/server";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
 
@@ -2206,17 +2209,70 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // disabled.
   const selectedProvider: ProviderDriverKind =
     selectedProviderEntry?.driverKind ?? requestedDriverKind;
-  const selectedCodexConfig = selectedProviderEntry
-    ? settings.providerInstances[selectedProviderEntry.instanceId]?.config
-    : null;
+  const liveVoiceEnvironmentId = activeThreadEnvironmentId ?? environmentId;
+  const liveVoiceConfig = useAtomValue(serverEnvironment.configValueAtom(liveVoiceEnvironmentId));
+  const liveVoiceCanOperate = useEnvironmentScope(
+    liveVoiceEnvironmentId,
+    AuthOrchestrationOperateScope,
+  );
+  const liveVoiceSession = useAtomValue(
+    environmentSession.sessionStateAtom(liveVoiceEnvironmentId),
+  );
+  // Do not qualify a newly selected environment using the previous composer's props.
+  const liveVoiceEntries = liveVoiceConfig
+    ? applyProviderInstanceSettings(
+        deriveProviderInstanceEntries(liveVoiceConfig.providers),
+        liveVoiceConfig.settings,
+        activeProjectId,
+      )
+    : [];
+  const liveVoiceSelection = resolveComposerProviderSelection({
+    entries: liveVoiceEntries,
+    candidateInstanceIds: [
+      selectedProviderByThreadId,
+      activeThread?.runtime?.providerInstanceId,
+      activeThreadModelSelection?.instanceId,
+      activeProjectDefaultModelSelection?.instanceId,
+    ],
+    lockedProvider,
+    lockedInstanceId:
+      activeThread?.runtime?.providerInstanceId ?? activeThreadModelSelection?.instanceId,
+  });
+  const liveVoiceInstanceId = selectedProviderEntry?.instanceId ?? null;
+  const liveVoiceProvider =
+    liveVoiceEntries.find(
+      (entry) =>
+        entry.instanceId ===
+        (liveVoiceInstanceId ?? liveVoiceSelection.unavailableProviderInstanceId),
+    ) ?? null;
+  const liveVoiceInstanceSettings = liveVoiceProvider
+    ? liveVoiceConfig?.settings.providerInstances[liveVoiceProvider.instanceId]
+    : undefined;
+  const liveVoiceAvailability = resolveLiveVoiceAvailability({
+    environmentId: liveVoiceEnvironmentId,
+    threadId: activeThreadId,
+    providerInstanceId: liveVoiceInstanceId,
+    catalogEnvironmentId: liveVoiceConfig?.environment.environmentId ?? null,
+    settingsKnown: liveVoiceConfig?.settings !== undefined,
+    canOperate: canOperateThread && liveVoiceCanOperate,
+    permissionState: AsyncResult.isFailure(liveVoiceSession)
+      ? "unavailable"
+      : Option.isSome(AsyncResult.value(liveVoiceSession))
+        ? "known"
+        : "pending",
+    selectionCurrent: liveVoiceSelection.selectedProviderEntry?.instanceId === liveVoiceInstanceId,
+    instanceRequested:
+      liveVoiceInstanceId !== null ||
+      liveVoiceSelection.unavailableProviderInstanceId !== undefined,
+    provider: liveVoiceProvider,
+    instanceConfigured: liveVoiceInstanceSettings !== undefined,
+    config: liveVoiceInstanceSettings?.config,
+  });
+  const selectedCodexConfig = liveVoiceInstanceSettings?.config;
   const liveVoiceProviderEligible =
     selectedProviderEntry?.driverKind === "codex" &&
-    readCodexSetupMode(selectedCodexConfig) === "managed";
-  const liveVoiceUnavailableReason = !activeThreadId
-    ? "Open an existing thread to start Live voice."
-    : !canOperateThread
-      ? "You need permission to operate this thread."
-      : "Live voice is available only for a managed Codex thread.";
+    readCodexSetupMode(selectedCodexConfig) === "managed" &&
+    liveVoiceAvailability.reason === null;
   const supportedRuntimeModes = selectedProviderEntry?.snapshot.supportedRuntimeModes;
   const compatibleRuntimeModeOptions =
     supportedRuntimeModes && supportedRuntimeModes.length > 0
@@ -7752,11 +7808,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     />
                   ) : null}
                   <LiveVoiceControl
-                    environmentId={activeThreadEnvironmentId ?? environmentId}
+                    environmentId={liveVoiceEnvironmentId}
                     threadId={activeThreadId}
                     providerInstanceId={selectedProviderEntry?.instanceId ?? null}
                     eligible={liveVoiceProviderEligible && canOperateThread}
-                    unavailableReason={liveVoiceUnavailableReason}
+                    availability={liveVoiceAvailability}
                   />
                   {showComposerAttachAction ? (
                     <>
