@@ -42,15 +42,15 @@ const pinnedSourceHashes = {
   "apps/desktop/src/electron/ElectronWindow.ts":
     "7bf806b3f80b87ea96ab784135a3ab8ca70f0bd20b8be6f60ff4806b8524311c",
   "apps/desktop/src/snapShot/DesktopSnapShot.ts":
-    "b3bdfd29080ff5420d10a663fa52dbf085c02dfd44cb75f66926c53e0b083332",
+    "ad0434335824deca8b392ca94ad9403dc2910413e728f57beacf51d01b8d99ee",
   "apps/desktop/src/snapShot/SnapShotTransition.ts":
     "0f1a5a7c472297810a622d52f650221d888c14c8b9e608582fde1e6de5636b1a",
   "apps/desktop/src/electron/WindowsForegroundFocusThread.ts":
     "9c87bcc1accd4734330709c22d8f36bbab61736d8a9ae3d150defccafa24274d",
   "apps/desktop/src/snapShot/RegionSnapShot.ts":
-    "72f15e88c628e510eae95e0cef0215232072f3491551983598b6eb4b0c60d6ee",
+    "bd2d27cf52641519998df20b589d982eef20cc0da86796dd5c2ff795c197c21a",
   "apps/desktop/src/snapShot/SnapShotAccessibilityProcess.ts":
-    "f6da3fe29ab10adf193eabb8617c0ddf971502aa285bc34f5968cb862d62935d",
+    "b050b7a8fad4d55fe07e5265afbd67a37009a19d9dc208eef3cf522ff2ce3ec1",
   "apps/desktop/src/electron/NixManagedUpdater.ts":
     "c9f1441f1ec02fc4985165b67e94474930a893637d65bf743a8bc7413bb34f48",
   "apps/desktop/src/permissions/MacPermissionHelper.ts":
