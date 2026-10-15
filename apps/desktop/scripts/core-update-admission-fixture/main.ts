@@ -172,6 +172,20 @@ const receipt = {
     futureEvents: "NOT_CLAIMED_AFTER_OWNED_SHUTDOWN",
     popupRefusalCause: "GUEST_AND_POPUP_LIVE_NO_EXCLUSIVE_CAUSALITY",
   },
+  reservationCoverage: {
+    olderAllocationBindRefused: false,
+    liveBoundReleaseRefused: false,
+    destroyedBindingRestored: false,
+  },
+  finalInventory: {
+    productionContentsIds: [] as number[],
+    nativeWindowIds: [] as number[],
+    nativeContentsIds: [] as number[],
+    expectedWindowId: null as number | null,
+    expectedContentsId: null as number | null,
+    tokenValid: false,
+    holdRetained: false,
+  },
   observations: {
     allocations: 0,
     guestAllocations: 0,
@@ -466,6 +480,7 @@ async function exercise(
   desktop: DesktopWindow.DesktopWindow["Service"],
   profiles: BrowserSession.BrowserSession["Service"],
   protocol: ElectronProtocol.ElectronProtocol["Service"],
+  applicationScope: Scope.Scope,
   runEffect: <A, E>(effect: Effect.Effect<A, E>) => Promise<A>,
 ) {
   const wait = async <A>(promise: Promise<A>) => {
@@ -488,11 +503,9 @@ async function exercise(
       windows.updateInventory,
   );
   if (!acquire || !reserve || !activity) throw new Error("Native API absent");
-  const scopes = new Set<Scope.Scope>();
   let sequence = 0;
   const hold = async () => {
-    const scope = await run(Scope.make());
-    scopes.add(scope);
+    const scope = await run(Scope.fork(applicationScope, "sequential"));
     const found = await run(
       acquire({
         generation: `fixture-${++sequence}`,
@@ -504,7 +517,6 @@ async function exercise(
       token: Option.getOrUndefined(found),
       close: async () => {
         await run(Scope.close(scope, Exit.void));
-        scopes.delete(scope);
       },
     };
   };
@@ -517,11 +529,13 @@ async function exercise(
   await constrain(session.defaultSession);
   running();
   await run(
-    protocol.registerDesktopProtocol({
-      scheme: "t3code-dev",
-      clerkFrontendApiHostname: undefined,
-      targetOrigin: new URL(origin),
-    }),
+    protocol
+      .registerDesktopProtocol({
+        scheme: "t3code-dev",
+        clerkFrontendApiHostname: undefined,
+        targetOrigin: new URL(origin),
+      })
+      .pipe(Scope.provide(applicationScope)),
   );
   const ready = signal("host");
   const mainLoaded = deferred<void>();
@@ -580,13 +594,23 @@ async function exercise(
     const bound = pending.bind(exactContents) && !pending.bind(exactContents);
     await wait(exactNative.loadURL("about:blank"));
     const fresh = await hold();
-    const valid = fresh.token?.isValid() === true;
+    const validBeforeRelease = fresh.token?.isValid() === true;
     await fresh.close();
-    return bound && valid;
+    const stillAlive = !exactNative.isDestroyed() && !exactContents.isDestroyed();
+    pending.release();
+    pending.release();
+    receipt.reservationCoverage.liveBoundReleaseRefused = stillAlive && (await refuses());
+    await wait(destroy(exactNative));
+    const afterDestroy = await hold();
+    receipt.reservationCoverage.destroyedBindingRestored = afterDestroy.token?.isValid() === true;
+    await afterDestroy.close();
+    return (
+      bound &&
+      validBeforeRelease &&
+      receipt.reservationCoverage.liveBoundReleaseRefused &&
+      receipt.reservationCoverage.destroyedBindingRestored
+    );
   });
-  await wait(destroy(exactNative));
-  pending.release();
-  pending.release();
   const first = await hold();
   requireValue(first.token?.isValid());
   await check("allocationRevokes", async () => {
@@ -621,9 +645,18 @@ async function exercise(
       "releasedBindingRefused",
       async () => cancelled!.bind(unknown.webContents) === false,
     );
+    const newer = reserve({ kind: "preview-pip", owner: host.id });
+    requireValue(newer);
+    receipt.reservationCoverage.olderAllocationBindRefused =
+      newer!.bind(unknown.webContents) === false;
+    newer!.release();
+    newer!.release();
     const denied = await refuses();
     await wait(destroy(unknown));
-    return denied;
+    const afterDestroy = await hold();
+    const restored = afterDestroy.token?.isValid() === true;
+    await afterDestroy.close();
+    return receipt.reservationCoverage.olderAllocationBindRefused && denied && restored;
   });
   await check("scopeReplacement", async () => {
     const old = await hold();
@@ -897,11 +930,35 @@ async function exercise(
   await check("nixActivationRevocation", () => nixCase("activation"));
   await check("finalInventory", async () => {
     const fresh = await hold();
-    const valid = fresh.token?.isValid() === true;
-    await fresh.close();
-    return valid;
+    const productionIds = (await run(windows.updateInventory!))
+      .map((item) => item.id)
+      .sort((a, b) => a - b);
+    const windowIds = BaseWindow.getAllWindows()
+      .filter((window) => !window.isDestroyed())
+      .map((window) => window.id)
+      .sort((a, b) => a - b);
+    const contentsIds = webContents
+      .getAllWebContents()
+      .filter((contents) => !contents.isDestroyed())
+      .map((contents) => contents.id)
+      .sort((a, b) => a - b);
+    Object.assign(receipt.finalInventory, {
+      productionContentsIds: productionIds,
+      nativeWindowIds: windowIds,
+      nativeContentsIds: contentsIds,
+      expectedWindowId: main.id,
+      expectedContentsId: host.id,
+      tokenValid: fresh.token?.isValid() === true,
+      holdRetained: fresh.token !== undefined,
+    });
+    // Keep this exact hold in the application scope until owned cleanup closes it.
+    return (
+      receipt.finalInventory.tokenValid &&
+      JSON.stringify(productionIds) === JSON.stringify([host.id]) &&
+      JSON.stringify(windowIds) === JSON.stringify([main.id]) &&
+      JSON.stringify(contentsIds) === JSON.stringify([host.id])
+    );
   });
-  for (const scope of scopes) await run(Scope.close(scope, Exit.void));
 }
 
 async function main() {
@@ -1029,6 +1086,7 @@ async function main() {
     services.desktop,
     services.profiles,
     services.protocol,
+    scope,
     <A, E>(effect: Effect.Effect<A, E>) => run(effect, { signal: executionAbort.signal }),
   );
   running();

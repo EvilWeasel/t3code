@@ -288,6 +288,19 @@ async function launch() {
   const artifactNamesMatch =
     JSON.stringify(FS.readdirSync(output).sort()) ===
     JSON.stringify(["electron.log", "fixture-receipt.json", "fixture-receipt.partial.json"].sort());
+  const requiredClassification = {
+    heldPiPWithSameGuest: "NOT_REACHABLE_BY_CONTRACT",
+    heldPopupWithSameGuest: "NOT_REACHABLE_BY_CONTRACT",
+    heldPopupUnit: "SOURCE_ONLY_SEPARATE_CONSUMER_TEST",
+    heldPiPUnit: "SOURCE_ONLY_SEPARATE_CONSUMER_TEST",
+    nixAsync70: "ADAPTER_ONLY_SYNTHETIC_IO_REAL_NATIVE_REVOCATION",
+    capture: "PRODUCTION_PIP_SYNTHETIC_LOOPBACK_ONLY_NO_SCREENSHOT_ARTIFACT",
+    futureEvents: "NOT_CLAIMED_AFTER_OWNED_SHUTDOWN",
+    popupRefusalCause: "GUEST_AND_POPUP_LIVE_NO_EXCLUSIVE_CAUSALITY",
+  };
+  const classificationMatches = Object.entries(requiredClassification).every(
+    ([key, value]) => fixture?.classification?.[key] === value,
+  );
   const passed =
     result.code === 0 &&
     result.signal === null &&
@@ -299,8 +312,7 @@ async function launch() {
     fixture?.scope === binding.scope &&
     fixture?.firstFailure === null &&
     fixture?.diagnosticsWriteFailed === false &&
-    fixture?.classification?.heldPiPWithSameGuest === "NOT_REACHABLE_BY_CONTRACT" &&
-    fixture?.classification?.heldPopupWithSameGuest === "NOT_REACHABLE_BY_CONTRACT" &&
+    classificationMatches &&
     Object.keys(fixture?.checks ?? {}).length === required.length &&
     required.every((name) => fixture?.checks?.[name] === "PASS") &&
     artifactNamesMatch &&
@@ -329,6 +341,7 @@ async function launch() {
         integrationWorkflowJobEvidenceRequired: true,
         rawOutputDiscarded: true,
         artifactNamesMatch,
+        classificationMatches,
       },
       null,
       2,
