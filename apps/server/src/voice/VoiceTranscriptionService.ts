@@ -467,7 +467,15 @@ export const layer = Layer.effect(
       ),
     );
     const getSettings = Effect.gen(function* () {
-      const config = yield* preferences.readForSettings;
+      const config = yield* preferences.readForSettings.pipe(
+        Effect.mapError(
+          () =>
+            new VoiceTranscriptionError({
+              reason: "provider_unavailable",
+              detail: "Transcription settings could not be read.",
+            }),
+        ),
+      );
       const live = yield* registry.listInstances;
       const settings = yield* settingsService.getSettings;
       const candidates = live.filter((entry) => entry.driverKind === "codex" && entry.enabled);

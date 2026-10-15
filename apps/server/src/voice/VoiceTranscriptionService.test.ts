@@ -621,11 +621,27 @@ it.effect("does not present unrelated preference read failures as credential rec
     const path = yield* Path.Path;
     const filename = path.join(config.stateDir, "voice-transcription.json");
     const networkBefore = recoveryNetwork.calls;
-    yield* fs.writeFileString(filename, "{invalid-json");
-    assert.equal((yield* service.getSettings.pipe(Effect.result))._tag, "Failure");
+    const privateSource = "fixture-private-config-content";
+    yield* fs.writeFileString(filename, `{invalid-json:${privateSource}`);
+    const invalidJson = yield* service.getSettings.pipe(Effect.result);
+    assert.equal(invalidJson._tag, "Failure");
+    if (invalidJson._tag === "Failure") {
+      assert.instanceOf(invalidJson.failure, VoiceTranscriptionError);
+      assert.equal(invalidJson.failure.reason, "provider_unavailable");
+      assert.equal(invalidJson.failure.detail, "Transcription settings could not be read.");
+      assert.notInclude(JSON.stringify(invalidJson.failure), privateSource);
+      assert.notInclude(JSON.stringify(invalidJson.failure), filename);
+    }
     yield* fs.remove(filename);
     yield* fs.makeDirectory(filename);
-    assert.equal((yield* service.getSettings.pipe(Effect.result))._tag, "Failure");
+    const invalidFile = yield* service.getSettings.pipe(Effect.result);
+    assert.equal(invalidFile._tag, "Failure");
+    if (invalidFile._tag === "Failure") {
+      assert.instanceOf(invalidFile.failure, VoiceTranscriptionError);
+      assert.equal(invalidFile.failure.reason, "provider_unavailable");
+      assert.equal(invalidFile.failure.detail, "Transcription settings could not be read.");
+      assert.notInclude(JSON.stringify(invalidFile.failure), filename);
+    }
     assert.equal(calls.spawns, 0);
     assert.equal(recoveryNetwork.calls, networkBefore);
   }).pipe(Effect.provide(recoveryServiceLayer(calls)), Effect.scoped);
