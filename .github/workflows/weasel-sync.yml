@@ -41,7 +41,7 @@ jobs:
           test "$GITHUB_REF" = refs/heads/main
           test "$GITHUB_RUN_ATTEMPT" = 1
           test "$(git rev-parse HEAD)" = "$TRUSTED_SHA"
-          printf '%s\n' '66d266734ce2bba96965fce8f088a9d78d0dfcfeda1b0fc04ee66b4840dda410  scripts/weasel/sync-upstream-main.sh' '18a850e5eb68f0f143b7c9ab52996615169b262e57be310e7baaf30c2c7c5433  scripts/weasel/test-sync-upstream-main.sh' | sha256sum --check --status
+          printf '%s\n' '66d266734ce2bba96965fce8f088a9d78d0dfcfeda1b0fc04ee66b4840dda410  scripts/weasel/sync-upstream-main.sh' '4757dcf9a974ca241263dabd00cb03a71b8c565888b29fd400ce6298504dcae0  scripts/weasel/test-sync-upstream-main.sh' | sha256sum --check --status
       - name: Probe latest public upstream main without models or installation
         run: bash scripts/weasel/sync-upstream-main.sh probe --output "$RUNNER_TEMP/probe"
       - name: Restore protected fork ledger ref or refuse
