@@ -66,7 +66,8 @@ jobs:
           public_dir="$(mktemp -d "$RUNNER_TEMP/public-upstream.XXXXXX")"
           env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -C "$public_dir" init --bare
           env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -C "$public_dir" -c http.extraHeader= -c credential.helper= -c core.askPass= fetch https://github.com/pingdotgg/t3code.git "$upstream"
-          git fetch "$public_dir" "$upstream"
+          git -C "$public_dir" update-ref refs/heads/pinned-upstream "$upstream"
+          git fetch "$public_dir" refs/heads/pinned-upstream
       - name: Reserve pair before any publication or qualification
         id: reserve
         run: |
@@ -269,6 +270,10 @@ jobs:
               # hash inventory verifies downloaded product bytes independently.
               sums=z.read('product-evidence/SHA256SUMS').decode('utf8').splitlines()
               if not sums: raise SystemExit('Empty product payload inventory')
+              listed=[line.split('  ',1)[1] for line in sums]
+              payload={n for n in names if not n.endswith('/') and n.startswith(('apps/server/dist/','apps/desktop/dist-electron/'))}
+              if len(listed)!=len(set(listed)) or set(listed)!=payload: raise SystemExit('Incomplete or duplicate product inventory')
+              if any(not n.endswith('/') and not n.startswith(('apps/server/dist/','apps/desktop/dist-electron/','product-evidence/')) for n in names): raise SystemExit('Unexpected product archive file')
               for line in sums:
                   digest,name=line.split('  ',1)
                   if name not in names or not name.startswith(('apps/server/dist/','apps/desktop/dist-electron/')): raise SystemExit('Product payload path mismatch')
