@@ -7,6 +7,7 @@ import { SettingsSection, SettingsRow } from "./settingsLayout";
 import { searchableSetting } from "./settingsSearch";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 
 export function VoiceTranscriptionSettingsPanel() {
   const { target, scope } = useSettingsScope();
@@ -90,7 +91,7 @@ export function VoiceTranscriptionSettingsPanel() {
   if (scope.kind !== "environment") {
     return (
       <SettingsSection id="voice" title="Voice transcription">
-        <p role="status">
+        <p role="status" className="px-4 py-3 text-xs leading-relaxed text-muted-foreground">
           Select one environment in the settings header to configure its voice provider and
           credentials.
         </p>
@@ -102,41 +103,69 @@ export function VoiceTranscriptionSettingsPanel() {
       <SettingsRow
         {...searchableSetting("voice-transcription")}
         title="Transcription provider"
-        description={`Applies to ${scope.label}. Reviewed recordings stay in their original draft while you change settings.`}
-      >
-        <select
-          aria-label="Voice transcription provider"
-          value={provider}
-          disabled={!settings || !editable || busy}
-          onChange={(event) => {
-            setProvider(event.target.value as "codex-account" | "openai-api");
-            setApiKey("");
-          }}
-        >
-          <option value="codex-account">Codex / ChatGPT account</option>
-          <option value="openai-api">OpenAI API key</option>
-        </select>
-      </SettingsRow>
+        description={`Applies to ${scope.label}. Recordings stay in their original draft.`}
+        control={
+          <div className="w-full min-w-0 @min-[32rem]/settings-row:w-60">
+            <Select
+              value={provider}
+              disabled={!settings || !editable || busy}
+              onValueChange={(value) => {
+                if (value !== "codex-account" && value !== "openai-api") return;
+                setProvider(value);
+                setApiKey("");
+              }}
+            >
+              <SelectTrigger size="sm" aria-label="Voice transcription provider">
+                <SelectValue>
+                  {(value: string) =>
+                    value === "openai-api" ? "OpenAI API key" : "Codex / ChatGPT account"
+                  }
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem value="codex-account">Codex / ChatGPT account</SelectItem>
+                <SelectItem value="openai-api">OpenAI API key</SelectItem>
+              </SelectPopup>
+            </Select>
+          </div>
+        }
+      />
       {provider === "codex-account" ? (
         <SettingsRow
           title="Codex account"
           description="Uses the enabled Codex instance and its existing sign-in. Transcription access depends on the account service; signing in does not confirm access. If it returns HTTP 403, you can explicitly choose OpenAI API key instead."
-        >
-          <select
-            aria-label="Transcription Codex account"
-            value={instanceId}
-            disabled={!settings || !editable || busy}
-            onChange={(event) => setInstanceId(event.target.value)}
-          >
-            <option value="">Automatic</option>
-            {settings?.instances.map((entry) => (
-              <option key={entry.id} value={entry.id}>
-                {entry.label}
-                {entry.authenticated ? "" : " (sign-in required)"}
-              </option>
-            ))}
-          </select>
-        </SettingsRow>
+          control={
+            <div className="w-full min-w-0 @min-[32rem]/settings-row:w-60">
+              <Select
+                value={instanceId}
+                disabled={!settings || !editable || busy}
+                onValueChange={(value) => {
+                  if (value !== null) setInstanceId(value);
+                }}
+              >
+                <SelectTrigger size="sm" aria-label="Transcription Codex account">
+                  <SelectValue>
+                    {(value: string) => {
+                      const entry = settings?.instances.find((instance) => instance.id === value);
+                      return entry
+                        ? `${entry.label}${entry.authenticated ? "" : " (sign-in required)"}`
+                        : "Automatic";
+                    }}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectPopup align="end" alignItemWithTrigger={false}>
+                  <SelectItem value="">Automatic</SelectItem>
+                  {settings?.instances.map((entry) => (
+                    <SelectItem key={entry.id} value={entry.id}>
+                      {entry.label}
+                      {entry.authenticated ? "" : " (sign-in required)"}
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+            </div>
+          }
+        />
       ) : (
         <SettingsRow
           title="OpenAI API key"
@@ -151,52 +180,71 @@ export function VoiceTranscriptionSettingsPanel() {
                     ? "A key is encrypted in this environment's private secret store and is never returned to the app. Leave empty to keep it. API billing applies."
                     : "Encrypted in this environment's private secret store. API billing applies separately from ChatGPT."
           }
-        >
-          <Input
-            type="password"
-            autoComplete="off"
-            aria-label="Transcription API key"
-            value={apiKey}
-            disabled={!editable || busy || settings?.supportsEncryptedApiKeyStorage !== true}
-            onChange={(event) => setApiKey(event.target.value)}
-          />
-        </SettingsRow>
+          control={
+            <div className="w-full min-w-0 @min-[32rem]/settings-row:w-60">
+              <Input
+                size="sm"
+                type="password"
+                autoComplete="off"
+                aria-label="Transcription API key"
+                value={apiKey}
+                disabled={!editable || busy || settings?.supportsEncryptedApiKeyStorage !== true}
+                onChange={(event) => setApiKey(event.target.value)}
+                placeholder={settings?.apiKeyConfigured ? "Saved key ••••••••" : "Enter API key"}
+                spellCheck={false}
+                autoCapitalize="none"
+              />
+            </div>
+          }
+        />
       )}
       {provider === "openai-api" ? (
-        <SettingsRow title="Transcription model" description="Used for OpenAI API transcription.">
-          <Input
-            aria-label="Transcription model"
-            value={model}
-            disabled={!editable || busy}
-            onChange={(event) => setModel(event.target.value)}
-          />
-        </SettingsRow>
+        <SettingsRow
+          title="Transcription model"
+          description="Used for OpenAI API transcription."
+          control={
+            <div className="w-full min-w-0 @min-[32rem]/settings-row:w-60">
+              <Input
+                size="sm"
+                aria-label="Transcription model"
+                value={model}
+                disabled={!editable || busy}
+                onChange={(event) => setModel(event.target.value)}
+              />
+            </div>
+          }
+        />
       ) : null}
       <SettingsRow
         title="Provider status"
         description={
-          error || settings?.message || "Select a connected environment to read its voice settings."
+          <span role="status" className="wrap-anywhere">
+            {error || settings?.message || "Reading voice settings from this environment…"}
+          </span>
         }
-      >
-        {provider === "openai-api" && settings?.apiKeySource === "saved" ? (
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={!editable || busy}
-            onClick={() => void save(true)}
-          >
-            Remove saved key
-          </Button>
-        ) : null}
-        <Button
-          variant="secondary"
-          size="sm"
-          disabled={!settings || !editable || busy}
-          onClick={() => void save()}
-        >
-          {busy ? "Saving…" : "Save voice settings"}
-        </Button>
-      </SettingsRow>
+        control={
+          <div className="flex flex-wrap items-center gap-2">
+            {provider === "openai-api" && settings?.apiKeySource === "saved" ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={!editable || busy}
+                onClick={() => void save(true)}
+              >
+                Remove saved key
+              </Button>
+            ) : null}
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!settings || !editable || busy}
+              onClick={() => void save()}
+            >
+              {busy ? "Saving…" : "Save voice settings"}
+            </Button>
+          </div>
+        }
+      />
     </SettingsSection>
   );
 }
