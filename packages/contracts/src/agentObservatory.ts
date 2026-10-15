@@ -140,3 +140,11 @@ export const AgentObservatoryCheckpointReached = Schema.Struct({
   sequence: PositiveInt,
 });
 export type AgentObservatoryCheckpointReached = typeof AgentObservatoryCheckpointReached.Type;
+
+/** Persisted on one canonical message. Sequence comes from its committed event envelope. */
+const { sequence: _sequence, ...MetadataFields } = AgentObservatorySnapshot.fields;
+export const AgentObservatoryMetadata = Schema.Struct({
+  ...MetadataFields,
+  requestId: CommandId,
+});
+export type AgentObservatoryMetadata = typeof AgentObservatoryMetadata.Type;

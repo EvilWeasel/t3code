@@ -1,3 +1,8 @@
+import type {
+  AgentObservatoryCommit,
+  AgentObservatoryCommitResult,
+} from "../observatory/AgentObservatoryPorts.ts";
+import { AgentObservatoryRefusal } from "../observatory/AgentObservatoryPorts.ts";
 import {
   CommandId,
   type OrchestrationV2Run,
@@ -71,6 +76,10 @@ export type EventSinkV2Error = typeof EventSinkV2Error.Type;
  * SERVICE DEFINITION
  */
 export interface EventSinkV2Shape {
+  /** Internal host-attested call only; no RPC/tool decoder may provide principal. */
+  readonly commitObservatoryUpdate: (
+    input: AgentObservatoryCommit,
+  ) => Effect.Effect<AgentObservatoryCommitResult, EventSinkV2Error | AgentObservatoryRefusal>;
   readonly write: (input: {
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;

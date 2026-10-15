@@ -293,6 +293,26 @@ export interface ProjectionRuntimeResponseContext {
   readonly session: OrchestrationV2ThreadProjection["providerSessions"][number] | undefined;
 }
 
+export interface NativeAgentRosterCursor {
+  readonly throughSequence: number;
+  readonly threadIds: ReadonlyArray<ThreadId>;
+  readonly afterId: string;
+}
+export interface NativeAgentRosterQuery {
+  /** Already-authorized selection, max 128 threads. Not discovered by opening histories. */
+  readonly threadIds: ReadonlyArray<ThreadId>;
+  readonly limit: number;
+  readonly cursor?: NativeAgentRosterCursor;
+}
+export interface NativeAgentRosterPage {
+  readonly source: "canonical-subagent-index";
+  readonly coverage: "recorded-current-only";
+  readonly throughSequence: number;
+  readonly status: "complete" | "partial" | "stale";
+  readonly agents: ReadonlyArray<OrchestrationV2Subagent>;
+  readonly nextCursor: NativeAgentRosterCursor | null;
+}
+
 export interface ProjectionRecordFilter {
   readonly messageRoles?: ReadonlyArray<OrchestrationV2ConversationMessage["role"]>;
   readonly turnItemRunId?: RunId;
@@ -367,6 +387,9 @@ export interface ProjectionStoreV2Shape {
     readonly threadId: ThreadId;
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2TurnItem | null, ProjectionStoreV2Error>;
+  readonly getCurrentNativeAgentRoster: (
+    input: NativeAgentRosterQuery,
+  ) => Effect.Effect<NativeAgentRosterPage, ProjectionStoreV2Error>;
   readonly getThreadRecords: <K extends ProjectionRecordField>(
     threadId: ThreadId,
     fields: ReadonlyArray<K>,
