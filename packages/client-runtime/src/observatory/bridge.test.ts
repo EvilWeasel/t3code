@@ -12,6 +12,7 @@ import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import {
   AVAILABLE_CONNECTION_STATE,
   type SupervisorConnectionState,
+  type NetworkStatus,
   type PreparedConnection,
 } from "../connection/model.ts";
 import type { ConnectionCatalogEntry } from "../connection/catalog.ts";
@@ -321,7 +322,7 @@ effectIt.effect(
                 yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(
                   entries,
                 ),
-              networkStatus: yield* SubscriptionRef.make("online" as const),
+              networkStatus: yield* SubscriptionRef.make<NetworkStatus>("online"),
               followStream,
             }),
             Layer.mock(EnvironmentCacheStore)({}),
@@ -354,7 +355,10 @@ effectIt.effect(
         yield* waitFor((value) => value.sources[0]?.status === "synchronizing");
         expect(streamScopes?.opened).toBe(0);
         yield* SubscriptionRef.set(session, Option.some(firstSession));
-        yield* SubscriptionRef.update(connection, (state) => ({ ...state, phase: "connected" }));
+        yield* SubscriptionRef.update(connection, (state): SupervisorConnectionState => ({
+          ...state,
+          phase: "connected",
+        }));
         yield* waitFor(
           (value) => value.sources[0]?.status === "synchronizing" && streamScopes?.opened === 1,
         );
@@ -391,12 +395,15 @@ effectIt.effect(
             value.nodes[0]?.title === "Current emission" &&
             value.selection?.detail?.projection.thread.title === "Current detail",
         );
-        yield* SubscriptionRef.update(first.detail, (state) => ({
+        yield* SubscriptionRef.update(first.detail, (state): EnvironmentThreadState => ({
           ...state,
           status: "synchronizing",
         }));
         yield* waitFor((value) => value.selection !== null && value.selection.detail === null);
-        yield* SubscriptionRef.update(first.detail, (state) => ({ ...state, status: "live" }));
+        yield* SubscriptionRef.update(first.detail, (state): EnvironmentThreadState => ({
+          ...state,
+          status: "live",
+        }));
         yield* waitFor(
           (value) => value.selection?.detail?.projection.thread.title === "Current detail",
         );
@@ -453,7 +460,7 @@ effectIt.effect(
         const authRestored = controlled.authRestored;
         yield* Deferred.succeed(authRestored.releaseShell, undefined);
         yield* waitFor((value) => value.nodes[0]?.title === "Auth restored");
-        yield* SubscriptionRef.update(connection, (state) => ({
+        yield* SubscriptionRef.update(connection, (state): SupervisorConnectionState => ({
           ...state,
           phase: "connecting",
           generation: 2,
@@ -463,7 +470,10 @@ effectIt.effect(
         );
         yield* Deferred.await(authRestored.shellClosed);
         yield* SubscriptionRef.set(session, Option.some({ ...firstSession }));
-        yield* SubscriptionRef.update(connection, (state) => ({ ...state, phase: "connected" }));
+        yield* SubscriptionRef.update(connection, (state): SupervisorConnectionState => ({
+          ...state,
+          phase: "connected",
+        }));
         const reconnected = controlled.reconnected;
         yield* Deferred.succeed(reconnected.releaseShell, undefined);
         yield* waitFor(
