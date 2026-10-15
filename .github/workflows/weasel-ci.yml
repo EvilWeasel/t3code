@@ -33,7 +33,7 @@ permissions:
 jobs:
   check:
     if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -51,10 +51,18 @@ jobs:
         run: vp install --frozen-lockfile
       - name: Run focused source gates
         run: bash scripts/weasel/check.sh
+      - name: Lint conversational work-control slice
+        run: >-
+          vp lint --report-unused-disable-directives
+          apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
+          apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
+          apps/server/src/voice/CodexLiveSessionService.test.ts
+          apps/server/src/voice/CodexLiveSessionService.ts
+          packages/provider-core/src/server/ProviderAdapter.ts
   product_bundle:
     needs: [check, windows_installer_guard]
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
