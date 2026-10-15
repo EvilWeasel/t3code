@@ -65,6 +65,7 @@ focused_tests=(
   apps/server/src/environment/ServerEnvironment.test.ts
   apps/server/src/cloud/pinnedRuntime.test.ts
   apps/server/src/serviceLauncher.test.ts
+  apps/server/src/serverRuntimeState.test.ts
   apps/server/src/voice/VoiceSettings.test.ts
   apps/web/src/voice/VoiceDictationControl.test.tsx
   apps/web/src/voice/LiveVoiceControl.test.tsx
