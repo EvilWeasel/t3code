@@ -25,6 +25,8 @@ jobs:
       upstream: ${{ steps.reserve.outputs.upstream }}
       reserved: ${{ steps.reserve.outputs.reserved }}
       activeLedger: ${{ steps.persist.outputs.commit }}
+      sourceStatus: ${{ steps.prepare.outputs.status }}
+      policyAllowed: ${{ steps.policy.outputs.allowed }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,12 +45,9 @@ jobs:
       - name: Probe latest public upstream main without models or installation
         run: bash scripts/weasel/sync-upstream-main.sh probe --output "$RUNNER_TEMP/probe"
       - name: Restore protected fork ledger ref or refuse
-        env:
-          REVIEWED_INITIAL_PAIR: ${{ vars.WEASEL_UPSTREAM_MAIN_REVIEWED_INITIAL_PAIR }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = morrowbyte/t3code
-          test "$REVIEWED_INITIAL_PAIR" = '260451f5536555af1970f52e7f4ae16578ae26c8:81493efb71e8e8244f95d3e9f71d8369654ab151'
           # Only trusted contents:write jobs can update this ref; candidate jobs
           # have contents:read. Uploaded artifacts are never ledger authority.
           # There is deliberately no initialization or missing-state fallback.
@@ -104,31 +103,71 @@ jobs:
       - name: Persist active reservation before any prepare or candidate execution
         id: persist
         if: steps.reserve.outputs.reserved == 'true'
+        env:
+          FORK: ${{ steps.reserve.outputs.fork }}
+          UPSTREAM: ${{ steps.reserve.outputs.upstream }}
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
           previous="$(cat "$RUNNER_TEMP/pre-attempt-ledger.commit")"
           git fetch origin refs/heads/automation/upstream-main-ledger
           test "$(git rev-parse FETCH_HEAD)" = "$previous"
           blob="$(git hash-object -w "$RUNNER_TEMP/active/ledger.json")"
-          tree="$(printf '100644 blob %s\tledger.json\n' "$blob" | git mktree)"
+          python3 - <<'PYADMISSION'
+          import json,os,pathlib
+          r={'schemaVersion':1,'repository':'morrowbyte/t3code','forkSha':os.environ['FORK'],'upstreamSha':os.environ['UPSTREAM'],'runId':os.environ['GITHUB_RUN_ID'],'runAttempt':1,'workflowSha':os.environ['TRUSTED_WORKFLOW_SHA'],'disposition':'not_dispatched'}
+          (pathlib.Path(os.environ['RUNNER_TEMP'])/'admission.json').write_text(json.dumps(r,sort_keys=True))
+          PYADMISSION
+          admission_path="admissions/$FORK-$UPSTREAM/$GITHUB_RUN_ID.json"
+          if git cat-file -e "$previous:$admission_path" 2>/dev/null; then exit 1; fi
+          admission_blob="$(git hash-object -w "$RUNNER_TEMP/admission.json")"
+          state_index="$(mktemp "$RUNNER_TEMP/state-index.XXXXXX")"
+          rm "$state_index"
+          GIT_INDEX_FILE="$state_index" git read-tree "$previous"
+          GIT_INDEX_FILE="$state_index" git update-index --add --cacheinfo "100644,$blob,ledger.json"
+          GIT_INDEX_FILE="$state_index" git update-index --add --cacheinfo "100644,$admission_blob,$admission_path"
+          tree="$(GIT_INDEX_FILE="$state_index" git write-tree)"
+          rm "$state_index"
           commit="$(printf 'Reserve upstream main pair before attempt\n' | env GIT_AUTHOR_NAME='github-actions[bot]' GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' GIT_COMMITTER_NAME='github-actions[bot]' GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' git -c commit.gpgsign=false commit-tree "$tree" -p "$previous")"
           git push origin "$commit:refs/heads/automation/upstream-main-ledger"
           test "$(git ls-remote origin refs/heads/automation/upstream-main-ledger | cut -f1)" = "$commit"
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
-      - name: Validate real Git helper fixtures on trusted source
+      - name: Keep initial semantic review hold after durable reservation
+        id: policy
         if: steps.persist.outputs.commit != ''
+        env:
+          REVIEWED_INITIAL_PAIR: ${{ vars.WEASEL_UPSTREAM_MAIN_REVIEWED_INITIAL_PAIR }}
+        run: |
+          if [[ "$REVIEWED_INITIAL_PAIR" == '260451f5536555af1970f52e7f4ae16578ae26c8:81493efb71e8e8244f95d3e9f71d8369654ab151' ]]; then
+            echo 'allowed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'allowed=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Validate real Git helper fixtures on trusted source
+        if: steps.policy.outputs.allowed == 'true'
         run: bash scripts/weasel/test-sync-upstream-main.sh
       - name: Prepare from immutable pre-attempt snapshot
         id: prepare
-        if: steps.persist.outputs.commit != ''
+        if: steps.policy.outputs.allowed == 'true'
         run: |
           set -euo pipefail
           fork="$(jq -er .forkSha "$RUNNER_TEMP/probe/receipt.json")"
           upstream="$(jq -er .upstreamSha "$RUNNER_TEMP/probe/receipt.json")"
-          bash scripts/weasel/sync-upstream-main.sh prepare --fork-sha "$fork" --upstream-sha "$upstream" --state-file "$RUNNER_TEMP/pre-attempt-ledger.json" --output "$RUNNER_TEMP/prepared"
-          test "$(jq -r .status "$RUNNER_TEMP/prepared/receipt.json")" = candidate_unqualified
-          candidate="$(jq -er .candidateSha "$RUNNER_TEMP/prepared/receipt.json")"
-          printf 'candidate=%s\nfork=%s\nupstream=%s\n' "$candidate" "$fork" "$upstream" >> "$GITHUB_OUTPUT"
+          if ! bash scripts/weasel/sync-upstream-main.sh prepare --fork-sha "$fork" --upstream-sha "$upstream" --state-file "$RUNNER_TEMP/pre-attempt-ledger.json" --output "$RUNNER_TEMP/prepared"; then
+            echo 'status=error' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          status="$(jq -er .status "$RUNNER_TEMP/prepared/receipt.json")"
+          case "$status" in
+            conflict|no_change|skipped_known_pair)
+              printf 'status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+              ;;
+            candidate_unqualified)
+              candidate="$(jq -er .candidateSha "$RUNNER_TEMP/prepared/receipt.json")"
+              printf 'status=%s\ncandidate=%s\n' "$status" "$candidate" >> "$GITHUB_OUTPUT"
+              ;;
+            *) echo 'status=error' >> "$GITHUB_OUTPUT"; exit 1 ;;
+          esac
       - name: Preserve exact attempt source and reservation evidence
         if: always() && steps.reserve.outputs.reserved == 'true'
         uses: actions/upload-artifact@v4
@@ -142,6 +181,8 @@ jobs:
           retention-days: 90
 
   publish_candidate:
+    outputs:
+      outcome: ${{ steps.publish.outputs.outcome }}
     needs: prepare
     if: needs.prepare.outputs.candidate != ''
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
@@ -160,6 +201,7 @@ jobs:
           name: upstream-main-attempt
           path: attempt
       - name: Verify inert candidate bundle and publish only fork ref
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE: ${{ needs.prepare.outputs.candidate }}
@@ -179,9 +221,15 @@ jobs:
           test "$(git rev-parse "$CANDIDATE^{tree}")" = "$(jq -er .treeSha attempt/prepared/receipt.json)"
           # Candidate changes to its gate policy require manual integration, never
           # a self-issued passing check or workflow modification.
-          test -z "$(git diff --name-only "$FORK" "$CANDIDATE" -- .github/workflows scripts/weasel apps/desktop/resources/morrowbyte-installer-guard.ps1 apps/desktop/resources/test-morrowbyte-installer-guard.ps1)"
+          if [[ -n "$(git diff --name-only "$FORK" "$CANDIDATE" -- .github/workflows scripts/weasel apps/desktop/resources/morrowbyte-installer-guard.ps1 apps/desktop/resources/test-morrowbyte-installer-guard.ps1)" ]]; then
+            echo 'outcome=policy_hold' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           git -c credential.helper='!gh auth git-credential' fetch origin main
-          test "$(git rev-parse FETCH_HEAD)" = "$FORK"
+          if [[ "$(git rev-parse FETCH_HEAD)" != "$FORK" ]]; then
+            echo 'outcome=stale_fence' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           ref="refs/heads/automation/upstream-main/$FORK-$UPSTREAM"
           test -z "$(git -c credential.helper='!gh auth git-credential' ls-remote origin "$ref")"
           git -c credential.helper='!gh auth git-credential' push origin "$CANDIDATE:$ref"
@@ -197,6 +245,8 @@ jobs:
     # No secrets inheritance; the candidate runs only with contents:read.
 
   promote:
+    outputs:
+      outcome: ${{ steps.promote.outputs.outcome }}
     needs: [prepare, publish_candidate, qualify]
     permissions:
       contents: write
@@ -214,6 +264,7 @@ jobs:
           name: sync-qualification-${{ needs.prepare.outputs.candidate }}
           path: qualification
       - name: Verify source/run gates and perform only fresh fast-forward
+        id: promote
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE: ${{ needs.prepare.outputs.candidate }}
@@ -221,6 +272,7 @@ jobs:
           FORK: ${{ needs.prepare.outputs.fork }}
           UPSTREAM: ${{ needs.prepare.outputs.upstream }}
           TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          ACTIVE_LEDGER: ${{ needs.prepare.outputs.activeLedger }}
         run: |
           set -euo pipefail
           test "$GITHUB_REPOSITORY" = morrowbyte/t3code
@@ -286,13 +338,55 @@ jobs:
           test "$(git rev-parse FETCH_HEAD)" = "$CANDIDATE"
           test "$(git show -s --format=%P "$CANDIDATE")" = "$FORK $UPSTREAM"
           git -c credential.helper='!gh auth git-credential' fetch origin main
-          test "$(git rev-parse FETCH_HEAD)" = "$FORK"
+          if [[ "$(git rev-parse FETCH_HEAD)" != "$FORK" ]]; then
+            echo 'outcome=stale_fence' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           public_dir="$(mktemp -d "$RUNNER_TEMP/public-main-check.XXXXXX")"
           observed="$(env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -C "$public_dir" -c credential.helper= -c http.extraHeader= -c core.askPass= ls-remote https://github.com/pingdotgg/t3code.git refs/heads/main | cut -f1)"
-          test "$observed" = "$UPSTREAM"
+          if [[ "$observed" != "$UPSTREAM" ]]; then
+            echo 'outcome=stale_fence' >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           git merge-base --is-ancestor "$FORK" "$CANDIDATE"
+          persist_promotion_phase() {
+            PROMOTION_PHASE="$1" python3 - <<'PYPHASE'
+          import json,os,pathlib,subprocess,tempfile,time,re
+          def git(*args,data=None,env=None,check=True):
+              return subprocess.run(['git','-c','credential.helper=!gh auth git-credential',*args],input=data,capture_output=True,check=check,env=env)
+          def text(*args): return git(*args).stdout.decode().strip()
+          active=os.environ['ACTIVE_LEDGER']; fork=os.environ['FORK']; upstream=os.environ['UPSTREAM']; candidate=os.environ['CANDIDATE']; phase=os.environ['PROMOTION_PHASE']
+          if phase not in ('possibly_sent','verified') or any(not re.fullmatch('[0-9a-f]{40}',x) for x in (active,fork,upstream,candidate)): raise SystemExit('Invalid promotion binding')
+          git('fetch','origin','refs/heads/automation/upstream-main-ledger'); previous=text('rev-parse','FETCH_HEAD'); git('merge-base','--is-ancestor',active,previous)
+          ledger=json.loads(text('show',previous+':ledger.json'))
+          if ledger['pairs'][-1]!={'forkSha':fork,'upstreamSha':upstream,'status':'active'} or ledger['expiresAt']<=time.time(): raise SystemExit('Promotion reservation unavailable')
+          admission=json.loads(text('show',active+':admissions/'+fork+'-'+upstream+'/'+os.environ['GITHUB_RUN_ID']+'.json'))
+          expected={'schemaVersion':1,'repository':'morrowbyte/t3code','forkSha':fork,'upstreamSha':upstream,'runId':os.environ['GITHUB_RUN_ID'],'runAttempt':1,'workflowSha':os.environ['TRUSTED_WORKFLOW_SHA'],'disposition':'not_dispatched'}
+          if admission!=expected: raise SystemExit('Promotion admission mismatch')
+          prefix='promotion/'+fork+'-'+upstream+'/'+active+'/'
+          marker={**expected,'reservation':active,'candidateSha':candidate,'disposition':phase}
+          path=prefix+phase+'.json'
+          if git('cat-file','-e',previous+':'+path,check=False).returncode==0: raise SystemExit('Promotion phase replay refused')
+          if phase=='possibly_sent':
+              if git('cat-file','-e',previous+':'+prefix+'verified.json',check=False).returncode==0: raise SystemExit('Promotion phase regression')
+          else:
+              sent=json.loads(text('show',previous+':'+prefix+'possibly_sent.json'))
+              if sent!={**marker,'disposition':'possibly_sent'}: raise SystemExit('Promotion send binding mismatch')
+          blob=git('hash-object','-w','--stdin',data=json.dumps(marker,sort_keys=True).encode()).stdout.decode().strip()
+          with tempfile.TemporaryDirectory(dir=os.environ['RUNNER_TEMP'],prefix='promotion-index-') as temp:
+              env={**os.environ,'GIT_INDEX_FILE':str(pathlib.Path(temp)/'index')}
+              git('read-tree',previous,env=env);git('update-index','--add','--cacheinfo','100644,'+blob+','+path,env=env);tree=git('write-tree',env=env).stdout.decode().strip()
+          env={**os.environ,'GIT_AUTHOR_NAME':'github-actions[bot]','GIT_AUTHOR_EMAIL':'41898282+github-actions[bot]@users.noreply.github.com','GIT_COMMITTER_NAME':'github-actions[bot]','GIT_COMMITTER_EMAIL':'41898282+github-actions[bot]@users.noreply.github.com'}
+          commit=git('-c','commit.gpgsign=false','commit-tree',tree,'-p',previous,data=('Retain promotion '+phase+' boundary\n').encode(),env=env).stdout.decode().strip()
+          if ledger['expiresAt']<=time.time(): raise SystemExit('Promotion state expired before send')
+          git('push','origin',commit+':refs/heads/automation/upstream-main-ledger')
+          if text('ls-remote','origin','refs/heads/automation/upstream-main-ledger').split()[0]!=commit: raise SystemExit('Promotion state ACK unknown')
+          PYPHASE
+          }
+          persist_promotion_phase possibly_sent
           git -c credential.helper='!gh auth git-credential' push origin "$CANDIDATE:refs/heads/main"
           test "$(git -c credential.helper='!gh auth git-credential' ls-remote origin refs/heads/main | cut -f1)" = "$CANDIDATE"
+          persist_promotion_phase verified
           # No release dispatch: publication remains independently authorized.
 
   record:
@@ -300,6 +394,7 @@ jobs:
     needs: [prepare, publish_candidate, qualify, promote]
     permissions:
       contents: write
+      issues: write
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 5
     steps:
@@ -307,47 +402,129 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           fetch-depth: 0
-      - name: Read exact current run reservation from fork state ref
+          persist-credentials: false
+      - name: Retain exact outcome and at most one private owner POST attempt
         env:
+          GH_TOKEN: ${{ github.token }}
           ACTIVE_LEDGER: ${{ needs.prepare.outputs.activeLedger }}
-        run: |
-          set -euo pipefail
-          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
-          test "$GITHUB_RUN_ATTEMPT" = 1
-          [[ "$ACTIVE_LEDGER" =~ ^[0-9a-f]{40}$ ]]
-          git fetch origin refs/heads/automation/upstream-main-ledger
-          test "$(git rev-parse FETCH_HEAD)" = "$ACTIVE_LEDGER"
-          mkdir active
-          git show "$ACTIVE_LEDGER:ledger.json" > active/ledger.json
-      - name: Retain terminal outcome without replay or extending expiry
-        env:
-          PROMOTED: ${{ needs.promote.result }}
           FORK: ${{ needs.prepare.outputs.fork }}
           UPSTREAM: ${{ needs.prepare.outputs.upstream }}
-          ACTIVE_LEDGER: ${{ needs.prepare.outputs.activeLedger }}
+          CANDIDATE: ${{ needs.prepare.outputs.candidate }}
+          TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          PREPARE: ${{ needs.prepare.result }}
+          PUBLISH: ${{ needs.publish_candidate.result }}
+          QUALIFY: ${{ needs.qualify.result }}
+          PROMOTE: ${{ needs.promote.result }}
+          POLICY_ALLOWED: ${{ needs.prepare.outputs.policyAllowed }}
+          SOURCE_STATUS: ${{ needs.prepare.outputs.sourceStatus }}
+          PUBLISH_OUTCOME: ${{ needs.publish_candidate.outputs.outcome }}
+          PROMOTE_OUTCOME: ${{ needs.promote.outputs.outcome }}
+          WORKFLOW_CANCELLED: ${{ cancelled() }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json,os,pathlib
-          p=pathlib.Path('active/ledger.json'); ledger=json.loads(p.read_text())
-          # Only the last reservation from this serialized run is transitioned.
-          if not ledger['pairs'] or ledger['pairs'][-1]!={'forkSha':os.environ['FORK'],'upstreamSha':os.environ['UPSTREAM'],'status':'active'}: raise SystemExit('Missing exact active reservation')
-          ledger['pairs'][-1]['status']='success' if os.environ['PROMOTED']=='success' else 'failed'
-          pathlib.Path('final').mkdir();pathlib.Path('final/ledger.json').write_text(json.dumps(ledger))
-          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out:
-              out.write('Upstream pair recorded '+ledger['pairs'][-1]['status']+'. No automatic replay; private attempt artifacts retain details.\n')
-          PY
-          previous="$ACTIVE_LEDGER"
-          git fetch origin refs/heads/automation/upstream-main-ledger
-          test "$(git rev-parse FETCH_HEAD)" = "$previous"
-          blob="$(git hash-object -w final/ledger.json)"
-          tree="$(printf '100644 blob %s\tledger.json\n' "$blob" | git mktree)"
-          commit="$(printf 'Retain upstream main attempt outcome\n' | env GIT_AUTHOR_NAME='github-actions[bot]' GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' GIT_COMMITTER_NAME='github-actions[bot]' GIT_COMMITTER_EMAIL='41898282+github-actions[bot]@users.noreply.github.com' git -c commit.gpgsign=false commit-tree "$tree" -p "$previous")"
-          git push origin "$commit:refs/heads/automation/upstream-main-ledger"
-          test "$(git ls-remote origin refs/heads/automation/upstream-main-ledger | cut -f1)" = "$commit"
+          python3 - <<'PYOUTCOME'
+          import hashlib,http.client,json,os,pathlib,re,ssl,subprocess,tempfile,time
+          # No gh/api retry path, redirect handler, proxy fallback or model call.
+          # ONE direct POST callsite below. A sending claim is never replayed.
+          def git(*args,data=None,env=None,check=True):
+              return subprocess.run(['git','-c','credential.helper=!gh auth git-credential',*args],input=data,capture_output=True,check=check,env=env)
+          def text(*args): return git(*args).stdout.decode().strip()
+          repo='morrowbyte/t3code'; active=os.environ['ACTIVE_LEDGER']; fork=os.environ['FORK']; upstream=os.environ['UPSTREAM']; source=os.environ['TRUSTED_WORKFLOW_SHA']; run=os.environ['GITHUB_RUN_ID']; candidate=os.environ['CANDIDATE'] or None
+          if os.environ['GITHUB_REPOSITORY']!=repo or os.environ['GITHUB_RUN_ATTEMPT']!='1' or not re.fullmatch('[1-9][0-9]*',run) or any(not re.fullmatch('[0-9a-f]{40}',x) for x in (active,fork,upstream,source)) or (candidate is not None and not re.fullmatch('[0-9a-f]{40}',candidate)): raise SystemExit('Invalid exact outcome binding')
+          git('fetch','origin','refs/heads/automation/upstream-main-ledger'); previous=text('rev-parse','FETCH_HEAD'); git('merge-base','--is-ancestor',active,previous)
+          raw=text('show',active+':ledger.json')
+          if text('show',previous+':ledger.json')!=raw: raise SystemExit('Reservation already transitioned; no replay')
+          ledger=json.loads(raw)
+          if ledger['pairs'][-1]!={'forkSha':fork,'upstreamSha':upstream,'status':'active'} or ledger['expiresAt']<=time.time(): raise SystemExit('Missing or expired exact reservation')
+          expected={'schemaVersion':1,'repository':repo,'forkSha':fork,'upstreamSha':upstream,'runId':run,'runAttempt':1,'workflowSha':source,'disposition':'not_dispatched'}
+          admission=json.loads(text('show',active+':admissions/'+fork+'-'+upstream+'/'+run+'.json'))
+          if admission!=expected: raise SystemExit('Durable admission binding mismatch')
+          phasePrefix='promotion/'+fork+'-'+upstream+'/'+active+'/'
+          def phase(name):
+              path=previous+':'+phasePrefix+name+'.json'
+              if git('cat-file','-e',path,check=False).returncode!=0: return False
+              if json.loads(text('show',path))!={**expected,'reservation':active,'candidateSha':candidate,'disposition':name}: raise SystemExit('Durable phase mismatch')
+              return True
+          sent=phase('possibly_sent'); verified=phase('verified')
+          if verified and not sent: raise SystemExit('Invalid phase history')
+          cancelled=os.environ['WORKFLOW_CANCELLED']=='true' or any(os.environ[k]=='cancelled' for k in ('PREPARE','PUBLISH','QUALIFY','PROMOTE'))
+          if verified: outcome='success'; status='success'; disposition='verified'
+          elif sent or cancelled: outcome='interrupted_unknown'; status='active'; disposition='possibly_sent' if sent else 'unknown'
+          else:
+              status='failed'; disposition='not_dispatched'
+              if os.environ['POLICY_ALLOWED']=='false' or os.environ['PUBLISH_OUTCOME']=='policy_hold': outcome='policy_hold'
+              elif os.environ['SOURCE_STATUS']=='conflict': outcome='source_conflict'
+              elif os.environ['PUBLISH_OUTCOME']=='stale_fence' or os.environ['PROMOTE_OUTCOME']=='stale_fence': outcome='stale_fence'
+              elif os.environ['QUALIFY']=='failure': outcome='qualification_failed'
+              else: outcome='operational_refusal'
+          binding={'schemaVersion':1,'repository':repo,'forkSha':fork,'upstreamSha':upstream,'reservation':active,'runId':run,'runAttempt':1,'workflowSha':source,'candidateSha':candidate}
+          prefix='outcomes/'+fork+'-'+upstream+'/'+active+'/'
+          def encoded(value): return json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+          def append(previous,files,message,ledgerBytes=None):
+              git('fetch','origin','refs/heads/automation/upstream-main-ledger')
+              if text('rev-parse','FETCH_HEAD')!=previous: raise SystemExit('Outcome state advanced; no replay')
+              currentLedger=json.loads(text('show',previous+':ledger.json'))
+              if currentLedger['expiresAt']<=time.time() or currentLedger['expiresAt']!=ledger['expiresAt'] or currentLedger['pairs'][-1]['forkSha']!=fork or currentLedger['pairs'][-1]['upstreamSha']!=upstream: raise SystemExit('Expired or foreign state; no mutation')
+              with tempfile.TemporaryDirectory(dir=os.environ['RUNNER_TEMP'],prefix='outcome-index-') as temp:
+                  env={**os.environ,'GIT_INDEX_FILE':str(pathlib.Path(temp)/'index')};git('read-tree',previous,env=env)
+                  for path,data in files.items():
+                      if git('cat-file','-e',previous+':'+path,check=False).returncode==0: raise SystemExit('Immutable outcome sidecar exists; no overwrite/replay')
+                      blob=git('hash-object','-w','--stdin',data=data).stdout.decode().strip();git('update-index','--add','--cacheinfo','100644,'+blob+','+path,env=env)
+                  if ledgerBytes is not None:
+                      blob=git('hash-object','-w','--stdin',data=ledgerBytes).stdout.decode().strip();git('update-index','--cacheinfo','100644,'+blob+',ledger.json',env=env)
+                  tree=git('write-tree',env=env).stdout.decode().strip()
+              env={**os.environ,'GIT_AUTHOR_NAME':'github-actions[bot]','GIT_AUTHOR_EMAIL':'41898282+github-actions[bot]@users.noreply.github.com','GIT_COMMITTER_NAME':'github-actions[bot]','GIT_COMMITTER_EMAIL':'41898282+github-actions[bot]@users.noreply.github.com'}
+              commit=git('-c','commit.gpgsign=false','commit-tree',tree,'-p',previous,data=(message+'\n').encode(),env=env).stdout.decode().strip()
+              git('push','origin',commit+':refs/heads/automation/upstream-main-ledger')
+              if text('ls-remote','origin','refs/heads/automation/upstream-main-ledger').split()[0]!=commit: raise SystemExit('Outcome state ACK unknown; no replay')
+              return commit
+          ledger['pairs'][-1]['status']=status
+          result={**binding,'outcome':outcome,'ledgerStatus':status,'promotionDisposition':disposition,'guarantee':'AT_MOST_ONE_POST_ATTEMPT'}
+          files={prefix+'result.json':encoded(result)}
+          def api(method,path,payload=None):
+              connection=http.client.HTTPSConnection('api.github.com',timeout=20,context=ssl.create_default_context())
+              try:
+                  connection.request(method,path,body=None if payload is None else encoded(payload),headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'morrowbyte-trusted-sync','Content-Type':'application/json'})
+                  response=connection.getresponse();data=response.read(1048577)
+                  if len(data)>1048576: raise ValueError('bounded response')
+                  return response.status,json.loads(data)
+              finally: connection.close()
+          if outcome=='success':
+              append(previous,files,'Retain verified upstream outcome',encoded(ledger))
+          else:
+              # GET is not a delivery attempt. Failure/private mismatch refuses
+              # all POSTs; no alternate intake or broad token is attempted.
+              try: code,metadata=api('GET','/repos/'+repo)
+              except Exception: raise SystemExit('Private fork intake unavailable; no POST')
+              if code!=200 or metadata.get('full_name')!=repo or metadata.get('private')is not True: raise SystemExit('Exact private fork required; no POST')
+              marker='<!-- weasel-upstream-main-outcome:'+fork+':'+upstream+':'+active+' -->'
+              title='Upstream main '+outcome+' '+fork[:12]+'-'+upstream[:12]
+              body='\n'.join([marker,'Static outcome: '+outcome,'Fork SHA: '+fork,'Upstream SHA: '+upstream,'Reservation: '+active,'Workflow source: '+source,'Candidate source: '+(candidate or 'unavailable'),'Run: https://github.com/'+repo+'/actions/runs/'+run,'Attempt: 1','Source receipts/conflicts: upstream-main-attempt artifact in that exact run.','Promotion disposition: '+disposition,'AT_MOST_ONE_POST_ATTEMPT; GitHub acceptance is not PM read.','Unknown remains unknown; no automatic replay.'])
+              if body.count(marker)!=1: raise SystemExit('Nonunique static marker')
+              bodySHA=hashlib.sha256(body.encode()).hexdigest()
+              claim={**binding,'state':'sending','marker':marker,'bodySHA256':bodySHA,'title':title,'body':body,'assignee':'EvilWeasel','guarantee':'AT_MOST_ONE_POST_ATTEMPT'}
+              files[prefix+'notification-claim.json']=encoded(claim)
+              previous=append(previous,files,'Claim one private owner POST before send',encoded(ledger))
+              # The only POST invocation. No retries, redirects, gh retry config,
+              # backoff, status reconciliation or alternative transport here.
+              accepted=None
+              try:
+                  code,response=api('POST','/repos/'+repo+'/issues',{'title':title,'body':body,'assignees':['EvilWeasel']})
+                  number=response.get('number');identity=response.get('id')
+                  if code==201 and type(number)is int and number>0 and type(identity)is int and identity>0 and response.get('html_url')=='https://github.com/'+repo+'/issues/'+str(number) and response.get('repository_url')=='https://api.github.com/repos/'+repo and response.get('title')==title and response.get('body')==body and any(a.get('login')=='EvilWeasel' for a in response.get('assignees',[])):
+                      accepted={**binding,'state':'accepted_by_github','marker':marker,'bodySHA256':bodySHA,'issueNumber':number,'issueId':identity,'issueURL':response['html_url'],'pmRead':'UNKNOWN'}
+              except Exception: pass
+              if accepted is None:
+                  append(previous,{prefix+'notification-unknown.json':encoded({**binding,'state':'outcome_unknown','marker':marker,'bodySHA256':bodySHA})},'Retain unknown POST outcome; never replay')
+                  raise SystemExit('Owner POST outcome unknown; no retry')
+              append(previous,{prefix+'notification-accepted.json':encoded(accepted)},'Retain GitHub acceptance; not PM read')
+          pathlib.Path('final').mkdir();pathlib.Path('final/outcome.json').write_bytes(encoded(result))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as out: out.write('Typed upstream outcome '+outcome+' retained; '+status+' pair state. No automatic replay.\n')
+          PYOUTCOME
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: upstream-main-ledger-final
-          path: final/ledger.json
-          if-no-files-found: error
+          name: upstream-main-outcome-evidence
+          path: final/outcome.json
+          if-no-files-found: warn
           retention-days: 90
