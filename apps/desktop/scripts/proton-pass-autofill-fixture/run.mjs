@@ -38,21 +38,67 @@ for (const key of ["--entry", "--output"])
 if (!/^:\d+(?:\.\d+)?$/.test(process.env.DISPLAY ?? "") || !process.env.XAUTHORITY)
   throw new Error("Private xvfb-run display required");
 const display = process.env.DISPLAY.split(".")[0];
-let xvfbPid;
+const wrapperPid = process.ppid;
+const wrapperCommand = NodeFS.readFileSync(`/proc/${wrapperPid}/cmdline`, "utf8")
+  .split("\0")
+  .filter(Boolean);
+const wrapperDirectory = NodeFS.realpathSync(`/proc/${wrapperPid}/cwd`);
+const xvfbRun = NodeFS.realpathSync("/usr/bin/xvfb-run");
+const resolveArgument = (argument) => {
+  try {
+    return NodeFS.realpathSync(NodePath.resolve(wrapperDirectory, argument));
+  } catch {
+    return null;
+  }
+};
+if (
+  NodeFS.statSync(`/proc/${wrapperPid}`).uid !== process.getuid() ||
+  !wrapperCommand.some((argument) => resolveArgument(argument) === xvfbRun) ||
+  !wrapperCommand.includes("--auto-servernum") ||
+  wrapperCommand.some((argument) => argument === "-f" || argument.startsWith("--auth-file")) ||
+  !wrapperCommand.some(
+    (argument) =>
+      resolveArgument(argument) === NodeFS.realpathSync(NodeURL.fileURLToPath(import.meta.url)),
+  ) ||
+  !Object.entries(options).every(([key, value]) => {
+    const at = wrapperCommand.indexOf(key);
+    return at !== -1 && wrapperCommand[at + 1] === value;
+  })
+)
+  throw new Error("This invocation must be a direct child of its own xvfb-run");
+const authority = NodeFS.realpathSync(process.env.XAUTHORITY);
+const authStat = NodeFS.statSync(authority);
+const authDirectory = NodeFS.statSync(NodePath.dirname(authority));
+if (
+  !authStat.isFile() ||
+  authStat.uid !== process.getuid() ||
+  (authStat.mode & 0o077) !== 0 ||
+  authDirectory.uid !== process.getuid() ||
+  (authDirectory.mode & 0o077) !== 0
+)
+  throw new Error("Private invocation-owned Xauthority required");
+const candidates = [];
 for (const pid of NodeFS.readdirSync("/proc").filter((entry) => /^\d+$/.test(entry))) {
   try {
     const command = NodeFS.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-    if (
-      NodePath.basename(command[0] ?? "") === "Xvfb" &&
-      command.includes(display) &&
-      NodeFS.statSync(`/proc/${pid}`).uid === process.getuid()
-    )
-      xvfbPid = Number(pid);
-  } catch {
-    /* A process may exit during this read-only ownership check. */
+    if (NodePath.basename(command[0] ?? "") !== "Xvfb" || !command.includes(display)) continue;
+    if (NodeFS.statSync(`/proc/${pid}`).uid !== process.getuid())
+      throw new Error("Ambiguous display owner");
+    const stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    candidates.push({ pid: Number(pid), parent: Number(fields[1]), command });
+  } catch (error) {
+    if (error instanceof Error && error.message === "Ambiguous display owner") throw error;
+    // Exiting processes cannot qualify; no fallback to an ambient display.
   }
 }
-if (!xvfbPid) throw new Error("Owned Xvfb process identity unavailable");
+if (candidates.length !== 1 || candidates[0].parent !== wrapperPid)
+  throw new Error("Unique sibling Xvfb from this xvfb-run required");
+const ownedXvfb = candidates[0];
+const authIndex = ownedXvfb.command.indexOf("-auth");
+if (authIndex < 0 || resolveArgument(ownedXvfb.command[authIndex + 1]) !== authority)
+  throw new Error("Xvfb auth does not match this invocation");
+const xvfbPid = ownedXvfb.pid;
 const xdotool = NodeFS.realpathSync("/usr/bin/xdotool");
 const repo = NodeFS.realpathSync(NodeURL.fileURLToPath(new URL("../../../../", import.meta.url)));
 const git = NodeChildProcess.execFileSync("/usr/bin/git", ["-C", repo, "rev-parse", "HEAD"], {
@@ -85,6 +131,9 @@ const binding = {
   expectedElectron: "44.4.5",
   entrySha256: hash(NodeFS.readFileSync(options["--entry"])),
   xvfbPid,
+  xvfbRunPid: wrapperPid,
+  xvfbRunSha256: hash(NodeFS.readFileSync(xvfbRun)),
+  privateDisplayBound: true,
   xdotoolSha256: hash(NodeFS.readFileSync(xdotool)),
 };
 const temporary = NodeFS.mkdtempSync(NodePath.join(runnerTemp, "morrowbyte-autofill-"));

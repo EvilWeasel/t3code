@@ -90,6 +90,7 @@ const required = [
   "redirect",
   "privateAdmissions",
   "privateCdp",
+  "publicRelayEvents",
   "privateEvents",
   "lateReply",
   "annotationCancellation",
@@ -273,7 +274,7 @@ let secondary = "";
 const hostPages = new Map<string, { partition: string; url: string }>();
 const preload = NodePath.join(repo, "apps/desktop/dist-electron/preview-pick-preload.cjs");
 const html =
-  () => `<!doctype html><html><head><meta charset="utf-8"><style nonce="fixture">body{font:18px sans-serif;margin:30px}input{display:block;margin:12px;height:36px}iframe{width:300px;height:180px}</style></head><body><form id="a"><input id="u" type="text" autocomplete="username"><input id="p" type="password"></form><form id="b"><input id="u2" type="text"><input id="p2" type="password"></form><iframe src="${secondary}/frame"></iframe><script nonce="fixture">
+  () => `<!doctype html><html><head><meta charset="utf-8"><style nonce="fixture">body{font:18px sans-serif;margin:30px}input{display:block;margin:12px;height:36px}iframe{width:300px;height:180px}</style></head><body><form id="a"><input id="u" type="text" autocomplete="username"><input id="p" type="password"></form><form id="b"><input id="u2" type="text"><input id="p2" type="password"></form><iframe src="${secondary}/frame"></iframe><iframe id="same-origin" src="${primary}/frame"></iframe><script nonce="fixture">
   document.querySelectorAll('input').forEach(input => input.addEventListener('focus', () => fetch('/event/focus-' + input.id, {method:'POST'})));
   new MutationObserver(() => { if(document.documentElement.hasAttribute('data-t3code-annotation-tool')) fetch('/event/overlay', {method:'POST'}); }).observe(document.documentElement,{attributes:true});
 </script></body></html>`;
@@ -502,6 +503,44 @@ async function exercise(
       return chosen.promise;
     },
   });
+  const cdp = async (id: number, method: string, params: object = {}, browser = false) =>
+    run(
+      host.handleCommandLine(
+        JSON.stringify({
+          type: "cdp",
+          threadId: "fixture-thread",
+          tabId: A.id,
+          message: JSON.stringify({
+            id,
+            method,
+            params,
+            ...(browser ? {} : { sessionId: "t3-preview-page" }),
+          }),
+        }),
+      ),
+    );
+  const waitReply = async (id: number) => {
+    // Real stream publishes FIFO; the request has an explicit event waiter, never a polling pass condition.
+    if (replies.has(id)) return;
+    await event(`reply-${id}`);
+  };
+  await check("publicRelayEvents", async () => {
+    await cdp(
+      90,
+      "Target.setAutoAttach",
+      { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+      true,
+    );
+    await waitReply(90);
+    await cdp(91, "Runtime.enable");
+    await waitReply(91);
+    if (!replies.get(90)?.success || !replies.get(91)?.success) return false;
+    const relayed = event("public-console");
+    const before = cdpEvents.count;
+    await A.wc.executeJavaScript("console.log('owned-public-baseline')");
+    await relayed;
+    return cdpEvents.count > before;
+  });
   await check("focusIdentity", () => focus(A));
   await check("nativeMenuLinkFill", async () => {
     const current = await target(A);
@@ -531,42 +570,27 @@ async function exercise(
       host.isPrivateEntry(A.wc)
     );
   });
-  const cdp = async (id: number, method: string, params: object = {}) =>
-    run(
-      host.handleCommandLine(
-        JSON.stringify({
-          type: "cdp",
-          threadId: "fixture-thread",
-          tabId: A.id,
-          message: JSON.stringify({ id, method, params, sessionId: "t3-preview-page" }),
-        }),
-      ),
-    );
-  const waitReply = async (id: number) => {
-    // Real stream publishes FIFO; the request has an explicit event waiter, never a polling pass condition.
-    if (replies.has(id)) return;
-    await event(`reply-${id}`);
-  };
   await check("privateCdp", async () => {
     await cdp(100, "DOM.getDocument");
     await waitReply(100);
     return replies.get(100)?.privateEntry === true;
   });
-  await check("privateEvents", async () => {
-    const before = cdpEvents.count;
-    const emitted = deferred<void>();
-    const listener = (_event: Electron.Event, method: string) => {
-      if (method === "Runtime.consoleAPICalled") emitted.resolve();
-    };
-    A.wc.debugger.on("message", listener);
-    await A.wc.debugger.sendCommand("Runtime.enable");
-    await A.wc.executeJavaScript("console.log('owned-fixture-event')");
-    await emitted.promise;
-    await cdp(101, "DOM.getDocument");
-    await waitReply(101);
-    A.wc.debugger.off("message", listener);
-    return cdpEvents.count === before;
-  });
+  if (checks.publicRelayEvents === "PASS")
+    await check("privateEvents", async () => {
+      const before = cdpEvents.count;
+      const emitted = deferred<void>();
+      const listener = (_event: Electron.Event, method: string) => {
+        if (method === "Runtime.consoleAPICalled") emitted.resolve();
+      };
+      A.wc.debugger.on("message", listener);
+      await A.wc.debugger.sendCommand("Runtime.enable");
+      await A.wc.executeJavaScript("console.log('owned-fixture-event')");
+      await emitted.promise;
+      await cdp(101, "DOM.getDocument");
+      await waitReply(101);
+      A.wc.debugger.off("message", listener);
+      return cdpEvents.count === before;
+    });
   await check("clearRevealedPair", async () => {
     await A.wc.executeJavaScript(
       "document.getElementById('p').type='text'; document.getElementById('u2').focus()",
@@ -710,30 +734,60 @@ async function exercise(
       await freshClear(A);
       return blocked && (await observer(A, true)) === true;
     });
-  for (const kind of [
-    "replacementRefusal",
-    "foreignDocumentRefusal",
-    "formMismatchRefusal",
-  ] as const)
+  for (const [index, kind] of (
+    ["replacementRefusal", "foreignDocumentRefusal", "formMismatchRefusal"] as const
+  ).entries())
     await check(kind, async () => {
       await service.fill(await target(A), reference);
+      await A.wc.executeJavaScriptInIsolatedWorld(1004, [
+        {
+          code: "globalThis.fixtureRetained={username:document.getElementById('u'),password:document.getElementById('p')};true",
+        },
+      ]);
       const mutation =
         kind === "replacementRefusal"
           ? "const old=document.getElementById('p');const clone=old.cloneNode(true);clone.value=old.value;old.replaceWith(clone);"
           : kind === "foreignDocumentRefusal"
-            ? "document.implementation.createHTMLDocument().body.append(document.getElementById('p'));"
+            ? "document.getElementById('same-origin').contentDocument.body.append(document.getElementById('a'));"
             : "document.getElementById('b').append(document.getElementById('p'));";
       await A.wc.executeJavaScript(mutation);
-      await focus(A);
-      const current = await target(A);
-      const result = (await rejected(service.clearAndResume(current))) && host.isPrivateEntry(A.wc);
-      const again = await target(A);
-      const repeated = await rejected(service.clearAndResume(again));
-      // Explicit owned navigation is the existing recovery path; never reopen sharing on stale refs.
+      if (kind === "replacementRefusal")
+        await A.wc.executeJavaScriptInIsolatedWorld(1004, [
+          { code: "globalThis.fixtureRetained.replacement=document.getElementById('p');true" },
+        ]);
+      const unchanged = async () =>
+        A.wc.executeJavaScriptInIsolatedWorld(1004, [
+          {
+            code: `(async()=>{
+        const r=globalThis.fixtureRetained;
+        const digest=async s=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s)))].map(b=>b.toString(16).padStart(2,'0')).join('');
+        const values=await digest(r.username.value)==='${hash(username)}' && await digest(r.password.value)==='${hash(password)}' && (!r.replacement || await digest(r.replacement.value)==='${hash(password)}');
+        const boundary=${kind === "replacementRefusal" ? "!r.password.isConnected && r.replacement.isConnected && r.replacement!==r.password" : kind === "foreignDocumentRefusal" ? "r.username instanceof HTMLInputElement && r.password instanceof HTMLInputElement && r.username!==r.password && r.username.isConnected && r.password.isConnected && r.username.form===r.password.form && r.username.form.isConnected && r.username.form.contains(r.username) && r.username.form.contains(r.password) && r.username.ownerDocument!==document && r.password.ownerDocument!==document && r.username.ownerDocument===r.password.ownerDocument" : "r.username.isConnected && r.password.isConnected && r.username.ownerDocument===document && r.password.ownerDocument===document && r.username.form!==r.password.form"};
+        return values && boundary;
+      })()`,
+          },
+        ]);
+      if ((await unchanged()) !== true) return false;
+      await focus(A, kind === "foreignDocumentRefusal" ? "u2" : "u");
+      const gatesClosed = async (id: number) => {
+        if (!host.isPrivateEntry(A.wc)) return false;
+        const capture = await rejected(run(manager.captureScreenshot(A.id)));
+        await cdp(id, "DOM.getDocument");
+        await waitReply(id);
+        return capture && replies.get(id)?.privateEntry === true && host.isPrivateEntry(A.wc);
+      };
+      const first =
+        (await rejected(service.clearAndResume(await target(A)))) &&
+        (await unchanged()) === true &&
+        (await gatesClosed(300 + index * 2));
+      const second =
+        (await rejected(service.clearAndResume(await target(A)))) &&
+        (await unchanged()) === true &&
+        (await gatesClosed(301 + index * 2));
       await A.wc.loadURL(`${primary}/login`);
       await focus(A);
       await freshClear(A);
-      return result && repeated;
+      return first && second;
     });
   for (const kind of ["navigationRead", "redirect"] as const)
     await check(kind, async () => {
@@ -794,21 +848,9 @@ async function exercise(
     return result;
   });
   await focus(A);
-  await check("lateReply", async () => {
-    const ready = event("relay-ready");
-    await cdp(200, "Runtime.evaluate", {
-      expression:
-        "new Promise(resolve=>{globalThis.fixtureReply=resolve;fetch('/event/relay-ready',{method:'POST'})})",
-      awaitPromise: true,
-    });
-    await ready;
-    await (await target(A)).enterPrivate();
-    await A.wc.executeJavaScript("globalThis.fixtureReply('owned-fixture')");
-    await freshClear(A);
-    await cdp(201, "Runtime.evaluate", { expression: "true" });
-    await waitReply(201);
-    return !replies.has(200) && replies.get(201)?.success === true;
-  });
+  // No public production seam exposes completion/drain of a discarded relay's own promise.
+  // An unrelated later response is NOT a completion barrier. Leave required evidence UNKNOWN.
+  checks.lateReply = "UNKNOWN_REQUIRED";
   await check("annotationCancellation", async () => {
     await focus(A);
     const current = await target(A);
@@ -985,6 +1027,7 @@ async function main() {
             error?: { code?: number; message?: string };
             result?: unknown;
             method?: string;
+            params?: { args?: { value?: unknown }[] };
           };
           if (typeof packet.id === "number") {
             replies.set(packet.id, {
@@ -994,7 +1037,14 @@ async function main() {
               success: packet.error === undefined && "result" in packet,
             });
             events.get(`reply-${packet.id}`)?.resolve();
-          } else cdpEvents.count += 1;
+          } else {
+            cdpEvents.count += 1;
+            if (
+              packet.method === "Runtime.consoleAPICalled" &&
+              packet.params?.args?.some((argument) => argument.value === "owned-public-baseline")
+            )
+              events.get("public-console")?.resolve();
+          }
         }),
       ),
       Effect.forkScoped,
