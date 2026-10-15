@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  type ServerTraceDiagnosticsResult,
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
@@ -10,6 +11,11 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
+import * as Layer from "effect/Layer";
+import { Atom, AtomRegistry } from "effect/reactivity";
+import * as EnvironmentRegistry from "../connection/registry.ts";
+import { RpcPermissionGuard } from "../rpc/client.ts";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
@@ -32,6 +38,7 @@ import * as Persistence from "../platform/persistence.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
+  createServerEnvironmentAtoms,
   applyServerWelcomeEvent,
   makeEnvironmentServerWelcomeState,
   makeEnvironmentServerConfigState,
@@ -925,4 +932,109 @@ describe("server state projection", () => {
       expect(yield* Queue.poll(savedConfigs)).toEqual(Option.none());
     }),
   );
+});
+
+describe("legacy trace diagnostics query", () => {
+  for (const snapshotOnly of [false, true]) {
+    it.effect(
+      snapshotOnly
+        ? "rejects a snapshot-only response without manufacturing an empty trace"
+        : "requests exactly the legacy empty input and retains the decoded trace consumer",
+      () =>
+        Effect.gen(function* () {
+          const inputs: unknown[] = [];
+          const trace: ServerTraceDiagnosticsResult = {
+            traceFilePath: "/fixture/server.ndjson",
+            scannedFilePaths: ["/fixture/server.ndjson"],
+            readAt: DateTime.makeUnsafe(1_000),
+            recordCount: 2,
+            parseErrorCount: 0,
+            firstSpanAt: Option.none(),
+            lastSpanAt: Option.none(),
+            failureCount: 0,
+            interruptionCount: 0,
+            slowSpanThresholdMs: 100,
+            slowSpanCount: 0,
+            logLevelCounts: {},
+            topSpansByCount: [],
+            slowestSpans: [],
+            commonFailures: [],
+            latestFailures: [],
+            latestWarningAndErrorLogs: [],
+            partialFailure: Option.none(),
+            error: Option.none(),
+          };
+          // Only the external RPC peer is scripted. The production query atom/decoder runs below.
+          const peer = {
+            [WS_METHODS.serverGetTraceDiagnostics]: (input: unknown) =>
+              Effect.sync(() => {
+                inputs.push(input);
+                return snapshotOnly
+                  ? { mainRendererSnapshot: { status: "unavailable", reason: "unsupported" } }
+                  : trace;
+              }),
+          } as unknown as WsRpcProtocolClient;
+          const state = yield* SubscriptionRef.make({
+            ...AVAILABLE_CONNECTION_STATE,
+            desired: true,
+            network: "online" as const,
+            phase: "connected" as const,
+            attempt: 1,
+            generation: 1,
+          });
+          const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+            target: TARGET,
+            state,
+            session: yield* SubscriptionRef.make(Option.some(session(peer))),
+            prepared: yield* SubscriptionRef.make<Option.Option<PreparedConnection>>(Option.none()),
+            connect: Effect.void,
+            disconnect: Effect.void,
+            retryNow: Effect.void,
+          });
+          const run: EnvironmentRegistry.EnvironmentRegistry["Service"]["run"] = (_id, effect) =>
+            Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+          const followStream: EnvironmentRegistry.EnvironmentRegistry["Service"]["followStream"] = (
+            _id,
+            stream,
+          ) =>
+            Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+          const runtime = Atom.runtime(
+            Layer.mergeAll(
+              Layer.mock(EnvironmentRegistry.EnvironmentRegistry)({
+                run,
+                followStream,
+                stateChanges: () => SubscriptionRef.changes(state),
+              }),
+              Layer.mock(Persistence.EnvironmentCacheStore)({}),
+              Layer.succeed(RpcPermissionGuard, { authorize: () => Effect.void }),
+            ),
+          );
+          const atoms = createServerEnvironmentAtoms(runtime, {
+            initialConfigValueAtom: () => Atom.make(null),
+          });
+          const registry = AtomRegistry.make();
+          yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
+          const outcome = yield* AtomRegistry.getResult(
+            registry,
+            atoms.traceDiagnostics({ environmentId: TARGET.environmentId, input: {} }),
+            { suspendOnWaiting: true },
+          ).pipe(Effect.exit);
+          expect(inputs).toEqual([{}]);
+          if (snapshotOnly) {
+            expect(Exit.isFailure(outcome)).toBe(true);
+            if (Exit.isFailure(outcome))
+              expect(Cause.pretty(outcome.cause)).toContain("traceFilePath");
+          } else {
+            expect(Exit.isSuccess(outcome)).toBe(true);
+            if (Exit.isSuccess(outcome)) {
+              // This assignment proves the public consumer remains the original trace type.
+              const originalConsumer: ServerTraceDiagnosticsResult = outcome.value;
+              expect(originalConsumer.recordCount).toBe(2);
+              expect(originalConsumer.traceFilePath).toBe(trace.traceFilePath);
+              expect(originalConsumer).not.toHaveProperty("mainRendererSnapshot");
+            }
+          }
+        }).pipe(Effect.scoped),
+    );
+  }
 });
