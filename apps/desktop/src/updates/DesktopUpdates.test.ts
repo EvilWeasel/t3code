@@ -21,6 +21,29 @@ import * as DesktopUpdates from "./DesktopUpdates.ts";
 import { flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
 
 describe("DesktopUpdates", () => {
+  it.effect("releases a committed client window after an asynchronous installer failure without starting backends", () => {
+    const harness = makeHarness({ clientOnlyInventory: [] });
+    return Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      assert.equal(harness.quitAndInstalls(), 1);
+      const { changes } = yield* updates.subscribe;
+      const recovered = yield* changes.pipe(
+        Stream.filter((state) => state.errorContext === "install" && state.installLease === undefined),
+        Stream.runHead, Effect.forkScoped,
+      );
+      yield* flushCallbacks;
+      harness.emit("error", new Error("installer failed after accepting the handoff"));
+      assert.isTrue(Option.isSome(yield* Fiber.join(recovered)));
+      assert.equal(harness.stopCount(), 0);
+      assert.deepEqual(harness.installSteps, ["quitAndInstall"]);
+    })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
   it.effect("installs a verified idle client without stopping or starting any backend", () => {
     const harness = makeHarness({ clientOnlyInventory: [{ id: 7, generation: "frame-1", audible: false }] });
     return Effect.scoped(Effect.gen(function* () {

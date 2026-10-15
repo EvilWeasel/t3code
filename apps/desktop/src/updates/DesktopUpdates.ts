@@ -681,6 +681,9 @@ export const make = Effect.gen(function* () {
               const hasExpectedDownload =
                 state.downloadedVersion !== null &&
                 (expectedVersion === undefined || state.downloadedVersion === expectedVersion);
+              if (clientOnly && (state.installLease?.phase !== "commit" ||
+                state.installLease.targetVersion !== expectedVersion ||
+                (yield* Clock.currentTimeMillis) >= state.installLease.expiresAt - 5_000)) return "refused" as const;
               if (
                 (yield* Ref.get(desktopState.quitting)) ||
                 !(yield* Ref.get(updaterConfiguredRef)) ||
@@ -695,7 +698,7 @@ export const make = Effect.gen(function* () {
               }
               const hasInstallableDownload =
                 state.status === "downloaded" ||
-                (state.status === "error" &&
+                (!clientOnly && state.status === "error" &&
                   (state.errorContext === null || state.errorContext === "install"));
               if (!hasInstallableDownload) return "refused" as const;
               return (yield* tryStartUpdateAction("install"))
@@ -805,7 +808,7 @@ export const make = Effect.gen(function* () {
       (yield* Ref.get(desktopState.quitting))) return;
     const targetVersion = state.downloadedVersion;
     if (compareSemverVersions(targetVersion, state.currentVersion) <= 0) return;
-    yield* holdPool((instances) => holdRenderers(Effect.gen(function* () {
+    yield* holdPool((instances) => holdRenderers(Effect.scoped(Effect.gen(function* () {
       const isEmpty = Effect.forEach(instances, (instance) => instance.snapshot).pipe(
         Effect.map((snapshots) => snapshots.every((snapshot) =>
           snapshot.desiredRunning === false && snapshot.ready === false && Option.isNone(snapshot.activePid) &&
@@ -834,11 +837,14 @@ export const make = Effect.gen(function* () {
       yield* updateState((current) => ({ ...current, installLease: {
         generation, targetVersion, expiresAt, phase: "commit",
       } }));
+      const completions = yield* PubSub.subscribe(finishedUpdateActions);
       const result = yield* installDownloadedUpdate(targetVersion, true);
       // Keep register/unregister/start and window creation fenced until the
       // app exits. A failed installer releases through the surrounding scope.
-      if (result.accepted && !result.failed) yield* Effect.never;
-    })).pipe(Effect.ensuring(Effect.gen(function* () {
+      if (result.accepted && !result.failed) {
+        while ((yield* PubSub.take(completions)) !== "install-recovery") { /* Await exit or recovery. */ }
+      }
+    }))).pipe(Effect.ensuring(Effect.gen(function* () {
       yield* Ref.set(pendingReadiness, null);
       yield* updateState(({ installLease: _lease, ...current }) => current);
     }))));
