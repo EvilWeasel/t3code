@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   sync:
-    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
+    if: github.repository == 'morrowbyte/t3code'
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'namespace-profile-ci-builder' }}
     timeout-minutes: 35
     steps:
@@ -25,6 +25,7 @@ jobs:
           WEASEL_UPSTREAM_TOKEN: ${{ secrets.WEASEL_UPSTREAM_TOKEN }}
         run: |
           set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
           if [[ -z "$WEASEL_UPSTREAM_TOKEN" ]]; then
             echo "Repository Actions secret WEASEL_UPSTREAM_TOKEN is required for sync checkout, GitHub API calls, and fast-forward promotion." >&2
             exit 1
@@ -33,6 +34,7 @@ jobs:
       - name: Checkout fork main
         uses: actions/checkout@v4
         with:
+          repository: morrowbyte/t3code
           ref: main
           fetch-depth: 0
           token: ${{ secrets.WEASEL_UPSTREAM_TOKEN }}

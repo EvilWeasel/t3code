@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Never let gh infer a repository from remotes (the upstream remote may win).
+fork_repo="${GITHUB_REPOSITORY:-}"
+if [[ "$fork_repo" != "morrowbyte/t3code" ]]; then
+  echo "Refusing sync outside the explicit morrowbyte/t3code fork." >&2
+  exit 1
+fi
+origin_push_url="$(git remote get-url --push origin)"
+case "$origin_push_url" in
+  https://github.com/morrowbyte/t3code.git|https://github.com/morrowbyte/t3code|git@github.com:morrowbyte/t3code.git) ;;
+  *) echo "Refusing sync: origin push URL is not the approved fork." >&2; exit 1 ;;
+esac
+
 upstream_repo="pingdotgg/t3code"
 fork_branch="main"
 issue_title="Weasel upstream nightly merge conflict"
@@ -12,7 +24,7 @@ reconcile_release_dispatch() {
   local run_name="Weasel desktop release $source_sha"
   local runs_json matching_runs active_run successful_run finished_run
 
-  runs_json="$(gh run list \
+  runs_json="$(gh run list --repo "$fork_repo" \
     --workflow weasel-release.yml \
     --branch "$fork_branch" \
     --limit 1000 \
@@ -38,10 +50,10 @@ reconcile_release_dispatch() {
   fi
 
   echo "No active or successful release run exists for $source_sha; dispatching the missing release."
-  gh workflow run weasel-release.yml --ref "$fork_branch" -f source_sha="$source_sha"
+  gh workflow run weasel-release.yml --repo "$fork_repo" --ref "$fork_branch" -f source_sha="$source_sha"
 }
 
-releases_json="$(gh api "repos/$upstream_repo/releases" --paginate --slurp)"
+releases_json="$(gh api --method GET "repos/$upstream_repo/releases" --paginate --slurp)"
 nightly_tag="$(jq -r '[.[][] | select(.draft == false and .published_at != null and (.tag_name | test("^(v.*-nightly\\.|nightly-v)")))] | sort_by(.published_at) | last | .tag_name // empty' <<<"$releases_json")"
 if [[ -z "$nightly_tag" ]]; then
   echo "No published upstream nightly release was found." >&2
@@ -78,7 +90,7 @@ else
 
   printf 'Conflicting paths:\n%s\n' "$unmerged_paths" >&2
   git merge --abort
-  open_issue="$(gh issue list --state open --search "\"$issue_title\" in:title" --json number --jq '.[0].number // empty')"
+  open_issue="$(gh issue list --repo "$fork_repo" --state open --search "\"$issue_title\" in:title" --json number --jq '.[0].number // empty')"
   issue_metadata="$(jq -cn \
     --arg tag "$nightly_tag" \
     --arg base_sha "$base_sha" \
@@ -91,14 +103,14 @@ Nightly **$nightly_tag** ($nightly_sha) could not be cleanly merged into fork ma
 
 Repair agent status: **not scheduled**. The fork pipeline does not activate or dispatch a repair agent; durable host scheduling and integration are owned by the parent."
   if [[ -n "$open_issue" ]]; then
-    issue_text="$(gh issue view "$open_issue" --json body,comments --jq '[.body, (.comments[] | .body)] | join("\\n")')"
+    issue_text="$(gh issue view "$open_issue" --repo "$fork_repo" --json body,comments --jq '[.body, (.comments[] | .body)] | join("\\n")')"
     if ! grep -Fq "$issue_marker" <<<"$issue_text"; then
-      gh issue comment "$open_issue" --body "$issue_update"
+      gh issue comment "$open_issue" --repo "$fork_repo" --body "$issue_update"
     fi
     echo "Conflict is tracked by existing issue #$open_issue."
   else
     printf '%s\n\n%s\n' "$issue_update" 'Resolve the conflict in a repair change, then rerun the sync workflow.' > "$issue_body_file"
-    gh issue create --title "$issue_title" --body-file "$issue_body_file"
+    gh issue create --repo "$fork_repo" --title "$issue_title" --body-file "$issue_body_file"
   fi
   exit 0
 fi
