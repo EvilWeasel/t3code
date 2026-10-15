@@ -1,8 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Exit from "effect/Exit";
-import * as Option from "effect/Option";
 import * as DateTime from "effect/DateTime";
-import * as RpcSchema from "effect/rpc/RpcSchema";
 import { AgentObservatoryNativeRosterPage } from "./agentObservatory.ts";
 import * as Schema from "effect/Schema";
 
@@ -231,15 +229,19 @@ describe("registered observatory read JSON codecs", () => {
       ],
       nextCursor: null,
     };
-    for (const method of [
-      WS_METHODS.agentObservatoryReadNativeRoster,
-      WS_METHODS.agentObservatorySubscribeNativeRoster,
-    ] as const) {
-      const rpc = registered(method);
-      const stream = RpcSchema.getStreamSchemas(rpc.successSchema);
-      const codec = Schema.toCodecJson(
-        Option.isSome(stream) ? stream.value.success : rpc.successSchema,
-      );
+    const unary = registered(WS_METHODS.agentObservatoryReadNativeRoster);
+    if (unary._tag !== WS_METHODS.agentObservatoryReadNativeRoster)
+      throw new Error("Unexpected observatory roster registration");
+    const rosterStream = registered(WS_METHODS.agentObservatorySubscribeNativeRoster);
+    if (rosterStream._tag !== WS_METHODS.agentObservatorySubscribeNativeRoster)
+      throw new Error("Unexpected observatory roster subscription registration");
+    const overviewStream = registered(WS_METHODS.agentObservatorySubscribe);
+    if (overviewStream._tag !== WS_METHODS.agentObservatorySubscribe)
+      throw new Error("Unexpected observatory subscription registration");
+    for (const codec of [
+      Schema.toCodecJson(unary.successSchema),
+      Schema.toCodecJson(rosterStream.successSchema.success),
+    ]) {
       const decoded = Schema.decodeUnknownSync(codec)(encoded);
       const typed = Schema.decodeUnknownSync(AgentObservatoryNativeRosterPage)(decoded);
       expect(DateTime.formatIso(typed.agents[0]!.updatedAt)).toBe(encoded.agents[0]!.updatedAt);
@@ -258,9 +260,12 @@ describe("registered observatory read JSON codecs", () => {
       expect(Schema.encodeSync(codec)(Schema.decodeUnknownSync(codec)(withPrivateExtras))).toEqual(
         encoded,
       );
-      const errorCodec = Schema.toCodecJson(
-        Option.isSome(stream) ? stream.value.error : rpc.errorSchema,
-      );
+    }
+    for (const errorCodec of [
+      Schema.toCodecJson(unary.errorSchema),
+      Schema.toCodecJson(rosterStream.successSchema.error),
+      Schema.toCodecJson(overviewStream.successSchema.error),
+    ]) {
       const refusal = new AgentObservatoryReadError({
         message: "Agent observatory data is unavailable.",
       });
@@ -277,9 +282,7 @@ describe("registered observatory read JSON codecs", () => {
         ),
       ).toBe(true);
     }
-    const rpc = registered(WS_METHODS.agentObservatorySubscribe);
-    const stream = Option.getOrThrow(RpcSchema.getStreamSchemas(rpc.successSchema));
-    const codec = Schema.toCodecJson(stream.success);
+    const codec = Schema.toCodecJson(overviewStream.successSchema.success);
     const offline = {
       environmentId: "destination",
       threadId: "thread:a",
