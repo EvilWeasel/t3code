@@ -1429,8 +1429,7 @@ it.effect(
         expect(transcript).not.toHaveProperty("providerSessions");
         expect(transcript).not.toHaveProperty("runs");
       }).pipe(
-        Effect.provide(layerTranscriptRead(projection)),
-        Effect.provide(layerTranscriptIdentity),
+        Effect.provide(Layer.mergeAll(layerTranscriptRead(projection), layerTranscriptIdentity)),
       );
     }),
 );
@@ -1471,8 +1470,7 @@ it.effect.each([0, 1])(
             );
         }
       }).pipe(
-        Effect.provide(layerTranscriptRead(projection)),
-        Effect.provide(layerTranscriptIdentity),
+        Effect.provide(Layer.mergeAll(layerTranscriptRead(projection), layerTranscriptIdentity)),
       );
     }),
 );
@@ -1494,8 +1492,7 @@ it.effect.each(["header", "row"] as const)(
         expect(error).toBeInstanceOf(ThreadManagementService.ThreadTranscriptTooLargeError);
         expect(error).toMatchObject({ threadId: transcriptThreadId });
       }).pipe(
-        Effect.provide(layerTranscriptRead(projection)),
-        Effect.provide(layerTranscriptIdentity),
+        Effect.provide(Layer.mergeAll(layerTranscriptRead(projection), layerTranscriptIdentity)),
       );
     }),
 );
@@ -1543,6 +1540,6 @@ it.effect.each(["projection", "legacy"] as const)(
           cause: source === "legacy" ? legacyError : original,
         });
         expect(snapshotCalls).toBe(source === "legacy" ? 0 : 1);
-      }).pipe(Effect.provide(readLayer), Effect.provide(layerTranscriptIdentity));
+      }).pipe(Effect.provide(Layer.mergeAll(readLayer, layerTranscriptIdentity)));
     }),
 );
