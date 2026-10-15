@@ -164,6 +164,38 @@ describe("DesktopUpdates", () => {
     })),
   );
 
+  it.effect("retains the exact install record when Nix activated but relaunch admission was revoked", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const released = yield* Deferred.make<void>();
+      const harness = makeHarness({
+        clientOnlyInventory: [],
+        quitAndInstall: Effect.fail(new ElectronUpdater.ElectronUpdaterNixActivationAdmissionError({
+          selectedVersion: "1.2.4", runningVersion: "1.2.3",
+        })),
+        runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
+      });
+      yield* Effect.scoped(Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        yield* TestClock.adjust(Duration.seconds(15));
+        harness.emit("update-downloaded", { version: "1.2.4" });
+        yield* flushCallbacks;
+        yield* TestClock.adjust(Duration.seconds(45));
+        yield* Deferred.await(released);
+        assert.equal(harness.stopCount(), 0);
+        assert.equal(harness.quitAndInstalls(), 1); // Activation was attempted: never claim zero mutation.
+        assert.equal(harness.installRecords.size, 1);
+        assert.deepEqual(JSON.parse([...harness.installRecords.values()][0]!), {
+          fromVersion: "1.2.3", targetVersion: "1.2.4",
+        });
+        const state = yield* updates.getState;
+        assert.equal(state.currentVersion, "1.2.3");
+        assert.equal(state.errorContext, "install");
+        assert.include(state.message ?? "", "Nix closure activated");
+      })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+    })),
+  );
+
   it.effect("releases a committed client window after an asynchronous installer failure without starting backends", () => {
     let released = false;
     const harness = makeHarness({ clientOnlyInventory: [], onRuntimeReservationReleased: () => { released = true; } });

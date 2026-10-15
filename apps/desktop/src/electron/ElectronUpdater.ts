@@ -6,7 +6,7 @@ import * as Scope from "effect/Scope";
 
 import { autoUpdater as electronAutoUpdater } from "electron-updater";
 import * as Electron from "electron";
-import { NixManagedUpdater } from "./NixManagedUpdater.ts";
+import { NixManagedUpdater, NixUpdateAdmissionError } from "./NixManagedUpdater.ts";
 import { quitAndInstallInPlace } from "./quitAndInstallInPlace.ts";
 
 let updaterInstance: typeof electronAutoUpdater | NixManagedUpdater | undefined;
@@ -77,11 +77,21 @@ export class ElectronUpdaterInstallAdmissionError extends Schema.TaggedError<Ele
   }
 }
 
+export class ElectronUpdaterNixActivationAdmissionError extends Schema.TaggedError<ElectronUpdaterNixActivationAdmissionError>()(
+  "ElectronUpdaterNixActivationAdmissionError",
+  { selectedVersion: Schema.String, runningVersion: Schema.String },
+) {
+  override get message(): string {
+    return "Nix closure activated; the running desktop was retained after update admission was revoked.";
+  }
+}
+
 export const ElectronUpdaterError = Schema.Union([
   ElectronUpdaterCheckForUpdatesError,
   ElectronUpdaterDownloadUpdateError,
   ElectronUpdaterQuitAndInstallError,
   ElectronUpdaterInstallAdmissionError,
+  ElectronUpdaterNixActivationAdmissionError,
 ]);
 export type ElectronUpdaterError = typeof ElectronUpdaterError.Type;
 
@@ -103,7 +113,7 @@ export class ElectronUpdater extends Context.Service<
       readonly isSilent: boolean;
       readonly isForceRunAfter: boolean;
       readonly beforeInstall?: () => boolean;
-    }) => Effect.Effect<void, ElectronUpdaterQuitAndInstallError | ElectronUpdaterInstallAdmissionError>;
+    }) => Effect.Effect<void, ElectronUpdaterQuitAndInstallError | ElectronUpdaterInstallAdmissionError | ElectronUpdaterNixActivationAdmissionError>;
     readonly on: <Args extends ReadonlyArray<unknown>>(
       eventName: string,
       listener: (...args: Args) => void,
@@ -183,8 +193,14 @@ export const make = ElectronUpdater.of({
             catch { throw new ElectronUpdaterInstallAdmissionError({ reason: "probe-failed" }); }
             if (!admitted) throw new ElectronUpdaterInstallAdmissionError({ reason: "refused" });
           }
+          // Nix revalidates this same held token across its activation awaits.
+          const updater = currentUpdater();
+          if (updater instanceof NixManagedUpdater) {
+            await updater.quitAndInstall(isSilent, isForceRunAfter, beforeInstall);
+            return;
+          }
           // No await between the live guard and the canonical native invocation.
-          await quitAndInstallInPlace(currentUpdater(), {
+          await quitAndInstallInPlace(updater, {
             platform: process.platform,
             isPackaged: Electron.app.isPackaged,
             executable: process.execPath,
@@ -193,7 +209,11 @@ export const make = ElectronUpdater.of({
           });
         },
         catch: (cause) => cause instanceof ElectronUpdaterInstallAdmissionError ? cause :
-          new ElectronUpdaterQuitAndInstallError({
+          cause instanceof NixUpdateAdmissionError
+            ? cause.selectedVersion === null
+              ? new ElectronUpdaterInstallAdmissionError({ reason: "refused" })
+              : new ElectronUpdaterNixActivationAdmissionError({ selectedVersion: cause.selectedVersion, runningVersion: cause.runningVersion })
+            : new ElectronUpdaterQuitAndInstallError({
             channel,
             isSilent,
             isForceRunAfter,

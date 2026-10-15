@@ -721,6 +721,7 @@ export const make = Effect.gen(function* () {
 
   const recoverFailedInstall = Effect.fn("desktop.updates.recoverFailedInstall")(function* (
     message: string,
+    preserveInstallRecord = false,
   ) {
     const ownsRecovery = yield* Ref.modify(activeUpdateActionRef, (activeAction) =>
       Option.isSome(activeAction) && activeAction.value === "install"
@@ -731,7 +732,7 @@ export const make = Effect.gen(function* () {
 
     yield* Ref.set(desktopState.quitting, false);
     yield* removeUpdateRestartMarker;
-    yield* removeInstallRecord;
+    if (!preserveInstallRecord) yield* removeInstallRecord;
     yield* Effect.gen(function* () {
       const instances = (yield* Ref.get(clientOnlyInstallRef)) ? [] : yield* pool.list;
       const restartExit = yield* Effect.forEach(instances, (instance) => instance.start, {
@@ -829,6 +830,9 @@ export const make = Effect.gen(function* () {
           return { accepted: true, completed: false, failed: false };
         }).pipe(
           Effect.catchTags({
+            ElectronUpdaterNixActivationAdmissionError: (error) => recoverFailedInstall(error.message, true).pipe(
+              Effect.as({ accepted: true, completed: false, failed: true }),
+            ),
             ElectronUpdaterInstallAdmissionError: () => clientOnly
               ? resetInstallAction.pipe(Effect.as({ accepted: false, completed: false, failed: false }))
               : recoverFailedInstall("Desktop update admission was revoked before installation.").pipe(

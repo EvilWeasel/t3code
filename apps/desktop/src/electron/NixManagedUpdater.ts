@@ -16,7 +16,16 @@ export interface NixUpdaterOptions {
   launcher: string;
   currentVersion: string;
   run?: (args: readonly string[], channel: string) => Promise<string>;
+  accessLauncher?: () => Promise<void>;
   relaunch: (launcher: string) => void;
+}
+
+export class NixUpdateAdmissionError extends Error {
+  constructor(readonly selectedVersion: string | null, readonly runningVersion: string) {
+    super(selectedVersion === null
+      ? "Nix update admission was revoked before activation."
+      : "Nix closure activated; running desktop retained because update admission was revoked.");
+  }
 }
 
 /** Adapter for immutable Store installs. The helper imports a CI-built closure;
@@ -98,12 +107,24 @@ export class NixManagedUpdater extends EventEmitter {
     this.emit("update-downloaded", { version });
   }
 
-  async quitAndInstall(_isSilent: boolean, isForceRunAfter: boolean): Promise<void> {
+  async quitAndInstall(_isSilent: boolean, isForceRunAfter: boolean, beforeInstall?: () => boolean): Promise<void> {
     if (!this.prepared) throw new Error("No verified Nix update is prepared");
     // Check before changing current: never strand the user on an unusable launcher.
     if (!isForceRunAfter) throw new Error("Nix desktop updates require relaunch");
-    await access(this.options.launcher, constants.X_OK);
-    await this.run(["--activate", this.prepared], this.releaseChannel);
+    const targetVersion = this.prepared;
+    const admit = (selectedVersion: string | null) => {
+      if (beforeInstall === undefined) return;
+      let ready = false;
+      try { ready = beforeInstall(); } catch { /* Unknown proof refuses mutation/relaunch. */ }
+      if (!ready) throw new NixUpdateAdmissionError(selectedVersion, this.options.currentVersion);
+    };
+    admit(null);
+    await (this.options.accessLauncher?.() ?? access(this.options.launcher, constants.X_OK));
+    admit(null);
+    await this.run(["--activate", targetVersion], this.releaseChannel);
+    // Activation is already a real mutation. A late refusal retains the old
+    // running process and reports selected/running divergence; never roll back blindly.
+    admit(targetVersion);
     this.options.relaunch(this.options.launcher);
   }
 }

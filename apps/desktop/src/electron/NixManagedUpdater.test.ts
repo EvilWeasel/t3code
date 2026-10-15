@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { NixManagedUpdater } from "./NixManagedUpdater.ts";
+import { NixManagedUpdater, NixUpdateAdmissionError, type NixUpdaterOptions } from "./NixManagedUpdater.ts";
 
 const version = "0.0.47-nightly.20261014.16";
-function fixture() {
+function fixture(options: Partial<NixUpdaterOptions> = {}) {
   const calls: Array<{ args: readonly string[]; channel: string }> = [];
   const relaunch = vi.fn();
   const run = vi.fn(async (args: readonly string[], channel: string) => {
@@ -15,6 +15,7 @@ function fixture() {
     currentVersion: "0.0.47-nightly.20261014.15",
     run,
     relaunch,
+    ...options,
   });
   return { updater, calls, run, relaunch };
 }
@@ -37,6 +38,60 @@ describe("NixManagedUpdater", () => {
     expect(calls.at(-1)).toEqual({ args: ["--activate", version], channel: "nightly" });
     expect(relaunch).toHaveBeenCalledOnce();
     expect(relaunch).toHaveBeenCalledWith(process.execPath);
+  });
+
+  it.each(["revoked", "expired"] as const)("refuses activation when proof is %s during launcher access", async (reason) => {
+    let finishAccess: () => void = () => { throw new Error("access not started"); };
+    let accessStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => { accessStarted = resolve; });
+    const accessLauncher = () => new Promise<void>((resolve) => { finishAccess = resolve; accessStarted(); });
+    let valid = true;
+    let now = 100;
+    const { updater, calls, relaunch } = fixture({ accessLauncher });
+    await updater.checkForUpdates();
+    await updater.downloadUpdate();
+    const installing = updater.quitAndInstall(true, true, () => valid && now < 200);
+    const rejected = expect(installing).rejects.toMatchObject({ selectedVersion: null });
+    await started;
+    if (reason === "revoked") valid = false; else now = 200;
+    finishAccess();
+    await rejected;
+    expect(calls.some(({ args }) => args[0] === "--activate")).toBe(false);
+    expect(relaunch).not.toHaveBeenCalled();
+  });
+
+  it("retains the running desktop and reports selected-version divergence after activation loses proof", async () => {
+    let finishActivation: () => void = () => { throw new Error("activation not started"); };
+    let activationStarted: () => void = () => {};
+    const started = new Promise<void>((resolve) => { activationStarted = resolve; });
+    let valid = true;
+    const { updater, run, relaunch } = fixture({ accessLauncher: async () => {} });
+    await updater.checkForUpdates();
+    await updater.downloadUpdate();
+    run.mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => { finishActivation = resolve; activationStarted(); });
+      return "";
+    });
+    const installing = updater.quitAndInstall(true, true, () => valid);
+    const rejected = expect(installing).rejects.toMatchObject({
+      selectedVersion: version, runningVersion: "0.0.47-nightly.20261014.15",
+    });
+    await started;
+    valid = false;
+    finishActivation();
+    await rejected;
+    expect(relaunch).not.toHaveBeenCalled();
+    expect(run.mock.calls.at(-1)?.[0]).toEqual(["--activate", version]);
+  });
+
+  it("treats a throwing live probe as refusal before any activation", async () => {
+    const { updater, calls, relaunch } = fixture();
+    await updater.checkForUpdates();
+    await updater.downloadUpdate();
+    await expect(updater.quitAndInstall(true, true, () => { throw new Error("unknown"); }))
+      .rejects.toBeInstanceOf(NixUpdateAdmissionError);
+    expect(calls.some(({ args }) => args[0] === "--activate")).toBe(false);
+    expect(relaunch).not.toHaveBeenCalled();
   });
 
   it("keeps failed imports from becoming downloaded updates or quitting", async () => {
