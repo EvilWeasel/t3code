@@ -1353,6 +1353,7 @@ it.effect.each([
           status: "running",
         },
       ],
+      providerSessions: [{ id: providerSessionId, providerInstanceId: instanceId }],
       providerThreads: [
         {
           id: "work-provider-thread",
