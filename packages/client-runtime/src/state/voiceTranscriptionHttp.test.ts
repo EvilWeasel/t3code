@@ -67,6 +67,7 @@ describe("requestEnvironmentVoiceSettings", () => {
       const result = yield* requestEnvironmentVoiceSettings({
         prepared: PREPARED,
         signer: Option.none(),
+        remoteAuthorization: Option.none(),
         update: {
           provider: "openai-api",
           instanceId: null,
@@ -98,6 +99,7 @@ describe("requestEnvironmentVoiceSettings", () => {
       const failure = yield* requestEnvironmentVoiceSettings({
         prepared: PREPARED,
         signer: Option.none(),
+        remoteAuthorization: Option.none(),
         update: {
           provider: "openai-api",
           instanceId: null,
@@ -131,6 +133,7 @@ describe("requestEnvironmentVoiceSettings", () => {
         yield* requestEnvironmentVoiceSettings({
           prepared: PREPARED,
           signer: Option.none(),
+        remoteAuthorization: Option.none(),
           update,
         }).pipe(Effect.provide(RpcHttp.layerRemoteHttpClient(fetchFn)));
       }
@@ -159,6 +162,7 @@ describe("requestEnvironmentVoiceSettings", () => {
         const failure = yield* requestEnvironmentVoiceSettings({
           prepared: PREPARED,
           signer: Option.none(),
+        remoteAuthorization: Option.none(),
           update: { provider: "openai-api", instanceId: null, model: "gpt-transcribe" },
         }).pipe(Effect.provide(RpcHttp.layerRemoteHttpClient(fetchFn)), Effect.flip);
         expect(failure._tag).toBe("EnvironmentScopeRequiredError");

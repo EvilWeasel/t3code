@@ -1,11 +1,10 @@
 import { EnvironmentId, EnvironmentScopeRequiredError } from "@t3tools/contracts";
 import type { PreparedConnection } from "@t3tools/client-runtime/connection";
-import * as Effect from "effect/Effect";
 import { beforeEach, expect, it, vi } from "vite-plus/test";
 
 const fixture = vi.hoisted(() => ({
   prepared: undefined as PreparedConnection | undefined,
-  failure: undefined as unknown,
+  failure: undefined as EnvironmentScopeRequiredError | undefined,
   calls: [] as unknown[],
 }));
 
@@ -19,7 +18,7 @@ vi.mock("../state/session", async () => {
   const Option = await import("effect/Option");
   return {
     environmentSession: {
-      preparedConnectionValueAtom: () => Atom.make(Option.fromNullable(fixture.prepared)),
+      preparedConnectionValueAtom: () => Atom.make(Option.fromUndefinedOr(fixture.prepared)),
     },
   };
 });
@@ -28,7 +27,9 @@ vi.mock("@t3tools/client-runtime/state/voice-transcription", async () => {
   return {
     requestEnvironmentVoiceSettings: (input: unknown) => {
       fixture.calls.push(input);
-      return Effect.fail(fixture.failure);
+      return fixture.failure === undefined
+        ? Effect.die("Missing configured transport failure")
+        : Effect.fail(fixture.failure);
     },
   };
 });
