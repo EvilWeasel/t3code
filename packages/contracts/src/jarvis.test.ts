@@ -85,3 +85,21 @@ describe("canonical Jarvis native transport", () => {
     ).toThrow();
   });
 });
+
+// Signed canonical Submit wrapper 4ca36264ac; Host supplies the conversation.
+// SHA-256 54f50e11f7b1b8da76e2effcaea78d9b397b8e2354d3814b46c57a60157d8da6.
+const submitRpcGolden =
+  '{"jsonrpc":"2.0","id":"rpc-1","method":"jarvis.submit","params":{"binding":{"engineSessionId":"engine-1","origin":{"environmentId":"environment-1","projectId":"project-1","parentThreadId":"parent-1","parentRunId":"run-1","parentRootNodeId":"root-1","taskId":"task-1","childThreadId":"child-1","childRunId":"child-run-1","childRootNodeId":"child-root-1"}},"requestId":"bridge-request-1","clientMessageId":"message-1","invocation":{"engineSessionId":"engine-1","capabilityId":"browser.fill","operationId":"fill","registrationRevision":"browser-1","arguments":{"text":"bounded example"},"target":{"targetId":"field-1","targetKind":"browser_input","surfaceId":"owned-tab-1","generation":"1","observedContextId":"context-1","observedObservationId":"observation-1"}}}}';
+it("uses the canonical Host-bound submit wrapper and rejects caller conversation or commands", () => {
+  const codec = Schema.fromJsonString(JarvisNativeRequest);
+  const request = Schema.decodeUnknownSync(codec)(submitRpcGolden);
+  expect(Schema.encodeSync(codec)(request)).toBe(submitRpcGolden);
+  for (const key of ["conversationId", "envelope", "command", "schema"]) {
+    expect(() =>
+      Schema.decodeUnknownSync(JarvisNativeRequest)({
+        ...request,
+        params: { ...request.params, [key]: "caller-controlled" },
+      }),
+    ).toThrow();
+  }
+});

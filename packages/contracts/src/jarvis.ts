@@ -54,7 +54,7 @@ export const JarvisSubmitCapability = strictStruct({
 });
 export type JarvisSubmitCapability = typeof JarvisSubmitCapability.Type;
 
-// Native transport candidate 72e964b9ccce939ecda4ecd99629199e3f50b8b3.
+// Native transport 72e964b9cc; Submit wrapper 4ca36264ac42c812f76df247fa60127a79041940.
 // Qualification of this later transport is separate from the data golden above.
 export const JarvisNativeTaskOrigin = strictStruct({
   environmentId: Schema.String,
@@ -90,7 +90,11 @@ export const JarvisNativeRequest = Schema.Union([
   nativeRequest("jarvis.catalog", {}),
   nativeRequest("jarvis.observe", { query: JarvisCapabilityObserveRequest }),
   nativeRequest("jarvis.prepare", { invocation: JarvisCapabilityJobRequest }),
-  nativeRequest("jarvis.submit", { envelope: JarvisSubmitCapability }),
+  nativeRequest("jarvis.submit", {
+    requestId: Schema.String,
+    clientMessageId: Schema.String,
+    invocation: JarvisCapabilityJobRequest,
+  }),
   nativeRequest("jarvis.status", { jobId: Schema.String }),
   nativeRequest("jarvis.cancel", { requestId: Schema.String, jobId: Schema.String }),
   nativeRequest("jarvis.subscribe", {}),
@@ -139,3 +143,22 @@ export const JarvisNativeNotification = Schema.Union([
   }),
 ]);
 export type JarvisNativeNotification = typeof JarvisNativeNotification.Type;
+
+export class JarvisMcpFailure extends Schema.TaggedError<JarvisMcpFailure>()("JarvisMcpFailure", {
+  code: Schema.Literals([
+    "unavailable",
+    "capability_denied",
+    "invalid_request",
+    "outcome_unknown",
+    "host_error",
+  ]),
+  message: Schema.String,
+}) {}
+
+/** Destination wrapper around canonical Jarvis data; it grants no job authority. */
+export const JarvisMcpResult = Schema.Struct({
+  engineSessionId: Schema.String,
+  origin: JarvisNativeTaskOrigin,
+  result: Schema.Json,
+});
+export type JarvisMcpResult = typeof JarvisMcpResult.Type;

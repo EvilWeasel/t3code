@@ -24,6 +24,9 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
+import * as JarvisService from "../integrations/jarvis/JarvisService.ts";
+import * as JarvisHandlers from "./toolkits/jarvis/handlers.ts";
+import { JarvisToolkit } from "./toolkits/jarvis/tools.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import * as PreviewControlsHandlers from "./toolkits/previewControls/handlers.ts";
 import { EnvironmentToolkit } from "./toolkits/environment/tools.ts";
@@ -814,6 +817,10 @@ export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorHandlers.layer,
 ).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
 
+export const layerJarvisToolkit = toolkitRegistration(JarvisToolkit, JarvisHandlers.layer).pipe(
+  Layer.provide(JarvisService.layer),
+);
+
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
@@ -869,6 +876,7 @@ export const layerMcpTransport = McpServer.layerHttp({
 export const layer = Layer.mergeAll(
   layerPreviewToolkit,
   layerOrchestratorToolkit,
+  layerJarvisToolkit,
   layerThreadToolkit,
   layerAttachmentToolkit,
   layerProjectRegistration,
