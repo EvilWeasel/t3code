@@ -192,9 +192,12 @@ describe("previewWindowOpenAction", () => {
         undefined,
         { data: [], contentType: "application/x-www-form-urlencoded" },
       ]) {
-        expect(PreviewManager.previewWindowOpenAction({ ...details({ url }), postBody })).toBe(
-          "navigate",
-        );
+        expect(
+          PreviewManager.previewWindowOpenAction({
+            ...details({ url }),
+            ...(postBody === undefined ? {} : { postBody }),
+          }),
+        ).toBe("navigate");
       }
     }
   });
@@ -209,7 +212,10 @@ describe("previewWindowOpenAction", () => {
           { data: [], contentType: "application/x-www-form-urlencoded" },
         ]) {
           expect(
-            PreviewManager.previewWindowOpenAction({ ...details({ url, disposition }), postBody }),
+            PreviewManager.previewWindowOpenAction({
+              ...details({ url, disposition }),
+              ...(postBody === undefined ? {} : { postBody }),
+            }),
           ).toBe("deny");
         }
       }
@@ -533,6 +539,7 @@ const makeFaviconWebContents = (options?: {
     executeJavaScriptInIsolatedWorld,
     fetch,
     debuggerOff,
+    getURL: webContents.getURL,
     listeners,
     loadURL,
     off,
@@ -666,7 +673,7 @@ describe("PreviewManager", () => {
           }
           expect(preview.loadURL).not.toHaveBeenCalled();
           expect(opened).toEqual([]);
-          expect(preview.webContents.getURL()).toBe("https://example.test/signin");
+          expect(preview.getURL()).toBe("https://example.test/signin");
         }),
       ),
   );
