@@ -67,3 +67,5 @@ export * from "./secretRequest.ts";
 export * from "./liveVoice.ts";
 export * from "./clientRpcPermissions.ts";
 export * from "./jarvis.ts";
+
+export * from "./agentObservatory.ts";
