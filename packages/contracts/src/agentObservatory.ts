@@ -56,7 +56,7 @@ export const AgentObservatoryPanelKind = Schema.Literals([
 export type AgentObservatoryPanelKind = typeof AgentObservatoryPanelKind.Type;
 
 /** Declarative data only: no HTML, script, CSS, URL, command or arbitrary component. */
-export const AgentObservatoryVisualState = Schema.Struct({
+const VisualStateShape = Schema.Struct({
   title: TrimmedNonEmptyString.check(Schema.isMaxLength(160)),
   summary: Schema.optional(Schema.String.check(Schema.isMaxLength(2_048))),
   steps: Schema.Array(Step).check(Schema.isMaxLength(40)),
@@ -76,9 +76,10 @@ export const AgentObservatoryVisualState = Schema.Struct({
       collapsed: Schema.Boolean,
     }),
   ).check(Schema.isMaxLength(9)),
-}).check(
+});
+export const AgentObservatoryVisualState = VisualStateShape.check(
   Schema.makeFilter(
-    (state) => {
+    (state: typeof VisualStateShape.Type) => {
       const stepIds = new Set(state.steps.map((step) => step.id));
       return (
         stepIds.size === state.steps.length &&
@@ -94,8 +95,8 @@ export type AgentObservatoryVisualState = typeof AgentObservatoryVisualState.Typ
 
 /** Both UI and agent use this intent; the server binds principal, owner and provenance. */
 export const AgentObservatoryUpdate = Schema.Struct({
-  requestId: CommandId,
-  expectedRevision: NonNegativeInt,
+  requestId: CommandId.check(Schema.isMaxLength(256)),
+  expectedRevision: NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER - 1)),
   state: AgentObservatoryVisualState,
 });
 export type AgentObservatoryUpdate = typeof AgentObservatoryUpdate.Type;
@@ -148,3 +149,21 @@ export const AgentObservatoryMetadata = Schema.Struct({
   requestId: CommandId,
 });
 export type AgentObservatoryMetadata = typeof AgentObservatoryMetadata.Type;
+
+export const AgentObservatoryIntent = Schema.Union([
+  Schema.Struct({ action: Schema.Literal("read") }),
+  Schema.Struct({ action: Schema.Literal("publish"), ...AgentObservatoryUpdate.fields }),
+]);
+export type AgentObservatoryIntent = typeof AgentObservatoryIntent.Type;
+export const AgentObservatoryInvocationResult = Schema.Union([
+  Schema.Struct({
+    action: Schema.Literal("read"),
+    snapshot: Schema.NullOr(AgentObservatorySnapshot),
+  }),
+  Schema.Struct({
+    action: Schema.Literal("publish"),
+    snapshot: AgentObservatorySnapshot,
+    replayed: Schema.Boolean,
+  }),
+]);
+export type AgentObservatoryInvocationResult = typeof AgentObservatoryInvocationResult.Type;
