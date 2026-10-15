@@ -47,7 +47,7 @@ export class AgentObservatoryInvocation extends Context.Service<
       ) => Effect.Effect<A, E, R>,
     ) => Effect.Effect<A, E | AgentObservatoryRefusal, R>;
   }
->()("t3/observatory/AgentObservatoryInvocation") {}
+>()("t3/observatory/AgentObservatoryPorts/AgentObservatoryInvocation") {}
 
 export interface AgentObservatoryCommit {
   readonly owner: AgentObservatoryOwner;

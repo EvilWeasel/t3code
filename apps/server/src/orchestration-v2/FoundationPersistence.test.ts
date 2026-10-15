@@ -3941,7 +3941,9 @@ it.effect("observatory and ordinary writers publish in the shared canonical comm
           publishCommitted: (events) =>
             (events.some(
               (stored) =>
-                stored.event.type === "message.updated" && stored.event.payload.observatory,
+                "event" in stored &&
+                stored.event.type === "message.updated" &&
+                stored.event.payload.observatory,
             )
               ? Deferred.succeed(paused, undefined).pipe(Effect.andThen(Deferred.await(release)))
               : Effect.void

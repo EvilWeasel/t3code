@@ -11,6 +11,7 @@ import {
   OrchestrationV2AppThread,
   OrchestrationV2DomainEvent,
   OrchestrationV2Run,
+  ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
