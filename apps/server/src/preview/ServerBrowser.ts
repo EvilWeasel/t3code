@@ -9,6 +9,8 @@ import {
   INCOGNITO_BROWSER_PROFILE_ID,
   resolveBrowserProfiles,
   type BrowserProfile,
+  type DesktopBrowserPrivateEntryRequest,
+  type DesktopBrowserPrivateEntryResponse,
   type PreviewReportProfilesInput,
   PREVIEW_AUTOMATION_SERVER_OPERATIONS,
   PreviewViewportSetting as PreviewViewportSettingSchema,
@@ -81,6 +83,260 @@ import * as PreviewBrowser from "./PreviewBrowser.ts";
 import * as PreviewBrowserHost from "./PreviewBrowserHost.ts";
 import { presentAsChrome, ServerBrowserContexts } from "./ServerBrowserContexts.ts";
 import { BrowserControlInterrupted, SessionControl } from "./SessionControl.ts";
+
+type NativeControlRequest = DesktopBrowserPrivateEntryRequest;
+type NativeControlResponse = DesktopBrowserPrivateEntryResponse;
+interface NativeControlTab {
+  readonly control: SessionControl;
+  readonly desktop: object | null;
+  readonly closing: boolean;
+}
+const nativeTargetKey = (key: { threadId: string; tabId: string }) =>
+  `${key.threadId}\u0000${key.tabId}`;
+const nativeBinding = (request: NativeControlRequest) => ({
+  threadId: request.threadId,
+  tabId: request.tabId,
+  channelEpoch: request.channelEpoch,
+  attachmentId: request.attachmentId,
+  requestId: request.requestId,
+});
+
+/** Real, short-lived SessionControl ownership; no credentials cross this boundary. */
+export const makeDesktopPrivateEntryAuthority = (
+  channel: Pick<
+    DesktopBrowserChannel.DesktopBrowserChannel["Service"],
+    "registerPrivateEntryHandler" | "isCurrentPrivateEntryAttachment" | "sendPrivateEntry"
+  >,
+  lookup: (key: DesktopBrowserChannel.DesktopTabKey) => NativeControlTab | undefined,
+) =>
+  Effect.gen(function* () {
+    const scope = yield* Effect.scope;
+    const runFork = Effect.runForkWith(yield* Effect.context<never>());
+    type Record = {
+      readonly request: Extract<NativeControlRequest, { type: "private-entry-acquire" }>;
+      readonly tab: NativeControlTab;
+      readonly desktop: object;
+      readonly holder: string;
+      readonly leaseId: string;
+      readonly generation: number;
+      phase: "pending" | "granted" | "releasing" | "released" | "cancelled";
+    };
+    // Keep replay fences for this attachment. At capacity, refuse new acquisitions
+    // until reattachment rather than evict a cancelled ID and grant its late replay.
+    const histories = new Map<
+      string,
+      {
+        target: DesktopBrowserChannel.DesktopPrivateEntryTarget;
+        requests: Map<string, Record | null>;
+      }
+    >();
+    const active = new Map<string, Record>();
+    const sameTarget = (
+      a: DesktopBrowserChannel.DesktopPrivateEntryTarget,
+      b: DesktopBrowserChannel.DesktopPrivateEntryTarget,
+    ) =>
+      nativeTargetKey(a) === nativeTargetKey(b) &&
+      a.channelEpoch === b.channelEpoch &&
+      a.attachmentId === b.attachmentId;
+    const reply = (response: NativeControlResponse) =>
+      channel.sendPrivateEntry(response).pipe(Effect.asVoid);
+    const refuse = (
+      request: NativeControlRequest,
+      reason: Extract<NativeControlResponse, { type: "private-entry-refused" }>["reason"],
+    ) => reply({ ...nativeBinding(request), type: "private-entry-refused", reason });
+    const releaseOwner = (record: Record) => {
+      if (record.tab.control.controller === record.holder)
+        void record.tab.control.release(record.holder).catch(constVoid);
+    };
+    const revoke = (
+      record: Record,
+      reason: Extract<NativeControlResponse, { type: "private-entry-revoked" }>["reason"],
+    ) => {
+      if (record.phase === "released" || record.phase === "cancelled") return Effect.void;
+      record.phase = "cancelled";
+      if (active.get(nativeTargetKey(record.request)) === record)
+        active.delete(nativeTargetKey(record.request));
+      releaseOwner(record);
+      return reply({
+        ...nativeBinding(record.request),
+        type: "private-entry-revoked",
+        leaseId: record.leaseId,
+        generation: record.generation,
+        reason,
+      });
+    };
+    const valid = (record: Record) =>
+      lookup(record.request) === record.tab &&
+      !record.tab.closing &&
+      record.tab.desktop === record.desktop &&
+      record.tab.control.controller === record.holder &&
+      record.tab.control.generation === record.generation;
+    const invalidate = (target: DesktopBrowserChannel.DesktopPrivateEntryTarget) =>
+      Effect.suspend(() => {
+        const key = nativeTargetKey(target);
+        const history = histories.get(key);
+        if (!history || !sameTarget(history.target, target)) return Effect.void;
+        histories.delete(key);
+        const record = active.get(key);
+        return record && sameTarget(record.request, target)
+          ? revoke(record, "detached")
+          : Effect.void;
+      });
+    const request = (input: NativeControlRequest) =>
+      Effect.gen(function* () {
+        if (!(yield* channel.isCurrentPrivateEntryAttachment(input)))
+          return yield* refuse(input, "stale");
+        const key = nativeTargetKey(input);
+        let history = histories.get(key);
+        if (history && !sameTarget(history.target, input)) {
+          yield* invalidate(history.target);
+          history = undefined;
+        }
+        if (!history) {
+          history = { target: input, requests: new Map() };
+          histories.set(key, history);
+        }
+        if (input.type === "private-entry-cancel") {
+          const record = history.requests.get(input.requestId);
+          if (record) return yield* revoke(record, "cancelled");
+          if (history.requests.size < 128) history.requests.set(input.requestId, null);
+          return yield* refuse(input, "cancelled");
+        }
+        if (input.type === "private-entry-release") {
+          const record = [...history.requests.values()].find(
+            (value) => value?.leaseId === input.leaseId && value.generation === input.generation,
+          );
+          if (!record || (active.has(key) && active.get(key) !== record))
+            return yield* refuse(input, "stale");
+          if (record.phase === "released") {
+            if (
+              lookup(input) !== record.tab ||
+              record.tab.closing ||
+              record.tab.desktop !== record.desktop ||
+              record.tab.control.controller !== null ||
+              record.tab.control.generation !== record.generation + 1
+            )
+              return yield* refuse(input, "stale");
+            return yield* reply({ ...input, type: "private-entry-released" });
+          }
+          if (record.phase !== "granted" || !valid(record)) return yield* refuse(input, "stale");
+          // Clear is a native precondition. Keep the ACK behind the canonical drain.
+          record.phase = "releasing";
+          const released = record.tab.control.release(record.holder).then(
+            () => true,
+            () => false,
+          );
+          yield* Effect.gen(function* () {
+            const drained = yield* Effect.promise(() => released).pipe(
+              Effect.timeoutOption("10 seconds"),
+            );
+            const current = yield* channel.isCurrentPrivateEntryAttachment(input);
+            if (record.phase !== "releasing") return;
+            if (
+              Option.contains(drained, true) &&
+              current &&
+              lookup(input) === record.tab &&
+              !record.tab.closing &&
+              record.tab.desktop === record.desktop &&
+              record.tab.control.controller === null &&
+              record.tab.control.generation === record.generation + 1
+            ) {
+              record.phase = "released";
+              if (active.get(key) === record) active.delete(key);
+              yield* reply({ ...input, type: "private-entry-released" });
+            } else {
+              yield* revoke(record, "control-changed");
+            }
+          }).pipe(Effect.forkIn(scope));
+          return;
+        }
+        const previous = history.requests.get(input.requestId);
+        if (history.requests.has(input.requestId)) {
+          if (previous?.phase === "granted" && valid(previous))
+            return yield* reply({
+              ...nativeBinding(input),
+              type: "private-entry-granted",
+              leaseId: previous.leaseId,
+              generation: previous.generation,
+            });
+          if (previous?.phase === "pending") return;
+          return yield* refuse(input, "cancelled");
+        }
+        if (history.requests.size >= 128 || active.has(key)) return yield* refuse(input, "busy");
+        const tab = lookup(input);
+        if (!tab || tab.closing || tab.desktop === null) return yield* refuse(input, "unavailable");
+        if (tab.control.agentId !== null) return yield* refuse(input, "agent-owned");
+        if (tab.control.controller !== null) return yield* refuse(input, "viewer-owned");
+        const leaseId = NodeCrypto.randomUUID();
+        const holder = `native-private-entry:${leaseId}`;
+        // No await between the authority predicate above and this synchronous reservation.
+        const taking = tab.control.take(holder).then(
+          () => true,
+          () => false,
+        );
+        const record: Record = {
+          request: input,
+          tab,
+          desktop: tab.desktop,
+          holder,
+          leaseId,
+          generation: tab.control.generation,
+          phase: "pending",
+        };
+        history.requests.set(input.requestId, record);
+        active.set(key, record);
+        yield* Effect.gen(function* () {
+          const drained = yield* Effect.promise(() => taking).pipe(
+            Effect.timeoutOption("10 seconds"),
+          );
+          if (record.phase !== "pending") return;
+          if (
+            !Option.contains(drained, true) ||
+            !valid(record) ||
+            !(yield* channel.isCurrentPrivateEntryAttachment(input))
+          ) {
+            yield* revoke(record, "control-changed");
+            return;
+          }
+          if (!valid(record) || record.phase !== "pending") return;
+          record.phase = "granted";
+          const sent = yield* channel.sendPrivateEntry({
+            ...nativeBinding(input),
+            type: "private-entry-granted",
+            leaseId,
+            generation: record.generation,
+          });
+          if (!sent) yield* revoke(record, "channel-closed");
+        }).pipe(Effect.forkIn(scope));
+      });
+    yield* channel.registerPrivateEntryHandler({ request, invalidate });
+    return {
+      invalidate,
+      closeTab: (key: DesktopBrowserChannel.DesktopTabKey) =>
+        Effect.suspend(() => {
+          const history = histories.get(nativeTargetKey(key));
+          if (!history) return Effect.void;
+          histories.delete(nativeTargetKey(key));
+          const record = active.get(nativeTargetKey(key));
+          return record ? revoke(record, "closed") : Effect.void;
+        }),
+      controlChanged: (key: DesktopBrowserChannel.DesktopTabKey) => {
+        const record = active.get(nativeTargetKey(key));
+        if (
+          record?.phase === "releasing" &&
+          record.tab.control.controller === null &&
+          record.tab.control.generation === record.generation + 1
+        )
+          return;
+        if (
+          record &&
+          (record.tab.control.controller !== record.holder ||
+            record.tab.control.generation !== record.generation)
+        )
+          runFork(revoke(record, "control-changed"));
+      },
+    };
+  });
 
 const SERVER_HOST_CLIENT_ID = SERVER_BROWSER_AUTOMATION_CLIENT_ID;
 const RENDER_SCALE = 2;
@@ -488,6 +744,9 @@ const make = Effect.gen(function* () {
   const setupCommand = yield* resolveRootCliCommand(PreviewBrowserHost.SETUP_SUBCOMMAND);
 
   const tabs = new Map<string, ServerTab>();
+  const nativePrivateEntry = yield* makeDesktopPrivateEntryAuthority(desktopChannel, (key) =>
+    tabs.get(tabKey(key.threadId, key.tabId)),
+  );
   const pendingTabs = new Map<string, Promise<ServerTab>>();
   /** Sessions closed while their tab was still opening; the open discards its page. */
   const closedPendingTabs = new Set<string>();
@@ -688,6 +947,7 @@ const make = Effect.gen(function* () {
     if (tabs.get(key) !== tab) return;
     tabs.delete(key);
     tab.closing = true;
+    runFork(nativePrivateEntry.closeTab({ threadId: tab.threadId, tabId: tab.tabId }));
     clearAbortedNavigation(tab);
     // A desktop page outlives the connection unless its session closed with it.
     const end = tab.desktop && !closeSession && sessionOpen(tab) ? "reconnect" : "gone";
@@ -772,9 +1032,10 @@ const make = Effect.gen(function* () {
     if (!desktop) await presentAsChrome(cdp, host);
     page.setDefaultTimeout(NAVIGATION_TIMEOUT_MS);
     page.setDefaultNavigationTimeout(NAVIGATION_TIMEOUT_MS);
-    const control = new SessionControl(snapshot.automationOwner ?? null, () =>
-      ServerBrowserPage.invalidateRefs(page),
-    );
+    const control = new SessionControl(snapshot.automationOwner ?? null, () => {
+      ServerBrowserPage.invalidateRefs(page);
+      nativePrivateEntry.controlChanged({ threadId: snapshot.threadId, tabId: snapshot.tabId });
+    });
     const tab: ServerTab = {
       threadId: ThreadId.make(snapshot.threadId),
       tabId: snapshot.tabId,

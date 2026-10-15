@@ -3,6 +3,7 @@ import * as NodeEvents from "node:events";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import {
+  type DesktopBrowserPrivateEntryResponse,
   EnvironmentId,
   PreviewTabId,
   ProviderInstanceId,
@@ -12,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -29,6 +31,7 @@ import * as DesktopChannel from "./DesktopBrowserChannel.ts";
 import * as Manager from "./Manager.ts";
 import * as ServerBrowser from "./ServerBrowser.ts";
 import * as PreviewBrowser from "./PreviewBrowser.ts";
+import { SessionControl } from "./SessionControl.ts";
 
 // Keep the manager, broker, ownership, refs, and viewer paths real; replace Chromium I/O only.
 vi.mock("./ServerBrowserContexts.ts", () => ({
@@ -170,6 +173,8 @@ const desktopRenders = (tabId: string) => {
 };
 const releasedDesktopTabs: Array<string> = [];
 const desktopConnections: Array<{ endpoint: string; context: ReturnType<typeof makeContext> }> = [];
+let nativeHandler: DesktopChannel.DesktopPrivateEntryHandler | undefined;
+let nativeReplyWaiter: ((response: DesktopBrowserPrivateEntryResponse) => void) | undefined;
 const testThread = {
   threadId: ThreadId.make("browser-test-thread"),
   providerSessionId: "agent-a",
@@ -202,6 +207,30 @@ const dependencies = Layer.mergeAll(
   Layer.succeed(DesktopChannel.DesktopBrowserChannel, {
     // Only tabs a test marks render on the desktop; the rest stay headless.
     available: true,
+    registerPrivateEntryHandler: (handler) =>
+      Effect.acquireRelease(
+        Effect.sync(() => {
+          nativeHandler = handler;
+        }),
+        () =>
+          Effect.sync(() => {
+            nativeHandler = undefined;
+          }),
+      ),
+    isCurrentPrivateEntryAttachment: (target) =>
+      Effect.sync(
+        () =>
+          desktopTabs.has(target.tabId) &&
+          target.channelEpoch === "native-channel" &&
+          target.attachmentId === "native-attachment",
+      ),
+    sendPrivateEntry: (response) =>
+      Effect.sync(() => {
+        const waiter = nativeReplyWaiter;
+        nativeReplyWaiter = undefined;
+        waiter?.(response);
+        return true;
+      }),
     awaitAttached: (key) => Effect.sync(() => desktopRenders(key.tabId)),
     detached: Stream.callback<{ threadId: string; tabId: string }>((queue) =>
       Effect.acquireRelease(
@@ -268,6 +297,8 @@ const viewerInput = (tabId: string, canOperate: boolean) => ({
 });
 
 beforeEach(() => {
+  nativeHandler = undefined;
+  nativeReplyWaiter = undefined;
   contexts.length = 0;
   contextRequests.length = 0;
   contextGate = null;
@@ -1567,4 +1598,436 @@ it.live("a desktop page that comes back reconnects without waiting for a viewer"
       expect(desktopConnections).toHaveLength(2);
     }),
   ).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "native human fill reserves a human-opened primary tab and refuses an existing auto-taken viewer",
+  () =>
+    Effect.gen(function* () {
+      const browser = yield* ServerBrowser.ServerBrowser;
+      const manager = yield* Manager.PreviewManager;
+      desktopRendersNext = true;
+      const opened = yield* manager.open({ threadId: scope.thread.threadId, runtime: "server" });
+      // Observation alone constructs the real ServerTab without claiming its human control.
+      yield* browser.attachViewer(viewerInput(opened.tabId, false));
+      const binding = {
+        threadId: scope.thread.threadId,
+        tabId: opened.tabId,
+        channelEpoch: "native-channel",
+        attachmentId: "native-attachment",
+        requestId: "native-acquire",
+      };
+      const next = () => {
+        const pending = Promise.withResolvers<DesktopBrowserPrivateEntryResponse>();
+        nativeReplyWaiter = pending.resolve;
+        return pending.promise;
+      };
+      const acquisition = next();
+      yield* nativeHandler!.request({ ...binding, type: "private-entry-acquire" });
+      const grant = yield* Effect.promise(() => acquisition);
+      expect(grant.type).toBe("private-entry-granted");
+      if (grant.type !== "private-entry-granted") throw new Error("Expected native grant");
+      const releasing = next();
+      yield* nativeHandler!.request({
+        ...binding,
+        type: "private-entry-release",
+        requestId: "native-release",
+        leaseId: grant.leaseId,
+        generation: grant.generation,
+      });
+      expect(yield* Effect.promise(() => releasing)).toMatchObject({
+        type: "private-entry-released",
+        requestId: "native-release",
+        generation: grant.generation,
+      });
+      // The existing viewer path REALLY auto-takes an unclaimed human tab.
+      yield* browser.attachViewer(viewerInput(opened.tabId, true));
+      const refusal = next();
+      yield* nativeHandler!.request({
+        ...binding,
+        type: "private-entry-acquire",
+        requestId: "must-not-impersonate-viewer",
+      });
+      expect(yield* Effect.promise(() => refusal)).toMatchObject({
+        type: "private-entry-refused",
+        reason: "viewer-owned",
+      });
+    }).pipe(Effect.provide(layer), Effect.scoped),
+);
+
+function nativeAuthorityFixture(
+  body: (fixture: {
+    router: Effect.Success<ReturnType<typeof DesktopChannel.makePrivateEntryRouter>>;
+    control: SessionControl;
+    responses: Queue.Queue<DesktopBrowserPrivateEntryResponse>;
+    target: {
+      threadId: string;
+      tabId: string;
+      channelEpoch: string;
+      attachmentId: string;
+      requestId: string;
+    };
+    tab: { control: SessionControl; desktop: object | null; closing: boolean };
+  }) => Effect.Effect<void>,
+  agentId: string | null = null,
+) {
+  return Effect.gen(function* () {
+    const responses = yield* Queue.unbounded<DesktopBrowserPrivateEntryResponse>();
+    const router = yield* DesktopChannel.makePrivateEntryRouter((response) =>
+      Queue.offer(responses, response).pipe(Effect.as(true)),
+    );
+    const target = {
+      threadId: "native-thread",
+      tabId: "native-tab",
+      channelEpoch: "native-epoch",
+      attachmentId: "native-incarnation",
+      requestId: "acquire-a",
+    };
+    let changed = () => {};
+    const control = new SessionControl(agentId, () => changed());
+    const tab = { control, desktop: {} as object | null, closing: false };
+    const authority = yield* ServerBrowser.makeDesktopPrivateEntryAuthority(router, () => tab);
+    changed = () => authority.controlChanged(target);
+    yield* router.attach(target, target);
+    yield* body({ router, control, responses, target, tab });
+  }).pipe(Effect.scoped);
+}
+
+it.live(
+  "native reservation drains current work and invalidates queued agent actions before grant",
+  () =>
+    nativeAuthorityFixture(({ router, control, responses, target }) =>
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const drain = Promise.withResolvers<void>();
+        const running = control.agent("permitted-on-human-tab", async () => {
+          Effect.runSync(Deferred.succeed(started, undefined));
+          await drain.promise;
+        });
+        yield* Deferred.await(started);
+        const queued = control
+          .agent("permitted-on-human-tab", async () => "must-not-run")
+          .then(
+            () => true,
+            () => false,
+          );
+        yield* router.receive({ ...target, type: "private-entry-acquire" });
+        expect(control.controller).toMatch(/^native-private-entry:/);
+        expect(yield* Queue.clear(responses)).toEqual([]);
+        drain.resolve();
+        yield* Effect.promise(() => running);
+        expect(yield* Effect.promise(() => queued)).toBe(false);
+        const grant = yield* Queue.take(responses);
+        expect(grant.type).toBe("private-entry-granted");
+        expect(grant).toMatchObject({ generation: control.generation, ...target });
+      }),
+    ),
+);
+
+it.live(
+  "native reservation refuses agent provenance, other human, headless and unknown attachment",
+  () =>
+    Effect.gen(function* () {
+      yield* nativeAuthorityFixture(
+        ({ router, target, responses }) =>
+          Effect.gen(function* () {
+            yield* router.receive({ ...target, type: "private-entry-acquire" });
+            expect(yield* Queue.take(responses)).toMatchObject({
+              type: "private-entry-refused",
+              reason: "agent-owned",
+            });
+          }),
+        "agent-owner",
+      );
+      yield* nativeAuthorityFixture(({ router, control, target, responses, tab }) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() => control.take("actual-other-viewer"));
+          yield* router.receive({ ...target, type: "private-entry-acquire" });
+          expect(yield* Queue.take(responses)).toMatchObject({
+            type: "private-entry-refused",
+            reason: "viewer-owned",
+          });
+          yield* Effect.promise(() => control.release("actual-other-viewer"));
+          tab.desktop = null;
+          yield* router.receive({ ...target, type: "private-entry-acquire" });
+          expect(yield* Queue.take(responses)).toMatchObject({
+            type: "private-entry-refused",
+            reason: "unavailable",
+          });
+          yield* router.receive({
+            ...target,
+            attachmentId: "unknown",
+            type: "private-entry-acquire",
+          });
+          expect(yield* Queue.take(responses)).toMatchObject({
+            type: "private-entry-refused",
+            reason: "stale",
+          });
+        }),
+      );
+    }),
+);
+
+it.live("cancelled acquisition and detach during drain never produce a late native grant", () =>
+  nativeAuthorityFixture(({ router, control, target, responses }) =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const drain = Promise.withResolvers<void>();
+      const running = control.agent("agent", async () => {
+        Effect.runSync(Deferred.succeed(started, undefined));
+        await drain.promise;
+      });
+      yield* Deferred.await(started);
+      yield* router.receive({ ...target, type: "private-entry-acquire" });
+      yield* router.receive({ ...target, type: "private-entry-cancel" });
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-revoked",
+        reason: "cancelled",
+        requestId: target.requestId,
+      });
+      yield* router.detach(target, target);
+      drain.resolve();
+      yield* Effect.promise(() => running);
+      expect(control.controller).toBeNull();
+      yield* router.receive({ ...target, type: "private-entry-acquire" });
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-refused",
+        reason: "stale",
+      });
+      expect(
+        (yield* Queue.clear(responses)).some(
+          (response) => response.type === "private-entry-granted",
+        ),
+      ).toBe(false);
+    }),
+  ),
+);
+
+it.live("native release uses its own request ID and cannot release the wrong lease", () =>
+  nativeAuthorityFixture(({ router, control, target, responses }) =>
+    Effect.gen(function* () {
+      yield* router.receive({ ...target, type: "private-entry-acquire" });
+      const grant = yield* Queue.take(responses);
+      if (grant.type !== "private-entry-granted") throw new Error("Expected grant");
+      yield* router.receive({
+        ...target,
+        type: "private-entry-release",
+        requestId: "wrong-release",
+        leaseId: "wrong",
+        generation: grant.generation,
+      });
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-refused",
+        reason: "stale",
+      });
+      expect(control.controller).not.toBeNull();
+      yield* router.receive({
+        ...target,
+        type: "private-entry-release",
+        requestId: "wrong-generation",
+        leaseId: grant.leaseId,
+        generation: grant.generation + 1,
+      });
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-refused",
+        reason: "stale",
+      });
+      expect(control.controller).not.toBeNull();
+      yield* router.receive({
+        ...target,
+        type: "private-entry-release",
+        requestId: "release-new-id",
+        leaseId: grant.leaseId,
+        generation: grant.generation,
+      });
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-released",
+        requestId: "release-new-id",
+        leaseId: grant.leaseId,
+        generation: grant.generation,
+      });
+      expect(control.controller).toBeNull();
+      yield* router.receive({ ...target, type: "private-entry-acquire" });
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-refused",
+        reason: "cancelled",
+      });
+    }),
+  ),
+);
+
+it.live(
+  "attachment replacement revokes old reservation and old cancel cannot touch its successor",
+  () =>
+    nativeAuthorityFixture(({ router, control, target, responses }) =>
+      Effect.gen(function* () {
+        yield* router.receive({ ...target, type: "private-entry-acquire" });
+        const original = yield* Queue.take(responses);
+        expect(original.type).toBe("private-entry-granted");
+        const replacement = {
+          ...target,
+          channelEpoch: "replacement-channel",
+          attachmentId: "replacement-document",
+          requestId: "replacement-acquire",
+        };
+        yield* router.attach(replacement, replacement);
+        expect(yield* Queue.take(responses)).toMatchObject({
+          type: "private-entry-revoked",
+          reason: "detached",
+          requestId: target.requestId,
+        });
+        expect(control.controller).toBeNull();
+        yield* router.receive({ ...replacement, type: "private-entry-acquire" });
+        const grant = yield* Queue.take(responses);
+        expect(grant.type).toBe("private-entry-granted");
+        const owner = control.controller;
+        yield* router.receive({ ...target, type: "private-entry-cancel" });
+        expect(yield* Queue.take(responses)).toMatchObject({
+          type: "private-entry-refused",
+          reason: "stale",
+        });
+        expect(control.controller).toBe(owner);
+        yield* router.close;
+        expect(control.controller).toBeNull();
+      }),
+    ),
+);
+
+it.live("owner loss during acquisition drain revokes before a grant", () =>
+  nativeAuthorityFixture(({ router, control, target, responses }) =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const drain = Promise.withResolvers<void>();
+      const running = control.agent("agent", async () => {
+        Effect.runSync(Deferred.succeed(started, undefined));
+        await drain.promise;
+      });
+      yield* Deferred.await(started);
+      yield* router.receive({ ...target, type: "private-entry-acquire" });
+      const owner = control.controller!;
+      const release = control.release(owner);
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-revoked",
+        reason: "control-changed",
+      });
+      drain.resolve();
+      yield* Effect.promise(() => running);
+      yield* Effect.promise(() => release);
+      expect(control.controller).toBeNull();
+      expect(
+        (yield* Queue.clear(responses)).some(
+          (response) => response.type === "private-entry-granted",
+        ),
+      ).toBe(false);
+    }),
+  ),
+);
+
+it.live("cancel during release drain cannot produce a release ACK that resumes native fill", () =>
+  nativeAuthorityFixture(({ router, control, target, responses }) =>
+    Effect.gen(function* () {
+      yield* router.receive({ ...target, type: "private-entry-acquire" });
+      const grant = yield* Queue.take(responses);
+      if (grant.type !== "private-entry-granted") throw new Error("Expected grant");
+      const started = yield* Deferred.make<void>();
+      const drain = Promise.withResolvers<void>();
+      const running = control.system(async () => {
+        Effect.runSync(Deferred.succeed(started, undefined));
+        await drain.promise;
+      });
+      yield* Deferred.await(started);
+      yield* router.receive({
+        ...target,
+        type: "private-entry-release",
+        requestId: "release",
+        leaseId: grant.leaseId,
+        generation: grant.generation,
+      });
+      yield* router.receive({ ...target, type: "private-entry-cancel" });
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-revoked",
+        reason: "cancelled",
+        requestId: target.requestId,
+      });
+      drain.resolve();
+      yield* Effect.promise(() => running);
+      expect(
+        (yield* Queue.clear(responses)).some(
+          (response) => response.type === "private-entry-released",
+        ),
+      ).toBe(false);
+    }),
+  ),
+);
+
+it.live("a repeated acquisition shares its lease and a tab close revokes exactly that lease", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const responses = yield* Queue.unbounded<DesktopBrowserPrivateEntryResponse>();
+      const router = yield* DesktopChannel.makePrivateEntryRouter((response) =>
+        Queue.offer(responses, response).pipe(Effect.as(true)),
+      );
+      const target = {
+        threadId: "thread",
+        tabId: "tab",
+        channelEpoch: "channel",
+        attachmentId: "attachment",
+        requestId: "acquire",
+      };
+      let changed = () => {};
+      const control = new SessionControl(null, () => changed());
+      const tab = { control, desktop: {}, closing: false };
+      const authority = yield* ServerBrowser.makeDesktopPrivateEntryAuthority(router, () => tab);
+      changed = () => authority.controlChanged(target);
+      yield* router.attach(target, target);
+      yield* router.receive({ ...target, type: "private-entry-acquire" });
+      const grant = yield* Queue.take(responses);
+      expect(grant.type).toBe("private-entry-granted");
+      yield* router.receive({ ...target, type: "private-entry-acquire" });
+      expect(yield* Queue.take(responses)).toEqual(grant);
+      tab.closing = true;
+      yield* authority.closeTab(target);
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-revoked",
+        reason: "closed",
+      });
+      expect(control.controller).toBeNull();
+      yield* router.receive({ ...target, requestId: "after-close", type: "private-entry-acquire" });
+      expect(yield* Queue.take(responses)).toMatchObject({
+        type: "private-entry-refused",
+        reason: "unavailable",
+      });
+    }),
+  ),
+);
+
+it.live("an undeliverable grant releases the actual SessionControl reservation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const revoked = yield* Deferred.make<DesktopBrowserPrivateEntryResponse>();
+      const router = yield* DesktopChannel.makePrivateEntryRouter((response) => {
+        if (response.type === "private-entry-granted") return Effect.succeed(false);
+        return Deferred.succeed(revoked, response).pipe(Effect.as(true));
+      });
+      const target = {
+        threadId: "thread",
+        tabId: "tab",
+        channelEpoch: "channel",
+        attachmentId: "attachment",
+        requestId: "acquire",
+      };
+      let changed = () => {};
+      const control = new SessionControl(null, () => changed());
+      const tab = { control, desktop: {}, closing: false };
+      const authority = yield* ServerBrowser.makeDesktopPrivateEntryAuthority(router, () => tab);
+      yield* router.attach(target, target);
+      changed = () => authority.controlChanged(target);
+      yield* router.receive({ ...target, type: "private-entry-acquire" });
+      expect(yield* Deferred.await(revoked)).toMatchObject({
+        type: "private-entry-revoked",
+        reason: "channel-closed",
+      });
+      expect(control.controller).toBeNull();
+    }),
+  ),
 );

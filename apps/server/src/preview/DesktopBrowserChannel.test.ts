@@ -3,6 +3,11 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodeURL from "node:url";
 
 import { expect, it } from "vite-plus/test";
+import { it as effectIt } from "@effect/vitest";
+import type { DesktopBrowserPrivateEntryResponse } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Queue from "effect/Queue";
+import { makePrivateEntryRouter } from "./DesktopBrowserChannel.ts";
 
 it("receives desktop messages and exits while the parent keeps both input pipes open", async () => {
   const child = NodeChildProcess.spawn(
@@ -57,3 +62,101 @@ it("receives desktop messages and exits while the parent keeps both input pipes 
     for (const stream of child.stdio) stream?.destroy();
   }
 });
+
+const privateTarget = {
+  threadId: "thread",
+  tabId: "tab",
+  channelEpoch: "connection-a",
+  attachmentId: "document-a",
+};
+effectIt.effect(
+  "private control requires both advertised attachment and registered authority",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const replies = yield* Queue.unbounded<DesktopBrowserPrivateEntryResponse>();
+        const router = yield* makePrivateEntryRouter((response) =>
+          Queue.offer(replies, response).pipe(Effect.as(true)),
+        );
+        const request = {
+          ...privateTarget,
+          type: "private-entry-acquire" as const,
+          requestId: "acquire",
+        };
+        yield* router.attach(privateTarget);
+        yield* router.receive(request);
+        expect(yield* Queue.take(replies)).toMatchObject({
+          type: "private-entry-refused",
+          reason: "stale",
+        });
+        yield* router.attach(privateTarget, privateTarget);
+        yield* router.receive(request);
+        expect(yield* Queue.take(replies)).toMatchObject({
+          type: "private-entry-refused",
+          reason: "unavailable",
+        });
+      }),
+    ),
+);
+
+effectIt.effect(
+  "replacement and EOF invalidate exact attachment and fence late grants and release ACKs",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const replies = yield* Queue.unbounded<DesktopBrowserPrivateEntryResponse>();
+        const invalidated = yield* Queue.unbounded<string>();
+        const requests = yield* Queue.unbounded<string>();
+        const router = yield* makePrivateEntryRouter((response) =>
+          Queue.offer(replies, response).pipe(Effect.as(true)),
+        );
+        yield* router.registerPrivateEntryHandler({
+          request: (request) => Queue.offer(requests, request.requestId).pipe(Effect.asVoid),
+          invalidate: (target) => Queue.offer(invalidated, target.attachmentId).pipe(Effect.asVoid),
+        });
+        yield* router.attach(privateTarget, privateTarget);
+        yield* router.receive({
+          ...privateTarget,
+          type: "private-entry-acquire",
+          requestId: "first",
+        });
+        expect(yield* Queue.take(requests)).toBe("first");
+        const replacement = {
+          ...privateTarget,
+          channelEpoch: "connection-b",
+          attachmentId: "document-b",
+        };
+        yield* router.attach(replacement, replacement);
+        expect(yield* Queue.take(invalidated)).toBe("document-a");
+        // An old close must not detach the replacement.
+        yield* router.detach(privateTarget, privateTarget);
+        expect(yield* router.isCurrentPrivateEntryAttachment(replacement)).toBe(true);
+        const late = { ...privateTarget, requestId: "first", leaseId: "old-lease", generation: 1 };
+        expect(yield* router.sendPrivateEntry({ ...late, type: "private-entry-granted" })).toBe(
+          false,
+        );
+        expect(
+          yield* router.sendPrivateEntry({
+            ...late,
+            type: "private-entry-released",
+            requestId: "release-old",
+          }),
+        ).toBe(false);
+        expect(yield* Queue.clear(replies)).toEqual([]);
+        yield* router.close;
+        expect(yield* Queue.take(invalidated)).toBe("document-b");
+        expect(yield* router.isCurrentPrivateEntryAttachment(replacement)).toBe(false);
+        expect(
+          yield* router.sendPrivateEntry({
+            ...replacement,
+            requestId: "late",
+            leaseId: "lease",
+            generation: 1,
+            type: "private-entry-granted",
+          }),
+        ).toBe(false);
+        yield* router.close;
+        expect(yield* Queue.clear(invalidated)).toEqual([]);
+      }),
+    ),
+);
