@@ -674,6 +674,22 @@ export interface ProviderAdapterV2LiveVoiceRuntime {
       readonly runId?: string;
       readonly message?: string;
     }) => Effect.Effect<string, ProviderAdapterV2Error>;
+    readonly onObserveWork?: (input: {
+      readonly plannerNativeThreadId: string;
+      readonly plannerTurnId: string;
+      readonly callId: string;
+      readonly action: "attach" | "detach";
+      readonly target: {
+        readonly environmentId: string;
+        readonly threadId: string;
+        readonly providerInstanceId: string;
+        readonly runId: string;
+        readonly attemptId: string;
+        readonly rootNodeId: string;
+      };
+      readonly progress: boolean;
+      readonly completion: boolean;
+    }) => Effect.Effect<string, ProviderAdapterV2Error>;
   }) => Effect.Effect<{ readonly plannerNativeThreadId: string }, ProviderAdapterV2Error>;
   readonly start: (input: {
     readonly plannerNativeThreadId: string;
