@@ -6612,7 +6612,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         parentNode === undefined ||
         parentNode.runId !== parentRun.id ||
-        parentRun.rootNodeId === null
+        parentRun.rootNodeId === null ||
+        parentRun.rootNodeId !== command.parentNodeId
       ) {
         return yield* new OrchestratorDispatchError({
           commandId: command.commandId,
