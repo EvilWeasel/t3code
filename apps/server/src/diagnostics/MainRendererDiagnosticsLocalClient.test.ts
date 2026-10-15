@@ -259,9 +259,13 @@ it.live.each([
           current = false;
           yield* Effect.promise(() => server.close());
         }
-        yield* Deferred.succeed(release, undefined);
+        if (!fdRead) yield* Deferred.succeed(release, undefined);
         const result = yield* Fiber.join(reading);
-        if (fdRead) yield* Fiber.join(fdRead);
+        if (fdRead) {
+          assert.deepEqual(result, { status: "unavailable", reason: "busy" });
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(fdRead);
+        }
         if (boundary === "ready") {
           assert.equal(result.status, "ready");
           if (result.status === "ready") {
