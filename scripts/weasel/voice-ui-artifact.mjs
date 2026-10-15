@@ -63,23 +63,44 @@ const server = await createServer({
   server: { host: "127.0.0.1", port: 0, fs: { allow: [repo] } },
 });
 const results = [];
+let currentCase;
+const diagnosticUrl = (value) => {
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}`.slice(0, 300);
+  } catch { return "unavailable"; }
+};
 try {
   await server.listen();
   const address = server.httpServer.address();
   const origin = `http://127.0.0.1:${address.port}`;
   browser = await chromium.launch({ headless: true });
   for (const width of [360, 1024]) for (const theme of ["light", "dark"]) for (const [provider, phase] of [["openai-api","review"],["codex-account","recording"],["openai-api","error"],["openai-api","transcribing"]]) {
+    const name = `${width}-${theme}-${provider}-${phase}`;
     const page = await browser.newPage({ viewport: { width, height: 1100 }, reducedMotion: "reduce" });
     const errors = [];
+    const failedRequests = [];
+    currentCase = { name, errors, failedRequests, stage: "navigation" };
     page.on("pageerror", (error) => errors.push(error.message));
+    page.on("requestfailed", (request) => {
+      if (failedRequests.length < 20) failedRequests.push({url:diagnosticUrl(request.url()),failure:request.failure()?.errorText});
+    });
     await page.route("**/*", (route) => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
     await page.addInitScript(() => { navigator.mediaDevices.getUserMedia = async () => { throw Error("Real microphone forbidden in fixture"); }; });
-    await page.goto(`${origin}/?${new URLSearchParams({theme,provider,phase})}`);
-    await page.getByRole("button", {name:"Save voice settings"}).waitFor({state:"visible"});
-    await page.getByText("Synthetic configured provider", {exact:true}).waitFor();
+    const deadline = Date.now() + 30_000;
+    const remaining = () => {
+      if (Date.now() >= deadline) throw new Error(`Fixture readiness deadline exceeded: ${name}`);
+      return deadline - Date.now();
+    };
+    try {
+    await page.goto(`${origin}/?${new URLSearchParams({theme,provider,phase})}`, {timeout:remaining()});
+    currentCase.stage = "module-requests-idle";
+    await page.waitForLoadState("networkidle", {timeout:remaining()});
+    currentCase.stage = "visible-settings";
+    await page.getByRole("button", {name:"Save voice settings"}).waitFor({state:"visible",timeout:remaining()});
+    await page.getByText("Synthetic configured provider", {exact:true}).waitFor({timeout:remaining()});
     await page.evaluate(() => document.fonts.ready);
     if (await page.locator("main").evaluate((element) => getComputedStyle(element).paddingTop) !== "16px") throw Error("Fixture Tailwind utilities are missing");
-    const name = `${width}-${theme}-${provider}-${phase}`;
     await page.screenshot({path:join(output,name+".png"),fullPage:true});
     if (phase === "error") {
       await page.getByText("Error details", {exact:true}).click();
@@ -87,11 +108,22 @@ try {
     }
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
     results.push({name,overflow,errors});
-    await page.close();
     if (errors.length || overflow) throw Error(JSON.stringify(results.at(-1)));
+    currentCase = undefined;
+    } catch (error) {
+      currentCase.failure = String(error.message).slice(0, 2000);
+      currentCase.pageUrl = diagnosticUrl(page.url());
+      if (page.url().startsWith(origin + "/")) {
+        await page.screenshot({path:join(output,name+"-failure.png"),fullPage:true,timeout:5000}).catch(() => {});
+        await page.content().then(html => writeFile(join(output,name+"-failure.html"),html.slice(0,262144))).catch(() => {});
+      }
+      throw error;
+    } finally {
+      await page.close();
+    }
   }
 } finally {
-  await writeFile(join(output,"fixture-receipt.json"),JSON.stringify({scope:"Real components/styles with synthetic boundaries; no microphone/provider/runtime acceptance",results},null,2));
+  await writeFile(join(output,"fixture-receipt.json"),JSON.stringify({scope:"Real components/styles with synthetic boundaries; no microphone/provider/runtime acceptance",results,currentCase},null,2));
   await browser?.close();
   await server.close();
   await rm(fixture,{recursive:true,force:true});
