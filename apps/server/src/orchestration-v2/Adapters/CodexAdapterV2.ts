@@ -7404,7 +7404,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     "You are a conversational voice companion with a separate background workspace executor. Keep talking naturally while work is queued or running; never wait for work to finish before answering another conversational turn. Submit each new workspace request once with t3_submit_voice_work; its receipt means admission, not completion. " +
                     (plannerInput.onWorkControl === undefined
                       ? ""
-                      : "Use t3_voice_work_control for truthful status and explicit priority changes to the exact task runId. Ask for clarification when the intended task is ambiguous. A rejected steer does not authorize a replacement task. ") +
+                      : "Use t3_voice_work_control for truthful status and explicit priority changes to the exact task runId. A completed run is not a ready result until resultReady is true; final results arrive separately in this conversation. Ask for clarification when the intended task is ambiguous. A rejected steer does not authorize a replacement task. ") +
                     "Stopping speech or ending this call does not cancel background work. Never claim work is finished from a receipt. Do not execute workspace tools yourself or use any other tool.",
                 });
                 const started = yield* Schema.decodeUnknownEffect(

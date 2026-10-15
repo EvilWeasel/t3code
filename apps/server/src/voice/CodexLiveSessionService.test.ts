@@ -811,6 +811,10 @@ it.effect.each([false, true])(
         );
         yield* firstGateRead;
         assert.equal(spoken.length, 0, "a still-running required child blocks speech");
+        assert.deepEqual(
+          decodeWorkStatus(yield* control("status", "child-pending", "durable-run-1")).tasks,
+          [{ runId: "durable-run-1", status: "completed", resultReady: false, commentary: null }],
+        );
 
         durableProjection = {
           ...durableProjection,
@@ -870,6 +874,10 @@ it.effect.each([false, true])(
         yield* Effect.promise(() => speechObserved);
         yield* Deferred.await(workFinished);
         assert.equal(completedWork, 1, "the held canonical job completes exactly once");
+        assert.deepEqual(
+          decodeWorkStatus(yield* control("status", "result-ready", "durable-run-1")).tasks,
+          [{ runId: "durable-run-1", status: "completed", resultReady: true, commentary: null }],
+        );
         assert.deepEqual(spoken, [
           {
             plannerNativeThreadId: "planner-native-1",
