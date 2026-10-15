@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Exit from "effect/Exit";
+import { TestClock } from "effect/testing";
 import { vi } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -216,45 +217,40 @@ describe("DesktopBrowserHost", () => {
     "a legacy no-reply timeout cancels the original request and never accepts its late grant",
     () =>
       Effect.gen(function* () {
-        vi.useFakeTimers();
-        try {
-          const host = yield* DesktopBrowserHost.make;
-          const backend = yield* connect(host);
-          const debuggee = makeDebuggee();
-          host.attach(key, debuggee.tab);
-          yield* Queue.take(backend.messages);
-          const acquiring = yield* Effect.exit(
-            Effect.tryPromise(() => host.acquirePrivateEntry(debuggee.tab.webContents)),
-          ).pipe(Effect.forkScoped);
-          const request = yield* Queue.take(backend.messages);
-          if (request.type !== "private-entry-acquire") throw new Error("Expected acquire");
-          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(5000));
-          expect(Exit.isFailure(yield* Fiber.join(acquiring))).toBe(true);
-          const cancelled = yield* Queue.take(backend.messages);
-          expect(cancelled).toMatchObject({
-            type: "private-entry-cancel",
-            requestId: request.requestId,
-          });
-          yield* backend.connection.handleCommandLine(
-            encodeJson({
-              ...request,
-              type: "private-entry-granted",
-              leaseId: "late",
-              generation: 1,
-            }),
-          );
-          expect((yield* Queue.take(backend.messages)).type).toBe("private-entry-cancel");
-          expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
-          expect(
-            Exit.isFailure(
-              yield* Effect.exit(
-                Effect.tryPromise(() => host.acquirePrivateEntry(debuggee.tab.webContents)),
-              ),
+        const host = yield* DesktopBrowserHost.make;
+        const backend = yield* connect(host);
+        const debuggee = makeDebuggee();
+        host.attach(key, debuggee.tab);
+        yield* Queue.take(backend.messages);
+        const acquiring = yield* Effect.exit(
+          Effect.tryPromise(() => host.acquirePrivateEntry(debuggee.tab.webContents)),
+        ).pipe(Effect.forkScoped);
+        const request = yield* Queue.take(backend.messages);
+        if (request.type !== "private-entry-acquire") throw new Error("Expected acquire");
+        yield* TestClock.adjust("5 seconds");
+        expect(Exit.isFailure(yield* Fiber.join(acquiring))).toBe(true);
+        const cancelled = yield* Queue.take(backend.messages);
+        expect(cancelled).toMatchObject({
+          type: "private-entry-cancel",
+          requestId: request.requestId,
+        });
+        yield* backend.connection.handleCommandLine(
+          encodeJson({
+            ...request,
+            type: "private-entry-granted",
+            leaseId: "late",
+            generation: 1,
+          }),
+        );
+        expect((yield* Queue.take(backend.messages)).type).toBe("private-entry-cancel");
+        expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
+        expect(
+          Exit.isFailure(
+            yield* Effect.exit(
+              Effect.tryPromise(() => host.acquirePrivateEntry(debuggee.tab.webContents)),
             ),
-          ).toBe(true);
-        } finally {
-          vi.useRealTimers();
-        }
+          ),
+        ).toBe(true);
       }).pipe(Effect.scoped),
   );
 

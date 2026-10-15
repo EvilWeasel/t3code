@@ -1,8 +1,16 @@
-import * as NodeChildProcess from "node:child_process";
+import * as NodeChildProcessSpawner from "@effect/platform-node/NodeChildProcessSpawner";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import * as NodePath from "@effect/platform-node/NodePath";
+import * as Layer from "effect/Layer";
+import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
+import * as Result from "effect/Result";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 export type ProtonPassState = "missing" | "unsupported" | "locked" | "signed-out" | "unavailable";
 export class ProtonPassUnavailable extends Error {
-  constructor(readonly state: ProtonPassState) {
+  readonly state: ProtonPassState;
+  constructor(state: ProtonPassState) {
     super(
       state === "missing" || state === "unsupported"
         ? "Proton Pass CLI is missing or unsupported. This integration requires CLI 2.4.2 installed on this desktop."
@@ -10,6 +18,7 @@ export class ProtonPassUnavailable extends Error {
           ? `Proton Pass CLI is ${state}. Unlock or sign in to the CLI explicitly; the desktop app uses a separate session.`
           : "Proton Pass CLI is unavailable. Check its local installation and CLI session, then try again.",
     );
+    this.state = state;
   }
 }
 export interface ProtonLoginReference {
@@ -25,49 +34,76 @@ export interface ProtonPassProvider {
 export type RunProtonPass = (args: readonly string[]) => Promise<string>;
 
 /** stdout is consumed privately; neither provider output nor errors enter app logs. */
-export const runProtonPass: RunProtonPass = (args) =>
-  new Promise((resolve, reject) => {
-    const child = NodeChildProcess.spawn("pass-cli", [...args], {
-      stdio: ["ignore", "pipe", "pipe"],
-      shell: false,
-    });
-    let stdout = "";
-    let stderr = "";
-    let failed = false;
-    const fail = (state: ProtonPassState) => {
-      if (failed) return;
-      failed = true;
-      child.kill();
-      reject(new ProtonPassUnavailable(state));
-    };
-    const timer = setTimeout(() => fail("unavailable"), 15000);
-    child.stdout.on("data", (bytes: Buffer) => {
-      stdout += bytes.toString();
-      if (stdout.length > 1024 * 1024) fail("unavailable");
-    });
-    child.stderr.on("data", (bytes: Buffer) => {
-      stderr = (stderr + bytes.toString()).slice(0, 4096);
-    });
-    child.once("error", () => {
-      clearTimeout(timer);
-      fail("missing");
-    });
-    child.once("close", (code) => {
-      clearTimeout(timer);
-      if (failed) return;
-      if (code !== 0) {
-        fail(
-          /locked|lock code|keyring/i.test(stderr)
-            ? "locked"
-            : /authenticated client|not logged|no session/i.test(stderr)
-              ? "signed-out"
-              : "unavailable",
+export const runProtonPassEffect = (args: readonly string[]) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const child = yield* spawner
+        .spawn(
+          ChildProcess.make("pass-cli", [...args], {
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+            shell: false,
+            killSignal: "SIGTERM",
+            forceKillAfter: "1 second",
+          }),
+        )
+        .pipe(Effect.mapError(() => new ProtonPassUnavailable("missing")));
+      let stdout = "";
+      let stderr = "";
+      const [, , code] = yield* Effect.all(
+        [
+          child.stdout.pipe(
+            Stream.decodeText(),
+            Stream.runForEach((text) => {
+              stdout += text;
+              return stdout.length > 1024 * 1024
+                ? Effect.fail(new ProtonPassUnavailable("unavailable"))
+                : Effect.void;
+            }),
+          ),
+          child.stderr.pipe(
+            Stream.decodeText(),
+            Stream.runForEach((text) =>
+              Effect.sync(() => {
+                stderr = (stderr + text).slice(0, 4096);
+              }),
+            ),
+          ),
+          child.exitCode,
+        ],
+        { concurrency: "unbounded" },
+      );
+      if (code !== 0)
+        return yield* Effect.fail(
+          new ProtonPassUnavailable(
+            /locked|lock code|keyring/i.test(stderr)
+              ? "locked"
+              : /authenticated client|not logged|no session/i.test(stderr)
+                ? "signed-out"
+                : "unavailable",
+          ),
         );
-        return;
-      }
-      resolve(stdout);
-    });
-  });
+      return stdout;
+    }),
+  ).pipe(
+    // Interrupting the scope kills the captured child, including on output overflow or timeout.
+    Effect.timeout("15 seconds"),
+    Effect.mapError((error) =>
+      error instanceof ProtonPassUnavailable ? error : new ProtonPassUnavailable("unavailable"),
+    ),
+  );
+const cliProcessLayer = NodeChildProcessSpawner.layer.pipe(
+  Layer.provide(Layer.mergeAll(NodeFileSystem.layer, NodePath.layer)),
+);
+export const runProtonPass: RunProtonPass = async (args) => {
+  const result = await Effect.runPromise(
+    runProtonPassEffect(args).pipe(Effect.result, Effect.provide(cliProcessLayer)),
+  );
+  if (Result.isFailure(result)) throw result.failure;
+  return result.success;
+};
 const text = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= 4096;
 const record = (value: unknown): value is Record<string, unknown> =>

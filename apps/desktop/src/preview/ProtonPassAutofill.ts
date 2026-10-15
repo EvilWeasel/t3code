@@ -1,5 +1,11 @@
-import * as NodeFSP from "node:fs/promises";
-import * as NodePath from "node:path";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import * as NodePath from "@effect/platform-node/NodePath";
+import * as Layer from "effect/Layer";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
 import type { ProtonLoginReference, ProtonPassProvider } from "./ProtonPassCli.ts";
 
 export interface AutofillTarget {
@@ -52,39 +58,56 @@ const validBinding = (value: unknown): value is LinkedLogin => {
     String(entry.partition).startsWith("persist:")
   );
 };
+const bindingIOLayer = Layer.mergeAll(NodeFileSystem.layer, NodePath.layer);
+const runBindingIO = async <A>(
+  operation: Effect.Effect<A, AutofillUnavailable, FileSystem.FileSystem | Path.Path>,
+) => {
+  const result = await Effect.runPromise(
+    operation.pipe(Effect.result, Effect.provide(bindingIOLayer)),
+  );
+  if (Result.isFailure(result)) throw result.failure;
+  return result.success;
+};
 /** Stores references only. Secret fields are never serialized. */
 export function makeBindingStore(file: string): BindingStore {
   return {
-    async read() {
-      try {
-        const parsed: unknown = JSON.parse(await NodeFSP.readFile(file, "utf8"));
-        if (Array.isArray(parsed)) return parsed.filter(validBinding);
-      } catch (error) {
-        if (
-          !(
-            typeof error === "object" &&
-            error !== null &&
-            "code" in error &&
-            error.code === "ENOENT"
-          )
-        )
-          throw new AutofillUnavailable();
-      }
-      return [];
-    },
-    async write(bindings) {
-      const data = bindings.map(({ shareId, itemId, title, origin, partition }) => ({
-        shareId,
-        itemId,
-        title,
-        origin,
-        partition,
-      }));
-      await NodeFSP.mkdir(NodePath.dirname(file), { recursive: true, mode: 0o700 });
-      const temporary = `${file}.tmp`;
-      await NodeFSP.writeFile(temporary, JSON.stringify(data), { mode: 0o600 });
-      await NodeFSP.rename(temporary, file);
-    },
+    read: () =>
+      runBindingIO(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const raw = yield* fs
+            .readFileString(file)
+            .pipe(
+              Effect.catch((error) =>
+                error.reason._tag === "NotFound"
+                  ? Effect.succeed(undefined)
+                  : Effect.fail(new AutofillUnavailable()),
+              ),
+            );
+          if (raw === undefined) return [];
+          const parsed = yield* Schema.decodeUnknownEffect(Schema.UnknownFromJsonString)(raw);
+          return Array.isArray(parsed) ? parsed.filter(validBinding) : [];
+        }).pipe(Effect.mapError(() => new AutofillUnavailable())),
+      ),
+    write: (bindings) =>
+      runBindingIO(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const data = bindings.map(({ shareId, itemId, title, origin, partition }) => ({
+            shareId,
+            itemId,
+            title,
+            origin,
+            partition,
+          }));
+          yield* fs.makeDirectory(path.dirname(file), { recursive: true, mode: 0o700 });
+          const temporary = `${file}.tmp`;
+          const encoded = yield* Schema.encodeEffect(Schema.UnknownFromJsonString)(data);
+          yield* fs.writeFileString(temporary, encoded, { mode: 0o600 });
+          yield* fs.rename(temporary, file);
+        }).pipe(Effect.mapError(() => new AutofillUnavailable())),
+      ),
   };
 }
 export function makeAutofill(provider: ProtonPassProvider, store: BindingStore) {

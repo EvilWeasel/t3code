@@ -1,7 +1,10 @@
 import { expect, it, vi } from "vite-plus/test";
-import * as NodeFSP from "node:fs/promises";
-import * as NodeOS from "node:os";
-import * as NodePath from "node:path";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import * as NodePath from "@effect/platform-node/NodePath";
+import * as Layer from "effect/Layer";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import {
   makeAutofill,
   makeBindingStore,
@@ -94,24 +97,26 @@ it("cancelling the native item choice reads no credentials and keeps privacy ena
   expect(target.clearAndResume).not.toHaveBeenCalled();
 });
 it("persists only reference fields even if an input object contains extra secret properties", async () => {
-  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "proton-bindings-test-"));
-  try {
-    const file = NodePath.join(directory, "bindings.json");
-    const store = makeBindingStore(file);
-    const entry = {
-      ...login,
-      origin: "https://site.test",
-      partition: "persist:p",
-      password: "must-not-persist",
-    };
-    await store.write([entry]);
-    expect(await NodeFSP.readFile(file, "utf8")).not.toContain("must-not-persist");
-    expect(await store.read()).toEqual([
-      { ...login, origin: "https://site.test", partition: "persist:p" },
-    ]);
-  } finally {
-    await NodeFSP.rm(directory, { recursive: true, force: true });
-  }
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "proton-bindings-test-" });
+      const file = path.join(directory, "bindings.json");
+      const store = makeBindingStore(file);
+      const entry = {
+        ...login,
+        origin: "https://site.test",
+        partition: "persist:p",
+        password: "must-not-persist",
+      };
+      yield* Effect.promise(() => store.write([entry]));
+      expect(yield* fs.readFileString(file)).not.toContain("must-not-persist");
+      expect(yield* Effect.promise(() => store.read())).toEqual([
+        { ...login, origin: "https://site.test", partition: "persist:p" },
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeFileSystem.layer, NodePath.layer))),
+  );
 });
 
 it("removes only the selected origin/profile/share/item association without reading credentials or resuming", async () => {

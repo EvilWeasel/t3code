@@ -21,6 +21,7 @@ import * as Context from "effect/Context";
 import * as NodePath from "node:path";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
+import type * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -35,6 +36,17 @@ const decodePrivateResponse = Schema.decodeUnknownOption(
 );
 const decodeCommand = Schema.decodeUnknownOption(Schema.fromJsonString(DesktopBrowserCommand));
 const lineEncoder = new TextEncoder();
+const decodePrivateCdpId = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.Struct({ id: Schema.Number })),
+);
+const encodePrivateCdpError = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      id: Schema.Number,
+      error: Schema.Struct({ code: Schema.Number, message: Schema.String }),
+    }),
+  ),
+);
 /** CDP commands through which an agent clicks, types, or navigates the page. */
 const AGENT_INPUT_COMMAND =
   /"method":"(?:Input\.|Page\.navigate"|Runtime\.(?:evaluate|callFunctionOn)")/;
@@ -79,7 +91,7 @@ interface LeaseState {
 }
 interface PendingControl {
   readonly request: DesktopBrowserPrivateEntryRequest;
-  readonly timer: ReturnType<typeof setTimeout>;
+  readonly timer: Fiber.Fiber<void>;
   readonly accept: (lease?: NativePrivateEntryLease) => void;
   readonly reject: () => void;
 }
@@ -208,7 +220,7 @@ export const make = Effect.gen(function* () {
     if (tab.pending) {
       const pending = tab.pending;
       tab.pending = null;
-      clearTimeout(pending.timer);
+      pending.timer.interruptUnsafe();
       if (pending.request.type === "private-entry-acquire") cancel(tab, pending.request);
       pending.reject();
     }
@@ -229,14 +241,20 @@ export const make = Effect.gen(function* () {
         return;
       }
       tab.releasedLease = null;
-      const timer = setTimeout(() => {
-        if (tab.pending?.request !== message) return;
-        tab.pending = null;
-        setPrivateEntry(tab.debuggee.webContents, true);
-        if (message.type === "private-entry-acquire") cancel(tab, message);
-        if (tab.lease) tab.lease.active = false;
-        reject(unavailable());
-      }, 5000);
+      const timer = runFork(
+        Effect.sleep("5 seconds").pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              if (tab.pending?.request !== message) return;
+              tab.pending = null;
+              setPrivateEntry(tab.debuggee.webContents, true);
+              if (message.type === "private-entry-acquire") cancel(tab, message);
+              if (tab.lease) tab.lease.active = false;
+              reject(unavailable());
+            }),
+          ),
+        ),
+      );
       tab.pending = {
         request: message,
         timer,
@@ -344,7 +362,7 @@ export const make = Effect.gen(function* () {
       tab.lease.generation === response.generation;
     const incomingRefusal = response.type === "private-entry-refused";
     if (!incomingGrant && !incomingRelease && !incomingRefusal) return;
-    clearTimeout(pending.timer);
+    pending.timer.interruptUnsafe();
     tab.pending = null;
     if (incomingGrant) {
       const lease: LeaseState = {
@@ -497,25 +515,16 @@ export const make = Effect.gen(function* () {
       if (!tab) return;
       if (privateContents.has(tab.debuggee.webContents)) {
         if (command.value.type === "cdp") {
-          try {
-            const request: unknown = JSON.parse(command.value.message);
-            if (
-              typeof request === "object" &&
-              request !== null &&
-              "id" in request &&
-              typeof request.id === "number"
-            )
-              emit({
-                type: "cdp",
-                ...tab.key,
-                message: JSON.stringify({
-                  id: request.id,
-                  error: { code: -32000, message: "This tab is private during credential entry." },
-                }),
-              });
-          } catch {
-            /* Ignore malformed protocol messages without exposing payloads. */
-          }
+          const request = decodePrivateCdpId(command.value.message);
+          if (Option.isSome(request))
+            emit({
+              type: "cdp",
+              ...tab.key,
+              message: encodePrivateCdpError({
+                id: request.value.id,
+                error: { code: -32000, message: "This tab is private during credential entry." },
+              }),
+            });
         }
         return;
       }

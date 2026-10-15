@@ -5207,15 +5207,17 @@ function makeAutofillDomFixture() {
     isConnected = true;
     ownerDocument = document;
     private storedValue = "";
-    constructor(
-      public type: string,
-      public form: {
-        querySelectorAll: (selector: string) => FakeInput[];
-        isConnected: boolean;
-        ownerDocument: typeof document;
-        contains: (field: FakeInput) => boolean;
-      },
-    ) {}
+    type: string;
+    form: {
+      querySelectorAll: (selector: string) => FakeInput[];
+      isConnected: boolean;
+      ownerDocument: typeof document;
+      contains: (field: FakeInput) => boolean;
+    };
+    constructor(type: string, form: FakeInput["form"]) {
+      this.type = type;
+      this.form = form;
+    }
     get value() {
       return this.storedValue;
     }
