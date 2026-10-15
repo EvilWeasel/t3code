@@ -76,6 +76,20 @@ focused_tests=(
   apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
   apps/web/src/voice/voiceSettingsClient.test.ts
 )
+main_renderer_diagnostics_tests=(
+  apps/desktop/src/ipc/methods/mainRendererDiagnostics.test.ts
+  apps/desktop/src/telemetry/DesktopTelemetryPublisher.test.ts
+  apps/server/src/resourceTelemetry/DesktopTelemetryReceiver.test.ts
+  apps/server/src/auth/RpcAuthorization.test.ts
+  packages/client-runtime/src/state/server.test.ts
+)
+for diagnostic_test in "${main_renderer_diagnostics_tests[@]}"; do
+  if [[ ! -f "$diagnostic_test" ]]; then
+    echo "Required Main renderer diagnostic gate is missing: $diagnostic_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$diagnostic_test")
+done
 server_continuation_tests=(
   apps/server/src/orchestration-v2/DelegatedCompletionDelivery.test.ts
   apps/server/src/orchestration-v2/FoundationPersistence.test.ts
