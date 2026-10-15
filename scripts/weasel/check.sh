@@ -112,10 +112,15 @@ for native_integration_test in "${native_integration_tests[@]}"; do
   focused_tests+=("$native_integration_test")
 done
 voice_tests=(
+  apps/web/src/voice/recordingDraftStore.test.ts
   apps/web/src/voice/useVoiceDictation.test.tsx
   packages/client-runtime/src/state/voiceTranscriptionHttp.test.ts
 )
 for voice_test in "${voice_tests[@]}"; do
+  if [[ "$voice_test" == apps/web/src/voice/recordingDraftStore.test.ts && ! -f "$voice_test" ]]; then
+    echo "Required recording durability gate is missing: $voice_test" >&2
+    exit 1
+  fi
   if [[ -f "$voice_test" ]]; then
     focused_tests+=("$voice_test")
   elif [[ "${WEASEL_ALLOW_MISSING_VOICE_TESTS:-0}" == "1" ]]; then
