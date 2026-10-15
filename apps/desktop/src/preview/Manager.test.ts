@@ -31,6 +31,7 @@ import * as BrowserSession from "./BrowserSession.ts";
 import * as DesktopBrowserHost from "./DesktopBrowserHost.ts";
 import * as PreviewManager from "./Manager.ts";
 import * as PreviewPasskeys from "./Passkeys.ts";
+import { makeAutofill } from "./ProtonPassAutofill.ts";
 
 describe("fitPictureInPictureContentSize", () => {
   it("preserves the PiP content area across aspect-ratio changes", () => {
@@ -320,13 +321,101 @@ const managerLayer = (platform: NodeJS.Platform = "darwin") =>
 const withManager = <A>(
   use: (
     manager: PreviewManager.PreviewManager["Service"],
+    host: DesktopBrowserHost.DesktopBrowserHost["Service"],
   ) => Effect.Effect<A, PreviewManager.PreviewManagerError, Scope.Scope>,
   platform: NodeJS.Platform = "darwin",
 ) =>
   Effect.gen(function* () {
     const manager = yield* PreviewManager.PreviewManager;
-    return yield* use(manager);
+    const host = yield* DesktopBrowserHost.DesktopBrowserHost;
+    return yield* use(manager, host);
   }).pipe(Effect.provide(managerLayer(platform)), Effect.scoped);
+
+/** Unit FD peer only: real Host correlation and Manager guards; not real SessionControl acceptance. */
+const withAutofillManager = <A>(
+  use: (
+    manager: PreviewManager.PreviewManager["Service"],
+    ready: Deferred.Deferred<void>,
+    peer: {
+      connection: DesktopBrowserHost.DesktopBrowserConnection;
+      releases: Queue.Queue<unknown>;
+      revoke: Effect.Effect<void>;
+    },
+  ) => Effect.Effect<A, PreviewManager.PreviewManagerError, Scope.Scope>,
+  options?: { refused?: boolean; holdRelease?: boolean },
+) =>
+  withManager((manager, host) =>
+    Effect.gen(function* () {
+      const ready = yield* Deferred.make<void>();
+      const releases = yield* Queue.unbounded<unknown>();
+      const connection = host.createConnection();
+      let grant:
+        | {
+            threadId: string;
+            tabId: string;
+            channelEpoch: string;
+            attachmentId: string;
+            requestId: string;
+            leaseId: string;
+            generation: number;
+          }
+        | undefined;
+      yield* connection.events.pipe(
+        Stream.runForEach((line) =>
+          Effect.gen(function* () {
+            const message = JSON.parse(new TextDecoder().decode(line)) as Record<string, unknown>;
+            if (message.type === "attached") {
+              yield* Deferred.succeed(ready, undefined);
+              return;
+            }
+            if (message.type === "private-entry-acquire") {
+              if (options?.refused) {
+                yield* connection.handleCommandLine(
+                  JSON.stringify({
+                    ...message,
+                    type: "private-entry-refused",
+                    reason: "agent-owned",
+                  }),
+                );
+                return;
+              }
+              const response = {
+                ...message,
+                type: "private-entry-granted",
+                leaseId: "unit-lease",
+                generation: 3,
+              };
+              grant = response as unknown as NonNullable<typeof grant>;
+              yield* connection.handleCommandLine(JSON.stringify(response));
+            } else if (message.type === "private-entry-release") {
+              yield* Queue.offer(releases, message);
+              if (!options?.holdRelease)
+                yield* connection.handleCommandLine(
+                  JSON.stringify({ ...message, type: "private-entry-released" }),
+                );
+            }
+          }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+      return yield* use(manager, ready, {
+        connection,
+        releases,
+        revoke: Effect.suspend(() =>
+          grant
+            ? connection.handleCommandLine(
+                JSON.stringify({
+                  ...grant,
+                  type: "private-entry-revoked",
+                  reason: "control-changed",
+                }),
+              )
+            : Effect.void,
+        ),
+      });
+    }),
+  );
 
 interface TestCapturedPreviewImage {
   readonly toJPEG: () => Buffer;
@@ -2427,7 +2516,7 @@ describe("PreviewManager", () => {
   effectIt.effect(
     "refuses private entry during capture and rejects private capture admissions before effects",
     () =>
-      withManager((manager) =>
+      withAutofillManager((manager, authorityReady) =>
         Effect.gen(function* () {
           let signalStarted: (() => void) | undefined;
           const started = new Promise<void>((resolve) => {
@@ -2456,8 +2545,11 @@ describe("PreviewManager", () => {
             capturePage,
           });
           fromId.mockReturnValue(wc);
-          yield* manager.createTab("private_tab");
+          yield* manager.createTab("private_tab", {
+            serverTab: { threadId: "unit-thread", tabId: "unit-tab" },
+          });
           yield* manager.registerWebview("private_tab", 42);
+          yield* Deferred.await(authorityReady);
           const target = yield* manager.getAutofillTarget(wc, frame);
           expect(target).toBeDefined();
           if (!target) return;
@@ -2494,7 +2586,7 @@ describe("PreviewManager", () => {
   );
 
   effectIt.effect("fences autofill to a focused persistent main-frame document", () =>
-    withManager((manager) =>
+    withAutofillManager((manager, authorityReady) =>
       Effect.gen(function* () {
         const preview = makeFaviconWebContents({ url: "https://example.com/login" });
         let focused = true;
@@ -2511,8 +2603,11 @@ describe("PreviewManager", () => {
           session: { fetch: vi.fn(), getStoragePath: () => storagePath },
         });
         fromId.mockReturnValue(wc);
-        yield* manager.createTab("private_tab");
+        yield* manager.createTab("private_tab", {
+          serverTab: { threadId: "unit-thread", tabId: "unit-tab" },
+        });
         yield* manager.registerWebview("private_tab", 42);
+        yield* Deferred.await(authorityReady);
         expect(
           yield* manager.getAutofillTarget(wc, { ...frame } as Electron.WebFrameMain),
         ).toBeUndefined();
@@ -2538,7 +2633,7 @@ describe("PreviewManager", () => {
 
   for (const boundary of ["focus", "insert"] as const) {
     effectIt.effect(`keeps sharing private until a pending native ${boundary} has settled`, () =>
-      withManager((manager) =>
+      withAutofillManager((manager, authorityReady) =>
         Effect.gen(function* () {
           const started = Promise.withResolvers<void>();
           const pending = Promise.withResolvers<boolean>();
@@ -2575,8 +2670,11 @@ describe("PreviewManager", () => {
             insertText,
           });
           fromId.mockReturnValue(wc);
-          yield* manager.createTab("private_tab");
+          yield* manager.createTab("private_tab", {
+            serverTab: { threadId: "unit-thread", tabId: "unit-tab" },
+          });
           yield* manager.registerWebview("private_tab", 42);
+          yield* Deferred.await(authorityReady);
           const target = yield* manager.getAutofillTarget(wc, frame);
           if (!target) throw new Error("Missing target");
           yield* Effect.promise(() => target.enterPrivate());
@@ -2623,7 +2721,7 @@ describe("PreviewManager", () => {
   effectIt.effect(
     "keeps a cancelled annotation capture admitted until its pending image drains",
     () =>
-      withManager((manager) =>
+      withAutofillManager((manager, authorityReady) =>
         Effect.gen(function* () {
           const overlay = Promise.withResolvers<void>();
           const started = Promise.withResolvers<void>();
@@ -2659,8 +2757,11 @@ describe("PreviewManager", () => {
             }),
           });
           fromId.mockReturnValue(wc);
-          yield* manager.createTab("private_tab");
+          yield* manager.createTab("private_tab", {
+            serverTab: { threadId: "unit-thread", tabId: "unit-tab" },
+          });
           yield* manager.registerWebview("private_tab", 42);
+          yield* Deferred.await(authorityReady);
           const target = yield* manager.getAutofillTarget(wc, frame);
           if (!target) throw new Error("Missing target");
           const pick = yield* manager.pickElement("private_tab").pipe(Effect.forkScoped);
@@ -2701,7 +2802,7 @@ describe("PreviewManager", () => {
   effectIt.effect(
     "keeps sharing private when the real clear script encounters a replaced password node",
     () =>
-      withManager((manager) =>
+      withAutofillManager((manager, authorityReady) =>
         Effect.gen(function* () {
           const { document, a, run } = makeAutofillDomFixture();
           document.activeElement = a.username;
@@ -2723,8 +2824,11 @@ describe("PreviewManager", () => {
             },
           });
           fromId.mockReturnValue(wc);
-          yield* manager.createTab("private_tab");
+          yield* manager.createTab("private_tab", {
+            serverTab: { threadId: "unit-thread", tabId: "unit-tab" },
+          });
           yield* manager.registerWebview("private_tab", 42);
+          yield* Deferred.await(authorityReady);
           const target = yield* manager.getAutofillTarget(wc, frame);
           if (!target) throw new Error("Missing target");
           yield* Effect.promise(() => target.enterPrivate());
@@ -2747,6 +2851,163 @@ describe("PreviewManager", () => {
           expect(replacement.value).toBe("fake-password");
         }),
       ),
+  );
+
+  effectIt.effect("a refused authoritative acquire prevents even the selected provider read", () =>
+    withAutofillManager(
+      (manager, ready) =>
+        Effect.gen(function* () {
+          const preview = makeFaviconWebContents({ url: "https://example.com/login" });
+          const frame = {
+            origin: "https://example.com",
+            isDestroyed: () => false,
+          } as Electron.WebFrameMain;
+          const execute = vi.fn(async () => true);
+          const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
+            mainFrame: frame,
+            isFocused: () => true,
+            session: { getStoragePath: () => "/synthetic/profile-a" },
+            executeJavaScriptInIsolatedWorld: execute,
+          });
+          fromId.mockReturnValue(wc);
+          yield* manager.createTab("private_tab", {
+            serverTab: { threadId: "unit-thread", tabId: "unit-tab" },
+          });
+          yield* manager.registerWebview("private_tab", 42);
+          yield* Deferred.await(ready);
+          const target = yield* manager.getAutofillTarget(wc, frame);
+          if (!target) throw new Error("Missing target");
+          const reference = { shareId: "v", itemId: "i", title: "Fake" };
+          const credentials = vi.fn(async () => ({
+            username: "fake-user",
+            password: "fake-password",
+          }));
+          const service = makeAutofill(
+            { vaults: async () => [], logins: async () => [], credentials },
+            {
+              read: async () => [
+                { ...reference, origin: target.origin, partition: target.partition },
+              ],
+              write: async () => {},
+            },
+          );
+          expect(
+            Exit.isFailure(
+              yield* Effect.exit(Effect.tryPromise(() => service.fill(target, reference))),
+            ),
+          ).toBe(true);
+          expect(credentials).not.toHaveBeenCalled();
+          expect(execute).not.toHaveBeenCalled();
+        }),
+      { refused: true },
+    ),
+  );
+
+  effectIt.effect("clears before release ACK and never opens sharing on half-close", () =>
+    withAutofillManager(
+      (manager, ready, peer) =>
+        Effect.gen(function* () {
+          const { document, a, run } = makeAutofillDomFixture();
+          document.activeElement = a.username;
+          const preview = makeFaviconWebContents({ url: "https://example.com/login" });
+          const frame = {
+            origin: "https://example.com",
+            isDestroyed: () => false,
+          } as Electron.WebFrameMain;
+          const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
+            mainFrame: frame,
+            isFocused: () => true,
+            session: { getStoragePath: () => "/synthetic/profile-a" },
+            executeJavaScriptInIsolatedWorld: async (
+              _world: number,
+              scripts: readonly { code: string }[],
+            ) => run(scripts[0]!.code),
+            insertText: async (value: string) => {
+              if (document.activeElement) document.activeElement.value = value;
+            },
+          });
+          fromId.mockReturnValue(wc);
+          yield* manager.createTab("private_tab", {
+            serverTab: { threadId: "unit-thread", tabId: "unit-tab" },
+          });
+          yield* manager.registerWebview("private_tab", 42);
+          yield* Deferred.await(ready);
+          const target = yield* manager.getAutofillTarget(wc, frame);
+          if (!target) throw new Error("Missing target");
+          yield* Effect.promise(() => target.enterPrivate());
+          yield* Effect.promise(() => target.fill("fake-user", "fake-password"));
+          const clearing = yield* Effect.exit(
+            Effect.tryPromise(() => target.clearAndResume()),
+          ).pipe(Effect.forkScoped);
+          yield* Queue.take(peer.releases);
+          expect(a.username.value).toBe("");
+          expect(a.password.value).toBe("");
+          expect(clearing.pollUnsafe()).toBeUndefined();
+          expect(Exit.isFailure(yield* Effect.exit(manager.captureScreenshot("private_tab")))).toBe(
+            true,
+          );
+          yield* peer.connection.closed;
+          yield* peer.connection.closed;
+          expect(Exit.isFailure(yield* Fiber.join(clearing))).toBe(true);
+          const current = yield* manager.getAutofillTarget(wc, frame);
+          expect(current?.privateEntry).toBe(true);
+          expect(
+            Exit.isFailure(yield* Effect.exit(Effect.tryPromise(() => current!.enterPrivate()))),
+          ).toBe(true);
+        }),
+      { holdRelease: true },
+    ),
+  );
+
+  effectIt.effect("revocation during native focus prevents the next credential insertion", () =>
+    withAutofillManager((manager, ready, peer) =>
+      Effect.gen(function* () {
+        const focused = Promise.withResolvers<void>();
+        const pending = Promise.withResolvers<boolean>();
+        const preview = makeFaviconWebContents({ url: "https://example.com/login" });
+        const frame = {
+          origin: "https://example.com",
+          isDestroyed: () => false,
+        } as Electron.WebFrameMain;
+        const inserted = vi.fn(async (_value: string) => {});
+        const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
+          mainFrame: frame,
+          isFocused: () => true,
+          session: { getStoragePath: () => "/synthetic/profile-a" },
+          insertText: inserted,
+          executeJavaScriptInIsolatedWorld: async (
+            _world: number,
+            scripts: readonly { code: string }[],
+          ) => {
+            if (scripts[0]?.code === PreviewManager.protonPassAutofillScripts.focusPassword) {
+              focused.resolve();
+              return pending.promise;
+            }
+            return true;
+          },
+        });
+        fromId.mockReturnValue(wc);
+        yield* manager.createTab("private_tab", {
+          serverTab: { threadId: "unit-thread", tabId: "unit-tab" },
+        });
+        yield* manager.registerWebview("private_tab", 42);
+        yield* Deferred.await(ready);
+        const target = yield* manager.getAutofillTarget(wc, frame);
+        if (!target) throw new Error("Missing target");
+        yield* Effect.promise(() => target.enterPrivate());
+        const filling = yield* Effect.exit(
+          Effect.tryPromise(() => target.fill("fake-user", "fake-password")),
+        ).pipe(Effect.forkScoped);
+        yield* Effect.promise(() => focused.promise);
+        yield* peer.revoke;
+        pending.resolve(true);
+        expect(Exit.isFailure(yield* Fiber.join(filling))).toBe(true);
+        expect(inserted).toHaveBeenCalledTimes(1);
+        expect(Exit.isFailure(yield* Effect.exit(manager.captureScreenshot("private_tab")))).toBe(
+          true,
+        );
+      }),
+    ),
   );
 
   effectIt.effect("captures a PNG screenshot into browser artifacts", () =>

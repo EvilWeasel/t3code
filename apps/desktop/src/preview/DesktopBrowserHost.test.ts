@@ -3,6 +3,9 @@ import { describe, expect, it } from "@effect/vitest";
 import { DesktopBrowserEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Queue from "effect/Queue";
+import * as Exit from "effect/Exit";
+import { vi } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as NodeEvents from "node:events";
@@ -33,6 +36,7 @@ const makeDebuggee = () => {
       }),
   });
   const webContents = {
+    isDestroyed: () => false,
     getURL: () => "http://localhost/",
     getTitle: () => "Page",
     getUserAgent: () => "Electron",
@@ -56,7 +60,196 @@ const takeEvents = (host: DesktopBrowserHost.DesktopBrowserHost["Service"], coun
     Effect.map((lines) => lines.map((line) => decodeEvent(new TextDecoder().decode(line)))),
   );
 
+const connect = Effect.fn(function* (host: DesktopBrowserHost.DesktopBrowserHost["Service"]) {
+  const connection = host.createConnection();
+  const messages = yield* Queue.unbounded<typeof DesktopBrowserEvent.Type>();
+  yield* connection.events.pipe(
+    Stream.runForEach((line) => Queue.offer(messages, decodeEvent(new TextDecoder().decode(line)))),
+    Effect.forkScoped,
+  );
+  yield* Effect.yieldNow;
+  return { connection, messages };
+});
+const grant = Effect.fn(function* (
+  host: DesktopBrowserHost.DesktopBrowserHost["Service"],
+  backend: {
+    connection: DesktopBrowserHost.DesktopBrowserConnection;
+    messages: Queue.Queue<typeof DesktopBrowserEvent.Type>;
+  },
+  source: Electron.WebContents,
+) {
+  const acquiring = yield* Effect.tryPromise(() => host.acquirePrivateEntry(source)).pipe(
+    Effect.forkScoped,
+  );
+  const request = yield* Queue.take(backend.messages);
+  if (request.type !== "private-entry-acquire") throw new Error("Expected acquire");
+  const response = {
+    ...request,
+    type: "private-entry-granted",
+    leaseId: "owned-lease",
+    generation: 7,
+  };
+  yield* backend.connection.handleCommandLine(encodeJson(response));
+  return { lease: yield* Fiber.join(acquiring), request, response };
+});
+
 describe("DesktopBrowserHost", () => {
+  it.effect("refuses unknown/unattached authority without sending an acquire", () =>
+    Effect.gen(function* () {
+      const host = yield* DesktopBrowserHost.make;
+      const debuggee = makeDebuggee();
+      host.attach(key, debuggee.tab);
+      expect(host.canRequestPrivateEntry(debuggee.tab.webContents)).toBe(false);
+      expect(
+        Exit.isFailure(
+          yield* Effect.exit(
+            Effect.tryPromise(() => host.acquirePrivateEntry(debuggee.tab.webContents)),
+          ),
+        ),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect(
+    "processes matching release ACK while private and rejects wrong request/generation",
+    () =>
+      Effect.gen(function* () {
+        const host = yield* DesktopBrowserHost.make;
+        const backend = yield* connect(host);
+        const debuggee = makeDebuggee();
+        host.attach(key, debuggee.tab);
+        yield* Queue.take(backend.messages);
+        const { lease } = yield* grant(host, backend, debuggee.tab.webContents);
+        host.setPrivateEntry(debuggee.tab.webContents, true);
+        const releasing = yield* Effect.tryPromise(() => lease.release()).pipe(Effect.forkScoped);
+        const request = yield* Queue.take(backend.messages);
+        if (request.type !== "private-entry-release") throw new Error("Expected release");
+        yield* backend.connection.handleCommandLine(
+          encodeJson({ ...request, type: "private-entry-released", generation: 8 }),
+        );
+        yield* backend.connection.handleCommandLine(
+          encodeJson({ ...request, type: "private-entry-released", requestId: "wrong" }),
+        );
+        expect(lease.current()).toBe(true);
+        expect(releasing.pollUnsafe()).toBeUndefined();
+        yield* backend.connection.handleCommandLine(
+          encodeJson({ ...request, type: "private-entry-released" }),
+        );
+        yield* Fiber.join(releasing);
+        expect(lease.current()).toBe(false);
+        // ACK alone never opens privacy; only Manager's verified clear can do so.
+        expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "command half-close invalidates a grant while input consumer lives and old close cannot invalidate replacement",
+    () =>
+      Effect.gen(function* () {
+        const host = yield* DesktopBrowserHost.make;
+        const old = yield* connect(host);
+        const debuggee = makeDebuggee();
+        host.attach(key, debuggee.tab);
+        yield* Queue.take(old.messages);
+        const first = yield* grant(host, old, debuggee.tab.webContents);
+        host.setPrivateEntry(debuggee.tab.webContents, true);
+        yield* old.connection.closed;
+        expect(first.lease.current()).toBe(false);
+        expect(host.canRequestPrivateEntry(debuggee.tab.webContents)).toBe(false);
+        expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
+        expect(
+          Exit.isFailure(yield* Effect.exit(Effect.tryPromise(() => first.lease.release()))),
+        ).toBe(true);
+        const current = yield* connect(host);
+        const attached = yield* Queue.take(current.messages);
+        expect(attached.type).toBe("attached");
+        expect(host.canRequestPrivateEntry(debuggee.tab.webContents)).toBe(true);
+        yield* old.connection.closed;
+        yield* old.connection.handleCommandLine(encodeJson(first.response));
+        expect(host.canRequestPrivateEntry(debuggee.tab.webContents)).toBe(true);
+        expect(first.lease.current()).toBe(false);
+        expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "revokes the original acquisition while private and ignores stale attachment results",
+    () =>
+      Effect.gen(function* () {
+        const host = yield* DesktopBrowserHost.make;
+        const backend = yield* connect(host);
+        const debuggee = makeDebuggee();
+        host.attach(key, debuggee.tab);
+        yield* Queue.take(backend.messages);
+        const acquired = yield* grant(host, backend, debuggee.tab.webContents);
+        host.setPrivateEntry(debuggee.tab.webContents, true);
+        yield* backend.connection.handleCommandLine(
+          encodeJson({
+            ...acquired.response,
+            type: "private-entry-revoked",
+            reason: "control-changed",
+            attachmentId: "stale",
+          }),
+        );
+        expect(acquired.lease.current()).toBe(true);
+        yield* backend.connection.handleCommandLine(
+          encodeJson({
+            ...acquired.response,
+            type: "private-entry-revoked",
+            reason: "control-changed",
+          }),
+        );
+        expect(acquired.lease.current()).toBe(false);
+        expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "a legacy no-reply timeout cancels the original request and never accepts its late grant",
+    () =>
+      Effect.gen(function* () {
+        vi.useFakeTimers();
+        try {
+          const host = yield* DesktopBrowserHost.make;
+          const backend = yield* connect(host);
+          const debuggee = makeDebuggee();
+          host.attach(key, debuggee.tab);
+          yield* Queue.take(backend.messages);
+          const acquiring = yield* Effect.exit(
+            Effect.tryPromise(() => host.acquirePrivateEntry(debuggee.tab.webContents)),
+          ).pipe(Effect.forkScoped);
+          const request = yield* Queue.take(backend.messages);
+          if (request.type !== "private-entry-acquire") throw new Error("Expected acquire");
+          yield* Effect.promise(() => vi.advanceTimersByTimeAsync(5000));
+          expect(Exit.isFailure(yield* Fiber.join(acquiring))).toBe(true);
+          const cancelled = yield* Queue.take(backend.messages);
+          expect(cancelled).toMatchObject({
+            type: "private-entry-cancel",
+            requestId: request.requestId,
+          });
+          yield* backend.connection.handleCommandLine(
+            encodeJson({
+              ...request,
+              type: "private-entry-granted",
+              leaseId: "late",
+              generation: 1,
+            }),
+          );
+          expect((yield* Queue.take(backend.messages)).type).toBe("private-entry-cancel");
+          expect(host.isPrivateEntry(debuggee.tab.webContents)).toBe(true);
+          expect(
+            Exit.isFailure(
+              yield* Effect.exit(
+                Effect.tryPromise(() => host.acquirePrivateEntry(debuggee.tab.webContents)),
+              ),
+            ),
+          ).toBe(true);
+        } finally {
+          vi.useRealTimers();
+        }
+      }).pipe(Effect.scoped),
+  );
+
   it.effect(
     "private entry blocks read-only CDP and events and drops pre-entry replies even after resume",
     () =>
@@ -100,8 +293,8 @@ describe("DesktopBrowserHost", () => {
       const host = yield* DesktopBrowserHost.make;
       host.attach(key, makeDebuggee().tab);
       // A restarted backend subscribes after the attach and still hears it.
-      expect(yield* takeEvents(host, 1)).toEqual([{ type: "attached", ...key }]);
-      expect(yield* takeEvents(host, 1)).toEqual([{ type: "attached", ...key }]);
+      expect(yield* takeEvents(host, 1)).toMatchObject([{ type: "attached", ...key }]);
+      expect(yield* takeEvents(host, 1)).toMatchObject([{ type: "attached", ...key }]);
     }),
   );
 

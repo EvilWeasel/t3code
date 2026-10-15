@@ -618,6 +618,15 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       const wc = yield* requireWebContents(tabId);
       return yield* privateAdmission(wc, operation);
     });
+  const privateReservations = new WeakMap<
+    Electron.WebContents,
+    {
+      lease: DesktopBrowserHost.NativePrivateEntryLease;
+      documentEpoch: number;
+      origin: string;
+      partition: string;
+    }
+  >();
   const autofillDocuments = new WeakMap<
     Electron.WebContents,
     { epoch: number; generation: number; pending: number; clearing: boolean }
@@ -3493,6 +3502,8 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
       wc.isDevToolsOpened() ||
       tab.controller === "agent" ||
       capture ||
+      ((!tab.serverTab || !browserHost.canRequestPrivateEntry(wc)) &&
+        !browserHost.isPrivateEntry(wc)) ||
       (!validOrigin(frame.origin) && !browserHost.isPrivateEntry(wc))
     )
       return undefined;
@@ -3524,7 +3535,15 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     };
     const assertPrivate = () => {
       assertCurrent();
-      if (!browserHost.isPrivateEntry(wc) || trackedDocument.clearing)
+      const reservation = privateReservations.get(wc);
+      if (
+        !browserHost.isPrivateEntry(wc) ||
+        trackedDocument.clearing ||
+        !reservation?.lease.current() ||
+        reservation.documentEpoch !== epoch ||
+        reservation.origin !== origin ||
+        reservation.partition !== partition
+      )
         throw new AutofillUnavailable();
     };
     const execute = (code: string) =>
@@ -3548,9 +3567,23 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         assertCurrent();
         if (trackedDocument.clearing || trackedDocument.pending !== 0)
           throw new AutofillUnavailable();
-        browserHost.setPrivateEntry(wc, true);
         trackedDocument.pending += 1;
         try {
+          let reservation = privateReservations.get(wc);
+          if (!reservation) {
+            const lease = await browserHost.acquirePrivateEntry(wc);
+            reservation = { lease, documentEpoch: epoch, origin, partition };
+            privateReservations.set(wc, reservation);
+            // Take/drain completes before privacy blocks the old agent's relay replies.
+            browserHost.setPrivateEntry(wc, true);
+          }
+          assertPrivate();
+          const afterGrantCaptures = await Effect.runPromise(
+            SynchronizedRef.get(frameCaptureSessionsRef),
+          );
+          assertPrivate();
+          if (afterGrantCaptures.has(tab.tabId) || (sensitiveOperations.get(wc) ?? 0) !== 0)
+            throw new AutofillUnavailable();
           if ((await execute(protonPassAutofillScripts.prepare)) !== true)
             throw new AutofillUnavailable();
           assertPrivate();
@@ -3589,7 +3622,9 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         }
       },
       async clearAndResume() {
-        assertPrivate();
+        assertCurrent();
+        if (!browserHost.isPrivateEntry(wc) || trackedDocument.clearing)
+          throw new AutofillUnavailable();
         // Refusal drains by keeping sharing closed until the caller retries.
         if (trackedDocument.pending !== 0) throw new AutofillUnavailable();
         trackedDocument.clearing = true;
@@ -3604,6 +3639,19 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
             !browserHost.isPrivateEntry(wc)
           )
             throw new AutofillUnavailable();
+          const reservation = privateReservations.get(wc);
+          if (!reservation) throw new AutofillUnavailable();
+          // Fields are verified empty before asking the authority to release its reservation.
+          await reservation.lease.release();
+          if (
+            !documentCurrent() ||
+            trackedDocument.generation !== clearingGeneration ||
+            privateReservations.get(wc) !== reservation ||
+            !browserHost.canRequestPrivateEntry(wc) ||
+            !browserHost.isPrivateEntry(wc)
+          )
+            throw new AutofillUnavailable();
+          privateReservations.delete(wc);
           browserHost.setPrivateEntry(wc, false);
         } finally {
           trackedDocument.clearing = false;
