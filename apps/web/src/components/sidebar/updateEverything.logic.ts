@@ -1,6 +1,8 @@
 import type { ServerUpdateState } from "@t3tools/client-runtime/state/server";
 import type { EnvironmentId, ServerConfig } from "@t3tools/contracts";
 import { cliReleaseChannelOf } from "@t3tools/shared/cliRelease";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 
 import {
   resolveServerSelfUpdateCapability,
@@ -8,7 +10,7 @@ import {
   supportsDesktopAppUpdate,
   supportsServerUpdateThreadContinuation,
 } from "~/versionSkew";
-import type { ServerUpdateTarget } from "../ServerUpdateAction";
+import type { ServerUpdateOutcome, ServerUpdateTarget } from "../ServerUpdateAction";
 
 export interface UpdateEverythingMachine {
   readonly environmentId: EnvironmentId;
@@ -63,86 +65,344 @@ export function collectRestartingMachines(
   });
 }
 
+/** A machine the run leaves alone, with a short reason such as "not connected". */
+export interface SkippedMachine {
+  readonly environmentId: EnvironmentId;
+  readonly label: string;
+  readonly reason: string;
+}
+
 /**
  * The servers that "update everything" moves to `targetVersion`: connected,
- * permitted, able to update over RPC, and behind the target. Two kinds stay
- * out. Servers this app hosts would relaunch the app mid-run, and the app's
- * own install updates them anyway. A service on another release channel
- * stays there; a desktop-managed server follows its own app's update feed, so
- * the channel rule does not apply to it.
+ * permitted, able to update over RPC, behind the target, and on its release
+ * channel. Every other behind server comes back in `skipped` with a reason for
+ * the confirmation; a machine that never connected has an unknown version, so
+ * it counts as skipped. Two kinds are in neither list: servers already on the
+ * target, and servers this app hosts, which would relaunch the app mid-run
+ * and update with the app's own install anyway. A desktop-managed server
+ * follows its own app's update feed, so the channel rule does not apply to it.
  */
 export function collectServerUpdateTargets(
   machines: ReadonlyArray<UpdateEverythingMachine>,
   targetVersion: string,
-): ServerUpdateTarget[] {
-  return machines.flatMap((machine) => {
+): { readonly targets: ServerUpdateTarget[]; readonly skipped: SkippedMachine[] } {
+  const targets: ServerUpdateTarget[] = [];
+  const skipped: SkippedMachine[] = [];
+  for (const machine of machines) {
     const config = machine.serverConfig;
+    if (machine.hostedByThisApp) continue;
     if (
-      config === null ||
-      !machine.connected ||
-      machine.hostedByThisApp ||
-      !machine.canMaintain ||
-      machine.updateState.status === "running"
+      config !== null &&
+      resolveVersionMismatch(config.environment.serverVersion, targetVersion) === null
     ) {
-      return [];
+      continue;
+    }
+    const skip = (reason: string) =>
+      skipped.push({ environmentId: machine.environmentId, label: machine.label, reason });
+    if (config === null || !machine.connected) {
+      skip("not connected");
+      continue;
+    }
+    if (!machine.canMaintain) {
+      skip("no permission");
+      continue;
+    }
+    if (machine.updateState.status === "running") {
+      skip("already updating");
+      continue;
     }
     const selfUpdate = resolveServerSelfUpdateCapability(config);
     const desktopAppUpdate = supportsDesktopAppUpdate(config);
-    if (selfUpdate === null || (selfUpdate === "desktop-managed" && !desktopAppUpdate)) {
-      return [];
+    if (selfUpdate === null) {
+      skip("needs a manual update");
+      continue;
+    }
+    if (selfUpdate === "desktop-managed" && !desktopAppUpdate) {
+      skip("needs a newer desktop app");
+      continue;
     }
     const serverVersion = config.environment.serverVersion;
-    if (resolveVersionMismatch(serverVersion, targetVersion) === null) return [];
     if (
       selfUpdate !== "desktop-managed" &&
       cliReleaseChannelOf(serverVersion) !== cliReleaseChannelOf(targetVersion)
     ) {
-      return [];
+      skip(`on the ${cliReleaseChannelOf(serverVersion)} channel`);
+      continue;
     }
-    return [
-      {
-        environmentId: machine.environmentId,
-        serverLabel: machine.label,
-        selfUpdate,
-        installation: config.environment.capabilities.serverInstallation,
-        desktopAppUpdate,
-        threadContinuation: supportsServerUpdateThreadContinuation(config),
-        continueThreadsAfterServerUpdate: config.settings.continueThreadsAfterServerUpdate ?? false,
-        targetVersion,
-      },
-    ];
-  });
+    targets.push({
+      environmentId: machine.environmentId,
+      serverLabel: machine.label,
+      selfUpdate,
+      installation: config.environment.capabilities.serverInstallation,
+      desktopAppUpdate,
+      threadContinuation: supportsServerUpdateThreadContinuation(config),
+      continueThreadsAfterServerUpdate: config.settings.continueThreadsAfterServerUpdate ?? false,
+      targetVersion,
+    });
+  }
+  return { targets, skipped };
 }
 
-export interface UpdateEverythingSteps {
-  /** Downloads this app's update. Resolves true when it is ready to install. */
+export interface UpdateEverythingSteps<Providers, Servers> {
+  /** Downloads this app's update. Resolves true when it is ready to install.
+      Without it, `localReady` is true: there is nothing to download. */
   readonly downloadLocal?: () => Promise<boolean>;
-  readonly updateProviders: () => Promise<void>;
-  readonly updateServers: () => Promise<void | ReadonlyArray<{
-    readonly label: string;
-    readonly message: string;
-  }>>;
-  /** Installs this app's update. The relaunch ends the run. */
-  readonly installLocal?: () => Promise<void>;
+  readonly updateProviders: () => Promise<Providers>;
+  readonly updateServers: () => Promise<Servers>;
 }
 
 /**
- * Runs one "update everything" pass. Providers
- * finish before any server restarts, so no install is cut off. The local download runs alongside the
- * remote work. This app installs last because its relaunch ends the run; a
- * failed download skips only that install. Steps report their own results.
+ * Runs the remote half of one "update everything" pass and returns each
+ * step's results. Providers finish before any server restarts, so no install
+ * is cut off. The local download runs alongside the remote work. The caller
+ * installs this app afterwards when `localReady`, because the relaunch ends
+ * the run; a failed download skips only that install.
  */
-export async function runUpdateEverything(steps: UpdateEverythingSteps): Promise<void> {
-  const [localReady, failures] = await Promise.all([
+export async function runUpdateEverything<Providers, Servers>(
+  steps: UpdateEverythingSteps<Providers, Servers>,
+): Promise<{
+  readonly localReady: boolean;
+  readonly providers: Providers;
+  readonly servers: Servers;
+}> {
+  const [localReady, remote] = await Promise.all([
     steps.downloadLocal?.() ?? Promise.resolve(true),
-    steps.updateProviders().then(steps.updateServers),
+    steps
+      .updateProviders()
+      .then(async (providers) => ({ providers, servers: await steps.updateServers() })),
   ]);
-  if (failures && failures.length > 0) {
-    throw new Error(
-      `Some hosts could not update: ${failures.map((failure) => `${failure.label}: ${failure.message}`).join("; ")}. This app has not restarted.`,
-    );
+  return { localReady, ...remote };
+}
+
+/** The current state of one machine in a running pass. */
+export type UpdateRunMachineStatus =
+  | "providers"
+  | "waiting"
+  | "downloading"
+  | "restarting"
+  | "done"
+  | "skipped"
+  | "failed";
+
+/** One machine in a running "update everything" pass. */
+export interface UpdateRunMachine {
+  readonly environmentId: EnvironmentId;
+  readonly label: string;
+  readonly updatesProviders: boolean;
+  readonly updatesServer: boolean;
+  /** Set when every update for this machine has finished. */
+  readonly result: "done" | "failed" | "skipped" | null;
+}
+
+/** A running "update everything" pass, kept while it runs. */
+export interface UpdateEverythingRun {
+  /** The version this app installs last, or null when it does not install. */
+  readonly localVersion: string | null;
+  /** Providers update first. Servers update after every provider finished. */
+  readonly phase: "providers" | "servers" | "installing";
+  readonly machines: ReadonlyArray<UpdateRunMachine>;
+}
+
+/** Status of one machine, from the run and that server's own update state. */
+export function resolveUpdateRunMachineStatus(
+  machine: UpdateRunMachine,
+  phase: UpdateEverythingRun["phase"],
+  serverState: ServerUpdateState,
+): UpdateRunMachineStatus {
+  if (machine.result !== null) return machine.result;
+  if (phase === "providers" && machine.updatesProviders) return "providers";
+  if (machine.updatesServer && serverState.status === "running") {
+    return serverState.stage === "resuming" ? "restarting" : "downloading";
   }
-  if (localReady) await steps.installLocal?.();
+  return "waiting";
+}
+
+const RUN_STATUS_LABELS: Record<UpdateRunMachineStatus, string> = {
+  providers: "updating providers",
+  waiting: "waiting",
+  downloading: "downloading",
+  restarting: "restarting",
+  done: "done",
+  skipped: "skipped",
+  failed: "failed",
+};
+
+/**
+ * Tooltip lines for a running pass, such as "alvin: restarting". `local` is
+ * this app's own state, such as "downloading 40%", or null when it does not
+ * install.
+ */
+export function describeUpdateRun(
+  machines: ReadonlyArray<{ readonly label: string; readonly status: UpdateRunMachineStatus }>,
+  local: string | null,
+): ReadonlyArray<string> {
+  return [
+    "Updating…",
+    ...(local === null ? [] : [`This app: ${local}`]),
+    ...machines.map((machine) => `${machine.label}: ${RUN_STATUS_LABELS[machine.status]}`),
+  ];
+}
+
+/** What one pass did. It is saved before this app installs, so it outlives the relaunch. */
+export interface UpdateEverythingResult {
+  /** The version this app installed last, or null when it did not install. */
+  readonly localVersion: string | null;
+  readonly updatedServers: number;
+  readonly updatedProviders: number;
+  /** One line per failure, each naming its machine. */
+  readonly failures: ReadonlyArray<string>;
+  readonly skipped?: ReadonlyArray<string>;
+}
+
+const SAVED_RESULT_KEY = "t3code:update-everything-result:v1";
+const SAVED_RESULT_MAX_AGE_MS = 10 * 60 * 1000;
+const SavedResult = Schema.fromJsonString(
+  Schema.Struct({
+    savedAt: Schema.Number,
+    localVersion: Schema.NullOr(Schema.String),
+    updatedServers: Schema.Number,
+    updatedProviders: Schema.Number,
+    failures: Schema.Array(Schema.String),
+    skipped: Schema.optionalKey(Schema.Array(Schema.String)),
+  }),
+);
+const decodeSavedResult = Schema.decodeUnknownOption(SavedResult);
+type ResultStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
+
+/** Verify that the summary survived storage before its owner quits. */
+export function persistUpdateEverythingResult(
+  result: UpdateEverythingResult,
+  storage: ResultStorage,
+  now: number,
+): boolean {
+  try {
+    const raw = JSON.stringify({ ...result, savedAt: now });
+    storage.setItem(SAVED_RESULT_KEY, raw);
+    if (storage.getItem(SAVED_RESULT_KEY) === raw) return true;
+  } catch {
+    // A failed write must not leave an older pass looking like this install.
+  }
+  try {
+    storage.removeItem(SAVED_RESULT_KEY);
+  } catch {
+    // Storage is unavailable.
+  }
+  return false;
+}
+
+export function clearUpdateEverythingResult(storage: ResultStorage): void {
+  storage.removeItem(SAVED_RESULT_KEY);
+}
+
+/** Consume a validated summary once after relaunch, without replaying updates. */
+export function takeUpdateEverythingResult(
+  storage: ResultStorage,
+  now: number,
+): UpdateEverythingResult | null {
+  try {
+    const raw = storage.getItem(SAVED_RESULT_KEY);
+    if (raw === null) return null;
+    const saved = decodeSavedResult(raw);
+    storage.removeItem(SAVED_RESULT_KEY);
+    return Option.getOrNull(
+      Option.filter(saved, (value) =>
+        now >= value.savedAt && now - value.savedAt < SAVED_RESULT_MAX_AGE_MS,
+      ),
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** The local handoff runs after every remote result has settled. */
+export async function installAfterUpdateEverything(input: {
+  readonly result: UpdateEverythingResult;
+  readonly localReady: boolean;
+  readonly install: () => Promise<boolean>;
+  readonly save: (result: UpdateEverythingResult) => boolean;
+  readonly clear: () => void;
+}): Promise<"relaunching" | "not-installed" | "storage-failed"> {
+  if (!input.localReady) return "not-installed";
+  if (!input.save(input.result)) return "storage-failed";
+  let relaunching = false;
+  try {
+    relaunching = await input.install();
+    return relaunching ? "relaunching" : "not-installed";
+  } finally {
+    if (!relaunching) input.clear();
+  }
+}
+
+/** Counts what a pass updated and lists each failure with its machine. */
+export function collectUpdateEverythingResult(input: {
+  readonly localVersion: string | null;
+  /** This app's own download or install failures. */
+  readonly localFailures: ReadonlyArray<string>;
+  readonly skipped?: ReadonlyArray<SkippedMachine>;
+  readonly servers: ReadonlyArray<{
+    readonly label: string;
+    readonly outcome: ServerUpdateOutcome;
+  }>;
+  readonly providers: ReadonlyArray<
+    | { readonly status: "interrupted" | "updated" }
+    | { readonly status: "failed"; readonly line: string }
+  >;
+}): UpdateEverythingResult {
+  const skipped = [
+    ...(input.skipped ?? []).map((machine) => `${machine.label}: ${machine.reason}`),
+    ...input.servers.flatMap(({ label, outcome }) => outcome.status === "skipped"
+      ? [`${label}: ${outcome.message ?? "Update was not started."}`] : []),
+  ];
+  return {
+    localVersion: input.localVersion,
+    updatedServers: input.servers.filter(({ outcome }) => outcome.status === "updated").length,
+    updatedProviders: input.providers.filter((outcome) => outcome.status === "updated").length,
+    failures: [
+      ...input.localFailures.map((failure) => `This app: ${failure}`),
+      ...input.servers.flatMap(({ label, outcome }) =>
+        outcome.status === "failed" ? [`${label}: ${outcome.message}`] : [],
+      ),
+      ...input.providers.flatMap((outcome) => (outcome.status === "failed" ? [outcome.line] : [])),
+    ],
+    ...(skipped.length > 0 ? { skipped } : {}),
+  };
+}
+
+/**
+ * The one toast for a finished pass, such as "Updated this app, 8 servers,
+ * and 3 providers" with a line per failure. `appVersion` is the version this
+ * app runs now: after the relaunch it tells whether the local install
+ * applied. Null when nothing finished, for example every request was
+ * interrupted.
+ */
+export function getUpdateEverythingToastView(
+  result: UpdateEverythingResult,
+  appVersion: string,
+): {
+  readonly type: "success" | "error";
+  readonly title: string;
+  readonly description?: string;
+} | null {
+  const parts = [
+    result.localVersion !== null && result.localVersion === appVersion ? "this app" : null,
+    countLabel(result.updatedServers, "server"),
+    countLabel(result.updatedProviders, "provider"),
+  ].filter((part) => part !== null);
+  const description = [
+    ...result.failures,
+    ...(result.skipped ?? []).map((line) => `Skipped ${line}`),
+  ].join("\n");
+  if (result.failures.length === 0 && !result.skipped?.length) {
+    return parts.length === 0 ? null : { type: "success", title: `Updated ${joinList(parts)}` };
+  }
+  return {
+    type: result.failures.length > 0 || parts.length === 0 ? "error" : "success",
+    title:
+      parts.length === 0
+        ? result.failures.length > 0 ? "Update failed" : "Updates skipped"
+        : `Updated ${joinList(parts)}`,
+    description,
+  };
 }
 
 export interface UpdateEverythingPlan {

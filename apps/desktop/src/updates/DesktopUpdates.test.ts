@@ -906,6 +906,102 @@ describe("DesktopUpdates", () => {
     ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   });
 
+  it.effect("records the version an install hands to the installer", () => {
+    let recordsAtStop: ReadonlyArray<string> = [];
+    const harness = makeHarness({
+      stopBackend: Effect.sync(() => {
+        recordsAtStop = [...harness.installRecords.values()];
+      }),
+    });
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        harness.emit("update-downloaded", { version: "1.2.4" });
+        yield* flushCallbacks;
+
+        assert.isTrue((yield* updates.install).accepted);
+        assert.deepEqual(
+          recordsAtStop.map((record) => JSON.parse(record)),
+          [{ fromVersion: "1.2.3", targetVersion: "1.2.4" }],
+        );
+      }),
+    ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
+  it.effect("flags an install that did not apply and keeps the flag through checks", () => {
+    const harness = makeHarness({
+      installRecord: JSON.stringify({ fromVersion: "1.2.3", targetVersion: "1.2.4" }),
+    });
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        assert.equal((yield* updates.getState).notAppliedVersion, "1.2.4");
+        // Kept, so the next start on 1.2.3 still knows 1.2.4 did not apply.
+        assert.isDefined(harness.previousInstallRecord());
+
+        harness.emit("update-available", { version: "1.2.4" });
+        yield* flushCallbacks;
+        const state = yield* updates.getState;
+        assert.equal(state.status, "available");
+        assert.equal(state.notAppliedVersion, "1.2.4");
+      }),
+    ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
+  it.effect("does not flag an install that applied", () => {
+    const harness = makeHarness({
+      installRecord: JSON.stringify({ fromVersion: "1.2.2", targetVersion: "1.2.3" }),
+    });
+
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        assert.isUndefined((yield* updates.getState).notAppliedVersion);
+        assert.isUndefined(harness.previousInstallRecord());
+      }),
+    ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
+  it.effect("does not attribute an unrelated version or malformed record to a failed install", () =>
+    Effect.gen(function* () {
+      for (const installRecord of [
+        JSON.stringify({ fromVersion: "1.2.1", targetVersion: "1.2.2" }),
+        '{"fromVersion":false}',
+      ]) {
+        const harness = makeHarness({ installRecord });
+        yield* Effect.scoped(Effect.gen(function* () {
+          const updates = yield* DesktopUpdates.DesktopUpdates;
+          yield* updates.configure;
+          assert.isUndefined((yield* updates.getState).notAppliedVersion);
+          assert.isUndefined(harness.previousInstallRecord());
+        })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+      }
+    }),
+  );
+
+  it.effect("does not automatically retry an exact version whose install did not apply", () => {
+    const harness = makeHarness({
+      clientOnlyInventory: [],
+      installRecord: JSON.stringify({ fromVersion: "1.2.3", targetVersion: "1.2.4" }),
+    });
+    return Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.equal(harness.stopCount(), 0);
+      assert.equal((yield* updates.getState).downloadedVersion, "1.2.4");
+    })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
   it.effect("drops the update restart marker when an install is interrupted", () =>
     Effect.gen(function* () {
       const stopping = yield* Deferred.make<void>();
@@ -926,6 +1022,7 @@ describe("DesktopUpdates", () => {
 
           yield* Fiber.interrupt(installFiber);
           assert.equal(harness.updateRestartMarkers.size, 0);
+          assert.equal(harness.installRecords.size, 0);
         }),
       ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
     }),
@@ -957,6 +1054,8 @@ describe("DesktopUpdates", () => {
         assert.deepEqual(harness.installSteps, ["quitAndInstall", "startBackend"]);
         // The restarted old backend must release its tunnel on a later quit.
         assert.equal(harness.updateRestartMarkers.size, 0);
+        // The app never quit, so the next start must not report an unapplied install.
+        assert.equal(harness.installRecords.size, 0);
       }),
     ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   });

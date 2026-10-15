@@ -42,6 +42,8 @@ export interface UpdatesHarnessOptions {
   readonly clientOnlyInstallQualified?: boolean;
   readonly omitInstallQualification?: boolean;
   readonly backendSnapshot?: DesktopBackendPool.DesktopBackendInstance["snapshot"];
+  /** Contents of the install record a previous run left behind. */
+  readonly installRecord?: string | undefined;
 }
 
 export function makeHarness(options: UpdatesHarnessOptions = {}) {
@@ -227,31 +229,45 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
         } satisfies DesktopAppSettings.DesktopAppSettings["Service"])
       : DesktopAppSettings.layer;
 
-  // Tracks the restart markers installs leave, so installs stay free of real
-  // disk I/O that would outrun the tests' settle loops.
+  // Tracks the restart markers and install records installs leave, so
+  // installs stay free of real disk I/O that would outrun the tests' settle loops.
   const updateRestartMarkers = new Set<string>();
+  // Contents of the install record, by path once an install writes one.
+  const installRecords = new Map<string, string>();
+  let previousInstallRecord = options.installRecord;
+  const isInstallRecord = (path: string) =>
+    path.endsWith(DesktopUpdates.DESKTOP_UPDATE_INSTALL_RECORD_FILE);
   const layerFileSystem = FileSystem.layerNoop({
-    readFileString: (path) =>
-      path === "/missing/resources/app-update.yml" && options.appUpdateYml !== undefined
-        ? Effect.succeed(options.appUpdateYml)
-        : path === "/missing/resources/package-type" && options.packageType !== undefined
-          ? Effect.succeed(options.packageType)
-          : Effect.fail(
-              PlatformError.systemError({
-                module: "FileSystem",
-                method: "readFileString",
-                _tag: "NotFound",
-                pathOrDescriptor: path,
-              }),
-            ),
+    readFileString: (path) => {
+      const installRecord = isInstallRecord(path)
+        ? (installRecords.get(path) ?? previousInstallRecord)
+        : undefined;
+      if (installRecord !== undefined) return Effect.succeed(installRecord);
+      if (path === "/missing/resources/app-update.yml" && options.appUpdateYml !== undefined) {
+        return Effect.succeed(options.appUpdateYml);
+      }
+      return path === "/missing/resources/package-type" && options.packageType !== undefined
+        ? Effect.succeed(options.packageType)
+        : Effect.fail(
+            PlatformError.systemError({
+              module: "FileSystem",
+              method: "readFileString",
+              _tag: "NotFound",
+              pathOrDescriptor: path,
+            }),
+          );
+    },
     makeDirectory: () => Effect.void,
-    writeFileString: (path) =>
+    writeFileString: (path, data) =>
       Effect.sync(() => {
-        updateRestartMarkers.add(path);
+        if (isInstallRecord(path)) installRecords.set(path, data);
+        else updateRestartMarkers.add(path);
       }),
     remove: (path) =>
       Effect.sync(() => {
         updateRestartMarkers.delete(path);
+        installRecords.delete(path);
+        if (isInstallRecord(path)) previousInstallRecord = undefined;
       }),
   });
 
@@ -283,6 +299,9 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     quitAndInstalls: () => quitAndInstallCount,
     installSteps,
     updateRestartMarkers,
+    installRecords,
+    /** The record the test started with, until the app removes it. */
+    previousInstallRecord: () => previousInstallRecord,
     downloadCount: () => downloadCount,
     stopCount: () => stopCount,
     feedUrls: (): ElectronUpdater.ElectronUpdaterFeedUrl[] => feedUrls,

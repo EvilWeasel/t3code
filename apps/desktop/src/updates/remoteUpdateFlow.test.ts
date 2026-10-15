@@ -34,6 +34,36 @@ function makeState(overrides: Partial<DesktopUpdateState> = {}): DesktopUpdateSt
 }
 
 describe("nextRemoteDesktopUpdateStep", () => {
+  it("does not install again a version that did not apply on this machine", () => {
+    const step = nextRemoteDesktopUpdateStep(
+      makeState({ status: "available", availableVersion: "1.2.4", notAppliedVersion: "1.2.4" }),
+      NO_ATTEMPTS,
+      null,
+    );
+    assert.equal(step.action, "done");
+    assert.include(step.action === "done" ? step.reason : "", "1.2.4 did not apply");
+    assert.deepEqual(
+      nextRemoteDesktopUpdateStep(
+        makeState({ status: "available", availableVersion: "1.2.5", notAppliedVersion: "1.2.4" }),
+        NO_ATTEMPTS,
+        null,
+      ),
+      { action: "download" },
+    );
+  });
+
+  it("refuses the exact downloaded failed version even when a newer release is available", () => {
+    const step = nextRemoteDesktopUpdateStep(
+      makeState({
+        status: "downloaded", availableVersion: "1.2.5", downloadedVersion: "1.2.4",
+        notAppliedVersion: "1.2.4",
+      }),
+      NO_ATTEMPTS, null,
+    );
+    assert.equal(step.action, "done");
+    assert.equal(step.action === "done" ? step.outcome : null, "failed");
+  });
+
   it("fails immediately when updates are disabled, preferring the known reason", () => {
     const state = makeState({ enabled: false, status: "disabled" });
     assert.deepEqual(nextRemoteDesktopUpdateStep(state, NO_ATTEMPTS, "dev build"), {

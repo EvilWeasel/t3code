@@ -65,29 +65,27 @@ type UpdateButtonProps = Pick<ComponentProps<typeof Button>, "variant" | "size" 
   readonly appearance?: "button" | "icon";
 };
 
-export type ServerUpdateResult =
-  | { readonly ok: true; readonly label: string; readonly version: string }
-  | { readonly ok: false; readonly label: string; readonly message: string };
+/** What {@link useServerUpdate} did. "skipped" covers a missing permission, an
+    update already in flight, and an interrupted request. */
+export type ServerUpdateOutcome =
+  | { readonly status: "updated" }
+  | { readonly status: "skipped"; readonly message?: string }
+  | { readonly status: "failed"; readonly message: string };
 
 /** Updates one server and waits until it is back on the target version.
-    Reports its own success or failure toast; never rejects. */
+    Toasts its success or failure unless `quiet`; never rejects. */
 export function useServerUpdate() {
   const updateServer = useAtomCommand(serverEnvironment.updateServer, { reportFailure: false });
   return async (
     target: ServerUpdateTarget,
-    failureTitle = "Server update failed",
-  ): Promise<ServerUpdateResult> => {
+    { quiet = false }: { readonly quiet?: boolean } = {},
+  ): Promise<ServerUpdateOutcome> => {
     const { environmentId, serverLabel, selfUpdate, targetVersion } = target;
     if (
       !canUpdateServer(appAtomRegistry.get(environmentSession.sessionStateAtom(environmentId))) ||
       pendingUpdateEnvironmentIds.has(environmentId)
-    ) {
-      return {
-        ok: false,
-        label: serverLabel,
-        message: "Update permission is missing or another update is running.",
-      };
-    }
+    )
+      return { status: "skipped", message: "Update permission is missing or another update is running." };
     pendingUpdateEnvironmentIds.add(environmentId);
     try {
       const result = await updateServer({
@@ -100,24 +98,30 @@ export function useServerUpdate() {
         },
       });
       if (result._tag === "Failure") {
-        if (isAtomCommandInterrupted(result)) {
-          return { ok: false, label: serverLabel, message: "Update was interrupted." };
-        }
+        if (isAtomCommandInterrupted(result)) return { status: "skipped", message: "Update was interrupted." };
         throw squashAtomCommandFailure(result);
       }
-      toastManager.add({
-        type: "success",
-        title: `${serverLabel} updated`,
-        description:
-          selfUpdate === "desktop-managed"
-            ? `Desktop app relaunched on ${result.value.targetVersion}.`
-            : `Reconnected on t3@${result.value.targetVersion}.`,
-      });
-      return { ok: true, label: serverLabel, version: result.value.targetVersion };
+      if (!quiet) {
+        toastManager.add({
+          type: "success",
+          title: `${serverLabel} updated`,
+          description:
+            selfUpdate === "desktop-managed"
+              ? `Desktop app relaunched on ${result.value.targetVersion}.`
+              : `Reconnected on t3@${result.value.targetVersion}.`,
+        });
+      }
+      return { status: "updated" };
     } catch (error) {
       const message = updateFailureMessage(error);
-      toastManager.add({ type: "error", title: failureTitle, description: message });
-      return { ok: false, label: serverLabel, message };
+      if (!quiet) {
+        toastManager.add({
+          type: "error",
+          title: `${serverLabel} update failed`,
+          description: message,
+        });
+      }
+      return { status: "failed", message };
     } finally {
       pendingUpdateEnvironmentIds.delete(environmentId);
     }
@@ -158,9 +162,7 @@ export function ServerUpdatesAction({
           )) ?? true;
         if (!confirmed) return;
       }
-      await Promise.all(
-        available.map((target) => update(target, `${target.serverLabel} update failed`)),
-      );
+      await Promise.all(available.map((target) => update(target)));
     } finally {
       pending.current = false;
       setIsPending(false);
@@ -188,7 +190,7 @@ export function canUpdateServer(
 
 /**
  * One-row status for an in-flight server update: "Downloading…" then
- * "Restarting…". The update is a wait, not a warning: a single pulsing dot
+ * "Restarting…". The update is a wait, not a warning: a single static dot
  * and label, no step rail, no versions. Failure turns the row red with the
  * rollback reason.
  */
@@ -210,10 +212,7 @@ export function ServerUpdateProgress({
   }
   return (
     <div className="mt-1 flex items-center gap-2 text-xs font-medium text-foreground">
-      <span
-        className="size-1.5 shrink-0 animate-status-pulse rounded-full bg-foreground"
-        aria-hidden="true"
-      />
+      <span className="size-1.5 shrink-0 rounded-full bg-foreground" aria-hidden="true" />
       <span>{serverUpdateStageLabel(state.stage)}</span>
     </div>
   );
@@ -394,7 +393,7 @@ export function OutdatedServerUpdateAction({
     } catch (error) {
       toastManager.add({
         type: "error",
-        title: "Server update failed",
+        title: `${serverLabel} update failed`,
         description: updateFailureMessage(error),
       });
     } finally {
