@@ -6,11 +6,16 @@ import {
   type DesktopUpdateChannel,
   type DesktopUpdateCheckResult,
   type DesktopUpdateState,
+  type DesktopUpdateReadiness,
+  type DesktopUpdateInstallLease,
 } from "@t3tools/contracts";
 import { errorTag } from "@t3tools/shared/observability";
+import { compareSemverVersions } from "@t3tools/shared/semver";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -188,6 +193,7 @@ export class DesktopUpdates extends Context.Service<
     readonly installPrepared: (
       expectedVersion: string,
     ) => Effect.Effect<DesktopPreparedUpdateInstallResult>;
+    readonly acknowledgeReadiness?: (senderId: number, readiness: DesktopUpdateReadiness) => Effect.Effect<boolean>;
   }
 >()("@t3tools/desktop/updates/DesktopUpdates") {}
 
@@ -347,6 +353,12 @@ export const make = Effect.gen(function* () {
   const activeUpdateActionRef = yield* Ref.make<Option.Option<UpdateAction>>(Option.none());
   const finishedUpdateActions = yield* PubSub.unbounded<UpdateAction>();
   const updaterConfiguredRef = yield* Ref.make(false);
+  const clientOnlyInstallRef = yield* Ref.make(false);
+  const pendingReadiness = yield* Ref.make<{
+    readonly lease: DesktopUpdateInstallLease;
+    readonly senders: ReadonlySet<number>;
+    readonly signal: Deferred.Deferred<boolean>;
+  } | null>(null);
   const lastLoggedDownloadMilestoneRef = yield* Ref.make(-1);
   const updateStateRef = yield* Ref.make<DesktopUpdateState>(
     createInitialDesktopUpdateState(
@@ -620,6 +632,7 @@ export const make = Effect.gen(function* () {
     [
       finishUpdateAction("install"),
       Ref.set(desktopState.quitting, false),
+      Ref.set(clientOnlyInstallRef, false),
       removeUpdateRestartMarker,
     ],
     { discard: true },
@@ -638,7 +651,7 @@ export const make = Effect.gen(function* () {
     yield* Ref.set(desktopState.quitting, false);
     yield* removeUpdateRestartMarker;
     yield* Effect.gen(function* () {
-      const instances = yield* pool.list;
+      const instances = (yield* Ref.get(clientOnlyInstallRef)) ? [] : yield* pool.list;
       const restartExit = yield* Effect.forEach(instances, (instance) => instance.start, {
         concurrency: "unbounded",
         discard: true,
@@ -655,7 +668,7 @@ export const make = Effect.gen(function* () {
     );
   });
 
-  const installDownloadedUpdate = (expectedVersion?: string) =>
+  const installDownloadedUpdate = (expectedVersion?: string, clientOnly = false) =>
     Effect.scoped(
       Effect.gen(function* () {
         const actionCompletions = yield* PubSub.subscribe(finishedUpdateActions);
@@ -676,7 +689,7 @@ export const make = Effect.gen(function* () {
                 return "refused" as const;
               }
               if (Option.isSome(activeAction)) {
-                return activeAction.value === "check" && expectedVersion !== undefined
+                return !clientOnly && activeAction.value === "check" && expectedVersion !== undefined
                   ? ("wait-for-check" as const)
                   : ("refused" as const);
               }
@@ -703,10 +716,11 @@ export const make = Effect.gen(function* () {
           return { accepted: false, completed: false, failed: false };
         }
 
+        yield* Ref.set(clientOnlyInstallRef, clientOnly);
         yield* Ref.set(desktopState.quitting, true);
 
         return yield* Effect.gen(function* () {
-          yield* writeUpdateRestartMarker;
+          if (!clientOnly) yield* writeUpdateRestartMarker;
           // Stop every backend in the pool, not just the primary. With
           // parallel WSL + Windows backends, leaving the WSL instance up
           // means quitAndInstall's app.quit() exits before the pool's
@@ -714,7 +728,7 @@ export const make = Effect.gen(function* () {
           // WSL child gets hard-killed by the OS instead of receiving
           // SIGTERM + grace. Stops run concurrently with the same 5s
           // budget the primary had on its own.
-          const instances = yield* pool.list;
+          const instances = clientOnly ? [] : yield* pool.list;
           yield* Effect.forEach(
             instances,
             (instance) => instance.stop({ timeout: Duration.seconds(5) }),
@@ -781,7 +795,59 @@ export const make = Effect.gen(function* () {
     };
   });
 
+  const attemptClientOnlyInstall = Effect.gen(function* () {
+    const state = yield* Ref.get(updateStateRef);
+    const holdPool = pool.withUpdateInventory;
+    const holdRenderers = electronWindow.withUpdateRenderers;
+    const inventory = electronWindow.updateInventory;
+    if (state.status !== "downloaded" || state.downloadedVersion === null ||
+      holdPool === undefined || holdRenderers === undefined || inventory === undefined ||
+      (yield* Ref.get(desktopState.quitting))) return;
+    const targetVersion = state.downloadedVersion;
+    if (compareSemverVersions(targetVersion, state.currentVersion) <= 0) return;
+    yield* holdPool((instances) => holdRenderers(Effect.gen(function* () {
+      const isEmpty = Effect.forEach(instances, (instance) => instance.snapshot).pipe(
+        Effect.map((snapshots) => snapshots.every((snapshot) =>
+          snapshot.desiredRunning === false && snapshot.ready === false && Option.isNone(snapshot.activePid) &&
+          snapshot.restartScheduled === false,
+        )),
+      );
+      if (!(yield* isEmpty)) return;
+      const expected = yield* inventory;
+      if (expected.some((renderer) => renderer.audible !== false)) return;
+      const generation = `${targetVersion}:${yield* Clock.currentTimeMillis}`;
+      const expiresAt = (yield* Clock.currentTimeMillis) + 20_000;
+      for (const phase of ["prepare", "validate"] as const) {
+        const lease = { generation, targetVersion, expiresAt, phase };
+        const signal = yield* Deferred.make<boolean>();
+        yield* Ref.set(pendingReadiness, { lease, senders: new Set(expected.map((item) => item.id)), signal });
+        yield* updateState((current) => ({ ...current, installLease: lease }));
+        if (expected.length > 0) {
+          const ready = yield* Deferred.await(signal).pipe(Effect.timeoutOption(Duration.seconds(5)));
+          if (Option.isNone(ready) || !ready.value) return;
+        }
+      }
+      const currentInventory = yield* inventory;
+      const sameInventory = JSON.stringify(expected) === JSON.stringify(currentInventory);
+      if (!sameInventory || !(yield* isEmpty) ||
+        (yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return;
+      yield* updateState((current) => ({ ...current, installLease: {
+        generation, targetVersion, expiresAt, phase: "commit",
+      } }));
+      const result = yield* installDownloadedUpdate(targetVersion, true);
+      // Keep register/unregister/start and window creation fenced until the
+      // app exits. A failed installer releases through the surrounding scope.
+      if (result.accepted && !result.failed) yield* Effect.never;
+    })).pipe(Effect.ensuring(Effect.gen(function* () {
+      yield* Ref.set(pendingReadiness, null);
+      yield* updateState(({ installLease: _lease, ...current }) => current);
+    }))));
+  }).pipe(Effect.catchCause(() => logUpdaterWarning("Client update window could not be verified; update remains prepared.")));
+
   const startUpdatePollers: Effect.Effect<void, never, Scope.Scope> = Effect.gen(function* () {
+    yield* Effect.sleep("1 minute").pipe(
+      Effect.andThen(attemptClientOnlyInstall), Effect.forever, Effect.forkScoped,
+    );
     // Keep Electron's implicit download/install hooks disabled. The same action
     // reservation and failure handling serve manual and background downloads;
     // installation still requires a separately admitted safe restart window.
@@ -996,6 +1062,22 @@ export const make = Effect.gen(function* () {
   });
 
   return DesktopUpdates.of({
+    acknowledgeReadiness: (senderId, readiness) => Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const completed = yield* Ref.modify(pendingReadiness, (pending) => {
+        if (pending === null || now >= pending.lease.expiresAt ||
+          JSON.stringify(pending.lease) !== JSON.stringify(readiness.lease) ||
+          !pending.senders.has(senderId)) return [null, pending] as const;
+        const senders = new Set(pending.senders);
+        senders.delete(senderId);
+        return [
+          !readiness.ready || senders.size === 0 ? { signal: pending.signal, ready: readiness.ready } : null,
+          { ...pending, senders },
+        ] as const;
+      });
+      if (completed !== null) yield* Deferred.succeed(completed.signal, completed.ready);
+      return completed !== null;
+    }),
     getState: Ref.get(updateStateRef),
     isActionActive: activeUpdateAction.pipe(Effect.map(Option.isSome)),
     isInstallActive: activeUpdateAction.pipe(

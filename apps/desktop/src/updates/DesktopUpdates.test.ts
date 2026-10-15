@@ -21,6 +21,77 @@ import * as DesktopUpdates from "./DesktopUpdates.ts";
 import { flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
 
 describe("DesktopUpdates", () => {
+  it.effect("installs a verified idle client without stopping or starting any backend", () => {
+    const harness = makeHarness({ clientOnlyInventory: [{ id: 7, generation: "frame-1", audible: false }] });
+    return Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      const acknowledge = updates.acknowledgeReadiness;
+      if (acknowledge === undefined) return yield* Effect.die("missing readiness service");
+      const { changes } = yield* updates.subscribe;
+      yield* Stream.runForEach(changes, (state) => state.installLease === undefined
+        ? Effect.void : acknowledge(7, { lease: state.installLease, ready: true }).pipe(Effect.asVoid),
+      ).pipe(Effect.forkScoped);
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      yield* flushCallbacks;
+      assert.equal(harness.quitAndInstalls(), 1);
+      assert.equal(harness.stopCount(), 0);
+      assert.deepEqual(harness.installSteps, ["quitAndInstall"]);
+    })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
+  it.effect("keeps the update staged with zero process stops for busy, missing or stale renderer proof", () =>
+    Effect.gen(function* () {
+      for (const proof of ["busy", "missing", "stale", "expired", "wrong-sender"] as const) {
+        const harness = makeHarness({ clientOnlyInventory: [{ id: 7, generation: "frame-1", audible: false }] });
+        yield* Effect.scoped(Effect.gen(function* () {
+          const updates = yield* DesktopUpdates.DesktopUpdates;
+          yield* updates.configure;
+          const acknowledge = updates.acknowledgeReadiness;
+          if (acknowledge === undefined) return yield* Effect.die("missing readiness service");
+          const { changes } = yield* updates.subscribe;
+          yield* Stream.runForEach(changes, (state) => {
+            const lease = state.installLease;
+            if (lease === undefined || proof === "missing") return Effect.void;
+            return acknowledge(proof === "wrong-sender" ? 8 : 7, {
+              lease: { ...lease,
+                generation: proof === "stale" ? "old-generation" : lease.generation,
+                expiresAt: proof === "expired" ? 0 : lease.expiresAt,
+              }, ready: proof !== "busy",
+            }).pipe(Effect.asVoid);
+          }).pipe(Effect.forkScoped);
+          yield* TestClock.adjust(Duration.seconds(15));
+          harness.emit("update-downloaded", { version: "1.2.4" });
+          yield* flushCallbacks;
+          yield* TestClock.adjust(Duration.seconds(45));
+          yield* TestClock.adjust(Duration.seconds(6));
+          assert.equal(harness.quitAndInstalls(), 0, proof);
+          assert.equal(harness.stopCount(), 0, proof);
+          assert.equal((yield* updates.getState).downloadedVersion, "1.2.4");
+        })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+      }
+    }),
+  );
+
+  it.effect("never installs or stops a backend whose desired state can restart a process", () => {
+    const harness = makeHarness({ clientOnlyInventory: [], backendSnapshot: Effect.succeed({
+      desiredRunning: true, ready: false, activePid: Option.none(), restartAttempt: 0, restartScheduled: false,
+    }) });
+    return Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.equal(harness.stopCount(), 0);
+    })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
   it.effect("only enables the packaged fork feed and never polls upstream or custom hosts", () =>
     Effect.gen(function* () {
       for (const [feed, enabled] of [

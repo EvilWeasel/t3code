@@ -38,12 +38,15 @@ export interface UpdatesHarnessOptions {
   /** Contents of the resources/package-type marker a Linux package ships. */
   readonly packageType?: string | undefined;
   readonly appUpdateYml?: string;
+  readonly clientOnlyInventory?: ReadonlyArray<{ readonly id: number; readonly generation: string; readonly audible: boolean }>;
+  readonly backendSnapshot?: DesktopBackendPool.DesktopBackendInstance["snapshot"];
 }
 
 export function makeHarness(options: UpdatesHarnessOptions = {}) {
   let checkCount = 0;
   let quitAndInstallCount = 0;
   let downloadCount = 0;
+  let stopCount = 0;
   let allowDowngrade = false;
   let fullChangelog = false;
   const feedUrls: ElectronUpdater.ElectronUpdaterFeedUrl[] = [];
@@ -111,6 +114,10 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
   } satisfies ElectronUpdater.ElectronUpdater["Service"]);
 
   const layerWindow = Layer.succeed(ElectronWindow.ElectronWindow, {
+    ...(options.clientOnlyInventory === undefined ? {} : {
+      updateInventory: Effect.succeed(options.clientOnlyInventory),
+      withUpdateRenderers: <A, E, R>(use: Effect.Effect<A, E, R>) => use,
+    }),
     create: () => Effect.die("unexpected BrowserWindow creation"),
     main: Effect.succeedNone,
     currentMainOrFirst: Effect.succeedNone,
@@ -135,9 +142,9 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     start: Effect.sync(() => {
       installSteps.push("startBackend");
     }).pipe(Effect.andThen(options.startBackend ?? Effect.void)),
-    stop: () => options.stopBackend ?? Effect.void,
+    stop: () => Effect.sync(() => { stopCount += 1; }).pipe(Effect.andThen(options.stopBackend ?? Effect.void)),
     currentConfig: Effect.succeedNone,
-    snapshot: Effect.succeed({
+    snapshot: options.backendSnapshot ?? Effect.succeed({
       desiredRunning: false,
       ready: false,
       activePid: Option.none(),
@@ -146,7 +153,16 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     }),
     waitForReady: () => Effect.succeed(true),
   };
-  const layerBackend = DesktopBackendPool.layerTest([stubBackendInstance]);
+  const layerBackend = options.clientOnlyInventory === undefined
+    ? DesktopBackendPool.layerTest([stubBackendInstance])
+    : Layer.succeed(DesktopBackendPool.DesktopBackendPool, {
+      primary: Effect.succeed(stubBackendInstance),
+      get: () => Effect.succeedSome(stubBackendInstance),
+      list: Effect.succeed([stubBackendInstance]),
+      register: () => Effect.die("unexpected backend registration"),
+      unregister: () => Effect.die("unexpected backend removal"),
+      withUpdateInventory: (use) => use([stubBackendInstance]).pipe(Effect.map(Option.some)),
+    });
 
   const layerEnvironment = DesktopEnvironment.layer({
     dirname: "/repo/apps/desktop/src",
@@ -263,6 +279,7 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     installSteps,
     updateRestartMarkers,
     downloadCount: () => downloadCount,
+    stopCount: () => stopCount,
     feedUrls: (): ElectronUpdater.ElectronUpdaterFeedUrl[] => feedUrls,
     fullChangelog: () => fullChangelog,
     listenerCount: () =>

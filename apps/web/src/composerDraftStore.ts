@@ -4403,6 +4403,30 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
 
 export const useComposerDraftStore = composerDraftStore;
 
+/** An update may acknowledge persistence only after the real storage readback
+ * matches the captured state. In-memory fallback is never a durable receipt. */
+export function flushAndVerifyComposerDrafts(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const state = composerDraftStore.getState();
+    if (Object.values(state.draftsByThreadKey).some((draft) =>
+      draft.files.some((file) => file.file !== null && file.uploadedAttachmentId === undefined) ||
+      draft.nonPersistedImageIds.length > 0 || draft.images.some((attachment) =>
+        !draft.persistedAttachments.some((persisted) => persisted.id === attachment.id),
+      ),
+    )) return false;
+    const value = { state: { capturedState: state }, version: COMPOSER_DRAFT_STORAGE_VERSION };
+    composerDebouncedStorage.setItem(COMPOSER_DRAFT_STORAGE_KEY, value);
+    composerDebouncedStorage.flush();
+    const expected = JSON.stringify({
+      state: partializeComposerDraftStoreState(state), version: COMPOSER_DRAFT_STORAGE_VERSION,
+    });
+    return window.localStorage.getItem(COMPOSER_DRAFT_STORAGE_KEY) === expected;
+  } catch {
+    return false;
+  }
+}
+
 export function beginBackgroundDraftSubmissionByRef(threadRef: ScopedThreadRef): void {
   const threadKey = scopedThreadKey(threadRef);
   useComposerDraftStore.setState((state) => ({

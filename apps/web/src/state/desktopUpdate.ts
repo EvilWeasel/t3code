@@ -6,8 +6,9 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as AsyncResult from "effect/reactivity/AsyncResult";
 import { Atom } from "effect/reactivity";
+import { createRendererUpdateReadiness } from "./desktopUpdateReadiness";
 
-type DesktopUpdateBridge = Pick<DesktopBridge, "getUpdateState" | "onUpdateState">;
+type DesktopUpdateBridge = Pick<DesktopBridge, "getUpdateState" | "onUpdateState" | "acknowledgeUpdateReadiness">;
 
 const INITIAL_STATE_READ_ATTEMPT_COUNT = 3;
 
@@ -37,9 +38,12 @@ export function createDesktopUpdateStateAtom(getBridge: () => DesktopUpdateBridg
       }
 
       let receivedUpdate = false;
+      const readiness = typeof document === "undefined" ? undefined : createRendererUpdateReadiness(bridge);
+      yield* Effect.addFinalizer(() => Effect.sync(() => readiness?.dispose()));
       yield* Effect.acquireRelease(
         Effect.sync(() =>
           bridge.onUpdateState((state) => {
+            void readiness?.observe(state);
             receivedUpdate = true;
             Queue.offerUnsafe(queue, state);
           }),
@@ -66,6 +70,7 @@ export function createDesktopUpdateStateAtom(getBridge: () => DesktopUpdateBridg
         }),
       );
       if (!receivedUpdate && initialState !== null) {
+        void readiness?.observe(initialState);
         Queue.offerUnsafe(queue, initialState);
       }
 

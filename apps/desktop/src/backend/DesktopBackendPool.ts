@@ -88,6 +88,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as SynchronizedRef from "effect/SynchronizedRef";
+import * as Semaphore from "effect/Semaphore";
 
 import * as FileSystem from "effect/FileSystem";
 import { HttpClient } from "effect/http";
@@ -141,6 +142,11 @@ export class DesktopBackendPoolCannotUnregisterPrimaryError extends Schema.Tagge
 export class DesktopBackendPool extends Context.Service<
   DesktopBackendPool,
   {
+    /** Holds registry mutations for one bounded update preparation. Closing
+     * instances make the attempt defer instead of disappearing from its proof. */
+    readonly withUpdateInventory?: <A, E, R>(
+      use: (instances: ReadonlyArray<DesktopBackendInstance>) => Effect.Effect<A, E, R>,
+    ) => Effect.Effect<Option.Option<A>, E, R>;
     // Look up a registered instance. None when no backend with that id is
     // currently registered (e.g. WSL backend disabled).
     readonly get: (id: BackendInstanceId) => Effect.Effect<Option.Option<DesktopBackendInstance>>;
@@ -279,7 +285,12 @@ export const layer = Layer.effect(
       },
     );
 
-    const primary = yield* DesktopBackendManager.makeBackendInstance({
+    const updateInventoryLane = yield* Semaphore.make(1);
+    const fenceInstanceStart = (instance: DesktopBackendInstance): DesktopBackendInstance => ({
+      ...instance,
+      start: updateInventoryLane.withPermits(1)(instance.start),
+    });
+    const primary = fenceInstanceStart(yield* DesktopBackendManager.makeBackendInstance({
       id: DesktopBackendManager.PRIMARY_INSTANCE_ID,
       // Keep this lazy. The pool layer is initialized before startup loads
       // persisted desktop settings, so resolving the primary label here would
@@ -303,7 +314,7 @@ export const layer = Layer.effect(
         ),
       onShutdown: () => desktopWindow.handleBackendNotReady,
       onPreflightFailed: handlePrimaryPreflightFailure,
-    });
+    }));
 
     const instancesRef = yield* SynchronizedRef.make<
       ReadonlyMap<BackendInstanceId, RegisteredInstance>
@@ -318,7 +329,7 @@ export const layer = Layer.effect(
 
     const register: DesktopBackendPool["Service"]["register"] = (spec) =>
       Effect.suspend(() =>
-        SynchronizedRef.modifyEffect(
+        updateInventoryLane.withPermits(1)(SynchronizedRef.modifyEffect(
           instancesRef,
           (
             current,
@@ -342,10 +353,10 @@ export const layer = Layer.effect(
               // Provide the captured factory services first, then the child scope
               // last so instance finalizers are owned by the unregisterable scope.
               const instanceScope = yield* Scope.fork(layerScope, "sequential");
-              const instance = yield* DesktopBackendManager.makeBackendInstance(spec).pipe(
+              const instance = fenceInstanceStart(yield* DesktopBackendManager.makeBackendInstance(spec).pipe(
                 Effect.provide(factoryContext),
                 Scope.provide(instanceScope),
-              );
+              ));
               const next = new Map(current);
               next.set(spec.id, {
                 _tag: "Active",
@@ -358,7 +369,7 @@ export const layer = Layer.effect(
               ] as const;
             });
           },
-        ).pipe(
+        )).pipe(
           Effect.flatMap((result) =>
             result._tag === "Registered"
               ? Effect.succeed(result.instance)
@@ -373,7 +384,7 @@ export const layer = Layer.effect(
           return yield* new DesktopBackendPoolCannotUnregisterPrimaryError();
         }
         const done = yield* Deferred.make<void>();
-        const action = yield* SynchronizedRef.modifyEffect(
+        const action = yield* updateInventoryLane.withPermits(1)(SynchronizedRef.modifyEffect(
           instancesRef,
           (
             current,
@@ -397,7 +408,7 @@ export const layer = Layer.effect(
               next as ReadonlyMap<BackendInstanceId, RegisteredInstance>,
             ] as const);
           },
-        );
+        ));
 
         if (action._tag === "Absent") return;
         if (action._tag === "Wait") {
@@ -424,6 +435,16 @@ export const layer = Layer.effect(
       });
 
     return DesktopBackendPool.of({
+      withUpdateInventory: (use) => updateInventoryLane.withPermits(1)(SynchronizedRef.modifyEffect(instancesRef, (current) =>
+        Effect.gen(function* () {
+          const entries = [...current.values()];
+          if (entries.some((entry) => entry._tag === "Closing")) {
+            return [Option.none(), current] as const;
+          }
+          const instances = entries.flatMap((entry) => entry._tag === "Active" ? [entry.instance] : []);
+          return [Option.some(yield* use(instances)), current] as const;
+        }),
+      )),
       get: (id) =>
         SynchronizedRef.get(instancesRef).pipe(
           Effect.map((instances) => {

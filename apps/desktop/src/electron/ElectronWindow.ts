@@ -11,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 
 import * as Electron from "electron";
 
@@ -109,6 +110,8 @@ export class ElectronWindowOperationError extends Schema.TaggedError<ElectronWin
 export class ElectronWindow extends Context.Service<
   ElectronWindow,
   {
+    readonly updateInventory?: Effect.Effect<ReadonlyArray<{ readonly id: number; readonly generation: string; readonly audible: boolean }>>;
+    readonly withUpdateRenderers?: <A, E, R>(use: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
     readonly create: (
       options: Electron.BrowserWindowConstructorOptions,
     ) => Effect.Effect<Electron.BrowserWindow, ElectronWindowCreateError>;
@@ -130,6 +133,7 @@ export class ElectronWindow extends Context.Service<
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const platform = yield* HostProcess.Platform;
+  const updateCreationLane = yield* Semaphore.make(1);
   // The focus worker loads a native accessibility module. Start it on the first
   // capture reveal so users who never capture pay nothing at launch.
   let windowsForegroundFocus: ReturnType<typeof startWindowsForegroundFocusThread> | undefined;
@@ -209,6 +213,12 @@ export const make = Effect.gen(function* () {
   });
 
   return ElectronWindow.of({
+    withUpdateRenderers: (use) => updateCreationLane.withPermits(1)(use),
+    updateInventory: listWindows.pipe(Effect.map((windows) => windows.map((window) => ({
+      id: window.webContents.id,
+      generation: `${window.webContents.mainFrame.processId}:${window.webContents.mainFrame.routingId}`,
+      audible: window.webContents.isCurrentlyAudible(),
+    })))),
     create: (options) => {
       const webPreferences = options.webPreferences;
       const diagnosticOptions = {
@@ -233,10 +243,10 @@ export const make = Effect.gen(function* () {
         },
       } satisfies typeof ElectronWindowCreateOptions.Type;
 
-      return Effect.try({
+      return updateCreationLane.withPermits(1)(Effect.try({
         try: () => new Electron.BrowserWindow(options),
         catch: (cause) => new ElectronWindowCreateError({ options: diagnosticOptions, cause }),
-      });
+      }));
     },
     main: liveMain,
     currentMainOrFirst,

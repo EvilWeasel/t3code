@@ -284,7 +284,22 @@ export interface DesktopUpdateState {
   message: string | null;
   errorContext: "check" | "download" | "install" | null;
   canRetry: boolean;
+  installLease?: DesktopUpdateInstallLease;
 }
+
+export const DesktopUpdateInstallLeaseSchema = Schema.Struct({
+  generation: TrimmedNonEmptyString,
+  targetVersion: TrimmedNonEmptyString,
+  expiresAt: Schema.Number,
+  phase: Schema.Literals(["prepare", "validate", "commit"]),
+});
+export type DesktopUpdateInstallLease = typeof DesktopUpdateInstallLeaseSchema.Type;
+
+export const DesktopUpdateReadinessSchema = Schema.Struct({
+  lease: DesktopUpdateInstallLeaseSchema,
+  ready: Schema.Boolean,
+});
+export type DesktopUpdateReadiness = typeof DesktopUpdateReadinessSchema.Type;
 
 export interface DesktopUpdateReleaseNote {
   version: string;
@@ -315,6 +330,7 @@ export const DesktopUpdateStateSchema = Schema.Struct({
   message: Schema.NullOr(Schema.String),
   errorContext: Schema.NullOr(Schema.Literals(["check", "download", "install"])),
   canRetry: Schema.Boolean,
+  installLease: Schema.optionalKey(DesktopUpdateInstallLeaseSchema),
 });
 
 /** The desktop app's `t3` command on PATH, managed from Settings. */
@@ -1238,6 +1254,7 @@ export interface DesktopBridge {
   checkForUpdate: () => Promise<DesktopUpdateCheckResult>;
   downloadUpdate: () => Promise<DesktopUpdateActionResult>;
   installUpdate: () => Promise<DesktopUpdateActionResult>;
+  acknowledgeUpdateReadiness?: (readiness: DesktopUpdateReadiness) => Promise<boolean>;
   onUpdateState: (listener: (state: DesktopUpdateState) => void) => () => void;
   /** Settings → `t3` command. Optional: older desktop builds lack it. */
   cliCommand?: {
