@@ -1,6 +1,8 @@
 import * as Schema from "effect/Schema";
 
-import { ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, PositiveInt, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+
+import { MainRendererDiagnosticsReadInput, MainRendererDiagnosticsReadResult } from "./ipc.ts";
 
 export const DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION = 1 as const;
 
@@ -51,3 +53,46 @@ export const DesktopAppActivationResponse = Schema.Union([
   DesktopAppActivationFailure,
 ]);
 export type DesktopAppActivationResponse = typeof DesktopAppActivationResponse.Type;
+
+
+// Separate from activation: these messages never enter the workspace/focus broker.
+const LocalDiagnosticNonce = Schema.String.check(
+  Schema.makeFilter((value: string) => /^[a-zA-Z0-9:_-]{1,128}$/.test(value)),
+);
+export const MainRendererLocalDiagnosticsHello = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("main-renderer-diagnostics-hello"),
+  requestId: LocalDiagnosticNonce,
+  requestNonce: LocalDiagnosticNonce,
+  expectedMainPid: PositiveInt,
+  stateDir: TrimmedNonEmptyString,
+  expiresAtMs: NonNegativeInt,
+});
+export type MainRendererLocalDiagnosticsHello = typeof MainRendererLocalDiagnosticsHello.Type;
+export const MainRendererLocalDiagnosticsCapability = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("main-renderer-diagnostics-capability"),
+  requestId: LocalDiagnosticNonce,
+  requestNonce: LocalDiagnosticNonce,
+  capabilityNonce: LocalDiagnosticNonce,
+  mainPid: PositiveInt,
+  stateDir: TrimmedNonEmptyString,
+  appVersion: TrimmedNonEmptyString,
+});
+export type MainRendererLocalDiagnosticsCapability = typeof MainRendererLocalDiagnosticsCapability.Type;
+export const MainRendererLocalDiagnosticsRead = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("main-renderer-diagnostics-read"),
+  capabilityNonce: LocalDiagnosticNonce,
+  input: MainRendererDiagnosticsReadInput,
+});
+export type MainRendererLocalDiagnosticsRead = typeof MainRendererLocalDiagnosticsRead.Type;
+export const MainRendererLocalDiagnosticsResult = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("main-renderer-diagnostics-result"),
+  requestId: LocalDiagnosticNonce,
+  requestNonce: LocalDiagnosticNonce,
+  capabilityNonce: LocalDiagnosticNonce,
+  result: MainRendererDiagnosticsReadResult,
+});
+export type MainRendererLocalDiagnosticsResult = typeof MainRendererLocalDiagnosticsResult.Type;
