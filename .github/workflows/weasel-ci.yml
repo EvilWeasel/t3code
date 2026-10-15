@@ -124,6 +124,7 @@ jobs:
           name: proton-pass-compatibility-${{ github.sha }}
           path: |
             ${{ runner.temp }}/proton-pass-compatibility/fixture-receipt.json
+            ${{ runner.temp }}/proton-pass-compatibility/fixture-receipt.partial.json
             ${{ runner.temp }}/proton-pass-compatibility/runner-receipt.json
             ${{ runner.temp }}/proton-pass-compatibility/electron.log
           if-no-files-found: error
