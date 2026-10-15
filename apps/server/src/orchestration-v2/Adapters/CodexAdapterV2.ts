@@ -162,15 +162,38 @@ type CodexLiveVoiceWorkControl = NonNullable<
   >[0]["onWorkControl"]
 >;
 
+type CodexLiveVoiceObserveWork = NonNullable<
+  Parameters<
+    ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]
+  >[0]["onObserveWork"]
+>;
+const codexLiveVoiceObserverId = Schema.String.check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(512),
+  Schema.isPattern(/\S/),
+);
+const codexLiveVoiceObserverTarget = Schema.Struct({
+  environmentId: codexLiveVoiceObserverId,
+  threadId: codexLiveVoiceObserverId,
+  providerInstanceId: codexLiveVoiceObserverId,
+  runId: codexLiveVoiceObserverId,
+  attemptId: codexLiveVoiceObserverId,
+  rootNodeId: codexLiveVoiceObserverId,
+});
+interface CodexLiveVoicePlanner {
+  readonly onSubmitWork: CodexLiveVoiceSubmitWork;
+  readonly onWorkControl?: CodexLiveVoiceWorkControl;
+  readonly onObserveWork?: CodexLiveVoiceObserveWork;
+  readonly observerNativeThreadId?: string;
+  readonly observerTurnId?: string | null;
+  readonly observerClosed?: boolean;
+}
+
 /** Route only the restricted planner's declared tools, retaining native call correlation. */
 export const routeCodexLiveVoiceTool = (
-  planner:
-    | {
-        readonly onSubmitWork: CodexLiveVoiceSubmitWork;
-        readonly onWorkControl?: CodexLiveVoiceWorkControl;
-      }
-    | undefined,
+  planner: CodexLiveVoicePlanner | undefined,
   payload: CodexSchema.DynamicToolCallParams,
+  isObserverCurrent?: () => Effect.Effect<boolean>,
 ): Effect.Effect<CodexSchema.DynamicToolCallResponse> =>
   Effect.gen(function* () {
     const refused: CodexSchema.DynamicToolCallResponse = {
@@ -225,8 +248,45 @@ export const routeCodexLiveVoiceTool = (
         ...(typeof args.runId === "string" ? { runId: args.runId } : {}),
         ...(typeof args.message === "string" ? { message: args.message } : {}),
       });
+    } else if (payload.tool === "t3_voice_observe_work" && planner.onObserveWork) {
+      if (
+        planner.observerClosed ||
+        planner.observerNativeThreadId !== payload.threadId ||
+        planner.observerTurnId !== payload.turnId ||
+        isObserverCurrent === undefined ||
+        !(yield* isObserverCurrent()) ||
+        Object.keys(args).length !== 4 ||
+        Object.keys(args).some(
+          (key) => !["action", "target", "progress", "completion"].includes(key),
+        ) ||
+        (args.action !== "attach" && args.action !== "detach") ||
+        typeof args.progress !== "boolean" ||
+        typeof args.completion !== "boolean" ||
+        typeof args.target !== "object" ||
+        args.target === null ||
+        Array.isArray(args.target)
+      )
+        return refused;
+      const target = yield* Schema.decodeUnknownEffect(codexLiveVoiceObserverTarget, {
+        onExcessProperty: "error",
+      })(args.target).pipe(Effect.result);
+      if (target._tag === "Failure" || !(yield* isObserverCurrent())) return refused;
+      // Requested target data is not authority; the service validates the
+      // exact canonical attempt and observer lease independently.
+      operation = planner.onObserveWork({
+        ...correlation,
+        action: args.action,
+        target: target.success,
+        progress: args.progress,
+        completion: args.completion,
+      });
     } else return refused;
     const result = yield* Effect.result(operation);
+    if (
+      payload.tool === "t3_voice_observe_work" &&
+      (isObserverCurrent === undefined || !(yield* isObserverCurrent()))
+    )
+      return refused;
     return result._tag === "Success"
       ? { contentItems: [{ type: "inputText", text: result.success }], success: true }
       : refused;
@@ -1902,15 +1962,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
         const liveVoiceEvents =
           yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2LiveVoiceEvent>();
-        const liveVoicePlanners = yield* Ref.make(
-          new Map<
-            string,
-            {
-              readonly onSubmitWork: CodexLiveVoiceSubmitWork;
-              readonly onWorkControl?: CodexLiveVoiceWorkControl;
-            }
-          >(),
-        );
+        const liveVoicePlanners = yield* Ref.make(new Map<string, CodexLiveVoicePlanner>());
         const liveVoiceSettingsWaiters = yield* Ref.make(
           new Map<
             string,
@@ -6523,6 +6575,40 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }).pipe(Effect.mapError(mcpAppsError("Codex MCP resource read failed."))),
         };
 
+        // Additional notification subscribers only maintain the restricted
+        // planner's native observer binding; ordinary turn handling is unchanged.
+        yield* client.handleServerNotification("turn/started", (payload) =>
+          Ref.update(liveVoicePlanners, (current) => {
+            const planner = current.get(payload.threadId);
+            return planner?.onObserveWork === undefined ||
+              planner.observerClosed ||
+              payload.turn.status !== "inProgress"
+              ? current
+              : new Map(current).set(payload.threadId, {
+                  ...planner,
+                  observerTurnId: payload.turn.id,
+                });
+          }),
+        );
+        yield* client.handleServerNotification("turn/completed", (payload) =>
+          Ref.update(liveVoicePlanners, (current) => {
+            const planner = current.get(payload.threadId);
+            return planner?.observerTurnId !== payload.turn.id
+              ? current
+              : new Map(current).set(payload.threadId, { ...planner, observerTurnId: null });
+          }),
+        );
+        const closeObserver = (threadId: string) =>
+          Ref.update(liveVoicePlanners, (current) => {
+            const planner = current.get(threadId);
+            return planner === undefined
+              ? current
+              : new Map(current).set(threadId, {
+                  ...planner,
+                  observerClosed: true,
+                  observerTurnId: null,
+                });
+          });
         const offerLiveVoiceEvent = (event: ProviderAdapter.ProviderAdapterV2LiveVoiceEvent) =>
           Queue.offer(liveVoiceEvents, event).pipe(Effect.asVoid);
         yield* client.handleServerNotification("thread/realtime/started", (payload) =>
@@ -6545,7 +6631,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           offerLiveVoiceEvent({ type: "error", plannerNativeThreadId: payload.threadId }),
         );
         yield* client.handleServerNotification("thread/realtime/closed", (payload) =>
-          offerLiveVoiceEvent({ type: "closed", plannerNativeThreadId: payload.threadId }),
+          closeObserver(payload.threadId).pipe(
+            Effect.andThen(
+              offerLiveVoiceEvent({ type: "closed", plannerNativeThreadId: payload.threadId }),
+            ),
+          ),
         );
         yield* client.handleServerNotification("thread/realtime/transcript/done", (payload) =>
           payload.role === "user" || payload.role === "assistant"
@@ -6559,9 +6649,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         );
         yield* client.handleServerRequest("item/tool/call", (payload) =>
           Ref.get(liveVoicePlanners).pipe(
-            Effect.flatMap((planners) =>
-              routeCodexLiveVoiceTool(planners.get(payload.threadId), payload),
-            ),
+            Effect.flatMap((planners) => {
+              const planner = planners.get(payload.threadId);
+              return routeCodexLiveVoiceTool(planner, payload, () =>
+                Ref.get(liveVoicePlanners).pipe(
+                  Effect.map(
+                    (current) =>
+                      planner !== undefined &&
+                      current.get(payload.threadId) === planner &&
+                      !planner.observerClosed &&
+                      planner.observerTurnId === payload.turnId,
+                  ),
+                ),
+              );
+            }),
           ),
         );
 
@@ -7399,12 +7500,60 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                             },
                           },
                         ]),
+                    ...(plannerInput.onObserveWork === undefined
+                      ? []
+                      : [
+                          {
+                            type: "function",
+                            name: "t3_voice_observe_work",
+                            description:
+                              "Explicitly attach or detach an observer for one exact existing canonical work attempt. Requested target IDs are not authority. This never submits, steers, cancels or restarts work.",
+                            inputSchema: {
+                              type: "object",
+                              properties: {
+                                action: { type: "string", enum: ["attach", "detach"] },
+                                target: {
+                                  type: "object",
+                                  properties: Object.fromEntries(
+                                    [
+                                      "environmentId",
+                                      "threadId",
+                                      "providerInstanceId",
+                                      "runId",
+                                      "attemptId",
+                                      "rootNodeId",
+                                    ].map((key) => [
+                                      key,
+                                      { type: "string", minLength: 1, maxLength: 512 },
+                                    ]),
+                                  ),
+                                  required: [
+                                    "environmentId",
+                                    "threadId",
+                                    "providerInstanceId",
+                                    "runId",
+                                    "attemptId",
+                                    "rootNodeId",
+                                  ],
+                                  additionalProperties: false,
+                                },
+                                progress: { type: "boolean" },
+                                completion: { type: "boolean" },
+                              },
+                              required: ["action", "target", "progress", "completion"],
+                              additionalProperties: false,
+                            },
+                          },
+                        ]),
                   ],
                   baseInstructions:
                     "You are a conversational voice companion with a separate background workspace executor. Keep talking naturally while work is queued or running; never wait for work to finish before answering another conversational turn. Submit each new workspace request once with t3_submit_voice_work; its receipt means admission, not completion. " +
                     (plannerInput.onWorkControl === undefined
                       ? ""
                       : "Use t3_voice_work_control for truthful status and explicit priority changes to the exact task runId. A completed run is not a ready result until resultReady is true; final results arrive separately in this conversation. Ask for clarification when the intended task is ambiguous. A rejected steer does not authorize a replacement task. ") +
+                    (plannerInput.onObserveWork === undefined
+                      ? ""
+                      : "Use t3_voice_observe_work only for explicit observation of an exact existing work attempt. An attach receipt is not progress, completion, verification or permission to control work. Detach and ending observation never cancel or steer work. Use only canonical observed artifact/result references; never invent accepted results. ") +
                     "Stopping speech or ending this call does not cancel background work. Never claim work is finished from a receipt. Do not execute workspace tools yourself or use any other tool.",
                 });
                 const started = yield* Schema.decodeUnknownEffect(
@@ -7464,6 +7613,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 yield* Ref.update(liveVoicePlanners, (current) =>
                   new Map(current).set(plannerNativeThreadId, {
                     onSubmitWork: plannerInput.onSubmitWork,
+                    ...(plannerInput.onObserveWork === undefined
+                      ? {}
+                      : {
+                          onObserveWork: plannerInput.onObserveWork,
+                          observerNativeThreadId: plannerNativeThreadId,
+                          observerTurnId: null,
+                          observerClosed: false,
+                        }),
                     ...(plannerInput.onWorkControl === undefined
                       ? {}
                       : { onWorkControl: plannerInput.onWorkControl }),
@@ -7487,9 +7644,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 })
                 .pipe(Effect.asVoid, Effect.mapError(liveVoiceFailure("realtime start"))),
             stop: (plannerNativeThreadId) =>
-              client.raw
-                .request("thread/realtime/stop", { threadId: plannerNativeThreadId })
-                .pipe(Effect.asVoid, Effect.mapError(liveVoiceFailure("realtime stop"))),
+              closeObserver(plannerNativeThreadId).pipe(
+                Effect.andThen(
+                  client.raw.request("thread/realtime/stop", { threadId: plannerNativeThreadId }),
+                ),
+                Effect.asVoid,
+                Effect.mapError(liveVoiceFailure("realtime stop")),
+              ),
             appendSpeech: (input) =>
               client.raw
                 .request("thread/realtime/appendSpeech", {

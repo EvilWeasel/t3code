@@ -32,6 +32,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as CodexClient from "effect-codex-app-server/client";
+import * as CodexSchema from "effect-codex-app-server/schema";
 import * as CodexError from "effect-codex-app-server/errors";
 import * as CodexReplay from "effect-codex-app-server/replay";
 import * as DateTime from "effect/DateTime";
@@ -71,6 +72,384 @@ const replayTranscriptJson = Schema.fromJsonString(CodexReplay.CodexAppServerRep
 const encodeReplayTranscriptJson = Schema.encodeEffect(replayTranscriptJson);
 const decodeReplayTranscriptJson = Schema.decodeUnknownEffect(replayTranscriptJson);
 const encodeStringJson = Schema.encodeEffect(Schema.fromJsonString(Schema.String));
+
+describe("Codex Live explicit observer native routing", () => {
+  type Observer = NonNullable<
+    Parameters<
+      ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]
+    >[0]["onObserveWork"]
+  >;
+  const target = {
+    environmentId: "env:fixture",
+    threadId: "thread:research",
+    providerInstanceId: "codex",
+    runId: "run:research",
+    attemptId: "attempt:research",
+    rootNodeId: "node:research",
+  };
+  const nativeThreadId = "observer-planner";
+  const nativeTurnId = "observer-turn";
+  const notification = (
+    method: string,
+    params: unknown,
+  ): CodexReplay.CodexAppServerReplayEntry => ({ type: "emit_inbound", frame: { method, params } });
+  const tool = (
+    id: string,
+    action: "attach" | "detach",
+    options: {
+      threadId?: string;
+      turnId?: string;
+      callId?: string;
+      arguments?: Schema.JsonObject;
+    } = {},
+  ): CodexReplay.CodexAppServerReplayEntry => ({
+    type: "emit_inbound",
+    label: id,
+    frame: {
+      id,
+      method: "item/tool/call",
+      params: {
+        threadId: options.threadId ?? nativeThreadId,
+        turnId: options.turnId ?? nativeTurnId,
+        callId: options.callId ?? id,
+        namespace: "t3",
+        tool: "t3_voice_observe_work",
+        arguments: options.arguments ?? { action, target, progress: true, completion: true },
+      },
+    },
+  });
+  const response = (id: string, success: boolean): CodexReplay.CodexAppServerReplayEntry => ({
+    type: "expect_outbound",
+    frame: {
+      id,
+      result: {
+        success,
+        contentItems: [
+          { type: "inputText", text: success ? '{"observed":true}' : '{"accepted":false}' },
+        ],
+      },
+    },
+  });
+  const turn = (id: string, status: "inProgress" | "completed") =>
+    notification(status === "inProgress" ? "turn/started" : "turn/completed", {
+      threadId: nativeThreadId,
+      turn: makeCodexReplayTurn({ id, status }),
+    });
+
+  const makeHarness = (
+    enabled: boolean,
+    entries: ReadonlyArray<CodexReplay.CodexAppServerReplayEntry>,
+    observe: Observer,
+  ) =>
+    Effect.gen(function* () {
+      const prepared = yield* Deferred.make<void>();
+      const finished = yield* Deferred.make<void>();
+      let plannerRequest: unknown;
+      let nativeClient: CodexClient.CodexAppServerClient["Service"] | undefined;
+      const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "unused" });
+      const initial = Schema.decodeUnknownSync(
+        Schema.Struct({ frame: Schema.Struct({ result: CodexSchema.V2ThreadStartResponse }) }),
+      )(preamble[4]).frame.result;
+      const transcript = makeCodexReplayTranscript({
+        scenario: `live-observer-${enabled}`,
+        entries: [
+          ...preamble.slice(0, 3),
+          { type: "expect_outbound", frame: { id: 2, method: "account/read", params: {} } },
+          { type: "emit_inbound", frame: { id: 2, result: { account: { type: "chatgpt" } } } },
+          // Native peer fixture accepts the produced request; assertions below
+          // independently inspect tool advertisement and its bounded schema.
+          {
+            type: "expect_outbound",
+            get frame() {
+              return { id: 3, method: "thread/start", params: plannerRequest };
+            },
+          },
+          {
+            type: "emit_inbound",
+            frame: {
+              id: 3,
+              result: {
+                ...initial,
+                approvalPolicy: "never",
+                sandbox: { type: "readOnly", networkAccess: false },
+              },
+            },
+          },
+          {
+            type: "expect_outbound",
+            frame: {
+              id: 4,
+              method: "thread/settings/update",
+              params: {
+                threadId: nativeThreadId,
+                model: CODEX_TEST_MODEL_SELECTION.model,
+                approvalPolicy: "never",
+                sandboxPolicy: { type: "readOnly", networkAccess: false },
+              },
+            },
+          },
+          { type: "emit_inbound", frame: { id: 4, result: {} } },
+          notification("thread/settings/updated", {
+            threadId: nativeThreadId,
+            threadSettings: {
+              model: CODEX_TEST_MODEL_SELECTION.model,
+              modelProvider: "openai",
+              cwd: "/workspace",
+              approvalPolicy: "never",
+              approvalsReviewer: "user",
+              collaborationMode: {
+                mode: "default",
+                settings: { model: CODEX_TEST_MODEL_SELECTION.model },
+              },
+              sandboxPolicy: { type: "readOnly", networkAccess: false },
+            },
+          }),
+          ...entries,
+          notification("thread/realtime/transcript/done", {
+            threadId: nativeThreadId,
+            role: "assistant",
+            text: "fixture-complete",
+          }),
+        ],
+      });
+      const driver = yield* CodexReplay.makeReplayDriver(transcript, {
+        beforeEmitInbound: (entry) =>
+          entry === entries[0] ? Deferred.await(prepared) : Effect.void,
+      });
+      const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
+        instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+        settings: DEFAULT_CODEX_SETTINGS,
+        environment: {},
+        clientFactory: {
+          open: () =>
+            Layer.build(CodexReplay.layerReplayWithDriver(driver)).pipe(
+              Effect.flatMap((context) =>
+                Effect.service(CodexClient.CodexAppServerClient).pipe(Effect.provide(context)),
+              ),
+              Effect.map((client) => {
+                nativeClient = client;
+                const request: CodexClient.CodexAppServerClient["Service"]["raw"]["request"] = (
+                  method,
+                  params,
+                ) => {
+                  if (method === "thread/start") plannerRequest = params;
+                  return client.raw.request(method, params);
+                };
+                return {
+                  ...client,
+                  raw: {
+                    ...client.raw,
+                    request,
+                  },
+                };
+              }),
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapter.ProviderAdapterOpenSessionError({
+                    driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+                    providerSessionId: ProviderSessionId.make("session:observer"),
+                    cause,
+                  }),
+              ),
+            ),
+        },
+        crypto: yield* Crypto.Crypto,
+        fileSystem: yield* FileSystem.FileSystem,
+        idAllocator: yield* IdAllocator.IdAllocatorV2,
+        serverConfig: yield* makeReplayServerConfig(`live-observer-${enabled}`).pipe(Effect.orDie),
+      });
+      const runtime = yield* adapter.openSession({
+        threadId: ThreadId.make("thread:voice-observer"),
+        providerSessionId: ProviderSessionId.make("session:observer"),
+        modelSelection: CODEX_TEST_MODEL_SELECTION,
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+      });
+      const live = runtime.liveVoice!;
+      yield* live.events.pipe(
+        Stream.runForEach((event) =>
+          event.type === "transcript" && event.text === "fixture-complete"
+            ? Deferred.succeed(finished, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+      yield* live.preparePlanner({
+        modelSelection: CODEX_TEST_MODEL_SELECTION,
+        onSubmitWork: () => Effect.die("Observer must not submit work"),
+        ...(enabled ? { onObserveWork: observe } : {}),
+      });
+      const request = Schema.decodeUnknownSync(
+        Schema.Struct({
+          dynamicTools: Schema.Array(
+            Schema.Struct({ name: Schema.String, inputSchema: Schema.JsonObject }),
+          ),
+          baseInstructions: Schema.String,
+        }),
+      )(plannerRequest);
+      const advertised = request.dynamicTools.find(
+        (value) => value.name === "t3_voice_observe_work",
+      );
+      assert.equal(advertised !== undefined, enabled);
+      if (advertised) {
+        assert.deepEqual(advertised.inputSchema.required, [
+          "action",
+          "target",
+          "progress",
+          "completion",
+        ]);
+        assert.equal(advertised.inputSchema.additionalProperties, false);
+        assert.include(request.baseInstructions, "never invent accepted results");
+      } else assert.notInclude(request.baseInstructions, "t3_voice_observe_work");
+      return {
+        start: Deferred.succeed(prepared, undefined),
+        finished: Deferred.await(finished),
+        nativeClient: nativeClient!,
+        driver,
+      };
+    });
+
+  it.effect.each([true, false])(
+    "native observer optional=%s preserves exact envelope and refuses foreign/ended calls",
+    (enabled) =>
+      Effect.gen(function* () {
+        const seen: Parameters<Observer>[0][] = [];
+        const entries = [
+          tool("before-turn", "attach"),
+          response("before-turn", false),
+          turn(nativeTurnId, "inProgress"),
+          tool("foreign", "attach", { threadId: "foreign-planner" }),
+          response("foreign", false),
+          tool("old", "attach", { turnId: "old-native-turn" }),
+          response("old", false),
+          tool("empty-call", "attach", { callId: "" }),
+          response("empty-call", false),
+          tool("attach", "attach"),
+          response("attach", enabled),
+          tool("detach", "detach"),
+          response("detach", enabled),
+          tool("malformed", "attach", {
+            arguments: {
+              action: "attach",
+              target: { ...target, forged: "authority" },
+              progress: true,
+              completion: true,
+            },
+          }),
+          response("malformed", false),
+          turn(nativeTurnId, "completed"),
+          tool("ended", "attach"),
+          response("ended", false),
+          notification("thread/realtime/closed", { threadId: nativeThreadId }),
+          turn("late-after-end", "inProgress"),
+          tool("late", "attach", { turnId: "late-after-end" }),
+          response("late", false),
+        ];
+        const harness = yield* makeHarness(enabled, entries, (input) =>
+          Effect.sync(() => {
+            seen.push(input);
+            return '{"observed":true}';
+          }),
+        );
+        yield* harness.start;
+        yield* harness.finished;
+        assert.deepEqual(
+          seen,
+          enabled
+            ? ["attach", "detach"].map((action) => ({
+                plannerNativeThreadId: nativeThreadId,
+                plannerTurnId: nativeTurnId,
+                callId: action,
+                action,
+                target,
+                progress: true,
+                completion: true,
+              }))
+            : [],
+        );
+        assert.isNull((yield* Ref.get(harness.driver.state)).failure);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+        ),
+      ),
+  );
+
+  it.effect("native rollover during deferred observer callback refuses late success", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const rolled = yield* Deferred.make<void>();
+      const entries = [
+        turn(nativeTurnId, "inProgress"),
+        tool("rollover", "attach"),
+        turn(nativeTurnId, "completed"),
+        turn("replacement-turn", "inProgress"),
+        response("rollover", false),
+      ];
+      let calls = 0;
+      const harness = yield* makeHarness(true, entries, () =>
+        Effect.sync(() => {
+          calls++;
+        }).pipe(
+          Effect.andThen(Deferred.succeed(entered, undefined)),
+          Effect.andThen(Deferred.await(release)),
+          Effect.as('{"observed":true}'),
+        ),
+      );
+      yield* harness.nativeClient.handleServerNotification("turn/started", (payload) =>
+        payload.turn.id === "replacement-turn"
+          ? Deferred.succeed(rolled, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      );
+      yield* harness.start;
+      yield* Deferred.await(entered);
+      yield* Deferred.await(rolled);
+      yield* Deferred.succeed(release, undefined);
+      yield* harness.finished;
+      assert.equal(calls, 1);
+      assert.isNull((yield* Ref.get(harness.driver.state)).failure);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+      ),
+    ),
+  );
+  it.effect(
+    "native canonical service refusal remains a bounded refusal without submitting work",
+    () =>
+      Effect.gen(function* () {
+        let calls = 0;
+        const harness = yield* makeHarness(
+          true,
+          [turn(nativeTurnId, "inProgress"), tool("refused", "attach"), response("refused", false)],
+          () =>
+            Effect.sync(() => {
+              calls++;
+            }).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+                    detail: "Synthetic owner refusal, never expose provider detail",
+                  }),
+                ),
+              ),
+            ),
+        );
+        yield* harness.start;
+        yield* harness.finished;
+        assert.equal(calls, 1);
+        assert.isNull((yield* Ref.get(harness.driver.state)).failure);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+        ),
+      ),
+  );
+});
 
 describe("restricted conversational LiveVoice tools", () => {
   it.effect("keeps correlated status and steering available while submitted work is held", () =>
