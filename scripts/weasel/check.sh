@@ -71,6 +71,22 @@ focused_tests=(
   apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
   apps/web/src/voice/voiceSettingsClient.test.ts
 )
+automatic_update_tests=(
+  apps/desktop/src/backend/DesktopBackendManager.test.ts
+  apps/desktop/src/backend/DesktopBackendPool.test.ts
+  apps/desktop/src/ipc/methods/updates.test.ts
+  apps/web/src/state/desktopUpdate.test.ts
+  apps/web/src/state/desktopUpdateReadiness.test.ts
+  apps/web/src/state/desktopUpdateDraftPersistence.test.ts
+  apps/web/src/composerDraftStore.test.ts
+)
+for automatic_update_test in "${automatic_update_tests[@]}"; do
+  if [[ ! -f "$automatic_update_test" ]]; then
+    echo "Required update readiness gate is missing: $automatic_update_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$automatic_update_test")
+done
 approval_tests=(
   apps/web/src/components/chat/ComposerPendingApprovalPanel.test.tsx
   apps/web/src/components/chat/ComposerPendingApprovalActions.test.tsx
