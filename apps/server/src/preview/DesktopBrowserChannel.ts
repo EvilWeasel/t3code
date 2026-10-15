@@ -13,6 +13,9 @@ import {
   DesktopBrowserCommand,
   DesktopBrowserEvent,
   type DesktopBrowserCommand as DesktopBrowserCommandType,
+  type DesktopBrowserPrivateEntryAttachment,
+  type DesktopBrowserPrivateEntryRequest,
+  type DesktopBrowserPrivateEntryResponse,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
@@ -40,6 +43,13 @@ export interface DesktopTabKey {
   readonly tabId: string;
 }
 
+export type DesktopPrivateEntryTarget = DesktopTabKey & DesktopBrowserPrivateEntryAttachment;
+export interface DesktopPrivateEntryHandler {
+  /** Starts acquisition synchronously; must not wait for SessionControl's drain. */
+  readonly request: (request: DesktopBrowserPrivateEntryRequest) => Effect.Effect<void>;
+  readonly invalidate: (target: DesktopPrivateEntryTarget) => Effect.Effect<void>;
+}
+
 const keyOf = ({ threadId, tabId }: DesktopTabKey) => `${threadId}\u0000${tabId}`;
 
 export class DesktopBrowserChannel extends Context.Service<
@@ -47,6 +57,17 @@ export class DesktopBrowserChannel extends Context.Service<
   {
     /** False when this server was not started by a desktop app. */
     readonly available: boolean;
+    /** One ServerBrowser authority per channel scope. No renderer or network authority. */
+    readonly registerPrivateEntryHandler: (
+      handler: DesktopPrivateEntryHandler,
+    ) => Effect.Effect<void, never, Scope.Scope>;
+    readonly isCurrentPrivateEntryAttachment: (
+      target: DesktopPrivateEntryTarget,
+    ) => Effect.Effect<boolean>;
+    /** False if detached/disconnected or the bound reply could not be written. */
+    readonly sendPrivateEntry: (
+      response: DesktopBrowserPrivateEntryResponse,
+    ) => Effect.Effect<boolean>;
     /**
      * Waits for a tab to be attached. Subscribes before it checks, so an
      * attach landing in between is never missed. False after `timeout`.
@@ -83,6 +104,9 @@ const make = Effect.gen(function* () {
   if (inputFd === undefined || controlFd === undefined) {
     return DesktopBrowserChannel.of({
       available: false,
+      registerPrivateEntryHandler: () => Effect.void,
+      isCurrentPrivateEntryAttachment: () => Effect.succeed(false),
+      sendPrivateEntry: () => Effect.succeed(false),
       awaitAttached: () => Effect.succeed(false),
       detached: Stream.empty,
       attached: Stream.empty,
@@ -203,6 +227,10 @@ const make = Effect.gen(function* () {
 
   return DesktopBrowserChannel.of({
     available: true,
+    // ABI checkpoint: no grant until the ServerBrowser reservation implementation lands.
+    registerPrivateEntryHandler: () => Effect.void,
+    isCurrentPrivateEntryAttachment: () => Effect.succeed(false),
+    sendPrivateEntry: () => Effect.succeed(false),
     awaitAttached: (key, timeout) =>
       Effect.scoped(
         Effect.gen(function* () {
