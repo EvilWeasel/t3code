@@ -147,9 +147,9 @@ describe("Codex Live explicit observer native routing", () => {
       let plannerRequest: unknown;
       let nativeClient: CodexClient.CodexAppServerClient["Service"] | undefined;
       const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "unused" });
-      const initial = Schema.decodeUnknownSync(
+      const initial = (yield* Schema.decodeUnknownEffect(
         Schema.Struct({ frame: Schema.Struct({ result: CodexSchema.V2ThreadStartResponse }) }),
-      )(preamble[4]).frame.result;
+      )(preamble[4])).frame.result;
       const transcript = makeCodexReplayTranscript({
         scenario: `live-observer-${enabled}`,
         entries: [
@@ -278,7 +278,7 @@ describe("Codex Live explicit observer native routing", () => {
         onSubmitWork: () => Effect.die("Observer must not submit work"),
         ...(enabled ? { onObserveWork: observe } : {}),
       });
-      const request = Schema.decodeUnknownSync(
+      const request = yield* Schema.decodeUnknownEffect(
         Schema.Struct({
           dynamicTools: Schema.Array(
             Schema.Struct({ name: Schema.String, inputSchema: Schema.JsonObject }),
@@ -355,7 +355,7 @@ describe("Codex Live explicit observer native routing", () => {
         assert.deepEqual(
           seen,
           enabled
-            ? ["attach", "detach"].map((action) => ({
+            ? (["attach", "detach"] as const).map((action) => ({
                 plannerNativeThreadId: nativeThreadId,
                 plannerTurnId: nativeTurnId,
                 callId: action,
