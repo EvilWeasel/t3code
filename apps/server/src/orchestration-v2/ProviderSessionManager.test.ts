@@ -4978,3 +4978,144 @@ it.effect(
       }),
     ),
 );
+
+for (const outcome of [
+  "close-before-handoff",
+  "interrupt-before-handoff",
+  "queued-drop",
+  "queued-and-taken",
+] as const) {
+  it.effect(`native input settlement: ${outcome}`, () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const state = yield* Ref.make(emptyState);
+        yield* Effect.gen(function* () {
+          const sink = yield* EventSink.EventSinkV2;
+          const allocator = yield* IdAllocator.IdAllocatorV2;
+          const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+          const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+          const projections = yield* ProjectionStore.ProjectionStoreV2;
+          const now = yield* DateTime.now;
+          const threadId = ThreadId.make(`thread:input-settlement:${outcome}`);
+          const sessionId = yield* allocator.allocate.providerSession({
+            providerInstanceId: modelSelection.instanceId,
+            threadId,
+          });
+          yield* sink.write({
+            events: [yield* makeThreadCreatedEvent({ idAllocator: allocator, threadId, now })],
+          });
+          const runtime = yield* manager.open({
+            threadId,
+            providerSessionId: sessionId,
+            modelSelection,
+            runtimePolicy,
+          });
+          const event = {
+            type: "provider_thread.updated" as const,
+            driver: CODEX_DRIVER,
+            providerThread: makeProviderThread({
+              idAllocator: allocator,
+              threadId,
+              providerSessionId: sessionId,
+              now,
+            }),
+          };
+          const gate = yield* makeBackendUpdateGate;
+          const observed = yield* Deferred.make<void>();
+          const settled = yield* Deferred.make<void>();
+          let interruptPump: Effect.Effect<void> | undefined;
+          manager.setUpdateAdmissionGate!({
+            ...gate,
+            noteNativeSettled: (input) => {
+              gate.noteNativeSettled(input);
+              if (input === event) Effect.runSync(Deferred.succeed(settled, undefined));
+            },
+            observe: (effect) =>
+              Effect.withFiber((fiber) => {
+                interruptPump = Fiber.interrupt(fiber).pipe(Effect.asVoid);
+                return outcome === "queued-and-taken" || outcome === "queued-drop"
+                  ? gate
+                      .observe(effect)
+                      .pipe(Effect.tap(() => Deferred.succeed(observed, undefined)))
+                  : Deferred.succeed(observed, undefined).pipe(
+                      Effect.andThen(gate.observe(effect)),
+                    );
+              }),
+          });
+          const first = yield* runtime.subscribeEvents!;
+          const second =
+            outcome === "queued-and-taken" ? yield* runtime.subscribeEvents! : undefined;
+          if (outcome === "close-before-handoff" || outcome === "interrupt-before-handoff")
+            yield* gate.hold;
+          const queue = (yield* Ref.get(state)).eventQueues.get(String(sessionId))!;
+          yield* Queue.offer(queue, event);
+          yield* Deferred.await(observed);
+          assert.equal(gate.pendingNative(), 1);
+          if (outcome === "queued-and-taken") {
+            yield* first.close;
+            // Dropping one queued copy cannot settle another copy or a taken event.
+            assert.equal(gate.pendingNative(), 1);
+            const received = yield* second!.events.pipe(Stream.runHead);
+            assert.isTrue(Option.isSome(received));
+            yield* second!.close;
+            assert.equal(gate.pendingNative(), 1);
+            assert.lengthOf(
+              (yield* projections.getThreadRecords(threadId, ["providerThreads"])).providerThreads,
+              0,
+            );
+            yield* ingestor.ingestNormalized({
+              providerSessionId: sessionId,
+              providerInstanceId: modelSelection.instanceId,
+              threadId,
+              event,
+            });
+            assert.lengthOf(
+              (yield* projections.getThreadRecords(threadId, ["providerThreads"])).providerThreads,
+              1,
+            );
+          } else if (outcome === "queued-drop") {
+            yield* first.close;
+          } else if (outcome === "close-before-handoff") {
+            yield* first.close;
+            yield* gate.release;
+          } else {
+            assert.isDefined(interruptPump);
+            yield* interruptPump!;
+            yield* first.close;
+            yield* gate.release;
+          }
+          yield* Deferred.await(settled);
+          assert.equal(gate.pendingNative(), 0);
+          // A later reservation must not inherit a false busy count from dropped input.
+          const responses: DesktopBackendUpdateResponse[] = [];
+          const coordinator = yield* makeBackendUpdateCoordinator({
+            environmentId: "env",
+            bootId: "boot",
+            gate,
+            prepare: Effect.succeed({ runIds: [], effectIds: [] }),
+            validate: Effect.succeed(true),
+            clear: Effect.void,
+            busy: Effect.succeed(false),
+            wake: Effect.void,
+            now: Effect.map(DateTime.now, DateTime.toEpochMillis),
+            send: (response) =>
+              Effect.sync(() => {
+                responses.push(response);
+              }),
+          });
+          const context = {
+            environmentId: "env",
+            bootId: "boot",
+            requestId: "after-drop",
+            targetVersion: "26",
+            admissionGeneration: 1,
+            expiresAt: DateTime.toEpochMillis(now) + 20_000,
+          };
+          yield* coordinator.request({ version: 1, type: "prepareBackendUpdate", context });
+          assert.isTrue(responses.some((response) => response.type === "backendUpdatePrepared"));
+          yield* coordinator.request({ version: 1, type: "abortBackendUpdate", context });
+        }).pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+      }),
+    ),
+  );
+}

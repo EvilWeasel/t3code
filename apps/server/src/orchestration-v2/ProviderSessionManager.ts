@@ -246,7 +246,11 @@ interface IdleThreadUnload {
 }
 
 type ProviderSessionEventSignal =
-  | { readonly type: "event"; readonly event: ProviderAdapter.ProviderAdapterV2Event }
+  | {
+      readonly type: "event";
+      readonly event: ProviderAdapter.ProviderAdapterV2Event;
+      readonly onTake?: () => boolean;
+    }
   | {
       readonly type: "failure";
       readonly cause: Cause.Cause<ProviderAdapter.ProviderAdapterV2Error>;
@@ -572,18 +576,50 @@ export const layerWithOptions = (
               ),
             );
 
+      // Track only undelivered obligations on the existing subscription queues.
+      // A close may discard a chunk already pulled from the queue by the stream.
+      const pendingDeliveries = new WeakMap<
+        Queue.Queue<ProviderSessionEventSignal, Cause.Done>,
+        Set<() => void>
+      >();
+      const discardDeliveries = (queue: Queue.Queue<ProviderSessionEventSignal, Cause.Done>) =>
+        Effect.sync(() => {
+          for (const drop of pendingDeliveries.get(queue) ?? []) drop();
+          pendingDeliveries.delete(queue);
+        });
       const publishToSubscribers = (
         subscribers: Ref.Ref<
           ReadonlyMap<number, Queue.Queue<ProviderSessionEventSignal, Cause.Done>>
         >,
         signal: ProviderSessionEventSignal,
+        recipient?: () => { take: () => boolean; drop: () => void },
       ) =>
-        Ref.get(subscribers).pipe(
-          Effect.flatMap((current) =>
-            Effect.forEach(current.values(), (queue) => Queue.offer(queue, signal), {
-              discard: true,
-            }),
-          ),
+        Effect.uninterruptible(
+          Effect.gen(function* () {
+            const current = yield* Ref.get(subscribers);
+            for (const queue of current.values()) {
+              if (signal.type !== "event" || recipient === undefined) {
+                yield* Queue.offer(queue, signal);
+                continue;
+              }
+              const delivery = recipient();
+              const pending = pendingDeliveries.get(queue) ?? new Set<() => void>();
+              pendingDeliveries.set(queue, pending);
+              const drop = () => {
+                pending.delete(drop);
+                delivery.drop();
+              };
+              pending.add(drop);
+              const accepted = yield* Queue.offer(queue, {
+                ...signal,
+                onTake: () => {
+                  pending.delete(drop);
+                  return delivery.take();
+                },
+              });
+              if (!accepted) drop();
+            }
+          }),
         );
 
       const failSubscribers = (entry: LiveSessionEntry, detail: string) =>
@@ -610,7 +646,11 @@ export const layerWithOptions = (
           const subscribers = yield* Ref.getAndSet(entry.eventSubscribers, new Map());
           yield* Effect.forEach(
             subscribers.values(),
-            (queue) => Queue.clear(queue).pipe(Effect.andThen(Queue.end(queue))),
+            (queue) =>
+              Queue.end(queue).pipe(
+                Effect.andThen(discardDeliveries(queue)),
+                Effect.andThen(Queue.clear(queue)),
+              ),
             { discard: true },
           );
         });
@@ -1663,26 +1703,27 @@ export const layerWithOptions = (
             updated.set(subscriberId, queue);
             return updated;
           });
-          const close = Ref.modify(subscribers, (current) => {
-            if (!current.has(subscriberId)) {
-              return [false, current] as const;
-            }
+          const close = Ref.update(subscribers, (current) => {
             const updated = new Map(current);
             updated.delete(subscriberId);
-            return [true, updated] as const;
+            return updated;
           }).pipe(
-            Effect.flatMap((removed) =>
-              removed
-                ? Queue.clear(queue).pipe(Effect.andThen(Queue.end(queue)), Effect.asVoid)
-                : Effect.void,
-            ),
+            // End first: a publisher with an earlier subscriber snapshot must
+            // not enqueue a new obligation after this close discards them.
+            Effect.andThen(Queue.end(queue)),
+            Effect.andThen(discardDeliveries(queue)),
+            Effect.andThen(Queue.clear(queue)),
+            Effect.asVoid,
           );
           const events = Stream.fromQueue(queue).pipe(
             Stream.mapEffect((signal) =>
               signal.type === "event"
-                ? Effect.succeed(signal.event)
+                ? Effect.sync(() => {
+                    return signal.onTake?.() === false ? [] : [signal.event];
+                  })
                 : Effect.failCause(signal.cause),
             ),
+            Stream.flattenArray,
             Stream.ensuring(close),
           );
           return { events, close } satisfies ProviderAdapter.ProviderAdapterV2EventSubscription;
@@ -1931,6 +1972,7 @@ export const layerWithOptions = (
             ) {
               stoppedByProvider = true;
             }
+            let recipient: (() => { take: () => boolean; drop: () => void }) | undefined;
             const consume = observeActivity(
               entry.runtime.providerSessionId,
               event.type === "turn.terminal"
@@ -1979,7 +2021,11 @@ export const layerWithOptions = (
                     }).pipe(entry.requestEventPermit.withPermits(1));
                     return;
                   }
-                  yield* publishToSubscribers(entry.eventSubscribers, { type: "event", event });
+                  yield* publishToSubscribers(
+                    entry.eventSubscribers,
+                    { type: "event", event },
+                    recipient,
+                  );
                 }),
               ),
             );
@@ -1990,16 +2036,41 @@ export const layerWithOptions = (
               // nonsemantic event may have a terminal event queued behind it.
               gate.noteNativeQueued(event);
               gate.noteControl();
-              const canonicalSubscriber =
-                (yield* Ref.get(entry.eventSubscribers)).size > 0 &&
-                (event.type === "provider_turn.updated" ||
-                  event.type === "provider_thread.updated" ||
-                  event.type === "subagent.updated" ||
-                  event.type === "runtime_request.updated" ||
-                  (event.type === "node.updated" && event.node.kind !== "assistant_message") ||
-                  (event.type === "turn_item.updated" &&
-                    event.turnItem.type !== "assistant_message" &&
-                    event.turnItem.type !== "reasoning"));
+              let queued = 0;
+              let consumed = false;
+              let finished = false;
+              const settleUndelivered = () => {
+                if (finished && queued === 0 && !consumed) gate.noteNativeSettled(event);
+              };
+              const semantic =
+                event.type === "provider_turn.updated" ||
+                event.type === "provider_thread.updated" ||
+                event.type === "subagent.updated" ||
+                event.type === "runtime_request.updated" ||
+                (event.type === "node.updated" && event.node.kind !== "assistant_message") ||
+                (event.type === "turn_item.updated" &&
+                  event.turnItem.type !== "assistant_message" &&
+                  event.turnItem.type !== "reasoning");
+              if (semantic)
+                recipient = () => {
+                  queued++;
+                  let pending = true;
+                  return {
+                    take: () => {
+                      if (!pending) return false;
+                      pending = false;
+                      queued--;
+                      consumed = true;
+                      return true;
+                    },
+                    drop: () => {
+                      if (!pending) return;
+                      pending = false;
+                      queued--;
+                      settleUndelivered();
+                    },
+                  };
+                };
               const terminal =
                 event.type === "turn.terminal" ||
                 (event.type === "provider_turn.updated" &&
@@ -2009,7 +2080,8 @@ export const layerWithOptions = (
               return yield* (terminal ? gate.terminal(consume) : gate.observe(consume)).pipe(
                 Effect.ensuring(
                   Effect.sync(() => {
-                    if (!canonicalSubscriber) gate.noteNativeSettled(event);
+                    finished = true;
+                    settleUndelivered();
                   }),
                 ),
               );
