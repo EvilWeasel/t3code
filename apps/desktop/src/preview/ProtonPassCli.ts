@@ -50,24 +50,30 @@ export const runProtonPassEffect = (args: readonly string[]) =>
           }),
         )
         .pipe(Effect.mapError(() => new ProtonPassUnavailable("missing")));
-      let stdout = "";
-      let stderr = "";
+      const stdout = new Uint8Array(1024 * 1024);
+      const stderr = new Uint8Array(4096);
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
       const [, , code] = yield* Effect.all(
         [
           child.stdout.pipe(
-            Stream.decodeText(),
-            Stream.runForEach((text) => {
-              stdout += text;
-              return stdout.length > 1024 * 1024
-                ? Effect.fail(new ProtonPassUnavailable("unavailable"))
-                : Effect.void;
+            Stream.runForEach((bytes) => {
+              // Reject the whole excess chunk before copying or decoding any of it.
+              if (bytes.byteLength > stdout.byteLength - stdoutBytes)
+                return Effect.fail(new ProtonPassUnavailable("unavailable"));
+              return Effect.sync(() => {
+                stdout.set(bytes, stdoutBytes);
+                stdoutBytes += bytes.byteLength;
+              });
             }),
           ),
           child.stderr.pipe(
-            Stream.decodeText(),
-            Stream.runForEach((text) =>
+            Stream.runForEach((bytes) =>
               Effect.sync(() => {
-                stderr = (stderr + text).slice(0, 4096);
+                // Keep the bounded raw prefix while continuing to drain every subsequent byte.
+                const retainedBytes = Math.min(bytes.byteLength, stderr.byteLength - stderrBytes);
+                stderr.set(bytes.subarray(0, retainedBytes), stderrBytes);
+                stderrBytes += retainedBytes;
               }),
             ),
           ),
@@ -75,17 +81,22 @@ export const runProtonPassEffect = (args: readonly string[]) =>
         ],
         { concurrency: "unbounded" },
       );
-      if (code !== 0)
+      // A single EOF decode handles chunk boundaries and flushes a terminal incomplete sequence.
+      // ignoreBOM preserves a leading U+FEFF credential character rather than consuming it.
+      const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+      if (code !== 0) {
+        const diagnostic = decoder.decode(stderr.subarray(0, stderrBytes));
         return yield* Effect.fail(
           new ProtonPassUnavailable(
-            /locked|lock code|keyring/i.test(stderr)
+            /locked|lock code|keyring/i.test(diagnostic)
               ? "locked"
-              : /authenticated client|not logged|no session/i.test(stderr)
+              : /authenticated client|not logged|no session/i.test(diagnostic)
                 ? "signed-out"
                 : "unavailable",
           ),
         );
-      return stdout;
+      }
+      return decoder.decode(stdout.subarray(0, stdoutBytes));
     }),
   ).pipe(
     // Interrupting the scope kills the captured child, including on output overflow or timeout.

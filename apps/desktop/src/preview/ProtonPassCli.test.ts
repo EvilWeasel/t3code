@@ -179,3 +179,168 @@ for (const [upstream, state] of [
     }),
   );
 }
+
+const successfulOutput = (chunks: readonly Uint8Array[]) =>
+  fixtureSpawner({
+    stdout: Stream.fromIterable(chunks),
+    stderr: Stream.empty,
+    exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+    started: Effect.void,
+    stopped: Effect.void,
+  });
+
+for (const terminalPartial of [false, true]) {
+  effectIt.effect(`preserves a leading BOM and split UTF-8, EOF flush=${terminalPartial}`, () =>
+    Effect.gen(function* () {
+      const text = "\uFEFF  user🙂€\n\n";
+      const bytes = new TextEncoder().encode(text);
+      // Split both the BOM and each multibyte character into individual bytes.
+      const chunks = Array.from(bytes, (byte) => Uint8Array.of(byte));
+      if (terminalPartial) chunks.push(Uint8Array.of(0xe2), Uint8Array.of(0x82));
+      const result = yield* runProtonPassEffect(["item", "view"]).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, successfulOutput(chunks)),
+      );
+      expect(result).toBe(text + (terminalPartial ? "\uFFFD" : ""));
+    }),
+  );
+}
+
+it("round-trips selected fields through the real runner, preserving BOM/whitespace and removing one LF only", async () => {
+  const username = "\uFEFF  synthetic🙂€\t";
+  const password = "\uFEFF synthetic-secret€🙂\n";
+  const invoked: string[][] = [];
+  const run = async (args: readonly string[]) => {
+    invoked.push([...args]);
+    const output =
+      args[0] === "--version"
+        ? "Proton Pass CLI 2.4.2\n"
+        : args.at(-1) === "username"
+          ? username + "\n"
+          : password + "\n";
+    const bytes = new TextEncoder().encode(output);
+    return Effect.runPromise(
+      runProtonPassEffect(args).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          successfulOutput(Array.from(bytes, (byte) => Uint8Array.of(byte))),
+        ),
+      ),
+    );
+  };
+  const provider = makeProtonPassProvider(run);
+  const selected = { shareId: "owned-vault", itemId: "owned-item", title: "Synthetic login" };
+  expect(await provider.credentials(selected)).toEqual({ username, password });
+  expect(invoked).toEqual([
+    ["--version"],
+    [
+      "item",
+      "view",
+      "--share-id",
+      selected.shareId,
+      "--item-id",
+      selected.itemId,
+      "--field",
+      "username",
+    ],
+    [
+      "item",
+      "view",
+      "--share-id",
+      selected.shareId,
+      "--item-id",
+      selected.itemId,
+      "--field",
+      "password",
+    ],
+  ]);
+});
+
+effectIt.effect("accepts exactly 1 MiB of multibyte output split inside a code point", () =>
+  Effect.gen(function* () {
+    const text = "é".repeat(512 * 1024);
+    const bytes = new TextEncoder().encode(text);
+    expect(bytes.byteLength).toBe(1024 * 1024);
+    const result = yield* runProtonPassEffect(["item", "view"]).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        successfulOutput([
+          bytes.subarray(0, 1),
+          bytes.subarray(1, bytes.byteLength - 1),
+          bytes.subarray(bytes.byteLength - 1),
+        ]),
+      ),
+    );
+    expect(result === text).toBe(true);
+  }),
+);
+
+effectIt.effect(
+  "rejects UTF-8 byte overflow below the old code-unit cap and finalizes the process",
+  () =>
+    Effect.gen(function* () {
+      const text = "é".repeat(512 * 1024 + 1);
+      const bytes = new TextEncoder().encode(text);
+      expect(text.length).toBeLessThan(1024 * 1024);
+      expect(bytes.byteLength).toBeGreaterThan(1024 * 1024);
+      let stopped = 0;
+      const spawner = fixtureSpawner({
+        stdout: Stream.make(bytes.subarray(0, 1024 * 1024 - 1), bytes.subarray(1024 * 1024 - 1)),
+        stderr: Stream.empty,
+        exitCode: Effect.never,
+        started: Effect.void,
+        stopped: Effect.sync(() => {
+          stopped += 1;
+        }),
+      });
+      const result = yield* runProtonPassEffect(["item", "view"]).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.result,
+      );
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) expect(result.failure.state).toBe("unavailable");
+      expect(stopped).toBe(1);
+    }),
+);
+
+effectIt.effect(
+  "retains only the first 4096 stderr bytes and concurrently drains the entire tail",
+  () =>
+    Effect.gen(function* () {
+      const drained = yield* Deferred.make<void>();
+      const prefix = new TextEncoder().encode("é".repeat(2048));
+      const tail = new TextEncoder().encode("locked private-tail-must-not-classify");
+      expect(prefix.byteLength).toBe(4096);
+      let consumed = 0;
+      const stderr = Stream.make(prefix.subarray(0, 4095), prefix.subarray(4095), tail).pipe(
+        Stream.tap((bytes) =>
+          Effect.sync(() => {
+            consumed += bytes.byteLength;
+          }),
+        ),
+        Stream.concat(
+          Stream.fromEffect(Deferred.succeed(drained, undefined).pipe(Effect.as(new Uint8Array()))),
+        ),
+      );
+      const spawner = fixtureSpawner({
+        // stdout cannot finish unless stderr reaches its explicit terminal handshake.
+        stdout: Stream.fromEffect(
+          Deferred.await(drained).pipe(Effect.as(new TextEncoder().encode("synthetic"))),
+        ),
+        stderr,
+        exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(1)),
+        started: Effect.void,
+        stopped: Effect.void,
+      });
+      const result = yield* runProtonPassEffect(["vault", "list"]).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Effect.result,
+      );
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure.state).toBe("unavailable");
+        expect(result.failure.message).not.toContain("private-tail");
+      }
+      expect(consumed).toBe(prefix.byteLength + tail.byteLength);
+      expect(yield* Deferred.isDone(drained)).toBe(true);
+    }),
+);
