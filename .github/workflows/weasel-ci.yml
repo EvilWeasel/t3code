@@ -60,6 +60,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsecret-1-dev pkg-config
           vp run build:desktop
+      - name: Capture synthetic voice UI across sizes and themes
+        run: node scripts/weasel/voice-ui-artifact.mjs
+      - name: Preserve visual fixture evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-ui-${{ github.sha }}
+          path: product-evidence/voice-ui
+          if-no-files-found: warn
+          retention-days: 7
       - name: Bind bundle to exact source
         env:
           SOURCE_SHA: ${{ github.sha }}
