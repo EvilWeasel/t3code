@@ -273,10 +273,12 @@ it.live.each([
         assert.equal(activates, 0);
       }),
     ).pipe(
-      Effect.provide(NodeServices.layer),
       Effect.provide(
-        ServerConfig.layerTest("/fixture", { prefix: "local-main" }).pipe(
-          Layer.provide(NodeServices.layer),
+        Layer.mergeAll(
+          NodeServices.layer,
+          ServerConfig.layerTest("/fixture", { prefix: "local-main" }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
         ),
       ),
     ),
@@ -355,10 +357,12 @@ it.live(
       });
       assert.equal(inspected, 0);
     }).pipe(
-      Effect.provide(NodeServices.layer),
       Effect.provide(
-        ServerConfig.layerTest("/fixture", { prefix: "local-main-refusal" }).pipe(
-          Layer.provide(NodeServices.layer),
+        Layer.mergeAll(
+          NodeServices.layer,
+          ServerConfig.layerTest("/fixture", { prefix: "local-main-refusal" }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
         ),
       ),
     ),
