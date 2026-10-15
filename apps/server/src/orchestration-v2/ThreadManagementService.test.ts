@@ -1,6 +1,8 @@
 import { expect, it } from "@effect/vitest";
 import {
   CommandId,
+  EnvironmentId,
+  PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   MessageId,
   NodeId,
   type OrchestrationV2Command,
@@ -11,7 +13,7 @@ import {
   ProviderDriverKind,
   ProviderSessionId,
   type OrchestrationV2StoredEvent,
-  type OrchestrationV2ThreadProjection,
+  OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderInstanceId,
@@ -19,6 +21,10 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
+import * as Schema from "effect/Schema";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
+import { projectedRowEncodedBytes } from "./threadHistoryPaging.ts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as Duration from "effect/Duration";
@@ -1287,4 +1293,256 @@ it.effect.each([
 
     expect(dispatched).toEqual(settles ? ["thread.settle"] : []);
   }),
+);
+
+const transcriptThreadId = ThreadId.make("thread:transcript:destination");
+const transcriptEnvironmentId = EnvironmentId.make("environment:transcript:destination");
+const layerTranscriptIdentity = Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
+  getEnvironmentId: Effect.succeed(transcriptEnvironmentId),
+});
+
+const transcriptProjection = (
+  now: DateTime.Utc,
+  text = "Visible local answer",
+  title = "Transcript fixture",
+) => {
+  const item = {
+    id: "item:transcript:local",
+    threadId: transcriptThreadId,
+    runId: null,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: 1,
+    status: "completed",
+    title: null,
+    startedAt: now,
+    completedAt: now,
+    updatedAt: now,
+    type: "assistant_message",
+    messageId: "message:transcript:local",
+    text,
+    streaming: false,
+  };
+  return Schema.decodeUnknownEffect(OrchestrationV2ThreadProjection)({
+    thread: {
+      id: transcriptThreadId,
+      projectId: "project:transcript",
+      title,
+      createdBy: "user",
+      creationSource: "web",
+      providerInstanceId: "codex",
+      modelSelection: { instanceId: "codex", model: "gpt-5-codex" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: null,
+      lineage: {
+        parentThreadId: null,
+        relationshipToParent: null,
+        rootThreadId: transcriptThreadId,
+      },
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    },
+    runs: [],
+    attempts: [],
+    nodes: [],
+    subagents: [],
+    providerSessions: [],
+    providerThreads: [],
+    providerTurns: [],
+    runtimeRequests: [],
+    messages: [],
+    plans: [],
+    checkpointScopes: [],
+    checkpoints: [],
+    contextHandoffs: [],
+    contextTransfers: [],
+    turnItems: [item, { ...item, id: "item:hidden", text: "Hidden non-visible fixture data" }],
+    visibleTurnItems: [
+      {
+        position: 0,
+        visibility: "inherited",
+        sourceThreadId: "thread:ancestor",
+        sourceItemId: "item:ancestor",
+        item: {
+          ...item,
+          id: "item:ancestor",
+          threadId: "thread:ancestor",
+          text: "Earlier inherited reference",
+          ordinal: 0,
+        },
+      },
+      {
+        position: 1,
+        visibility: "local",
+        sourceThreadId: transcriptThreadId,
+        sourceItemId: item.id,
+        item,
+      },
+    ],
+    updatedAt: now,
+  });
+};
+const layerTranscriptRead = (projection: OrchestrationV2ThreadProjection) =>
+  ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(
+      Layer.mock(Orchestrator.OrchestratorV2)({
+        getThreadSnapshot: (threadId) =>
+          threadId === transcriptThreadId
+            ? Effect.succeed({ schemaVersion: 1, snapshotSequence: 23, projection })
+            : Effect.die("Unexpected transcript fixture thread"),
+      }),
+    ),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+
+it.effect(
+  "getThreadTranscript returns only visible ordered canonical rows, not private projection collections",
+  () =>
+    Effect.gen(function* () {
+      const projection = yield* transcriptProjection(yield* DateTime.now);
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const transcript = yield* service.getThreadTranscript(transcriptThreadId);
+        expect(transcript).toEqual({
+          threadId: transcriptThreadId,
+          title: projection.thread.title,
+          updatedAt: projection.updatedAt,
+          items: projection.visibleTurnItems,
+        });
+        expect(transcript.items.map((row) => row.visibility)).toEqual(["inherited", "local"]);
+        expect(transcript.items.map((row) => row.sourceItemId)).not.toContain("item:hidden");
+        expect(transcript).not.toHaveProperty("messages");
+        expect(transcript).not.toHaveProperty("providerSessions");
+        expect(transcript).not.toHaveProperty("runs");
+      }).pipe(
+        Effect.provide(layerTranscriptRead(projection)),
+        Effect.provide(layerTranscriptIdentity),
+      );
+    }),
+);
+
+it.effect.each([0, 1])(
+  "getThreadTranscript counts the destination header and every row newline at the file boundary (+%s)",
+  (extraByte) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const base = yield* transcriptProjection(now, "");
+      const headerBytes = Buffer.byteLength(
+        threadTranscriptHeader(transcriptEnvironmentId, {
+          threadId: base.thread.id,
+          title: base.thread.title,
+          updatedAt: base.updatedAt,
+        }),
+        "utf8",
+      );
+      const fixedBytes =
+        headerBytes +
+        base.visibleTurnItems.reduce((sum, row) => sum + projectedRowEncodedBytes(row) + 1, 0);
+      const projection = yield* transcriptProjection(
+        now,
+        "x".repeat(PROVIDER_SEND_TURN_MAX_FILE_BYTES - fixedBytes + extraByte),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const result = yield* service.getThreadTranscript(transcriptThreadId).pipe(Effect.result);
+        if (extraByte === 0) {
+          expect(result._tag).toBe("Success");
+          if (result._tag === "Success")
+            expect(result.success.items).toEqual(projection.visibleTurnItems);
+        } else {
+          expect(result._tag).toBe("Failure");
+          if (result._tag === "Failure")
+            expect(result.failure).toBeInstanceOf(
+              ThreadManagementService.ThreadTranscriptTooLargeError,
+            );
+        }
+      }).pipe(
+        Effect.provide(layerTranscriptRead(projection)),
+        Effect.provide(layerTranscriptIdentity),
+      );
+    }),
+);
+
+it.effect.each(["header", "row"] as const)(
+  "getThreadTranscript rejects UTF8 byte overflow in %s even below the character limit",
+  (location) =>
+    Effect.gen(function* () {
+      const multibyte = "界".repeat(Math.ceil(PROVIDER_SEND_TURN_MAX_FILE_BYTES / 3));
+      expect(multibyte.length).toBeLessThan(PROVIDER_SEND_TURN_MAX_FILE_BYTES);
+      const projection = yield* transcriptProjection(
+        yield* DateTime.now,
+        location === "row" ? multibyte : "Visible",
+        location === "header" ? multibyte : "Transcript fixture",
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const error = yield* service.getThreadTranscript(transcriptThreadId).pipe(Effect.flip);
+        expect(error).toBeInstanceOf(ThreadManagementService.ThreadTranscriptTooLargeError);
+        expect(error).toMatchObject({ threadId: transcriptThreadId });
+      }).pipe(
+        Effect.provide(layerTranscriptRead(projection)),
+        Effect.provide(layerTranscriptIdentity),
+      );
+    }),
+);
+
+it.effect.each(["projection", "legacy"] as const)(
+  "getThreadTranscript preserves %s read failures without returning a partial transcript",
+  (source) =>
+    Effect.gen(function* () {
+      const original = new Error("synthetic fixture read failure");
+      const projectionError = new Orchestrator.OrchestratorProjectionError({
+        threadId: transcriptThreadId,
+        cause: original,
+      });
+      const legacyError = new LegacyV1ThreadImporter.LegacyV1ThreadImportError({
+        threadId: transcriptThreadId,
+        operation: "hydrate transcript for",
+        cause: original,
+      });
+      let snapshotCalls = 0;
+      const readLayer = ThreadManagementService.layerWithLegacyImporter.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadSnapshot: () =>
+              Effect.suspend(() => {
+                snapshotCalls += 1;
+                return Effect.fail(projectionError);
+              }),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+            ensureTranscript: () => (source === "legacy" ? Effect.fail(legacyError) : Effect.void),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const error = yield* service.getThreadTranscript(transcriptThreadId).pipe(Effect.flip);
+        expect(error).toBeInstanceOf(Orchestrator.OrchestratorProjectionError);
+        expect(error).toMatchObject({
+          threadId: transcriptThreadId,
+          cause: source === "legacy" ? legacyError : original,
+        });
+        expect(snapshotCalls).toBe(source === "legacy" ? 0 : 1);
+      }).pipe(Effect.provide(readLayer), Effect.provide(layerTranscriptIdentity));
+    }),
 );
