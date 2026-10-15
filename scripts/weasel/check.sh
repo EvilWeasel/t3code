@@ -148,6 +148,9 @@ for observatory_test in "${observatory_tests[@]}"; do
   focused_tests+=("$observatory_test")
 done
 main_renderer_diagnostics_tests=(
+  apps/desktop/src/app/DesktopAppActivation.test.ts
+  apps/server/src/diagnostics/MainRendererDiagnosticsLocalClient.test.ts
+  apps/server/src/ws.test.ts
   apps/desktop/src/ipc/DesktopIpc.test.ts
   packages/contracts/src/rpc.test.ts
   apps/desktop/src/ipc/methods/mainRendererDiagnostics.test.ts

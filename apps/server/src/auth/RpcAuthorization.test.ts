@@ -1,3 +1,4 @@
+import { readMainRendererDiagnosticsForTarget } from "../ws.ts";
 import {
   AuthEnvironmentMaintainScope,
   AuthDiagnosticsReadScope,
@@ -489,15 +490,15 @@ it.effect(
           Effect.provide(
             Layer.mergeAll(
               group.toLayerHandler(WS_METHODS.serverGetTraceDiagnostics, () =>
-                Effect.sync(() => {
-                  handled++;
-                  return {
-                    mainRendererSnapshot: {
-                      status: "unavailable" as const,
-                      reason: "unsupported" as const,
-                    },
-                  };
-                }),
+                readMainRendererDiagnosticsForTarget(
+                  input.mainRendererSnapshot,
+                  input.mainRendererSnapshot.target.environmentId,
+                  Effect.succeed(true),
+                  Effect.sync(() => {
+                    handled++;
+                    return { status: "unavailable" as const, reason: "unsupported" as const };
+                  }),
+                ).pipe(Effect.map((mainRendererSnapshot) => ({ mainRendererSnapshot }))),
               ),
               RpcAuthorization.layer(scopes),
             ),

@@ -1,3 +1,4 @@
+import { readMainRendererDiagnosticsForTarget } from "./ws.ts";
 import { assert, it } from "@effect/vitest";
 import {
   ORCHESTRATION_PROTOCOL_VERSION,
@@ -363,4 +364,53 @@ it.live.each(["thread", "shell"] as const)(
         [after!.sequence, liveSequence],
       );
     }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect(
+  "local Main selector refuses foreign environment and missing exact thread before transport",
+  () =>
+    Effect.gen(function* () {
+      let connections = 0;
+      const request = {
+        requestId: "request",
+        requestNonce: "nonce",
+        optIn: true as const,
+        expiresAtMs: 5_000,
+        target: {
+          environmentId: "24efa85c-862c-4de4-9b5e-aaaa041e28a4" as const,
+          threadId: "7cd05d6b-5e09-4691-a664-0b56c6283f12" as const,
+          providerInstanceId: "codex",
+        },
+      };
+      const read = Effect.sync(() => {
+        connections++;
+        return { status: "unavailable" as const, reason: "unsupported" as const };
+      });
+      assert.equal(
+        (yield* readMainRendererDiagnosticsForTarget(
+          request,
+          "foreign",
+          Effect.succeed(true),
+          read,
+        )).status,
+        "unavailable",
+      );
+      assert.equal(
+        (yield* readMainRendererDiagnosticsForTarget(
+          request,
+          request.target.environmentId,
+          Effect.succeed(false),
+          read,
+        )).status,
+        "unavailable",
+      );
+      assert.equal(connections, 0);
+      yield* readMainRendererDiagnosticsForTarget(
+        request,
+        request.target.environmentId,
+        Effect.succeed(true),
+        read,
+      );
+      assert.equal(connections, 1);
+    }),
 );

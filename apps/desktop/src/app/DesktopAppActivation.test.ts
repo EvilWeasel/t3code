@@ -16,7 +16,7 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import { afterEach, describe, expect } from "vite-plus/test";
 
-import { startDesktopAppControlServer } from "./DesktopAppActivation.ts";
+import { startDesktopAppControlServer } from "./DesktopAppControlServer.ts";
 
 const openServers: Array<{ close: () => Promise<void> }> = [];
 
@@ -203,5 +203,144 @@ describe("desktop app control server", () => {
         await NodeFSP.rm(root, { recursive: true, force: true });
       });
     }),
+  );
+});
+
+// The new branch is strictly passive; all legacy activation tests above are unchanged.
+describe("finite passive local Main control", () => {
+  it.each([
+    "top-extra",
+    "nested-extra",
+    "wrong-pid",
+    "wrong-nonce",
+    "changed-target",
+    "valid",
+  ] as const)(
+    "negotiates only the admitted connection and keeps %s out of activation",
+    async (variant) => {
+      const Schema = await import("effect/Schema");
+      const { MainRendererLocalDiagnosticsCapability, MainRendererLocalDiagnosticsResult } =
+        await import("@t3tools/contracts");
+      const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+      const decodeCapability = Schema.decodeUnknownSync(
+        Schema.fromJsonString(MainRendererLocalDiagnosticsCapability),
+        { onExcessProperty: "error" },
+      );
+      const decodeResult = Schema.decodeUnknownSync(
+        Schema.fromJsonString(MainRendererLocalDiagnosticsResult),
+        { onExcessProperty: "error" },
+      );
+      const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "main-passive-"));
+      const target = makeTarget(NodePath.join(root, "userdata"), "linux", process.getuid?.());
+      let activation = 0;
+      let reads = 0;
+      const readTarget = {
+        environmentId: "24efa85c-862c-4de4-9b5e-aaaa041e28a4",
+        threadId: "7cd05d6b-5e09-4691-a664-0b56c6283f12",
+        providerInstanceId: "codex",
+      };
+      const expiresAtMs =
+        (await import("effect/DateTime")).toEpochMillis(
+          (await import("effect/DateTime")).nowUnsafe(),
+        ) + 5_000;
+      const server = await startDesktopAppControlServer({
+        ...target,
+        userId: process.getuid?.(),
+        handle: async (r) => {
+          activation++;
+          return {
+            version: 1,
+            requestId: r.requestId,
+            ok: false,
+            code: "internal-error",
+            message: "not activation",
+          };
+        },
+        cancel: () => {
+          activation++;
+        },
+        onReclaimError: () => undefined,
+        diagnostics: {
+          mainPid: process.pid,
+          stateDir: NodePath.join(root, "userdata"),
+          appVersion: "fixture",
+          read: async () => {
+            reads++;
+            return { status: "unavailable", reason: "context-changed" };
+          },
+          cancel: () => undefined,
+        },
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const socket = NodeNet.createConnection(target.address);
+          socket.setEncoding("utf8");
+          let buffer = "";
+          let capSeen = false;
+          socket.once("error", reject);
+          socket.once("close", () => resolve());
+          socket.once("connect", () =>
+            socket.write(
+              `${encode({
+                version: 1,
+                type: "main-renderer-diagnostics-hello",
+                requestId: "read",
+                requestNonce: "nonce",
+                expectedMainPid: variant === "wrong-pid" ? process.pid + 1 : process.pid,
+                stateDir: NodePath.join(root, "userdata"),
+                expiresAtMs,
+                target:
+                  variant === "nested-extra"
+                    ? { ...readTarget, rawSettings: "refused" }
+                    : readTarget,
+                ...(variant === "top-extra" ? { rawSettings: "refused" } : {}),
+              })}\n`,
+            ),
+          );
+          socket.on("data", (chunk: string) => {
+            try {
+              buffer += chunk;
+              const end = buffer.indexOf("\n");
+              if (end < 0) return;
+              const line = buffer.slice(0, end);
+              buffer = buffer.slice(end + 1);
+              if (!capSeen) {
+                const cap = decodeCapability(line);
+                capSeen = true;
+                socket.write(
+                  `${encode({
+                    version: 1,
+                    type: "main-renderer-diagnostics-read",
+                    capabilityNonce: variant === "wrong-nonce" ? "other" : cap.capabilityNonce,
+                    input: {
+                      requestId: "read",
+                      requestNonce: "nonce",
+                      optIn: true,
+                      expiresAtMs,
+                      target:
+                        variant === "changed-target"
+                          ? { ...readTarget, providerInstanceId: "other" }
+                          : readTarget,
+                    },
+                  })}\n`,
+                );
+              } else {
+                const result = decodeResult(line);
+                expect(result.result.status).toBe("unavailable");
+                socket.destroy();
+              }
+            } catch (error) {
+              socket.destroy();
+              reject(error);
+            }
+          });
+        });
+        expect(reads).toBe(variant === "valid" ? 1 : 0);
+        expect(activation).toBe(0);
+      } finally {
+        await server.close();
+        await NodeFSP.rm(root, { recursive: true, force: true });
+      }
+    },
   );
 });

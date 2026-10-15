@@ -1,3 +1,8 @@
+import type {
+  MainRendererDiagnosticsReadInput,
+  MainRendererDiagnosticsReadResult,
+} from "@t3tools/contracts";
+import * as MainRendererDiagnosticsLocalClient from "./diagnostics/MainRendererDiagnosticsLocalClient.ts";
 import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
@@ -1309,6 +1314,9 @@ const layerWsRpc = (
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
       const desktopDiagnostics = yield* DesktopTelemetryReceiver.DesktopTelemetryReceiver;
+      const localMainDiagnostics = yield* Effect.serviceOption(
+        MainRendererDiagnosticsLocalClient.MainRendererDiagnosticsLocalClient,
+      );
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
       yield* Effect.addFinalizer(() =>
@@ -2452,28 +2460,31 @@ const layerWsRpc = (
             AuthOrchestrationReadScope,
             Effect.gen(function* () {
               const environmentId = yield* serverEnvironment.getEnvironmentId;
-              if (environmentId !== request.target.environmentId)
-                return {
-                  mainRendererSnapshot: {
-                    status: "unavailable" as const,
-                    reason: "target-mismatch" as const,
-                  },
-                };
-              // Exact authorized thread read, metadata only: no transcript or provider work.
-              const thread = yield* threadManagement
+              const threadExists = threadManagement
                 .getThreadRecords(ThreadId.make(request.target.threadId), [])
-                .pipe(Effect.option);
-              if (Option.isNone(thread))
-                return {
-                  mainRendererSnapshot: {
-                    status: "unavailable" as const,
-                    reason: "target-mismatch" as const,
-                  },
-                };
-              const result =
-                desktopDiagnostics.readMainRendererDiagnostics === undefined
-                  ? { status: "unavailable" as const, reason: "unsupported" as const }
-                  : yield* desktopDiagnostics.readMainRendererDiagnostics(request, environmentId);
+                .pipe(Effect.option, Effect.map(Option.isSome));
+              // Choose topology before issuing a read. An FD refusal is never retried locally.
+              const read =
+                config.desktopTelemetryFd === undefined &&
+                config.desktopTelemetryControlFd === undefined
+                  ? Option.isSome(localMainDiagnostics)
+                    ? localMainDiagnostics.value.read(request, environmentId)
+                    : Effect.succeed({
+                        status: "unavailable" as const,
+                        reason: "unsupported" as const,
+                      })
+                  : desktopDiagnostics.readMainRendererDiagnostics === undefined
+                    ? Effect.succeed({
+                        status: "unavailable" as const,
+                        reason: "unsupported" as const,
+                      })
+                    : desktopDiagnostics.readMainRendererDiagnostics(request, environmentId);
+              const result = yield* readMainRendererDiagnosticsForTarget(
+                request,
+                environmentId,
+                threadExists,
+                read,
+              );
               return { mainRendererSnapshot: result };
             }),
           );
@@ -3325,3 +3336,19 @@ export const layer = Layer.unwrap(
     );
   }),
 );
+
+/** Shared selector boundary: authorization middleware runs before this function. */
+export const readMainRendererDiagnosticsForTarget = Effect.fn(
+  "ws.readMainRendererDiagnosticsForTarget",
+)(function* (
+  request: MainRendererDiagnosticsReadInput,
+  environmentId: string,
+  threadExists: Effect.Effect<boolean>,
+  read: Effect.Effect<MainRendererDiagnosticsReadResult>,
+) {
+  if (environmentId !== request.target.environmentId)
+    return { status: "unavailable" as const, reason: "target-mismatch" as const };
+  if (!(yield* threadExists))
+    return { status: "unavailable" as const, reason: "target-mismatch" as const };
+  return yield* read;
+});
