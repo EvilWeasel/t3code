@@ -132,9 +132,22 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$FOCUS_SELECTED_RUNNER" = blacksmith-8vcpu-ubuntu-2404
           test "$(id -u)" != 0
-          for required in /usr/bin/git /usr/bin/xvfb-run /usr/bin/Xvfb /usr/bin/xdotool; do
+          for required in /usr/bin/git /usr/bin/xvfb-run /usr/bin/Xvfb; do
             test -x "$required" || { echo "Missing existing focus prerequisite: $required" >&2; exit 1; }
           done
+          if [[ ! -x /usr/bin/xdotool ]]; then
+            sudo apt-get install -y --no-install-recommends xdotool
+          fi
+          test -x /usr/bin/xdotool
+          umask 077
+          mkdir -p "$RUNNER_TEMP/focus-platform"
+          xdotool_path="$(readlink -f /usr/bin/xdotool)"
+          {
+            printf 'source_sha=%s\nrun_id=%s\njob=%s\nrunner_name=%s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_JOB" "$RUNNER_NAME"
+            dpkg-query -W -f='xdotool_version=${Version}\n' xdotool
+            printf 'xdotool_realpath=%s\n' "$xdotool_path"
+            sha256sum "$xdotool_path"
+          } > "$RUNNER_TEMP/focus-platform/receipt.txt"
           test -s apps/desktop/dist-electron/preview-pick-preload.cjs
           (cd apps/desktop/scripts/proton-pass-focus-prerequisite && vp pack)
           test -s "$MORROWBYTE_FOCUS_BUNDLE_DIR/main.cjs"
@@ -153,6 +166,14 @@ jobs:
             --scenario second-focus-before-close || negative_status=$?
           test "$positive_status" -eq 0
           test "$negative_status" -eq 0
+      - name: Preserve focus platform prerequisite metadata
+        if: always() && inputs.qualifyFocusPrerequisite
+        uses: actions/upload-artifact@v4
+        with:
+          name: focus-prerequisite-platform-${{ github.sha }}
+          path: ${{ runner.temp }}/focus-platform/receipt.txt
+          if-no-files-found: error
+          retention-days: 7
       - name: Preserve positive focus prerequisite receipts
         if: always() && inputs.qualifyFocusPrerequisite
         uses: actions/upload-artifact@v4
