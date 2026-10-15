@@ -200,6 +200,94 @@ it.layer(NodeServices.layer)("service state persistence", (it) => {
     }),
   );
 
+  it.effect("never restores a pending trial backup beside another database owner", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-owned-trial-" });
+      const statePath = path.join(root, "runtime", "service-state.json");
+      const databasePath = path.join(root, "userdata", "state.sqlite");
+      const startsPath = path.join(root, "starts.txt");
+      const updateId = "owned-trial";
+      const backupDir = path.join(root, "runtime", "db-backup", updateId);
+      yield* fs.makeDirectory(path.dirname(databasePath), { recursive: true });
+      yield* fs.writeFileString(databasePath, "before trial backup");
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.0.0"),
+        `import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(startsPath)}, "old runtime started\\n");
+process.exit(0);
+`,
+      );
+      yield* writeFakeRuntime(
+        fs,
+        path,
+        path.join(root, "runtime", "versions", "1.1.0"),
+        `import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+if (readFileSync(${JSON.stringify(path.join(backupDir, "database"))}, "utf8") !== "before trial backup") throw new Error("Missing original backup");
+appendFileSync(${JSON.stringify(startsPath)}, "trial started\\n");
+writeFileSync(${JSON.stringify(databasePath)}, "other owner current database");
+writeFileSync(${JSON.stringify(`${databasePath}-wal`)}, "other owner wal");
+writeFileSync(${JSON.stringify(`${databasePath}-shm`)}, "other owner shm");
+process.exit(${SERVER_EXIT_CODE_STATE_DIR_OWNED});
+`,
+      );
+      yield* Effect.promise(() =>
+        writeServiceState(statePath, {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+          update: {
+            id: updateId,
+            fromVersion: "1.0.0",
+            targetVersion: "1.1.0",
+            dbPath: databasePath,
+            status: "pending",
+          },
+        }),
+      );
+      const refused = Promise.withResolvers<void>();
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+            if (String(chunk).includes("owns this T3 home")) refused.resolve();
+            return true;
+          }),
+        ),
+        (spy) => Effect.sync(() => spy.mockRestore()),
+      );
+      const launcher = new Launcher(root, yield* Effect.promise(() => readServiceState(statePath)));
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const running = launcher.run();
+          void running.catch(refused.reject);
+          return running;
+        }),
+        (running) =>
+          Effect.promise(async () => {
+            await launcher.stop("SIGTERM");
+            await running;
+          }),
+      );
+      yield* Effect.promise(() => refused.promise);
+      const state = yield* Effect.promise(() => readServiceState(statePath));
+      assert.equal(state.activeVersion, "1.0.0");
+      assert.equal(state.update?.status, "failed");
+      assert.equal(
+        state.update?.status === "failed" ? state.update.reason : undefined,
+        "state-dir-owned",
+      );
+      assert.equal(yield* fs.readFileString(databasePath), "other owner current database");
+      assert.equal(yield* fs.readFileString(`${databasePath}-wal`), "other owner wal");
+      assert.equal(yield* fs.readFileString(`${databasePath}-shm`), "other owner shm");
+      assert.equal(yield* fs.readFileString(startsPath), "trial started\n");
+      assert.isFalse(yield* fs.exists(backupDir));
+      // The launcher remains alive without starting the old runtime; the scoped
+      // finalizer stops only this fixture's launcher after these assertions.
+    }),
+  );
+
   it.effect("serializes shutdown with launcher recovery", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

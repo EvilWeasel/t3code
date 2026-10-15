@@ -6,6 +6,7 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as References from "effect/References";
 import * as Schema from "effect/Schema";
 
@@ -91,6 +92,47 @@ describe("server ownership", () => {
         state: { ...state, pid: 0 },
       });
       yield* Effect.scoped(ServerOwnership.acquireServerOwnership(statePath));
+    }).pipe(Effect.provide(layerOwnership)),
+  );
+
+  it.effect("preserves an unreadable legacy record without probing or stopping its process", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-owner-legacy-denied-" });
+      const statePath = path.join(root, "server-runtime.json");
+      const state = yield* makeState;
+      yield* ServerRuntimeState.persistServerRuntimeState({ path: statePath, state });
+      const before = yield* fs.readFileString(statePath);
+      let processCalls = 0;
+      const unreadable = {
+        ...fs,
+        readFileString: (filename: string, encoding?: string) =>
+          filename === statePath
+            ? Effect.fail(
+                PlatformError.systemError({
+                  _tag: "PermissionDenied",
+                  module: "FileSystem",
+                  method: "readFileString",
+                  pathOrDescriptor: statePath,
+                  description: "Fixture legacy record is unreadable.",
+                }),
+              )
+            : fs.readFileString(filename, encoding),
+      } satisfies FileSystem.FileSystem;
+      // Current upstream discovery treats this unknown legacy owner as absent.
+      // This checks nonmutation, not proof that a legacy server is safe to start beside.
+      yield* Effect.scoped(ServerOwnership.acquireServerOwnership(statePath)).pipe(
+        Effect.provideService(FileSystem.FileSystem, unreadable),
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: () => {
+            processCalls += 1;
+            return Effect.die("Unexpected process operation for unreadable legacy discovery");
+          },
+        }),
+      );
+      assert.equal(processCalls, 0);
+      assert.equal(yield* fs.readFileString(statePath), before);
     }).pipe(Effect.provide(layerOwnership)),
   );
 
