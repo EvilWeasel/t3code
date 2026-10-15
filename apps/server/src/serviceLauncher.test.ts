@@ -262,9 +262,9 @@ process.exit(${SERVER_EXIT_CODE_STATE_DIR_OWNED});
         Effect.sync(() => {
           const running = launcher.run();
           void running.catch(refused.reject);
-          return running;
+          return { running };
         }),
-        (running) =>
+        ({ running }) =>
           Effect.promise(async () => {
             await launcher.stop("SIGTERM");
             await running;
