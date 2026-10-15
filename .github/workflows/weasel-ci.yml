@@ -18,6 +18,11 @@ on:
         required: false
         default: false
         type: boolean
+      qualifyProtonAutofill:
+        description: Qualify native linked-login autofill with an isolated fake provider
+        required: false
+        default: false
+        type: boolean
   push:
     branches: [main, "weasel/**"]
   pull_request:
@@ -76,8 +81,17 @@ jobs:
           CANDIDATE_VERSION: ${{ inputs.candidateVersion }}
           SOURCE_SHA: ${{ github.sha }}
           SOURCE_REPOSITORY: ${{ github.repository }}
+          QUALIFY_PROTON_AUTOFILL: ${{ inputs.qualifyProtonAutofill || false }}
+          PROBE_PROTON_PASS: ${{ inputs.probeProtonPass || false }}
         run: |
           set -euo pipefail
+          if [[ "$QUALIFY_PROTON_AUTOFILL" == true ]]; then
+            test "$SOURCE_REPOSITORY" = morrowbyte/t3code
+            test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+            test "$PROBE_PROTON_PASS" = false
+            test "$BUILD_CANDIDATE_CLI" = false
+            test -z "$CANDIDATE_VERSION"
+          fi
           if [[ "$BUILD_CANDIDATE_CLI" != true ]]; then
             test -z "$CANDIDATE_VERSION"
             exit 0
@@ -102,6 +116,40 @@ jobs:
           name: voice-ui-${{ github.sha }}
           path: product-evidence/voice-ui
           if-no-files-found: warn
+          retention-days: 7
+      - name: Qualify native Proton autofill with a synthetic provider
+        if: inputs.qualifyProtonAutofill
+        timeout-minutes: 5
+        env:
+          MORROWBYTE_NAMESPACE_PROBE: "1"
+          MORROWBYTE_NAMESPACE_PROFILE: namespace-profile-ci-builder
+          MORROWBYTE_AUTOFILL_BUNDLE_DIR: ${{ runner.temp }}/proton-pass-autofill-build
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(id -u)" -ne 0
+          sudo apt-get install -y xvfb xdotool
+          command -v xvfb-run
+          command -v xdotool
+          (cd apps/desktop/scripts/proton-pass-autofill-fixture && vp pack)
+          test -s "$MORROWBYTE_AUTOFILL_BUNDLE_DIR/main.cjs"
+          autofill_probe_electron="$(node apps/desktop/scripts/ensure-electron-runtime.mjs)"
+          xvfb-run --auto-servernum node apps/desktop/scripts/proton-pass-autofill-fixture/run.mjs \
+            --electron "$autofill_probe_electron" \
+            --entry "$MORROWBYTE_AUTOFILL_BUNDLE_DIR/main.cjs" \
+            --output "$RUNNER_TEMP/proton-pass-autofill"
+      - name: Preserve native autofill qualification receipts
+        if: always() && inputs.qualifyProtonAutofill
+        uses: actions/upload-artifact@v4
+        with:
+          name: proton-pass-autofill-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/proton-pass-autofill/fixture-receipt.json
+            ${{ runner.temp }}/proton-pass-autofill/fixture-receipt.partial.json
+            ${{ runner.temp }}/proton-pass-autofill/runner-receipt.json
+            ${{ runner.temp }}/proton-pass-autofill/electron.log
+          if-no-files-found: error
           retention-days: 7
       - name: Probe synthetic Proton extension compatibility on pinned Electron
         if: inputs.probeProtonPass
