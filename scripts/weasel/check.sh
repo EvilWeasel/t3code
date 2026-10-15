@@ -135,6 +135,10 @@ observatory_tests=(
   packages/client-runtime/src/observatory/bridge.test.ts
   packages/client-runtime/src/observatory/state.test.ts
   packages/contracts/src/agentObservatory.test.ts
+  packages/client-runtime/src/observatory/paging.test.ts
+  apps/server/src/observatory/AgentObservatoryService.test.ts
+  apps/server/src/orchestration-v2/ProjectionStore.test.ts
+  packages/contracts/src/orchestrationV2.test.ts
 )
 for observatory_test in "${observatory_tests[@]}"; do
   if [[ ! -f "$observatory_test" ]]; then
