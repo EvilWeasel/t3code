@@ -2216,6 +2216,12 @@ export type OrchestrationV2RuntimeRequestJson = typeof OrchestrationV2RuntimeReq
 export const OrchestrationV2ConversationMessageJson = OrchestrationV2ConversationMessage.mapFields(
   (fields) => ({
     ...fields,
+    observatory: Schema.optional(
+      AgentObservatoryMetadata.mapFields((metadata) => ({
+        ...metadata,
+        recordedAt: Schema.DateTimeUtcFromString,
+      })),
+    ),
     createdAt: Schema.DateTimeUtcFromString,
     updatedAt: Schema.DateTimeUtcFromString,
   }),

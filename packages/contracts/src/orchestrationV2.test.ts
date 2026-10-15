@@ -1618,6 +1618,17 @@ describe("agent observatory message metadata", () => {
     const message = decode({ ...raw, observatory: metadata });
     const encoded = Schema.encodeSync(OrchestrationV2ConversationMessageJson)(message);
     expect(encoded.observatory).toEqual(metadata);
+    expect(DateTime.isUtc(message.observatory?.recordedAt)).toBe(true);
+    const persisted = Schema.encodeSync(
+      Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
+    )(message);
+    const replayed = Schema.decodeUnknownSync(
+      Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
+    )(persisted);
+    expect(replayed).toEqual(message);
+    expect(replayed.observatory && DateTime.formatIso(replayed.observatory.recordedAt)).toBe(
+      metadata.recordedAt,
+    );
     expect(decode(encoded).observatory?.owner.attemptId).toBe("attempt:obs");
     expect(message.observatory).not.toHaveProperty("sequence");
     expect(message.observatory?.state).not.toHaveProperty("paused");

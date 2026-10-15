@@ -3880,6 +3880,7 @@ it.layer(Layer.mergeAll(layerTest, NodeServices.layer))(
 
 it.effect("observatory rollback leaves no receipt, event or message projection", () =>
   Effect.gen(function* () {
+    let failedProjectionCalls = 0;
     const layerFailingProjection = Layer.effect(
       ProjectionStore.ProjectionStoreV2,
       Effect.gen(function* () {
@@ -3888,20 +3889,27 @@ it.effect("observatory rollback leaves no receipt, event or message projection",
           ...delegate,
           apply: (event) =>
             event.type === "message.updated" && event.payload.observatory
-              ? Effect.fail(
-                  new ProjectionStore.ProjectionStoreApplyEventError({ eventType: event.type }),
+              ? Effect.sync(() => {
+                  failedProjectionCalls += 1;
+                }).pipe(
+                  Effect.andThen(
+                    Effect.fail(
+                      new ProjectionStore.ProjectionStoreApplyEventError({ eventType: event.type }),
+                    ),
+                  ),
                 )
               : delegate.apply(event),
         });
       }),
     ).pipe(Layer.provide(layerProjectionStoreProvided));
-    const failingSink = EventSink.layer.pipe(
+    const failingSink = Layer.fresh(EventSink.layer).pipe(
       Layer.provide(Layer.mergeAll(layerDatabase, layerEventStoreProvided, layerFailingProjection)),
     );
     yield* Effect.gen(function* () {
       const sink = yield* EventSink.EventSinkV2;
       const { input } = yield* seedObservatoryOwner("rollback");
       const result = yield* sink.commitObservatoryUpdate(input).pipe(Effect.result);
+      assert.equal(failedProjectionCalls, 1);
       assert.equal(result._tag, "Failure");
       const store = yield* EventStore.EventStoreV2;
       const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
@@ -3917,7 +3925,16 @@ it.effect("observatory rollback leaves no receipt, event or message projection",
         (yield* projection.getThreadRecords(input.owner.threadId, ["messages"])).messages.length,
         0,
       );
-    }).pipe(Effect.provide(Layer.mergeAll(layerTest, failingSink, NodeServices.layer)));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layerStoresProvided,
+          layerCommandReceiptStoreProvided,
+          failingSink,
+          NodeServices.layer,
+        ),
+      ),
+    );
   }),
 );
 
@@ -3958,7 +3975,7 @@ it.effect("observatory and ordinary writers publish in the shared canonical comm
         });
       }),
     ).pipe(Layer.provide(layerEventStoreProvided));
-    const sinkLayer = EventSink.layer.pipe(
+    const sinkLayer = Layer.fresh(EventSink.layer).pipe(
       Layer.provide(Layer.mergeAll(layerDatabase, layerProjectionStoreProvided, wrappedStore)),
     );
     yield* Effect.gen(function* () {
