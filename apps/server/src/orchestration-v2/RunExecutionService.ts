@@ -1502,6 +1502,7 @@ export const layer: Layer.Layer<
             text: entry.text,
           }));
           const observatoryCallback =
+            input.session.driver === "codex" &&
             Option.isSome(trustedObservatory) &&
             Option.isSome(observatory) &&
             Option.isSome(observatoryCrypto)

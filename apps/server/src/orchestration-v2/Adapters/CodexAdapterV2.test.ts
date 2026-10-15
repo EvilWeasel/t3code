@@ -1,3 +1,4 @@
+import { AgentObservatoryInvocationResult } from "@t3tools/contracts";
 import * as NodeOS from "node:os";
 
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
@@ -11,6 +12,7 @@ import {
   CheckpointId,
   CodexSettings,
   EnvironmentId,
+  EventId,
   MessageId,
   type ModelSelection,
   NodeId,
@@ -2107,6 +2109,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       Effect.void,
     onRequest: (method: string, params: unknown) => Effect.Effect<void> = () => Effect.void,
     readChildMetadata?: Parameters<typeof withCodexReplayChildMetadata>[2],
+    observatoryAvailable?: boolean,
   ) =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2134,6 +2137,17 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   (client) =>
                     ({
                       ...client,
+                      ...(observatoryAvailable === true
+                        ? {
+                            raw: {
+                              ...client.raw,
+                              request: (method, params) =>
+                                onRequest(method, params).pipe(
+                                  Effect.andThen(client.raw.request(method, params)),
+                                ),
+                            },
+                          }
+                        : {}),
                       request: (method, params) =>
                         onRequest(method, params).pipe(
                           Effect.andThen(client.request(method, params)),
@@ -2169,6 +2183,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
       });
       const providerThread = yield* runtime.ensureThread({
+        ...(observatoryAvailable === undefined ? {} : { observatoryAvailable }),
         threadId,
         modelSelection: CODEX_TEST_MODEL_SELECTION,
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
@@ -3821,6 +3836,246 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           Effect.provide(
             Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
           ),
+        ),
+      ),
+  );
+
+  it.effect.each([
+    { registered: true, callback: true },
+    { registered: false, callback: true },
+    { registered: true, callback: false },
+  ])(
+    "normal native observatory registration/instruction/read-publish protocol $registered/$callback",
+    ({ registered, callback }) =>
+      Effect.gen(function* () {
+        const scenario = `observatory-protocol-${registered}-${callback}`;
+        const nativeThreadId = `native-${scenario}`;
+        const nativeTurnId = `turn-${scenario}`;
+        let startRequest: unknown;
+        let turnRequest: unknown;
+        let publishText = "";
+        const calls: Array<{
+          native: ProviderAdapter.ProviderAdapterV2NativeInvocation;
+          action: string;
+        }> = [];
+        const active = registered && callback;
+        const refusal = "Agent observatory unavailable for this native invocation.";
+        const response = (
+          id: number,
+          text: () => string,
+          success: boolean,
+        ): CodexReplay.CodexAppServerReplayEntry => ({
+          type: "expect_outbound",
+          get frame() {
+            return { id, result: { success, contentItems: [{ type: "inputText", text: text() }] } };
+          },
+        });
+        const call = (
+          id: number,
+          callId: string,
+          args: Schema.Json,
+          threadId = nativeThreadId,
+          turnId = nativeTurnId,
+          namespace?: string,
+        ): CodexReplay.CodexAppServerReplayEntry => ({
+          type: "emit_inbound",
+          frame: {
+            id,
+            method: "item/tool/call",
+            params: {
+              threadId,
+              turnId,
+              callId,
+              tool: "t3_observatory",
+              arguments: args,
+              ...(namespace === undefined ? {} : { namespace }),
+            },
+          },
+        });
+        const state = {
+          title: "Inspect routing",
+          steps: [],
+          todos: [],
+          currentStepId: null,
+          requestedCheckpoint: null,
+          layout: "single" as const,
+          panels: [{ kind: "plan" as const, collapsed: false }],
+        };
+        const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "fixture" });
+        const transcript = makeCodexReplayTranscript({
+          scenario,
+          entries: [
+            ...preamble.slice(0, 3),
+            {
+              type: "expect_outbound",
+              get frame() {
+                return { id: 2, method: "thread/start", params: startRequest };
+              },
+            },
+            ...preamble.slice(4, 5),
+            {
+              type: "expect_outbound",
+              get frame() {
+                return { id: 3, method: "turn/start", params: turnRequest };
+              },
+            },
+            ...preamble.slice(6),
+            call(10, "read-own", { action: "read", threadId: "model-forged-thread" }),
+            response(10, () => (active ? '{"action":"read","snapshot":null}' : refusal), active),
+            call(11, "read-own", { action: "read" }),
+            response(11, () => (active ? '{"action":"read","snapshot":null}' : refusal), active),
+            call(12, "publish-own", {
+              action: "publish",
+              requestId: "request:protocol",
+              expectedRevision: 0,
+              state,
+            }),
+            response(12, () => (active ? publishText : refusal), active),
+            call(13, "read-own", {
+              action: "publish",
+              requestId: "request:changed",
+              expectedRevision: 0,
+              state,
+            }),
+            response(
+              13,
+              () => (active ? "Agent observatory call conflicts with its original body." : refusal),
+              false,
+            ),
+            call(14, "foreign", { action: "read" }, "foreign-native-thread"),
+            response(14, () => refusal, false),
+            call(15, "old", { action: "read" }, nativeThreadId, "old-native-turn"),
+            response(15, () => refusal, false),
+            call(
+              16,
+              "foreign-namespace",
+              { action: "read" },
+              nativeThreadId,
+              nativeTurnId,
+              "foreign",
+            ),
+            response(16, () => refusal, false),
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                },
+              },
+            },
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          () => Effect.void,
+          (method, params) =>
+            Effect.sync(() => {
+              if (method === "thread/start") startRequest = params;
+              if (method === "turn/start") turnRequest = params;
+            }),
+          undefined,
+          registered,
+        );
+        const now = yield* DateTime.now;
+        const turnInput = makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("attempt:observatory-protocol"),
+          text: "fixture",
+        });
+        const onObservatoryInvocation: NonNullable<
+          ProviderAdapter.ProviderAdapterV2TurnInput["onObservatoryInvocation"]
+        > = (native, intent) =>
+          Effect.gen(function* () {
+            calls.push({ native, action: intent.action });
+            if (intent.action === "read") return { action: "read" as const, snapshot: null };
+            const result = {
+              action: "publish" as const,
+              replayed: false,
+              snapshot: {
+                owner: {
+                  environmentId: EnvironmentId.make("env:protocol"),
+                  threadId: turnInput.threadId,
+                  runId: turnInput.runId,
+                  attemptId: turnInput.attemptId,
+                  rootNodeId: turnInput.rootNodeId,
+                  providerInstanceId: CODEX_TEST_MODEL_SELECTION.instanceId,
+                  providerThreadId: harness.providerThread.id,
+                  providerTurnId: native.providerTurnId,
+                },
+                revision: 1,
+                eventId: EventId.make("event:protocol"),
+                sequence: 12,
+                recordedAt: now,
+                provenance: "agent-authored" as const,
+                nativeFrontier: {
+                  source: "observed-native" as const,
+                  sequence: 11,
+                  rawEventId: null,
+                },
+                state: intent.state,
+              },
+            };
+            publishText = yield* Schema.encodeEffect(
+              Schema.fromJsonString(AgentObservatoryInvocationResult),
+            )(result);
+            return result;
+          });
+        yield* harness.runtime.startTurn({
+          ...turnInput,
+          ...(callback ? { onObservatoryInvocation } : {}),
+        });
+        yield* harness.firstTerminal;
+        const start = yield* Schema.decodeUnknownEffect(
+          Schema.Struct({
+            dynamicTools: Schema.optional(
+              Schema.Array(Schema.Struct({ name: Schema.String, inputSchema: Schema.JsonObject })),
+            ),
+          }),
+        )(startRequest);
+        assert.equal(
+          start.dynamicTools?.some((tool) => tool.name === "t3_observatory") ?? false,
+          registered,
+        );
+        if (registered) {
+          const tool = start.dynamicTools?.find((tool) => tool.name === "t3_observatory");
+          assert.isDefined(tool);
+          assert.notProperty(tool?.inputSchema, "owner");
+        }
+        const params = yield* Schema.decodeUnknownEffect(
+          Schema.Struct({
+            collaborationMode: Schema.optional(
+              Schema.Struct({
+                settings: Schema.Struct({ developer_instructions: Schema.optional(Schema.String) }),
+              }),
+            ),
+          }),
+        )(turnRequest);
+        assert.equal(
+          params.collaborationMode?.settings.developer_instructions?.includes(
+            "Use t3_observatory",
+          ) ?? false,
+          active,
+        );
+        assert.equal(calls.length, active ? 2 : 0);
+        if (active) {
+          assert.deepEqual(
+            calls.map((call) => call.action),
+            ["read", "publish"],
+          );
+          for (const call of calls) {
+            assert.equal(call.native.nativeThreadId, nativeThreadId);
+            assert.equal(call.native.nativeTurnId, nativeTurnId);
+          }
+          assert.notEqual(calls[0]?.native.providerTurnId, "model-forged-thread");
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),
       ),
   );

@@ -1,3 +1,4 @@
+import * as Observatory from "../observatory/AgentObservatoryService.ts";
 import * as NetAddress from "effect/net/NetAddress";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -321,6 +322,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly hangSessionScopeClose?: boolean;
     readonly startTurn?: Effect.Effect<void>;
     readonly beforeUnload?: Effect.Effect<void>;
+    readonly ensureThread?: ProviderAdapter.ProviderAdapterV2SessionRuntime["ensureThread"];
     /** Registers the process's closeCount finalizer before `beforeOpen` runs. */
     readonly spawnBeforeOpen?: boolean;
     /** Completed when a hanging scope close reaches its wedged finalizer. */
@@ -408,7 +410,8 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
             : {
                 hasPendingBackgroundWorkForThread: () => options.hasPendingBackgroundWorkForThread!,
               }),
-          ensureThread: () => unimplemented("ensureThread unused in test"),
+          ensureThread:
+            options.ensureThread ?? (() => unimplemented("ensureThread unused in test")),
           resumeThread: (threadInput) =>
             Ref.update(state, (current) => ({
               ...current,
@@ -443,6 +446,8 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
 });
 
 function layerTest(input: {
+  readonly ensureThread?: ProviderAdapter.ProviderAdapterV2SessionRuntime["ensureThread"];
+  readonly observatoryLayer?: Layer.Layer<Observatory.AgentObservatoryService>;
   readonly state: Ref.Ref<TestProviderRuntimeState>;
   readonly idleTimeoutMs: number;
   readonly maxIdlePinMs?: number;
@@ -484,6 +489,7 @@ function layerTest(input: {
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
+      ...(input.ensureThread === undefined ? {} : { ensureThread: input.ensureThread }),
       ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
       ...(input.mcpConfigs === undefined ? {} : { mcpConfigs: input.mcpConfigs }),
       ...(input.beforeOpen === undefined ? {} : { beforeOpen: input.beforeOpen }),
@@ -536,6 +542,7 @@ function layerTest(input: {
           layerProviderEventIngestorTest,
           layerConfiguredMcpRegistry,
           layerTestStores,
+          ...(input.observatoryLayer === undefined ? [] : [input.observatoryLayer]),
           ...(input.serverSettingsLayer === undefined ? [] : [input.serverSettingsLayer]),
           ...(input.projectServiceLayer === undefined ? [] : [input.projectServiceLayer]),
         ),
@@ -4758,4 +4765,65 @@ it.effect(
       });
       assert.isFalse(denied?.capabilities?.has("device"));
     }),
+);
+
+it.effect.each([false, true])(
+  "observatory registration presence is host-derived, not an ensureThread flag (%s)",
+  (present) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const seen: boolean[] = [];
+      const ids = yield* IdAllocator.IdAllocatorV2.pipe(Effect.provide(IdAllocator.layer));
+      const layers = layerTest({
+        state,
+        idleTimeoutMs: 60_000,
+        ...(present
+          ? { observatoryLayer: Layer.mock(Observatory.AgentObservatoryService)({}) }
+          : {}),
+        ensureThread: (input) =>
+          Effect.gen(function* () {
+            seen.push(input.observatoryAvailable === true);
+            return makeProviderThread({
+              idAllocator: ids,
+              threadId: input.threadId,
+              providerSessionId:
+                input.providerSessionId ??
+                (yield* ids.allocate.providerSession({
+                  threadId: input.threadId,
+                  providerInstanceId: modelSelection.instanceId,
+                })),
+              now: yield* DateTime.now,
+            });
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const ids = yield* IdAllocator.IdAllocatorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make(`thread:observatory-presence:${present}`);
+        const providerSessionId = yield* ids.allocate.providerSession({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* sink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now: yield* DateTime.now }),
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* runtime.ensureThread({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+          observatoryAvailable: !present,
+        });
+        assert.deepEqual(seen, [present]);
+      }).pipe(Effect.provide(layers));
+    }).pipe(Effect.scoped),
 );
