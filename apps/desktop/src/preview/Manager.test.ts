@@ -2698,6 +2698,57 @@ describe("PreviewManager", () => {
       ),
   );
 
+  effectIt.effect(
+    "keeps sharing private when the real clear script encounters a replaced password node",
+    () =>
+      withManager((manager) =>
+        Effect.gen(function* () {
+          const { document, a, run } = makeAutofillDomFixture();
+          document.activeElement = a.username;
+          const preview = makeFaviconWebContents({ url: "https://example.com/login" });
+          const frame = {
+            origin: "https://example.com",
+            isDestroyed: () => false,
+          } as Electron.WebFrameMain;
+          const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
+            mainFrame: frame,
+            isFocused: () => true,
+            session: { getStoragePath: () => "/synthetic/profile-a" },
+            executeJavaScriptInIsolatedWorld: async (
+              _world: number,
+              scripts: readonly { code: string }[],
+            ) => run(scripts[0]!.code),
+            insertText: async (value: string) => {
+              if (document.activeElement) document.activeElement.value = value;
+            },
+          });
+          fromId.mockReturnValue(wc);
+          yield* manager.createTab("private_tab");
+          yield* manager.registerWebview("private_tab", 42);
+          const target = yield* manager.getAutofillTarget(wc, frame);
+          if (!target) throw new Error("Missing target");
+          yield* Effect.promise(() => target.enterPrivate());
+          yield* Effect.promise(() => target.fill("fake-user", "fake-password"));
+          const replacement = a.replacePassword();
+          document.activeElement = a.username;
+          expect(run(PreviewManager.protonPassAutofillScripts.clear)).toBe(false);
+          expect(a.password.value).toBe("fake-password");
+          expect(replacement.value).toBe("fake-password");
+          expect(
+            Exit.isFailure(yield* Effect.exit(Effect.tryPromise(() => target.clearAndResume()))),
+          ).toBe(true);
+          // A second attempt still refuses: failed clear must retain bookkeeping.
+          expect(run(PreviewManager.protonPassAutofillScripts.clear)).toBe(false);
+          const latest = yield* manager.getAutofillTarget(wc, frame);
+          expect(latest?.privateEntry).toBe(true);
+          expect(Exit.isFailure(yield* Effect.exit(manager.captureScreenshot("private_tab")))).toBe(
+            true,
+          );
+          expect(replacement.value).toBe("fake-password");
+        }),
+      ),
+  );
+
   effectIt.effect("captures a PNG screenshot into browser artifacts", () =>
     withManager((manager) =>
       Effect.gen(function* () {
@@ -4755,16 +4806,22 @@ describe("PreviewOperationError", () => {
   });
 });
 
-it("refuses a different form until isolated bookkeeping clears the original revealed fields", () => {
+function makeAutofillDomFixture() {
   const document: { activeElement?: FakeInput } = {};
   class FakeInput {
     disabled = false;
     autocomplete = "";
     isConnected = true;
+    ownerDocument = document;
     private storedValue = "";
     constructor(
       public type: string,
-      public form: { querySelectorAll: (selector: string) => FakeInput[] },
+      public form: {
+        querySelectorAll: (selector: string) => FakeInput[];
+        isConnected: boolean;
+        ownerDocument: typeof document;
+        contains: (field: FakeInput) => boolean;
+      },
     ) {}
     get value() {
       return this.storedValue;
@@ -4783,6 +4840,9 @@ it("refuses a different form until isolated bookkeeping clears the original reve
   const form = () => {
     const fields: FakeInput[] = [];
     const owner = {
+      isConnected: true,
+      ownerDocument: document,
+      contains: (field: FakeInput) => fields.includes(field),
       querySelectorAll: (selector: string) =>
         fields.filter((field) =>
           selector === 'input[type="password"]'
@@ -4795,12 +4855,27 @@ it("refuses a different form until isolated bookkeeping clears the original reve
     const username = new FakeInput("text", owner);
     const password = new FakeInput("password", owner);
     fields.push(username, password);
-    return { username, password };
+    return {
+      username,
+      password,
+      replacePassword() {
+        const replacement = new FakeInput(password.type, owner);
+        replacement.value = password.value;
+        password.isConnected = false;
+        fields[fields.indexOf(password)] = replacement;
+        return replacement;
+      },
+    };
   };
   const a = form();
   const b = form();
   const isolated = NodeVM.createContext({ document, HTMLInputElement: FakeInput });
   const run = (code: string): unknown => NodeVM.runInContext(code, isolated);
+  return { document, a, b, run };
+}
+
+it("refuses a different form until isolated bookkeeping clears the original revealed fields", () => {
+  const { document, a, b, run } = makeAutofillDomFixture();
   document.activeElement = a.username;
   expect(run(PreviewManager.protonPassAutofillScripts.prepare)).toBe(true);
   // Link -> fill on the same pair remains supported.

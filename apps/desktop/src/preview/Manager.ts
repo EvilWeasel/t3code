@@ -560,9 +560,19 @@ export const protonPassAutofillScripts = {
   clear: `(() => {
     const fields = globalThis.__morrowbyteProtonFields;
     if (fields) {
+      const livePair = () => {
+        const { username, password } = fields;
+        const form = username?.form;
+        return username instanceof HTMLInputElement && password instanceof HTMLInputElement &&
+          username !== password && username.isConnected && password.isConnected &&
+          username.ownerDocument === document && password.ownerDocument === document &&
+          form && form.isConnected && form.ownerDocument === document &&
+          password.form === form && form.contains(username) && form.contains(password);
+      };
+      if (!livePair()) return false;
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
       setter.call(fields.username, ''); setter.call(fields.password, '');
-      if (fields.username.value !== '' || fields.password.value !== '') return false;
+      if (!livePair() || fields.username.value !== '' || fields.password.value !== '') return false;
     }
     delete globalThis.__morrowbyteProtonFields;
     return true;
