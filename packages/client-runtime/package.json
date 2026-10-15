@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./observatory": {
+      "types": "./src/observatory/index.ts",
+      "default": "./src/observatory/index.ts"
+    },
     "./composerThreadItems": {
       "types": "./src/composerThreadItems.ts",
       "default": "./src/composerThreadItems.ts"
