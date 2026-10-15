@@ -2,7 +2,6 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 
 import {
-  OrchestrationV2Command,
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpDelegateTaskResult,
@@ -14,6 +13,7 @@ import {
   OrchestratorMcpExternalDelegateTaskInput,
   OrchestratorMcpExternalTaskEventsInput,
 } from "./orchestratorMcp.ts";
+import { OrchestrationV2Command } from "./orchestrationV2.ts";
 
 const decodeCreateThreadsInput = Schema.decodeUnknownSync(OrchestratorMcpCreateThreadsInput);
 const decodeDelegateTaskInput = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskInput);
