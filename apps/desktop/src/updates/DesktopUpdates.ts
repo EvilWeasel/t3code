@@ -13,6 +13,7 @@ import { errorTag } from "@t3tools/shared/observability";
 import { compareSemverVersions } from "@t3tools/shared/semver";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
@@ -22,6 +23,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -85,6 +87,41 @@ const DesktopUpdateInstallRecord = Schema.fromJsonString(
 );
 const decodeInstallRecord = Schema.decodeUnknownEffect(DesktopUpdateInstallRecord);
 const encodeInstallRecord = Schema.encodeEffect(DesktopUpdateInstallRecord);
+
+// This file is historical metadata only. It never carries admission authority.
+export const DESKTOP_UPDATE_DEFER_RECORD_PREFIX = "desktop-update-deferred-";
+const DEFER_RECORD_MAX_BYTES = 16_384;
+const deferEncoder = new TextEncoder();
+const deferText = (bytes: number) => Schema.String.check(Schema.makeFilter(
+  (text) => text.length > 0 && deferEncoder.encode(text).length <= bytes && !/[\u0000-\u001f\u007f]/.test(text),
+  { expected: `bounded update metadata (${bytes} UTF-8 bytes)` },
+));
+const DeferReason = Schema.Literals(["runtime-busy", "runtime-unknown", "peer-unsupported", "peer-disconnected", "stale-proof", "expired-proof", "renderer-refused", "storage-unavailable", "recovery-held"]);
+type DeferReason = typeof DeferReason.Type;
+const DeferPeer = Schema.Struct({
+  instanceId: deferText(256),
+  status: Schema.Literals(["ready", "held", "superseded"]),
+  shutdown: Schema.Literals(["not-started", "unconfirmed", "stopped"]),
+});
+const DeferRecord = Schema.Struct({
+  version: Schema.Literal(1), profileKey: Schema.String.check(Schema.makeFilter((value) => /^[a-f0-9]{64}$/.test(value))),
+  profile: Schema.NullOr(deferText(64)), attemptId: deferText(512),
+  observedAt: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  runningVersion: deferText(128), targetVersion: deferText(128), channel: DesktopUpdateChannelSchema,
+  phase: Schema.Literals(["deferred", "recovery-held"]), reason: DeferReason,
+  stopState: Schema.Literals(["not-started", "may-have-started"]),
+  peers: Schema.Array(DeferPeer).check(Schema.isMaxLength(32)),
+});
+type DeferRecord = typeof DeferRecord.Type;
+type DeferAttempt = Pick<DeferRecord, "profileKey" | "profile" | "attemptId" | "observedAt" | "runningVersion" | "targetVersion" | "channel"> & { readonly admissionGeneration: number };
+const DeferJson = Schema.fromJsonString(DeferRecord);
+const decodeDeferRecord = Schema.decodeUnknownEffect(DeferJson, { onExcessProperty: "error" });
+const encodeDeferRecord = Schema.encodeEffect(DeferJson);
+const sameDeferMeaning = (a: DeferRecord, b: DeferRecord) => a.profileKey === b.profileKey && a.profile === b.profile &&
+  a.runningVersion === b.runningVersion && a.targetVersion === b.targetVersion && a.channel === b.channel &&
+  a.phase === b.phase && a.reason === b.reason && a.stopState === b.stopState && a.peers.length === b.peers.length &&
+  a.peers.every((peer, index) => { const other = b.peers[index]; return other !== undefined && peer.instanceId === other.instanceId && peer.status === other.status && peer.shutdown === other.shutdown; });
+const deferMessage = (record: DeferRecord) => `Recorded update deferral for ${record.targetVersion}: ${record.reason} (${new Date(record.observedAt).toISOString()}).${record.peers.length === 0 ? "" : ` Peers: ${record.peers.map((peer) => `${peer.instanceId}=${peer.shutdown}/${peer.status}`).join(", ")}.`}`;
 
 const decodeAppUpdateYmlConfig = Schema.decodeUnknownEffect(AppUpdateYmlConfig);
 const decodeUpdateInfo = Schema.decodeUnknownEffect(UpdateInfo);
@@ -167,6 +204,7 @@ export class DesktopUpdateUnexpectedActionError extends Schema.TaggedError<Deskt
 export type DesktopUpdateConfigureError = never;
 
 interface OwnedBackendInstallAdmission {
+  readonly attempt: DeferAttempt;
   readonly instances: ReadonlyArray<DesktopBackendPool.DesktopBackendInstance>;
   readonly stopAll: Effect.Effect<boolean>;
   readonly stopping: () => boolean;
@@ -387,6 +425,7 @@ export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
+  const crypto = yield* Crypto.Crypto;
   const qualification = yield* Effect.serviceOption(DesktopUpdateInstallQualification);
 
   const appUpdateYmlConfigRef = yield* Ref.make<Option.Option<AppUpdateYmlConfig>>(Option.none());
@@ -395,7 +434,37 @@ export const make = Effect.gen(function* () {
   const updaterConfiguredRef = yield* Ref.make(false);
   const clientOnlyInstallRef = yield* Ref.make(false);
   const recoveryInstancesRef = yield* Ref.make<ReadonlyArray<DesktopBackendPool.DesktopBackendInstance> | null>(null);
-  const recoveryOutcomesRef = yield* Ref.make<ReadonlyArray<{ readonly instanceId: string; readonly status: "ready" | "held" | "superseded" }>>([]);
+  const recoveryOutcomesRef = yield* Ref.make<ReadonlyArray<{ readonly instanceId: string; readonly status: "ready" | "held" | "superseded"; readonly shutdown: "not-started" | "unconfirmed" | "stopped" }>>([]);
+  const deferStorageMutex = yield* Semaphore.make(1);
+  const deferWriterRef = yield* Ref.make(Option.none<string>());
+  const latestDeferAttemptRef = yield* Ref.make(Option.none<DeferAttempt>());
+  const recoveryAttemptRef = yield* Ref.make(Option.none<DeferAttempt>());
+  const recoveryStoppingRef = yield* Ref.make(false);
+  const lastDeferRecordRef = yield* Ref.make(Option.none<DeferRecord>());
+  const deferUnavailableRef = yield* Ref.make(false);
+  // Only matching canonical profile inputs can name a scope. Include the SDK
+  // origin: development/production can share T3 home but use different locks.
+  const deferScope = yield* Effect.gen(function* () {
+    if (!Option.isOption(environment.profileId) || !Option.isOption(config.desktopProfile) ||
+      typeof environment.stateDir !== "string" || !environment.path.isAbsolute(environment.stateDir) ||
+      typeof environment.isDevelopment !== "boolean" ||
+      typeof environment.appDataDirectory !== "string" || !environment.path.isAbsolute(environment.appDataDirectory)) return Option.none<{ profileKey: string; profile: string | null; path: string }>();
+    if (environment.isDevelopment !== Option.isSome(config.devServerUrl)) return Option.none();
+    if (typeof environment.homeDirectory !== "string" || !environment.path.isAbsolute(environment.homeDirectory)) return Option.none();
+    const expectedAppData = environment.platform === "win32"
+      ? Option.getOrElse(config.appDataDirectory, () => environment.path.join(environment.homeDirectory, "AppData", "Roaming"))
+      : environment.platform === "darwin" ? environment.path.join(environment.homeDirectory, "Library", "Application Support")
+      : Option.getOrElse(config.xdgConfigHome, () => environment.path.join(environment.homeDirectory, ".config"));
+    if (expectedAppData !== environment.appDataDirectory) return Option.none();
+    const profile = Option.getOrNull(environment.profileId);
+    if (profile !== Option.getOrNull(config.desktopProfile) || (profile !== null && !/^[A-Za-z0-9_-]{1,64}$/.test(profile))) return Option.none();
+    const origin = deferEncoder.encode(JSON.stringify(["desktop-update-defer", 1, environment.appDataDirectory, environment.isDevelopment, profile]));
+    const digest = yield* crypto.digest("SHA-256", origin).pipe(Effect.option);
+    if (Option.isNone(digest) || digest.value.length !== 32) return Option.none();
+    const profileKey = Array.from(digest.value, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    if (!/^[a-f0-9]{64}$/.test(profileKey)) return Option.none();
+    return Option.some({ profileKey, profile, path: environment.path.join(environment.stateDir, `${DESKTOP_UPDATE_DEFER_RECORD_PREFIX}${profileKey}.json`) });
+  });
   const heldRecoveryRef = yield* Ref.make<OwnedBackendInstallAdmission["deferRecovery"] | null>(null);
   const admissionSequence = yield* Ref.make(0);
   const pendingReadiness = yield* Ref.make<{
@@ -422,12 +491,19 @@ export const make = Effect.gen(function* () {
     Effect.flatMap((state) => electronWindow.sendAll(IpcChannels.UPDATE_STATE_CHANNEL, state)),
   );
 
+  const decorateDeferState = (state: DesktopUpdateState) => Effect.gen(function* () {
+    if (state.errorContext !== null || (state.status !== "idle" && state.status !== "downloaded")) return state;
+    if (yield* Ref.get(deferUnavailableRef)) return { ...state, message: "Update outcome storage is unavailable; automatic installation remains deferred." };
+    const record = yield* Ref.get(lastDeferRecordRef);
+    return Option.isSome(record) && (state.status === "idle" || state.downloadedVersion === record.value.targetVersion)
+      ? { ...state, message: deferMessage(record.value) } : state;
+  });
   const setState = (state: DesktopUpdateState): Effect.Effect<void> =>
-    stateMutex
+    decorateDeferState(state).pipe(Effect.flatMap((state) => stateMutex
       .withPermits(1)(
         Ref.set(updateStateRef, state).pipe(Effect.andThen(PubSub.publish(stateChanges, state))),
       )
-      .pipe(Effect.andThen(emitState));
+      .pipe(Effect.andThen(emitState))));
 
   const updateState = (
     f: (state: DesktopUpdateState) => DesktopUpdateState,
@@ -720,6 +796,98 @@ export const make = Effect.gen(function* () {
       })),
     );
 
+  const metadataUnavailable = Effect.all([
+    Ref.set(deferUnavailableRef, true), Ref.set(lastDeferRecordRef, Option.none()),
+  ], { discard: true });
+  const boundedMetadata = (path: string) => Effect.scoped(Effect.gen(function* () {
+    const file = yield* fileSystem.open(path, { flag: "r" });
+    const info = yield* file.stat;
+    if (info.type !== "File" || info.size <= 0n || info.size > BigInt(DEFER_RECORD_MAX_BYTES)) return yield* Effect.fail("invalid-metadata" as const);
+    const bytes = yield* file.readAlloc(DEFER_RECORD_MAX_BYTES + 1);
+    if (Option.isNone(bytes) || bytes.value.length !== Number(info.size) || bytes.value.length > DEFER_RECORD_MAX_BYTES) return yield* Effect.fail("invalid-metadata" as const);
+    return yield* Effect.try({ try: () => new TextDecoder("utf-8", { fatal: true }).decode(bytes.value), catch: () => "invalid-metadata" as const });
+  }));
+  const readDeferRecord: Effect.Effect<{ readonly kind: "missing" | "unavailable" } | { readonly kind: "record"; readonly record: DeferRecord }> = Effect.suspend(() => {
+    if (Option.isNone(deferScope)) return Effect.succeed({ kind: "unavailable" as const });
+    const scope = deferScope.value;
+    return boundedMetadata(scope.path).pipe(
+      Effect.flatMap(decodeDeferRecord),
+      Effect.flatMap((record) => Clock.currentTimeMillis.pipe(Effect.map((now) => record.profileKey === scope.profileKey && record.profile === scope.profile &&
+        record.observedAt <= now + 60_000 && new Set(record.peers.map((peer) => peer.instanceId)).size === record.peers.length
+          ? { kind: "record" as const, record } : { kind: "unavailable" as const }))),
+      Effect.catch((error) => Effect.succeed(PlatformError.isPlatformError(error) && error.reason._tag === "NotFound"
+        ? { kind: "missing" as const } : { kind: "unavailable" as const })),
+    );
+  });
+  const refreshDeferRecord = Effect.gen(function* () {
+    const stored = yield* readDeferRecord;
+    if (stored.kind === "unavailable") { yield* metadataUnavailable; return false; }
+    yield* Ref.set(deferUnavailableRef, false);
+    yield* Ref.set(lastDeferRecordRef, stored.kind === "record" ? Option.some(stored.record) : Option.none());
+    return true;
+  });
+  const beginDeferAttempt = (state: DesktopUpdateState) => deferStorageMutex.withPermits(1)(stateMutex.withPermits(1)(Effect.gen(function* () {
+    const current = yield* Ref.get(updateStateRef);
+    if (Option.isSome(yield* Ref.get(activeUpdateActionRef)) || current.downloadedVersion !== state.downloadedVersion || current.channel !== state.channel) return Option.none<DeferAttempt>();
+    const writer = yield* Ref.get(deferWriterRef);
+    if (Option.isNone(deferScope) || Option.isNone(writer) || state.downloadedVersion === null) {
+      yield* metadataUnavailable;
+      return Option.none<DeferAttempt>();
+    }
+    const sequence = yield* Ref.modify(admissionSequence, (value) => [value + 1, value + 1]);
+    const attempt: DeferAttempt = { profileKey: deferScope.value.profileKey, profile: deferScope.value.profile,
+      attemptId: `${writer.value}:${sequence}`, admissionGeneration: sequence, observedAt: yield* Clock.currentTimeMillis,
+      runningVersion: environment.appVersion, targetVersion: state.downloadedVersion, channel: state.channel };
+    yield* Ref.set(latestDeferAttemptRef, Option.some(attempt));
+    return Option.some(attempt);
+  })));
+  const ownsDeferAttempt = (attempt: DeferAttempt) => Ref.get(latestDeferAttemptRef).pipe(Effect.map((owner) => Option.isSome(owner) && owner.value === attempt));
+  // The only writer. Claiming a newer attempt uses this SAME lane, so it cannot
+  // race between an older writer's ownership check and awaited atomic rename.
+  const storeDeferRecord = (attempt: DeferAttempt, reason: DeferReason, peers: DeferRecord["peers"] = [], afterStop = false, probeOnly = false) =>
+    deferStorageMutex.withPermits(1)(Effect.scoped(Effect.gen(function* () {
+      if (!(yield* ownsDeferAttempt(attempt))) return "superseded" as const;
+      if (Option.isNone(deferScope) || !(yield* refreshDeferRecord)) return "unavailable" as const;
+      const { admissionGeneration: _generation, ...metadata } = attempt;
+      const record: DeferRecord = { version: 1, ...metadata, reason, phase: afterStop || reason === "recovery-held" ? "recovery-held" : "deferred",
+        stopState: afterStop ? "may-have-started" : "not-started",
+        peers: peers.toSorted((a, b) => a.instanceId === b.instanceId ? 0 : a.instanceId < b.instanceId ? -1 : 1) };
+      const text = yield* encodeDeferRecord(record);
+      if (deferEncoder.encode(text).length > DEFER_RECORD_MAX_BYTES || new Set(record.peers.map((peer) => peer.instanceId)).size !== record.peers.length) return yield* Effect.fail("invalid-metadata" as const);
+      const prior = yield* Ref.get(lastDeferRecordRef);
+      if (!probeOnly && Option.isSome(prior) && sameDeferMeaning(prior.value, record)) return "stored" as const;
+      yield* fileSystem.makeDirectory(environment.stateDir, { recursive: true, mode: 0o700 });
+      const temporary = yield* fileSystem.makeTempFileScoped({ directory: environment.stateDir, prefix: `.${DESKTOP_UPDATE_DEFER_RECORD_PREFIX}` });
+      yield* fileSystem.chmod(temporary, 0o600);
+      yield* Effect.scoped(Effect.gen(function* () {
+        const file = yield* fileSystem.open(temporary, { flag: "w", mode: 0o600 });
+        yield* file.writeAll(deferEncoder.encode(text));
+        yield* file.sync;
+      }));
+      const staged = yield* boundedMetadata(temporary);
+      const decoded = yield* decodeDeferRecord(staged);
+      if (staged !== text || decoded.attemptId !== attempt.attemptId || decoded.profileKey !== attempt.profileKey) return yield* Effect.fail("invalid-metadata" as const);
+      if (probeOnly) {
+        // Exercise the atomic rename/readback boundary using ONLY owned temps;
+        // the existing completed record is never replaced by a provisional probe.
+        const destination = yield* fileSystem.makeTempFileScoped({ directory: environment.stateDir, prefix: `.${DESKTOP_UPDATE_DEFER_RECORD_PREFIX}` });
+        yield* fileSystem.rename(temporary, destination);
+        if ((yield* boundedMetadata(destination)) !== text) return yield* Effect.fail("invalid-metadata" as const);
+        return "stored" as const;
+      }
+      yield* fileSystem.rename(temporary, deferScope.value.path);
+      const published = yield* boundedMetadata(deferScope.value.path);
+      if (published !== text) return yield* Effect.fail("invalid-metadata" as const);
+      const verified = yield* decodeDeferRecord(published);
+      yield* Ref.set(lastDeferRecordRef, Option.some(verified));
+      yield* Ref.set(deferUnavailableRef, false);
+      return "stored" as const;
+    })).pipe(Effect.catch(() => metadataUnavailable.pipe(Effect.as("unavailable" as const))), Effect.uninterruptible));
+  const deferInstall = (attempt: DeferAttempt, reason: DeferReason, peers: DeferRecord["peers"] = []) => storeDeferRecord(attempt, reason, peers).pipe(
+    Effect.tap((result) => result === "superseded" ? Effect.void : updateState((state) => state).pipe(Effect.asVoid)),
+    Effect.as({ accepted: false, completed: false, failed: false }),
+  );
+
   const resetInstallAction = Effect.all(
     [
       finishUpdateAction("install"),
@@ -727,6 +895,8 @@ export const make = Effect.gen(function* () {
       Ref.set(clientOnlyInstallRef, false),
       Ref.set(recoveryInstancesRef, null),
       Ref.set(recoveryOutcomesRef, []),
+      Ref.set(recoveryAttemptRef, Option.none()),
+      Ref.set(recoveryStoppingRef, false),
       Ref.set(heldRecoveryRef, null),
       removeUpdateRestartMarker,
       removeInstallRecord,
@@ -763,7 +933,14 @@ export const make = Effect.gen(function* () {
       }).pipe(Effect.exit);
       const outcomes = yield* Ref.get(recoveryOutcomesRef);
       const held = outcomes.filter((outcome) => outcome.status === "held");
-      const recoveryMessage = held.length === 0 ? message : `${message} Recovery remains held for app-owned backends: ${held.slice(0, 128).map((outcome) => outcome.instanceId.slice(0, 128)).join(", ")}. No committed peer was reopened.`;
+      const attempt = yield* Ref.get(recoveryAttemptRef);
+      const afterStop = yield* Ref.get(recoveryStoppingRef);
+      const persisted = Option.isNone(attempt) ? "stored" as const : yield* storeDeferRecord(attempt.value, "recovery-held", [...outcomes], afterStop);
+      const storageMessage = persisted === "unavailable" ? (afterStop
+        ? " Deferred outcome storage is unavailable after shutdown admission; stopped/unconfirmed peer outcomes remain in this running session."
+        : " Deferred outcome storage is unavailable during install recovery; no owned backend shutdown began.") : "";
+      const shutdownMessage = outcomes.length === 0 ? "" : ` Shutdown outcomes: ${outcomes.map((peer) => `${peer.instanceId.slice(0, 128)}=${peer.shutdown}`).join(", ")}.`;
+      const recoveryMessage = held.length === 0 ? message + storageMessage + shutdownMessage : `${message} Recovery remains held for app-owned backends: ${held.slice(0, 128).map((outcome) => outcome.instanceId.slice(0, 128)).join(", ")}. No committed peer was reopened.${storageMessage}${shutdownMessage}`;
       yield* updateState((current) => reduceDesktopUpdateStateOnInstallFailure(current, recoveryMessage));
       if (Exit.isFailure(restartExit)) {
         yield* logUpdaterError("Desktop update install recovery could not restart every backend.");
@@ -786,6 +963,7 @@ export const make = Effect.gen(function* () {
             Effect.gen(function* () {
               const state = yield* Ref.get(updateStateRef);
               const activeAction = yield* Ref.get(activeUpdateActionRef);
+              if (owned !== undefined && !(yield* ownsDeferAttempt(owned.attempt))) return "refused" as const;
               const hasExpectedDownload =
                 state.downloadedVersion !== null &&
                 (expectedVersion === undefined || state.downloadedVersion === expectedVersion);
@@ -829,7 +1007,9 @@ export const make = Effect.gen(function* () {
 
         yield* Ref.set(clientOnlyInstallRef, clientOnly);
         yield* Ref.set(recoveryInstancesRef, owned?.instances ?? null);
-        yield* Ref.set(recoveryOutcomesRef, (owned?.instances ?? []).map((instance) => ({ instanceId: instance.id, status: "held" as const })));
+        yield* Ref.set(recoveryOutcomesRef, (owned?.instances ?? []).map((instance) => ({ instanceId: instance.id, status: "held" as const, shutdown: "not-started" as const })));
+        yield* Ref.set(recoveryAttemptRef, owned === undefined ? Option.none() : Option.some(owned.attempt));
+        yield* Ref.set(recoveryStoppingRef, false);
         yield* Ref.set(heldRecoveryRef, owned?.deferRecovery ?? null);
         yield* Ref.set(desktopState.quitting, true);
 
@@ -841,6 +1021,7 @@ export const make = Effect.gen(function* () {
           const { downloadedVersion } = yield* Ref.get(updateStateRef);
           const recordVerified = downloadedVersion !== null && (yield* writeInstallRecord(downloadedVersion));
           if (runtime !== undefined && !recordVerified) {
+            if (owned !== undefined) yield* deferInstall(owned.attempt, "storage-unavailable");
             yield* resetInstallAction;
             return { accepted: false, completed: false, failed: false };
           }
@@ -876,7 +1057,7 @@ export const make = Effect.gen(function* () {
               Effect.as({ accepted: true, completed: false, failed: true }),
             ),
             ElectronUpdaterInstallAdmissionError: () => (clientOnly || (owned !== undefined && !owned.stopping()))
-              ? resetInstallAction.pipe(Effect.as({ accepted: false, completed: false, failed: false }))
+              ? resetInstallAction.pipe(Effect.andThen(owned === undefined ? Effect.void : deferInstall(owned.attempt, "stale-proof")), Effect.as({ accepted: false, completed: false, failed: false }))
               : recover("Desktop update admission was revoked before installation.").pipe(
                 Effect.as({ accepted: true, completed: false, failed: true }),
               ),
@@ -938,8 +1119,6 @@ export const make = Effect.gen(function* () {
 
   const refusedInstall = { accepted: false, completed: false, failed: false };
   const attemptAdmittedInstall = (expectedVersion?: string, trigger: "automatic" | "manual" = "automatic") => Effect.gen(function* () {
-    if (Option.isNone(qualification)) return refusedInstall;
-    const runtimeQualification = qualification.value;
     const state = yield* Ref.get(updateStateRef);
     const holdPool = pool.withUpdateInventory;
     const holdRenderers = electronWindow.withUpdateRenderers;
@@ -947,18 +1126,22 @@ export const make = Effect.gen(function* () {
     if (Option.isSome(yield* Ref.get(activeUpdateActionRef)) || state.status !== "downloaded" || state.downloadedVersion === null ||
       (expectedVersion !== undefined && state.downloadedVersion !== expectedVersion) ||
       (trigger === "automatic" && state.notAppliedVersion === state.downloadedVersion) ||
-      holdPool === undefined || holdRenderers === undefined || inventory === undefined ||
       (yield* Ref.get(desktopState.quitting))) return refusedInstall;
     const targetVersion = state.downloadedVersion;
     if (compareSemverVersions(targetVersion, state.currentVersion) <= 0) return refusedInstall;
+    const captured = yield* beginDeferAttempt(state);
+    if (Option.isNone(captured)) { yield* updateState((current) => current); return refusedInstall; }
+    const attempt = captured.value;
+    if (Option.isNone(qualification) || holdPool === undefined || holdRenderers === undefined || inventory === undefined) return yield* deferInstall(attempt, "runtime-unknown");
+    const runtimeQualification = qualification.value;
     let recovery: { readonly message: string; readonly preserveInstallRecord: boolean } | undefined;
     let recoveryHook: OwnedBackendInstallAdmission["deferRecovery"] | undefined;
     const result = yield* holdPool((instances) => holdRenderers(Effect.scoped(Effect.gen(function* () {
-      const admissionGeneration = yield* Ref.modify(admissionSequence, (value) => [value + 1, value + 1]);
-      const generation = `${targetVersion}:${yield* Clock.currentTimeMillis}:${admissionGeneration}`;
+      const admissionGeneration = attempt.admissionGeneration;
+      const generation = attempt.attemptId;
       const expiresAt = (yield* Clock.currentTimeMillis) + 30_000;
       const reservation = yield* runtimeQualification.acquireRuntimeReservation({ generation, targetVersion, expiresAt });
-      if (Option.isNone(reservation) || !reservation.value.isValid()) return refusedInstall;
+      if (Option.isNone(reservation) || !reservation.value.isValid()) return yield* deferInstall(attempt, "runtime-unknown");
       const runtime = reservation.value;
       const prepared: Array<{ instance: DesktopBackendPool.DesktopBackendInstance; proof: DesktopBackendPool.DesktopBackendUpdateProof }> = [];
       let stopping = false;
@@ -970,28 +1153,30 @@ export const make = Effect.gen(function* () {
       // this inventory and are never shutdown targets for a client update.
       const preparation = yield* Effect.forEach(instances, (instance, index) => Effect.gen(function* () {
         const snapshot = snapshots[index];
-        if (snapshot === undefined) return false;
+        if (snapshot === undefined) return "runtime-unknown" as const;
         const inactive = !snapshot.desiredRunning && !snapshot.ready && Option.isNone(snapshot.activePid) && !snapshot.restartScheduled;
-        if (inactive) return true;
-        if (!snapshot.desiredRunning || !snapshot.ready || Option.isNone(snapshot.activePid) || snapshot.restartScheduled ||
-          instance.prepareUpdate === undefined || instance.stopForUpdate === undefined) return false;
+        if (inactive) return "ready" as const;
+        if (!snapshot.desiredRunning || !snapshot.ready || Option.isNone(snapshot.activePid) || snapshot.restartScheduled) return "runtime-busy" as const;
+        if (instance.prepareUpdate === undefined || instance.stopForUpdate === undefined) return "peer-unsupported" as const;
         const proof = yield* instance.prepareUpdate({ requestId: generation, targetVersion, admissionGeneration, expiresAt });
-        if (Option.isNone(proof)) return false;
+        if (Option.isNone(proof)) return "runtime-unknown" as const;
         prepared.push({ instance, proof: proof.value });
-        return true;
+        return "ready" as const;
       }), { concurrency: "unbounded" });
-      if (!preparation.every(Boolean) || !runtime.isValid()) return refusedInstall;
+      const refusal = preparation.find((result) => result !== "ready");
+      if (refusal !== undefined) return yield* deferInstall(attempt, refusal, instances.flatMap((instance, index) => preparation[index] === "ready" ? [] : [{ instanceId: instance.id, status: "held" as const, shutdown: "not-started" as const }]));
+      if (!runtime.isValid()) return yield* deferInstall(attempt, "stale-proof");
       const expected = yield* inventory;
-      if (expected.some((renderer) => renderer.audible !== false)) return refusedInstall;
+      if (expected.some((renderer) => renderer.audible !== false)) return yield* deferInstall(attempt, "runtime-busy");
       for (const phase of ["prepare", "validate"] as const) {
-        if (!runtime.isValid()) return refusedInstall;
+        if (!runtime.isValid()) return yield* deferInstall(attempt, "stale-proof");
         const lease = { generation, targetVersion, expiresAt, phase };
         const signal = yield* Deferred.make<boolean>();
         yield* Ref.set(pendingReadiness, { lease, senders: new Set(expected.map((item) => item.id)), signal });
         yield* updateState((current) => ({ ...current, installLease: lease }));
         if (expected.length > 0) {
           const ready = yield* Deferred.await(signal).pipe(Effect.timeoutOption(Duration.seconds(5)));
-          if (Option.isNone(ready) || !ready.value) return refusedInstall;
+          if (Option.isNone(ready) || !ready.value) return yield* deferInstall(attempt, "renderer-refused");
         }
       }
       const currentInventory = yield* inventory;
@@ -1000,25 +1185,38 @@ export const make = Effect.gen(function* () {
         return current !== undefined && renderer.id === current.id && renderer.generation === current.generation && renderer.audible === current.audible;
       });
       const validPrepared = yield* Effect.forEach(prepared, ({ proof }) => proof.isValid);
-      if (!sameInventory || !validPrepared.every(Boolean) || !runtime.isValid() || (yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return refusedInstall;
+      if ((yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return yield* deferInstall(attempt, "expired-proof");
+      if (!sameInventory || !validPrepared.every(Boolean) || !runtime.isValid()) return yield* deferInstall(attempt, "stale-proof");
       const committed = yield* Effect.forEach(prepared, ({ proof }) => proof.commit, { concurrency: "unbounded" });
-      if (!committed.every(Boolean) || !runtime.isValid() ||
-        (yield* Clock.currentTimeMillis) >= expiresAt - 5_000 || !runtime.tryCommit()) return refusedInstall;
+      if ((yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return yield* deferInstall(attempt, "expired-proof");
+      if (!committed.every(Boolean) || !runtime.isValid() || !runtime.tryCommit()) return yield* deferInstall(attempt, "stale-proof");
       yield* updateState((current) => ({ ...current, installLease: { generation, targetVersion, expiresAt, phase: "commit" } }));
+      // Verify worst-case final capacity and atomic storage BEFORE touching
+      // the canonical from/target install record, restart marker or any process.
+      const worst = prepared.map(({ instance }) => ({ instanceId: instance.id, status: "superseded" as const, shutdown: "unconfirmed" as const }));
+      if ((yield* storeDeferRecord(attempt, "storage-unavailable", worst, true, true)) !== "stored") return refusedInstall;
       const completions = yield* PubSub.subscribe(finishedUpdateActions);
       const owned: OwnedBackendInstallAdmission = {
+        attempt,
         instances: prepared.map(({ instance, proof }) => ({ ...instance, start: proof.recover.pipe(
           Effect.flatMap((status) => Ref.update(recoveryOutcomesRef, (outcomes) => outcomes.map((outcome) => outcome.instanceId === instance.id ? { ...outcome, status } : outcome))),
         ) })),
         stopping: () => stopping,
         deferRecovery: (message, preserveInstallRecord = false) => Effect.sync(() => { recovery = { message, preserveInstallRecord }; }),
         stopAll: Effect.gen(function* () {
+          if (!(yield* ownsDeferAttempt(attempt))) return false;
           const valid = yield* Effect.forEach(prepared, ({ proof }) => proof.isValid);
           if (!runtime.isValid() || !valid.every(Boolean) || (yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return false;
           // Irreversible batch admission: no peer may be aborted/opened once
           // the first canonical shutdown can begin. Later failure is recovery.
           stopping = prepared.length > 0;
-          const stopped = yield* Effect.forEach(prepared, ({ instance, proof }) => instance.stopForUpdate?.(proof) ?? Effect.succeed(false), { concurrency: "unbounded" });
+          yield* Ref.set(recoveryStoppingRef, stopping);
+          const stopped = yield* Effect.forEach(prepared, ({ instance, proof }) => Effect.gen(function* () {
+            yield* Ref.update(recoveryOutcomesRef, (outcomes) => outcomes.map((peer) => peer.instanceId === instance.id ? { ...peer, shutdown: "unconfirmed" as const } : peer));
+            const result = yield* (instance.stopForUpdate?.(proof) ?? Effect.succeed(false));
+            if (result) yield* Ref.update(recoveryOutcomesRef, (outcomes) => outcomes.map((peer) => peer.instanceId === instance.id ? { ...peer, shutdown: "stopped" as const } : peer));
+            return result;
+          }), { concurrency: "unbounded" });
           return stopped.every(Boolean);
         }),
       };
@@ -1034,7 +1232,7 @@ export const make = Effect.gen(function* () {
     })))).pipe(Effect.onExit(() => Ref.update(heldRecoveryRef, (current) => current === recoveryHook ? null : current).pipe(
       Effect.andThen(Effect.suspend(() => recovery === undefined ? Effect.void : recoverFailedInstall(recovery.message, recovery.preserveInstallRecord))),
     )));
-    return Option.getOrElse(result, () => refusedInstall);
+    return Option.isNone(result) ? yield* deferInstall(attempt, "runtime-busy") : result.value;
   }).pipe(Effect.catchCause((cause) => Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) :
     logUpdaterWarning("Update admission could not be verified; update remains prepared.").pipe(Effect.as(refusedInstall))));
 
@@ -1295,6 +1493,8 @@ export const make = Effect.gen(function* () {
         void Effect.runPromiseWith(context)(effect);
       };
 
+      yield* Ref.set(deferWriterRef, yield* crypto.randomUUIDv4.pipe(Effect.option));
+      yield* deferStorageMutex.withPermits(1)(refreshDeferRecord);
       const appUpdateYmlConfig = yield* readAppUpdateYml;
       yield* Ref.set(appUpdateYmlConfigRef, appUpdateYmlConfig);
 

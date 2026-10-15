@@ -1696,3 +1696,339 @@ it.effect("uses explicit recovery after partial shutdown and never falsely repor
     })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   })),
 );
+
+const previousDefer = (path: string) => JSON.stringify({ version: 1, profileKey: path.split(/[\\/]/).at(-1)!.slice(DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX.length, -5), profile: null, attemptId: "previous-owner:1", observedAt: 0,
+  runningVersion: "1.2.3", targetVersion: "1.2.4", channel: "stable", phase: "deferred", reason: "runtime-busy", stopState: "not-started", peers: [] });
+function completedDefer(harness: ReturnType<typeof makeHarness>) {
+  const entries = [...harness.deferFiles].filter(([path]) => !path.includes(`.${DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX}`));
+  assert.lengthOf(entries, 1);
+  return { path: entries[0]![0], text: entries[0]![1], record: JSON.parse(entries[0]![1]) as {
+    targetVersion: string; runningVersion: string; attemptId: string; reason: string; observedAt: number; profileKey: string;
+    phase: string; stopState: string; peers: Array<{ instanceId: string; status: string; shutdown: string }>;
+  } };
+}
+
+it.effect("restores only the recorded defer metadata after 24h and a fresh service without replaying an update", () =>
+  Effect.gen(function* () {
+    const files = new Map<string, string>();
+    const released = yield* Deferred.make<void>();
+    const first = makeHarness({ deferFiles: files, clientOnlyInventory: [], clientOnlyInstallQualified: false,
+      runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid) });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      first.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      yield* Deferred.await(released);
+      assert.equal(completedDefer(first).record.reason, "runtime-unknown");
+      assert.equal((yield* updates.getState).status, "downloaded");
+      assert.equal(first.quitAndInstalls(), 0);
+    })).pipe(Effect.provide(first.layer));
+    const saved = completedDefer(first);
+    yield* TestClock.adjust(Duration.hours(24));
+    const second = makeHarness({ deferFiles: files, omitInstallQualification: true });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      const state = yield* updates.getState;
+      assert.include(state.message ?? "", "runtime-unknown");
+      assert.include(state.message ?? "", "1.2.4");
+      assert.isNull(state.downloadedVersion); // Saved metadata is never an artifact or proof.
+      assert.equal(second.quitAndInstalls(), 0);
+      assert.equal(second.stopCount(), 0);
+      assert.equal(second.checkCount(), 0);
+      assert.equal(completedDefer(second).text, saved.text);
+    })).pipe(Effect.provide(second.layer));
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect.each(["write", "readback", "rename"] as const)("pre-stop defer storage %s failure preserves the previous record and performs ZERO stops/install", (failure) =>
+  Effect.scoped(Effect.gen(function* () {
+    const steps: string[] = [];
+    const released = yield* Deferred.make<void>();
+    const denied = PlatformError.systemError({ _tag: "PermissionDenied", module: "FileSystem", method: "defer-fixture" });
+    const harness = makeHarness({ clientOnlyInventory: [], deferRecord: previousDefer,
+      backendInstances: [ownedBackendFixture("primary", steps)],
+      beforeDeferWrite: failure === "write" ? Effect.fail(denied) : undefined,
+      beforeDeferRename: failure === "rename" ? Effect.fail(denied) : undefined,
+      transformDeferRead: failure === "readback" ? (path, text) => path.includes(`.${DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX}`) ? text + "corrupt" : text : undefined,
+      runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
+    });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      yield* Deferred.await(released);
+      assert.isFalse(steps.some((step) => step.startsWith("stop:")));
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.equal(completedDefer(harness).text, previousDefer(completedDefer(harness).path));
+      assert.isFalse(harness.deferRemoved.includes(completedDefer(harness).path));
+      assert.equal(harness.installRecords.size, 0); // Probe precedes even the canonical install record.
+      assert.equal((yield* updates.getState).status, "downloaded");
+      assert.include((yield* updates.getState).message ?? "", "storage is unavailable");
+    })).pipe(Effect.provide(harness.layer));
+  }).pipe(Effect.provide(TestClock.layer()))),
+);
+
+it.effect.each(["wrong-profile", "corrupt", "oversized", "unknown-scope"] as const)("refuses %s outcome storage without aliasing scope or installing", (failure) =>
+  Effect.scoped(Effect.gen(function* () {
+    const released = yield* Deferred.make<void>();
+    const steps: string[] = [];
+    const harness = makeHarness({ clientOnlyInventory: [], backendInstances: [ownedBackendFixture("primary", steps)],
+      env: failure === "wrong-profile" ? { T3CODE_DESKTOP_PROFILE: "weasel" } : failure === "unknown-scope" ? { T3CODE_DESKTOP_PROFILE: "../invalid" } : undefined,
+      deferRecord: failure === "corrupt" ? "{" : failure === "oversized" ? "x".repeat(16_385) : previousDefer,
+      runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
+    });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      if (failure === "unknown-scope") yield* updates.installPrepared("1.2.4");
+      else { yield* TestClock.adjust(Duration.seconds(45)); yield* Deferred.await(released); }
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.isFalse(steps.some((step) => step.startsWith("stop:")));
+      assert.include((yield* updates.getState).message ?? "", "storage is unavailable");
+      if (failure === "unknown-scope") assert.equal(harness.deferFiles.size, 0);
+    })).pipe(Effect.provide(harness.layer));
+  }).pipe(Effect.provide(TestClock.layer()))),
+);
+
+it.effect.each(["32-valid", "33-peers", "UTF8-envelope"] as const)("checks the actual completed-envelope capacity before stops: %s", (boundary) =>
+  Effect.scoped(Effect.gen(function* () {
+    const steps: string[] = [];
+    const released = yield* Deferred.make<void>();
+    const installed = yield* Deferred.make<void>();
+    const count = boundary === "33-peers" ? 33 : 32;
+    const instances = Array.from({ length: count }, (_, index) => ownedBackendFixture(
+      boundary === "UTF8-envelope" ? `${index}${'"'.repeat(250)}` : `owned-${index}`, steps));
+    const harness = makeHarness({ clientOnlyInventory: [], backendInstances: instances,
+      quitAndInstall: Deferred.succeed(installed, undefined).pipe(Effect.asVoid),
+      runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid) });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      if (boundary === "32-valid") {
+        yield* Deferred.await(installed);
+        assert.equal(harness.quitAndInstalls(), 1);
+        assert.equal(steps.filter((step) => step.startsWith("stop:")).length, 32);
+      } else {
+        yield* Deferred.await(released);
+        assert.equal(harness.quitAndInstalls(), 0);
+        assert.isFalse(steps.some((step) => step.startsWith("stop:")));
+        assert.equal(harness.installRecords.size, 0);
+      }
+    })).pipe(Effect.provide(harness.layer));
+  }).pipe(Effect.provide(TestClock.layer()))),
+);
+
+it.effect("reports actual stopped/unconfirmed peers when recovery-held storage fails AFTER partial shutdown", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const steps: string[] = [];
+    let storageFailed = false;
+    const harness = makeHarness({ clientOnlyInventory: [], backendInstances: [
+      ownedBackendFixture("stopped-peer", steps, { stop: Effect.sync(() => { storageFailed = true; return true; }) }),
+      ownedBackendFixture("held-peer", steps, { stop: Effect.succeed(false), recoveryStatus: "held" }),
+    ], beforeDeferWrite: Effect.suspend(() => storageFailed
+      ? Effect.fail(PlatformError.systemError({ _tag: "PermissionDenied", module: "FileSystem", method: "write" })) : Effect.void) });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      const { changes } = yield* updates.subscribe;
+      yield* changes.pipe(Stream.filter((state) => state.errorContext === "install"), Stream.runHead);
+      const state = yield* updates.getState;
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.isTrue(steps.includes("stop:stopped-peer"));
+      assert.isTrue(steps.includes("stop:held-peer"));
+      assert.isFalse(steps.some((step) => step.startsWith("abort:")));
+      assert.include(state.message ?? "", "storage is unavailable after shutdown admission");
+      assert.include(state.message ?? "", "stopped-peer=stopped");
+      assert.include(state.message ?? "", "held-peer=unconfirmed");
+      assert.notInclude(state.message ?? "", "zero stops");
+    })).pipe(Effect.provide(harness.layer));
+  }).pipe(Effect.provide(TestClock.layer()))),
+);
+
+it.effect("a newer captured attempt supersedes an old delayed refusal without replay or late overwrite", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const lane = yield* Semaphore.make(1);
+    const commitStarted = yield* Deferred.make<void>();
+    const finishCommit = yield* Deferred.make<void>();
+    const steps: string[] = [];
+    let prepares = 0;
+    const original = ownedBackendFixture("owned", steps, { commit: Deferred.succeed(commitStarted, undefined).pipe(Effect.andThen(Deferred.await(finishCommit)), Effect.as(false)) });
+    const harness = makeHarness({ clientOnlyInventory: [], inventoryLane: (effect) => lane.withPermits(1)(effect), backendInstances: [{ ...original,
+      prepareUpdate: (request) => ++prepares === 1 ? original.prepareUpdate!(request) : Effect.succeedNone,
+    }] });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      const older = yield* updates.installPrepared("1.2.4").pipe(Effect.forkScoped);
+      yield* Deferred.await(commitStarted);
+      harness.emit("update-downloaded", { version: "1.2.5" });
+      const { changes } = yield* updates.subscribe;
+      yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.5"), Stream.runHead);
+      const newer = yield* updates.installPrepared("1.2.5").pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.succeed(finishCommit, undefined);
+      yield* Fiber.join(newer);
+      yield* Fiber.join(older); // Consuming the older completion late must not change history.
+      const record = completedDefer(harness);
+      assert.equal(record.record.targetVersion, "1.2.5");
+      assert.equal(prepares, 2);
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.isFalse(steps.some((step) => step.startsWith("stop:")));
+      assert.equal(harness.deferRenames.filter(({ to }) => to === record.path).length, 1);
+      assert.isFalse(harness.deferRemoved.includes(record.path));
+    })).pipe(Effect.provide(harness.layer));
+  }).pipe(Effect.provide(TestClock.layer()))),
+);
+
+it.effect("isolates actual SDK origins and development while the legitimate absent-profile scope remains stable", () =>
+  Effect.gen(function* () {
+    const files = new Map<string, string>();
+    const save = (options: Parameters<typeof makeHarness>[0]) => Effect.gen(function* () {
+      const released = yield* Deferred.make<void>();
+      const harness = makeHarness({ ...options, deferFiles: files, clientOnlyInventory: [], clientOnlyInstallQualified: false,
+        runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid) });
+      yield* Effect.scoped(Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        harness.emit("update-downloaded", { version: "1.2.4" });
+        const { changes } = yield* updates.subscribe;
+        yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.4"), Stream.runHead);
+        yield* updates.installPrepared("1.2.4");
+        yield* Deferred.await(released);
+        assert.equal(harness.quitAndInstalls(), 0);
+        assert.equal(harness.stopCount(), 0);
+      })).pipe(Effect.provide(harness.layer));
+      return harness;
+    });
+    const first = yield* save({ homeDirectory: "/sdk-origin-a" });
+    const initial = completedDefer(first);
+    assert.isNull(JSON.parse(initial.text).profile);
+    assert.match(initial.record.profileKey, /^[a-f0-9]{64}$/);
+    assert.notInclude(initial.text, "/sdk-origin-a");
+    yield* save({ homeDirectory: "/sdk-origin-a" });
+    assert.equal(files.size, 1); // Fresh SDK, same legitimate absent default, same filename.
+    assert.equal(files.get(initial.path), initial.text); // Unchanged meaning is not rewritten.
+    yield* save({ homeDirectory: "/sdk-origin-b" });
+    assert.equal(files.size, 2); // Same T3 home, different actual SDK appDataDirectory.
+    yield* save({ homeDirectory: "/sdk-origin-a", env: { VITE_DEV_SERVER_URL: "http://localhost:5173" } });
+    assert.equal(files.size, 3);
+    for (const text of files.values()) {
+      assert.isNull(JSON.parse(text).profile);
+      assert.notInclude(text, "appDataDirectory");
+      assert.notInclude(text, "/sdk-origin-");
+    }
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect.each(["profile", "development", "appData", "filename-digest"] as const)("refuses %s scope disagreement before install or metadata publication", (mismatch) =>
+  Effect.scoped(Effect.gen(function* () {
+    const steps: string[] = [];
+    const harness = makeHarness({ clientOnlyInventory: [], backendInstances: [ownedBackendFixture("owned", steps)],
+      platform: mismatch === "appData" ? "win32" : "darwin",
+      env: mismatch === "appData" ? { APPDATA: "C:\\actual-sdk-appdata" } : undefined,
+      environmentProfileOverride: mismatch === "profile" ? Option.some("unexpected-profile") : undefined,
+      environmentDevelopmentOverride: mismatch === "development" ? true : undefined,
+      environmentAppDataOverride: mismatch === "appData" ? "C:\\different-sdk-appdata" : undefined,
+      deferRecord: mismatch === "filename-digest" ? (path) => {
+        const record = JSON.parse(previousDefer(path));
+        record.profileKey = "0".repeat(64);
+        return JSON.stringify(record);
+      } : undefined,
+    });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      const { changes } = yield* updates.subscribe;
+      yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.4"), Stream.runHead);
+      yield* updates.installPrepared("1.2.4");
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.isFalse(steps.some((step) => step.startsWith("stop:")));
+      assert.equal(harness.deferRenames.length, 0);
+      assert.equal(harness.installRecords.size, 0);
+      if (mismatch !== "filename-digest") assert.equal(harness.deferFiles.size, 0);
+      assert.include((yield* updates.getState).message ?? "", "storage is unavailable");
+    })).pipe(Effect.provide(harness.layer));
+  }).pipe(Effect.provide(TestClock.layer()))),
+);
+
+it.effect("persists partial-shutdown recovery-held peer identities across a fresh service without replay", () =>
+  Effect.gen(function* () {
+    const files = new Map<string, string>();
+    const steps: string[] = [];
+    const first = makeHarness({ deferFiles: files, clientOnlyInventory: [], backendInstances: [
+      ownedBackendFixture("stopped-peer", steps),
+      ownedBackendFixture("surviving-peer", steps, { stop: Effect.succeed(false), recoveryStatus: "held" }),
+    ] });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      first.emit("update-downloaded", { version: "1.2.4" });
+      const { changes } = yield* updates.subscribe;
+      yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.4"), Stream.runHead);
+      yield* updates.installPrepared("1.2.4");
+      const record = completedDefer(first).record;
+      assert.equal(record.phase, "recovery-held");
+      assert.equal(record.stopState, "may-have-started");
+      assert.deepEqual(record.peers.map((peer) => [peer.instanceId, peer.shutdown, peer.status]), [
+        ["stopped-peer", "stopped", "ready"], ["surviving-peer", "unconfirmed", "held"],
+      ]);
+      assert.equal(first.quitAndInstalls(), 0);
+      assert.isFalse(steps.some((step) => step.startsWith("abort:")));
+    })).pipe(Effect.provide(first.layer));
+    const second = makeHarness({ deferFiles: files, omitInstallQualification: true });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      const state = yield* updates.getState;
+      assert.include(state.message ?? "", "surviving-peer=unconfirmed/held");
+      assert.include(state.message ?? "", "stopped-peer=stopped/ready");
+      assert.isNull(state.downloadedVersion);
+      assert.equal(second.quitAndInstalls(), 0);
+      assert.equal(second.stopCount(), 0);
+      assert.equal(second.checkCount(), 0);
+    })).pipe(Effect.provide(second.layer));
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
+it.effect("reports unavailable after published readback corruption without claiming the old record survived", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const harness = makeHarness({ clientOnlyInventory: [], clientOnlyInstallQualified: false, deferRecord: previousDefer,
+      transformDeferRead: (path, text) => !path.includes(`.${DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX}`) && text.includes('"runtime-unknown"') ? text + "corrupt" : text,
+    });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      const { changes } = yield* updates.subscribe;
+      yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.4"), Stream.runHead);
+      yield* updates.installPrepared("1.2.4");
+      const published = completedDefer(harness);
+      assert.notEqual(published.text, previousDefer(published.path));
+      assert.equal(harness.deferRenames.filter(({ to }) => to === published.path).length, 1);
+      assert.isFalse(harness.deferRemoved.includes(published.path));
+      assert.include((yield* updates.getState).message ?? "", "storage is unavailable");
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.equal(harness.stopCount(), 0);
+    })).pipe(Effect.provide(harness.layer));
+  }).pipe(Effect.provide(TestClock.layer()))),
+);

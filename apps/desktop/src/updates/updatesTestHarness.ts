@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import type { DesktopUpdateState } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as ByteSize from "effect/ByteSize";
 import * as FileSystem from "effect/FileSystem";
 import * as PlatformError from "effect/PlatformError";
 import * as Layer from "effect/Layer";
@@ -37,6 +38,11 @@ export interface UpdatesHarnessOptions {
   readonly startBackend?: Effect.Effect<void>;
   readonly env?: Record<string, string | undefined>;
   readonly platform?: NodeJS.Platform;
+  readonly homeDirectory?: string;
+  /** Simulates a disagreeing bootstrap environment; all other fields remain canonical. */
+  readonly environmentProfileOverride?: Option.Option<string>;
+  readonly environmentDevelopmentOverride?: boolean;
+  readonly environmentAppDataOverride?: string;
   /** Contents of the resources/package-type marker a Linux package ships. */
   readonly packageType?: string | undefined;
   readonly appUpdateYml?: string;
@@ -49,6 +55,12 @@ export interface UpdatesHarnessOptions {
   readonly backendSnapshot?: DesktopBackendPool.DesktopBackendInstance["snapshot"];
   /** Contents of the install record a previous run left behind. */
   readonly installRecord?: string | undefined;
+  readonly deferFiles?: Map<string, string>;
+  readonly deferRecord?: string | ((path: string) => string);
+  readonly beforeDeferWrite?: Effect.Effect<void, PlatformError.PlatformError>;
+  readonly beforeDeferRename?: Effect.Effect<void, PlatformError.PlatformError>;
+  readonly beforeDeferRead?: (path: string) => Effect.Effect<void, PlatformError.PlatformError>;
+  readonly transformDeferRead?: (path: string, text: string) => string;
   readonly beforeWriteInstallRecord?: Effect.Effect<void, PlatformError.PlatformError>;
 }
 
@@ -186,9 +198,9 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
       withUpdateInventory: (use) => (options.inventoryLane?.(use(backendInstances)) ?? use(backendInstances)).pipe(Effect.map(Option.some)),
     });
 
-  const layerEnvironment = DesktopEnvironment.layer({
+  const layerEnvironmentBase = DesktopEnvironment.layer({
     dirname: "/repo/apps/desktop/src",
-    homeDirectory: `/tmp/t3-desktop-updates-home-${process.pid}`,
+    homeDirectory: options.homeDirectory ?? `/tmp/t3-desktop-updates-home-${process.pid}`,
     platform: options.platform ?? "darwin",
     processArch: "x64",
     appVersion: "1.2.3",
@@ -209,6 +221,15 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
       ),
     ),
   );
+
+  const layerEnvironment = Layer.effect(DesktopEnvironment.DesktopEnvironment, Effect.gen(function* () {
+    const environment = yield* DesktopEnvironment.DesktopEnvironment;
+    return { ...environment,
+      profileId: options.environmentProfileOverride ?? environment.profileId,
+      isDevelopment: options.environmentDevelopmentOverride ?? environment.isDevelopment,
+      appDataDirectory: options.environmentAppDataOverride ?? environment.appDataDirectory,
+    };
+  })).pipe(Layer.provide(layerEnvironmentBase));
 
   let testSettings: DesktopAppSettings.DesktopSettings = {
     ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
@@ -255,7 +276,46 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
   let previousInstallRecord = options.installRecord;
   const isInstallRecord = (path: string) =>
     path.endsWith(DesktopUpdates.DESKTOP_UPDATE_INSTALL_RECORD_FILE);
+  const deferFiles = options.deferFiles ?? new Map<string, string>();
+  const deferRemoved: string[] = [];
+  const deferRenames: Array<{ from: string; to: string }> = [];
+  const deferEncoder = new TextEncoder();
+  let deferTempSequence = 0;
+  let deferSeeded = false;
+  const deferNotFound = (path: string) => PlatformError.systemError({ module: "FileSystem", method: "open", _tag: "NotFound", pathOrDescriptor: path });
   const layerFileSystem = FileSystem.layerNoop({
+    chmod: () => Effect.void,
+    makeTempFileScoped: (input) => Effect.acquireRelease(
+      Effect.sync(() => { const path = `${input?.directory}/${input?.prefix}${++deferTempSequence}.tmp`; deferFiles.set(path, ""); return path; }),
+      (path) => Effect.sync(() => { deferRemoved.push(path); deferFiles.delete(path); }),
+    ),
+    rename: (from, to) => (options.beforeDeferRename ?? Effect.void).pipe(Effect.andThen(Effect.sync(() => {
+      const text = deferFiles.get(from);
+      if (text === undefined) throw new Error("owned temporary missing");
+      deferFiles.set(to, text); deferFiles.delete(from); deferRenames.push({ from, to });
+    }))),
+    open: (path, input) => Effect.gen(function* () {
+      if (!path.includes(DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX)) return yield* Effect.fail(deferNotFound(path));
+      if (input?.flag !== "w") yield* (options.beforeDeferRead?.(path) ?? Effect.void);
+      if (!deferSeeded && !path.includes(`.${DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX}`) && options.deferRecord !== undefined) {
+        deferSeeded = true; if (!deferFiles.has(path)) deferFiles.set(path, typeof options.deferRecord === "function" ? options.deferRecord(path) : options.deferRecord);
+      }
+      if (input?.flag === "w") deferFiles.set(path, "");
+      const raw = deferFiles.get(path);
+      if (raw === undefined) return yield* Effect.fail(deferNotFound(path));
+      const bytes = deferEncoder.encode(options.transformDeferRead?.(path, raw) ?? raw);
+      const info: FileSystem.File.Info = { type: "File", size: ByteSize.bytes(deferEncoder.encode(raw).length), dev: 0, mode: 0o600,
+        mtime: Option.none(), atime: Option.none(), birthtime: Option.none(), ino: Option.none(), nlink: Option.none(), uid: Option.none(), gid: Option.none(), rdev: Option.none(), blksize: Option.none(), blocks: Option.none() };
+      const file: FileSystem.File = {
+        [FileSystem.FileTypeId]: FileSystem.FileTypeId, stat: Effect.succeed(info), sync: Effect.void,
+        readAlloc: (size) => Effect.succeed(Option.some(bytes.slice(0, size))),
+        read: (buffer) => Effect.sync(() => { const data = bytes.slice(0, buffer.length); buffer.set(data); return data.length; }),
+        seek: () => Effect.succeed(0n), truncate: () => Effect.void,
+        write: (buffer) => Effect.succeed(buffer.length),
+        writeAll: (buffer) => (options.beforeDeferWrite ?? Effect.void).pipe(Effect.andThen(Effect.sync(() => { deferFiles.set(path, new TextDecoder().decode(buffer)); }))),
+      };
+      return file;
+    }),
     readFileString: (path) => {
       const installRecord = isInstallRecord(path)
         ? (installRecords.get(path) ?? previousInstallRecord)
@@ -325,6 +385,9 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     installSteps,
     updateRestartMarkers,
     installRecords,
+    deferFiles,
+    deferRemoved,
+    deferRenames,
     /** The record the test started with, until the app removes it. */
     previousInstallRecord: () => previousInstallRecord,
     downloadCount: () => downloadCount,
