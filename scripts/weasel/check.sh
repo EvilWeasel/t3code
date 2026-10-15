@@ -86,7 +86,7 @@ server_continuation_tests=(
   apps/server/src/orchestration-v2/runtimeLayer.test.ts
   apps/server/src/process/agentScope.test.ts
   apps/server/src/mcp/OrchestratorMcpService.activity.test.ts
-  apps/server/src/orchestration-v2/Toolkit.integration.test.ts
+  apps/server/src/mcp/OrchestratorMcpToolkit.integration.test.ts
 )
 for server_continuation_test in "${server_continuation_tests[@]}"; do
   if [[ ! -f "$server_continuation_test" ]]; then
