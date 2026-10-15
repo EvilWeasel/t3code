@@ -53,6 +53,7 @@ describe("OrchestratorMcpService", () => {
     "refuses read-only, wrong-environment and provider callers before external delegation can touch state",
     () => {
       const dependencies = Layer.mergeAll(
+        Layer.mock(SecretRequests.SecretRequests)({}),
         Layer.mock(ThreadManagementService.ThreadManagementService)({}),
         Layer.mock(ProviderRegistry.ProviderRegistry)({}),
         Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),

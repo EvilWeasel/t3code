@@ -963,7 +963,12 @@ const make = Effect.gen(function* () {
       const commandId = stableCommandId({ scope, operation, requestKey: clientRequestId });
       const retry = yield* threadManagement.hasReceipt(commandId);
       const bytes = yield* crypto
-        .digest("SHA-256", new TextEncoder().encode(JSON.stringify(canonicalValue(input))))
+        .digest(
+          "SHA-256",
+          new TextEncoder().encode(
+            Schema.encodeSync(Schema.UnknownFromJsonString)(canonicalValue(input)),
+          ),
+        )
         .pipe(
           Effect.mapError(() =>
             failure("orchestration_error", "Could not bind the external request."),
@@ -1565,7 +1570,8 @@ const make = Effect.gen(function* () {
             parentThreadId: parentThreadId,
             taskId,
             observedByRunId:
-              observingRun?.providerInstanceId === scope.thread?.providerInstanceId
+              observingRun !== undefined &&
+              observingRun.providerInstanceId === scope.thread?.providerInstanceId
                 ? observingRun.id
                 : null,
           })
@@ -2052,13 +2058,14 @@ const make = Effect.gen(function* () {
       return {
         taskId: input.taskId,
         status: "cancel_requested",
-      };
+      } satisfies OrchestratorMcpTaskCancelResult;
     });
 
   const loadExternalParent = (
     scope: McpInvocationScope,
     input: OrchestratorMcpExternalParent,
     write: boolean,
+    requireCurrentRoot = true,
   ) =>
     Effect.gen(function* () {
       yield* requireCapability(scope);
@@ -2091,7 +2098,7 @@ const make = Effect.gen(function* () {
         yield* resolveInteractionMode("default", parent.thread.interactionMode);
       }
       const run = parent.runs.find((candidate) => candidate.id === input.parentRunId);
-      if (run === undefined || run.rootNodeId !== input.parentRootNodeId)
+      if (run === undefined || (requireCurrentRoot && run.rootNodeId !== input.parentRootNodeId))
         return yield* failure(
           "parent_not_active",
           "The selected parent run and root do not match.",
@@ -2105,7 +2112,23 @@ const make = Effect.gen(function* () {
     write: boolean,
   ) =>
     Effect.gen(function* () {
-      const binding = yield* loadExternalParent(scope, input, write);
+      const binding = yield* loadExternalParent(scope, input, write, false);
+      const { nodes } = yield* threadManagement
+        .getThreadRecords(input.parentThreadId, ["nodes"])
+        .pipe(Effect.mapError(threadManagementFailure));
+      const originalRoot = nodes.find(
+        (node) =>
+          node.id === input.parentRootNodeId &&
+          node.runId === input.parentRunId &&
+          node.kind === "root_turn" &&
+          node.rootNodeId === node.id &&
+          node.parentNodeId === null,
+      );
+      if (originalRoot === undefined)
+        return yield* failure(
+          "task_not_found",
+          "The delegated task's original root binding is unavailable.",
+        );
       const task = binding.parent.subagents.find(
         (candidate) =>
           candidate.id === input.taskId &&
@@ -2125,7 +2148,7 @@ const make = Effect.gen(function* () {
   return OrchestratorMcpService.of({
     externalDelegateTask: (scope, input) =>
       Effect.gen(function* () {
-        const { parent, run } = yield* loadExternalParent(scope, input, true);
+        const { parent, run } = yield* loadExternalParent(scope, input, true, false);
         const { retry } = yield* claimExternalMutation(
           scope,
           "external-delegate-task",
@@ -2134,7 +2157,9 @@ const make = Effect.gen(function* () {
         );
         if (
           !retry &&
-          (parent.thread.archivedAt !== null || !ThreadManagementService.isActiveRun(run))
+          (parent.thread.archivedAt !== null ||
+            !ThreadManagementService.isActiveRun(run) ||
+            run.rootNodeId !== input.parentRootNodeId)
         )
           return yield* failure(
             "parent_not_active",

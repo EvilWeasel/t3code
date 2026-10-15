@@ -820,7 +820,7 @@ describe("orchestrator MCP toolkit", () => {
                 const changedId = NodeId.make("node:external-new-attempt-root");
                 const now = yield* DateTime.now;
                 const sink = yield* EventSink.EventSinkV2;
-                yield* sink.commit({
+                yield* sink.write({
                   commandId: CommandId.make("external:root-change"),
                   events: [
                     {
@@ -873,6 +873,10 @@ describe("orchestrator MCP toolkit", () => {
                 (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
               ).toHaveLength(before.subagents.length);
               expect(yield* Ref.get(preparedRuns)).toBe(0);
+              if (change === "root")
+                expect(
+                  (yield* invoke("external_task_status", selected)).structuredContent,
+                ).toMatchObject({ taskId: task.taskId, status: "cancelled" });
             }
           }).pipe(Effect.provide(layer));
         }),
