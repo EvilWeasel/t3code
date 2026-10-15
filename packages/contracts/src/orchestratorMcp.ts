@@ -4,6 +4,7 @@ import * as SchemaTransformation from "effect/SchemaTransformation";
 
 import {
   ContextTransferId,
+  EnvironmentId,
   IsoDateTime,
   MessageId,
   NodeId,
@@ -30,6 +31,7 @@ import {
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
+  OrchestrationV2ThreadStreamItem,
 } from "./orchestrationV2.ts";
 import {
   ProviderOptionDescriptor,
@@ -196,6 +198,56 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
 });
 export type OrchestratorMcpDelegateTaskInput = typeof OrchestratorMcpDelegateTaskInput.Type;
 
+/** External OAuth clients select a real parent; they do not become its provider session. */
+export const OrchestratorMcpExternalParent = Schema.Struct({
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  parentThreadId: ThreadId,
+  parentRunId: RunId,
+  parentRootNodeId: NodeId,
+});
+export type OrchestratorMcpExternalParent = typeof OrchestratorMcpExternalParent.Type;
+
+export const OrchestratorMcpExternalDelegateTaskInput = Schema.Struct({
+  ...OrchestratorMcpDelegateTaskInput.fields,
+  ...OrchestratorMcpExternalParent.fields,
+  clientRequestId: OrchestratorMcpClientRequestId,
+  mode: Schema.optional(Schema.Literal("async")),
+});
+export type OrchestratorMcpExternalDelegateTaskInput =
+  typeof OrchestratorMcpExternalDelegateTaskInput.Type;
+
+export const OrchestratorMcpExternalTaskInput = Schema.Struct({
+  ...OrchestratorMcpExternalParent.fields,
+  taskId: NodeId,
+});
+export type OrchestratorMcpExternalTaskInput = typeof OrchestratorMcpExternalTaskInput.Type;
+
+export const OrchestratorMcpExternalTaskCancelInput = Schema.Struct({
+  ...OrchestratorMcpExternalTaskInput.fields,
+  clientRequestId: OrchestratorMcpClientRequestId,
+  reason: Schema.optional(OrchestratorMcpPrompt),
+});
+export type OrchestratorMcpExternalTaskCancelInput =
+  typeof OrchestratorMcpExternalTaskCancelInput.Type;
+
+export const OrchestratorMcpExternalTaskSteerInput = Schema.Struct({
+  ...OrchestratorMcpExternalTaskInput.fields,
+  childRunId: RunId,
+  clientRequestId: OrchestratorMcpClientRequestId,
+  message: OrchestratorMcpPrompt,
+});
+export type OrchestratorMcpExternalTaskSteerInput =
+  typeof OrchestratorMcpExternalTaskSteerInput.Type;
+
+export const OrchestratorMcpExternalTaskEventsInput = Schema.Struct({
+  ...OrchestratorMcpExternalTaskInput.fields,
+  afterSequence: Schema.optional(NonNegativeInt),
+  timeoutMs: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(30_000))),
+});
+export type OrchestratorMcpExternalTaskEventsInput =
+  typeof OrchestratorMcpExternalTaskEventsInput.Type;
+
 export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   taskId: NodeId,
   childThreadId: ThreadId,
@@ -218,6 +270,15 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
   }),
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
+
+export const OrchestratorMcpExternalTaskEventsResult = Schema.Struct({
+  task: OrchestratorMcpDelegateTaskResult,
+  /** Canonical bounded snapshot recovery; sequence space is never recreated by the bridge. */
+  snapshot: OrchestrationV2ThreadStreamItem,
+  timedOut: Schema.Boolean,
+});
+export type OrchestratorMcpExternalTaskEventsResult =
+  typeof OrchestratorMcpExternalTaskEventsResult.Type;
 
 export const OrchestratorMcpTaskStatusInput = Schema.Struct({
   taskId: NodeId,

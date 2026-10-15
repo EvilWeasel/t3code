@@ -97,6 +97,8 @@ for execution_test in "${execution_tests[@]}"; do
   focused_tests+=("$execution_test")
 done
 native_integration_tests=(
+  packages/contracts/src/orchestratorMcp.test.ts
+  apps/server/src/mcp/OrchestratorMcpService.test.ts
   apps/server/src/mcp/OrchestratorMcpToolkit.integration.test.ts
 )
 for native_integration_test in "${native_integration_tests[@]}"; do

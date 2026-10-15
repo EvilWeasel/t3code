@@ -49,6 +49,67 @@ const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
 );
 
 describe("OrchestratorMcpService", () => {
+  it.effect(
+    "refuses read-only, wrong-environment and provider callers before external delegation can touch state",
+    () => {
+      const dependencies = Layer.mergeAll(
+        Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+        Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        Layer.mock(ProjectService.ProjectService)({}),
+        ServerSettings.layerTest(),
+        NodeServices.layer,
+      );
+      return Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const scope: McpInvocationScope = {
+          environmentId: EnvironmentId.make("native-env"),
+          capabilities: new Set(["orchestration"]),
+          requestNamespace: "client:one",
+          issuedAt: 0,
+          thread: undefined,
+          client: { sessionId: "one", label: "Jarvis", access: "read-only" },
+        };
+        const input = {
+          environmentId: scope.environmentId,
+          projectId: ProjectId.make("native-project"),
+          parentThreadId: ThreadId.make("native-parent"),
+          parentRunId: RunId.make("native-run"),
+          parentRootNodeId: NodeId.make("native-root"),
+          task: "Inspect a fixture",
+          clientRequestId: "one",
+        };
+        assert.strictEqual(
+          (yield* service.externalDelegateTask(scope, input).pipe(Effect.flip)).code,
+          "capability_denied",
+        );
+        assert.strictEqual(
+          (yield* service
+            .externalDelegateTask({ ...scope, environmentId: EnvironmentId.make("other") }, input)
+            .pipe(Effect.flip)).code,
+          "capability_denied",
+        );
+        assert.strictEqual(
+          (yield* service
+            .externalDelegateTask(
+              {
+                ...scope,
+                client: undefined,
+                thread: {
+                  threadId: input.parentThreadId,
+                  providerSessionId: "real-provider-session",
+                  providerInstanceId: ProviderInstanceId.make("codex"),
+                },
+              },
+              input,
+            )
+            .pipe(Effect.flip)).code,
+          "capability_denied",
+        );
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+    },
+  );
   it.effect("retries terminal acknowledgement with a fresh command id", () =>
     Effect.gen(function* () {
       const parentThreadId = ThreadId.make("thread:mcp-ack-parent");

@@ -9,6 +9,7 @@ import {
   IsoDateTime,
   isProviderNativeSubagentThread,
   MessageId,
+  NodeId,
   type ModelSelection,
   type OrchestrationV2DelegatedCompletionDelivery,
   type OrchestrationV2ProviderCapabilities,
@@ -46,6 +47,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
@@ -524,6 +526,358 @@ const layerUnusedScheduledTaskStub = Layer.succeed(
 );
 
 describe("orchestrator MCP toolkit", () => {
+  it.live(
+    "binds external delegation, retry, snapshot recovery and cancellation to a real parent without a provider caller",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const cwd = yield* checkpointWorkspace("external-mcp-task");
+          const capturedTurns = yield* Ref.make<ReadonlyArray<CapturedTurn>>([]);
+          const registry = ProviderAdapterRegistry.layerFromAdapters([
+            makeDeterministicAdapter({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+              capabilities: CodexProviderCapabilitiesV2,
+              capturedTurns,
+              shouldComplete: () => false,
+              response: () => "fixture",
+            }),
+          ]);
+          const runtime = ProviderReplayHarness.layerWithRegistry(
+            {
+              name: "external-mcp-task",
+              runtimePolicyOverride: {
+                cwd,
+                approvalPolicy: "never",
+                sandboxPolicy: {
+                  type: "readOnly",
+                  access: { type: "fullAccess" },
+                  networkAccess: false,
+                },
+              },
+            },
+            registry,
+            { runEffectWorker: false },
+          );
+          const domain = Layer.merge(
+            runtime,
+            ThreadManagementService.layer.pipe(
+              Layer.provide(runtime),
+              Layer.provide(ServerSettings.layerTest()),
+              Layer.provide(
+                CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+              ),
+            ),
+          );
+          const preparations = yield* Queue.unbounded<{
+            started: Deferred.Deferred<void>;
+            release: Deferred.Deferred<void>;
+          }>();
+          const preparedRuns = yield* Ref.make(0);
+          const layer = McpHttpServer.layerOrchestratorToolkit.pipe(
+            Layer.provide(
+              Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+                prepareRun: () => Ref.update(preparedRuns, (count) => count + 1),
+              }),
+            ),
+            Layer.provide(
+              Layer.mock(GitVcsDriver.GitVcsDriver)({
+                resolveCommit: () =>
+                  Effect.gen(function* () {
+                    const gate = yield* Queue.take(preparations);
+                    yield* Deferred.succeed(gate.started, undefined);
+                    yield* Deferred.await(gate.release);
+                    return { commitSha: "a".repeat(40) };
+                  }),
+              }),
+            ),
+            Layer.provideMerge(McpServer.McpServer.layer),
+            Layer.provideMerge(domain),
+            Layer.provide(registry),
+            Layer.provide(
+              ProviderRegistryMock.layer([
+                makeProviderSnapshot({
+                  instanceId: codexInstanceId,
+                  driver: ProviderDriverKind.make("codex"),
+                  model: codexModel,
+                }),
+              ]),
+            ),
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(layerUnusedScheduledTaskStub),
+            Layer.provide(Layer.mock(ThreadSearch.ThreadSearch)({})),
+            Layer.provide(
+              Layer.mock(ProjectService.ProjectService)({
+                getById: () =>
+                  Effect.succeed(Option.some({ id: projectId, workspaceRoot: cwd } as never)),
+              }),
+            ),
+            Layer.provideMerge(
+              SecretRequests.layer.pipe(
+                Layer.provide(layerMemorySecretStore),
+                Layer.provide(domain),
+              ),
+            ),
+            Layer.provide(NodeServices.layer),
+          );
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const server = yield* McpServer.McpServer;
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("external:create"),
+              threadId: parentThreadId,
+              projectId,
+              title: "External parent",
+              createdBy: "user",
+              creationSource: "web",
+              modelSelection: codexSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: cwd,
+            });
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make("external:start"),
+              threadId: parentThreadId,
+              messageId: MessageId.make("external:start"),
+              text: "Controlled parent",
+              createdBy: "user",
+              creationSource: "web",
+              attachments: [],
+              modelSelection: codexSelection,
+              dispatchMode: { type: "start_immediately" },
+            });
+            const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+            const run = parent.runs[0];
+            if (!run || run.rootNodeId === null)
+              return yield* Effect.die("Missing real parent root");
+            const scope: McpInvocationContext.McpInvocationScope = {
+              environmentId: EnvironmentId.make("external-fixture"),
+              capabilities: new Set(["orchestration"]),
+              requestNamespace: "client:external-fixture",
+              issuedAt: 0,
+              thread: undefined,
+              client: {
+                sessionId: "external-fixture",
+                label: "Jarvis fixture",
+                access: "full-access",
+              },
+            };
+            const binding = {
+              environmentId: scope.environmentId,
+              projectId,
+              parentThreadId,
+              parentRunId: run.id,
+              parentRootNodeId: run.rootNodeId,
+            };
+            const invoke = (name: string, args: Record<string, unknown>, invocation = scope) =>
+              server
+                .callTool({ name, arguments: args })
+                .pipe(
+                  Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+                  Effect.provideService(McpSchema.McpServerClient, client),
+                );
+            const request = {
+              ...binding,
+              task: "Controlled child",
+              clientRequestId: "external-delegate-one",
+              target: { providerInstanceId: codexInstanceId, model: codexModel },
+            };
+            const accepted = yield* invoke("external_delegate_task", request);
+            expect(accepted.isError).not.toBe(true);
+            const task = yield* decodeDelegateTaskResult(accepted.structuredContent);
+            const repeated = yield* invoke("external_delegate_task", request);
+            expect(repeated.structuredContent).toMatchObject({
+              taskId: task.taskId,
+              childThreadId: task.childThreadId,
+              childRunId: task.childRunId,
+            });
+            expect(
+              (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+            ).toHaveLength(1);
+            expect(
+              declaredFailure(
+                yield* invoke("external_delegate_task", {
+                  ...request,
+                  task: "Changed body under the same key",
+                }),
+              )?.code,
+            ).toBe("invalid_request");
+            expect(
+              (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+            ).toHaveLength(1);
+            expect(
+              (yield* orchestrator.getThreadProjection(task.childThreadId)).thread.lineage,
+            ).toMatchObject({ parentThreadId, relationshipToParent: "subagent" });
+            const readOnly = {
+              ...scope,
+              client: { ...scope.client!, access: "read-only" as const },
+            };
+            expect(
+              declaredFailure(
+                yield* invoke(
+                  "external_delegate_task",
+                  { ...request, clientRequestId: "read-only" },
+                  readOnly,
+                ),
+              )?.code,
+            ).toBe("capability_denied");
+            expect(
+              declaredFailure(
+                yield* invoke("external_delegate_task", {
+                  ...request,
+                  clientRequestId: "wrong-root",
+                  parentRootNodeId: task.taskId,
+                }),
+              )?.code,
+            ).toBe("parent_not_active");
+            expect(
+              declaredFailure(
+                yield* invoke("external_delegate_task", {
+                  ...request,
+                  clientRequestId: "wrong-env",
+                  environmentId: "other",
+                }),
+              )?.code,
+            ).toBe("capability_denied");
+            expect(
+              (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+            ).toHaveLength(1);
+            const selected = { ...binding, taskId: task.taskId };
+            const first = yield* invoke("external_task_events", selected, readOnly);
+            expect(first.isError).not.toBe(true);
+            expect(first.structuredContent).toMatchObject({
+              task: { taskId: task.taskId },
+              snapshot: { kind: "snapshot", projection: { thread: { id: task.childThreadId } } },
+              timedOut: false,
+            });
+            const ahead = yield* invoke(
+              "external_task_events",
+              { ...selected, afterSequence: Number.MAX_SAFE_INTEGER },
+              readOnly,
+            );
+            expect(ahead.structuredContent).toMatchObject({
+              snapshot: { kind: "snapshot" },
+              timedOut: false,
+            });
+            const reauthorized = {
+              ...scope,
+              requestNamespace: "client:new-session",
+              client: { ...scope.client!, sessionId: "new-session" },
+            };
+            expect(
+              (yield* invoke("external_task_status", selected, reauthorized)).structuredContent,
+            ).toMatchObject({ taskId: task.taskId });
+            expect(
+              (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+            ).toHaveLength(1);
+            const stopped = yield* invoke("external_task_cancel", {
+              ...selected,
+              clientRequestId: "stop-before-provider",
+            });
+            expect(stopped.isError).not.toBe(true);
+            const status = yield* invoke("external_task_status", selected);
+            expect(status.structuredContent).toMatchObject({
+              taskId: task.taskId,
+              status: "cancelled",
+            });
+            expect(yield* Ref.get(capturedTurns)).toHaveLength(0);
+            const staleSteer = yield* invoke("external_task_steer", {
+              ...selected,
+              childRunId: task.childRunId,
+              clientRequestId: "stale-steer",
+              message: "Do not start a new run",
+            });
+            expect(staleSteer.isError).toBe(true);
+            expect((yield* orchestrator.getThreadProjection(task.childThreadId)).runs).toHaveLength(
+              1,
+            );
+            // Stop, a replacement run, and a changed attempt root all happen after
+            // the real service's preflight while its Git boundary is awaiting.
+            for (const change of ["root", "run", "mode", "stop"] as const) {
+              const before = yield* orchestrator.getThreadProjection(parentThreadId);
+              const active = before.runs.findLast(ThreadManagementService.isActiveRun);
+              if (!active || active.rootNodeId === null)
+                return yield* Effect.die("Missing race parent");
+              const gate = {
+                started: yield* Deferred.make<void>(),
+                release: yield* Deferred.make<void>(),
+              };
+              yield* Queue.offer(preparations, gate);
+              const pending = yield* invoke("external_delegate_task", {
+                ...request,
+                parentRunId: active.id,
+                parentRootNodeId: active.rootNodeId,
+                isolation: "worktree",
+                clientRequestId: `await-race-${change}`,
+              }).pipe(Effect.forkChild);
+              yield* Deferred.await(gate.started);
+              if (change === "root") {
+                const root = before.nodes.find((node) => node.id === active.rootNodeId);
+                if (!root) return yield* Effect.die("Missing real root node");
+                const changedId = NodeId.make("node:external-new-attempt-root");
+                const now = yield* DateTime.now;
+                const sink = yield* EventSink.EventSinkV2;
+                yield* sink.commit({
+                  commandId: CommandId.make("external:root-change"),
+                  events: [
+                    {
+                      id: EventId.make("external:node-change"),
+                      type: "node.updated",
+                      threadId: parentThreadId,
+                      occurredAt: now,
+                      payload: { ...root, id: changedId, rootNodeId: changedId },
+                    },
+                    {
+                      id: EventId.make("external:run-change"),
+                      type: "run.updated",
+                      threadId: parentThreadId,
+                      occurredAt: now,
+                      payload: { ...active, rootNodeId: changedId },
+                    },
+                  ],
+                });
+              } else if (change === "mode") {
+                yield* orchestrator.dispatch({
+                  type: "thread.runtime-mode.set",
+                  commandId: CommandId.make("external:lower-parent-mode"),
+                  threadId: parentThreadId,
+                  runtimeMode: "approval-required",
+                });
+              } else {
+                yield* orchestrator.dispatch({
+                  type: "thread.stop",
+                  commandId: CommandId.make(`external:${change}:stop`),
+                  threadId: parentThreadId,
+                });
+                if (change === "run")
+                  yield* orchestrator.dispatch({
+                    type: "message.dispatch",
+                    commandId: CommandId.make("external:replace-run"),
+                    threadId: parentThreadId,
+                    messageId: MessageId.make("external:replace-run"),
+                    text: "New controlled run",
+                    createdBy: "user",
+                    creationSource: "web",
+                    attachments: [],
+                    modelSelection: codexSelection,
+                    dispatchMode: { type: "start_immediately" },
+                  });
+              }
+              yield* Deferred.succeed(gate.release, undefined);
+              const refused = yield* Fiber.join(pending);
+              expect(refused.isError).toBe(true);
+              expect(
+                (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+              ).toHaveLength(before.subagents.length);
+              expect(yield* Ref.get(preparedRuns)).toBe(0);
+            }
+          }).pipe(Effect.provide(layer));
+        }),
+      ),
+  );
   it.live(
     "delegates cross-provider tasks, polls and cancels children, and creates ordinary threads",
     () =>

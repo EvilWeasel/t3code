@@ -10,6 +10,8 @@ import {
   OrchestratorMcpThreadReadInput,
   OrchestratorMcpThreadSendInput,
   OrchestratorMcpThreadWaitInput,
+  OrchestratorMcpExternalDelegateTaskInput,
+  OrchestratorMcpExternalTaskEventsInput,
 } from "./orchestratorMcp.ts";
 
 const decodeCreateThreadsInput = Schema.decodeUnknownSync(OrchestratorMcpCreateThreadsInput);
@@ -22,6 +24,43 @@ const decodeThreadSendInput = Schema.decodeUnknownSync(OrchestratorMcpThreadSend
 const decodeThreadWaitInput = Schema.decodeUnknownSync(OrchestratorMcpThreadWaitInput);
 
 describe("orchestrator MCP contracts", () => {
+  const externalParent = {
+    environmentId: "environment-one",
+    projectId: "project-one",
+    parentThreadId: "parent-one",
+    parentRunId: "run-one",
+    parentRootNodeId: "root-one",
+  };
+  it("requires explicit real parent identities and a retry key for external delegation", () => {
+    const decode = Schema.decodeUnknownSync(OrchestratorMcpExternalDelegateTaskInput);
+    expect(
+      decode({
+        ...externalParent,
+        task: "Inspect the controlled fixture",
+        clientRequestId: "request-one",
+      }).parentRootNodeId,
+    ).toBe("root-one");
+    expect(() => decode({ task: "Inspect", clientRequestId: "request-one" })).toThrow();
+    expect(() => decode({ ...externalParent, task: "Inspect" })).toThrow();
+    expect(() =>
+      decode({
+        ...externalParent,
+        parentRootNodeId: "",
+        task: "Inspect",
+        clientRequestId: "request-one",
+      }),
+    ).toThrow();
+    expect(() =>
+      decode({ ...externalParent, task: "Inspect", clientRequestId: "request-one", mode: "wait" }),
+    ).toThrow();
+  });
+  it("bounds external event waits while preserving the canonical nonnegative cursor", () => {
+    const decode = Schema.decodeUnknownSync(OrchestratorMcpExternalTaskEventsInput);
+    const input = { ...externalParent, taskId: "task-one", afterSequence: 0, timeoutMs: 30_000 };
+    expect(decode(input).afterSequence).toBe(0);
+    expect(() => decode({ ...input, timeoutMs: 30_001 })).toThrow();
+    expect(() => decode({ ...input, afterSequence: -1 })).toThrow();
+  });
   it("accepts explicit worktree isolation and keeps shared delegation as the default", () => {
     expect(decodeDelegateTaskInput({ task: "Review changes" }).isolation).toBeUndefined();
     expect(

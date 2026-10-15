@@ -1,5 +1,11 @@
 import {
   OrchestratorMcpCapabilitiesResult,
+  OrchestratorMcpExternalDelegateTaskInput,
+  OrchestratorMcpExternalTaskInput,
+  OrchestratorMcpExternalTaskCancelInput,
+  OrchestratorMcpExternalTaskSteerInput,
+  OrchestratorMcpExternalTaskEventsInput,
+  OrchestratorMcpExternalTaskEventsResult,
   OrchestrationV2StopWorkflowInput,
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpCreateThreadsResult,
@@ -44,6 +50,57 @@ const dependencies = [
   ThreadManagementService.ThreadManagementService,
   OrchestratorMcpService.OrchestratorMcpService,
 ];
+const ExternalDelegateTaskTool = Tool.make("external_delegate_task", {
+  description:
+    "External OAuth clients only: delegate one real child from an explicitly selected ACTIVE parent thread/run/root in this authenticated environment. Reuse clientRequestId only within this session and identical request. Never manufacture a provider session or replace this with top-level thread creation. On uncertain outcome across reauthorization, reconcile known task identity; do not resubmit.",
+  parameters: OrchestratorMcpExternalDelegateTaskInput,
+  success: OrchestratorMcpDelegateTaskResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.OpenWorld, true);
+const ExternalTaskStatusTool = Tool.make("external_task_status", {
+  description:
+    "Read a retained real child task bound to the selected parent run/root, including after the parent settles. Does not acknowledge or consume the provider parent's result delivery.",
+  parameters: OrchestratorMcpExternalTaskInput,
+  success: OrchestratorMcpDelegateTaskResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Idempotent, true);
+const ExternalTaskCancelTool = Tool.make("external_task_cancel", {
+  description:
+    "Request targeted cancellation of the bound delegated child and its descendants under the external client's and parent's existing mode ceilings. An accepted cancellation is not a terminal result; reconcile task status.",
+  parameters: OrchestratorMcpExternalTaskCancelInput,
+  success: OrchestratorMcpTaskCancelResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Destructive, true);
+const ExternalTaskSteerTool = Tool.make("external_task_steer", {
+  description:
+    "Steer exactly the named active childRunId of the bound real child. A terminal/stale run is refused without starting another turn. New work requires a separate explicit delegation and request identity.",
+  parameters: OrchestratorMcpExternalTaskSteerInput,
+  success: OrchestratorMcpThreadSendResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+}).annotate(Tool.Destructive, true);
+const ExternalTaskEventsTool = Tool.make("external_task_events", {
+  description:
+    "Read a bounded canonical snapshot for the selected real child. Reuses its canonical snapshotSequence; old/ahead cursors recover by snapshot. An up-to-date afterSequence may await one persisted child event for at most timeoutMs (maximum30s). Timeout/reconnection is not completion. This does not provide a second event cursor or forward MCP OAuth to WebSocket/HTTP.",
+  parameters: OrchestratorMcpExternalTaskEventsInput,
+  success: OrchestratorMcpExternalTaskEventsResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Idempotent, true);
 const threadMetadataDependencies = [
   McpInvocationContext.McpInvocationContext,
   ThreadManagementService.ThreadManagementService,
@@ -273,6 +330,11 @@ const ThreadInterruptTool = Tool.make("t3_thread_interrupt", {
   .annotate(Tool.Destructive, true);
 
 export const OrchestratorToolkit = Toolkit.make(
+  ExternalDelegateTaskTool,
+  ExternalTaskStatusTool,
+  ExternalTaskCancelTool,
+  ExternalTaskSteerTool,
+  ExternalTaskEventsTool,
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
   TaskStatusTool,

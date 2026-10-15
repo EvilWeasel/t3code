@@ -9,6 +9,57 @@ import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
 
 const handlers = {
+  external_delegate_task: McpToolAccess.writesThreads(
+    (input) => [input.parentThreadId],
+    (input) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).externalDelegateTask(
+          scope,
+          input,
+        );
+      }),
+  ),
+  external_task_status: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).externalTaskStatus(
+        scope,
+        input,
+      );
+    }),
+  ),
+  external_task_cancel: McpToolAccess.writesThreads(
+    (input) => [input.parentThreadId],
+    (input) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).externalTaskCancel(
+          scope,
+          input,
+        );
+      }),
+  ),
+  external_task_steer: McpToolAccess.writesThreads(
+    (input) => [input.parentThreadId],
+    (input) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).externalTaskSteer(
+          scope,
+          input,
+        );
+      }),
+  ),
+  external_task_events: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).externalTaskEvents(
+        scope,
+        input,
+      );
+    }),
+  ),
   orchestrator_capabilities: McpToolAccess.reads(() =>
     Effect.gen(function* () {
       const scope = yield* McpInvocationContext.McpInvocationContext;
