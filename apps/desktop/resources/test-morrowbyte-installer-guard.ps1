@@ -46,6 +46,58 @@ $fixtureFailure = $null
 $fixtureCleanupFallback = $false
 $fixtureCleanupFailed = $false
 $fixtureBoundaryTimeoutMs = 5000
+$fixturePhase = 'prepare'
+$fixtureTerminal = $null
+$fixtureReleaseAttempted = $false
+$fixtureCreation = $null
+$fixtureCapturedPid = $null
+# Static state only, captured before cleanup can release/dispose the owned child.
+function Write-FixtureBoundary([string]$Phase) {
+    $alive = 'unknown'; $exitCode = 'unknown'; $moduleAvailable = 'unknown'; $terminal = 'pending'
+    if ($fixtureStarted -and $null -ne $fixtureProcess) {
+        try {
+            $fixtureProcess.Refresh()
+            $alive = (-not $fixtureProcess.HasExited).ToString().ToLowerInvariant()
+            if ($fixtureProcess.HasExited) { $exitCode = [string]$fixtureProcess.ExitCode }
+            try { $moduleAvailable = ($null -ne $fixtureProcess.MainModule).ToString().ToLowerInvariant() } catch { $moduleAvailable = 'unavailable' }
+        } catch { $alive = 'unavailable' }
+    }
+    if ($null -ne $fixtureTerminal -and $fixtureTerminal.IsCompleted) {
+        try {
+            $terminal = switch ($fixtureTerminal.Result) {
+                'MORROWBYTE_GUARD_FIXTURE_EOF' { 'eof-before-release'; break }
+                'MORROWBYTE_GUARD_FIXTURE_MISMATCH' { 'nonmatching-release'; break }
+                'MORROWBYTE_GUARD_FIXTURE_MATCHED' { 'matched-release'; break }
+                default { 'unclassified-terminal'; break }
+            }
+        } catch { $terminal = 'unavailable' }
+    }
+    Write-Output ('Morrowbyte fixture boundary: phase={0}; alive={1}; exit={2}; module={3}; release_attempted={4}; terminal={5}; pid={6}' -f $Phase, $alive, $exitCode, $moduleAvailable, $fixtureReleaseAttempted, $terminal, $(if ($null -eq $fixtureCapturedPid) { 'unknown' } else { $fixtureCapturedPid }))
+}
+function Assert-FixtureCimIdentity([string]$Phase) {
+    # Resolve only the captured PID and the unique invocation-owned image name.
+    # No alternate PID selection, path fallback or owner substitution.
+    $rows = @(CimCmdlets\Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = ' + $fixtureCapturedPid) -OperationTimeoutSec 5 -ErrorAction Stop)
+    Assert-Equal 1 $rows.Count
+    $row = $rows[0]
+    if ([string]::IsNullOrWhiteSpace([string]$row.ExecutablePath) -or $null -eq $row.CreationDate) { throw 'Owned fixture CIM identity unavailable.' }
+    $exactPath = [IO.Path]::GetFullPath([string]$row.ExecutablePath).Equals([IO.Path]::GetFullPath($fixtureExe), [StringComparison]::OrdinalIgnoreCase)
+    $creation = [string]$row.CreationDate.ToUniversalTime().Ticks
+    if ($null -eq $script:fixtureCreation) { $script:fixtureCreation = $creation }
+    $sameCreation = $script:fixtureCreation -eq $creation
+    $owner = CimCmdlets\Invoke-CimMethod -InputObject $row -MethodName GetOwnerSid -OperationTimeoutSec 5 -ErrorAction Stop
+    $sameOwner = $owner.ReturnValue -eq 0 -and $owner.Sid -eq $fixtureOwner.Value
+    $names = @(CimCmdlets\Get-CimInstance -ClassName Win32_Process -Filter ("Name = '" + $fixtureName + "'") -OperationTimeoutSec 5 -ErrorAction Stop)
+    $captured = @($names | Where-Object { $_.ProcessId -eq $fixtureCapturedPid })
+    $containsCaptured = $captured.Count -eq 1
+    Write-Output ('Morrowbyte fixture identity: phase={0}; exact_path={1}; same_creation={2}; same_owner={3}; name_count={4}; contains_captured={5}' -f $Phase, $exactPath, $sameCreation, $sameOwner, $names.Count, $containsCaptured)
+    Assert-Equal $true $exactPath
+    Assert-Equal $true $sameCreation
+    Assert-Equal $true $sameOwner
+    Assert-Equal $true $containsCaptured
+    $fixtureProcess.Refresh()
+    Assert-Equal $false $fixtureProcess.HasExited
+}
 $fixtureReleaseBytes = [Text.Encoding]::ASCII.GetBytes("MORROWBYTE_GUARD_FIXTURE_RELEASE`n")
 try {
     New-Item -ItemType Directory -Path $fixtureRoot -ErrorAction Stop | Out-Null
@@ -71,8 +123,11 @@ public static class MorrowbyteGuardFixture {
         var expected = System.Text.Encoding.ASCII.GetBytes("MORROWBYTE_GUARD_FIXTURE_RELEASE\n");
         var input = Console.OpenStandardInput();
         for (int i = 0; i < expected.Length; i++) {
-            if (input.ReadByte() != expected[i]) return 2;
+            int value = input.ReadByte();
+            if (value < 0) { Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_EOF"); return 2; }
+            if (value != expected[i]) { Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_MISMATCH"); return 2; }
         }
+        Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_MATCHED");
         return 0;
     }
 }
@@ -93,14 +148,19 @@ public static class MorrowbyteGuardFixture {
     $fixtureProcess.StartInfo = $fixtureStart
     $fixtureStarted = $fixtureProcess.Start()
     if (-not $fixtureStarted) { throw 'Owned fixture process did not start.' }
+    $fixturePhase = 'readiness'
     $fixturePid = $fixtureProcess.Id
+    $fixtureCapturedPid = $fixturePid
+    $fixtureTerminal = $fixtureProcess.StandardError.ReadLineAsync()
     $ready = $fixtureProcess.StandardOutput.ReadLineAsync()
     if (-not $ready.Wait($fixtureBoundaryTimeoutMs)) { throw 'Owned fixture readiness was not observed.' }
     Assert-Equal 'MORROWBYTE_GUARD_FIXTURE_READY' $ready.Result
     Assert-Equal $false $fixtureProcess.HasExited
     Assert-Equal $fixturePid $fixtureProcess.Id
-    Assert-Equal $true ([IO.Path]::GetFullPath($fixtureProcess.MainModule.FileName).Equals(
-        [IO.Path]::GetFullPath($fixtureExe), [StringComparison]::OrdinalIgnoreCase))
+    $fixturePhase = 'initial-identity'
+    Import-Module CimCmdlets -ErrorAction Stop
+    Write-FixtureBoundary $fixturePhase
+    Assert-FixtureCimIdentity $fixturePhase
     Write-Output ('Morrowbyte guard fixture: pid={0}; exact_image=true; ready=true; sha256={1}' -f $fixturePid, $fixtureHash)
 
     # Preserve the real Windows PowerShell poisoned-module-environment checks.
@@ -109,22 +169,38 @@ public static class MorrowbyteGuardFixture {
     $powershell = [IO.Path]::Combine($env:WINDIR, 'System32\WindowsPowerShell\v1.0\powershell.exe')
     & $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PSScriptRoot\morrowbyte-installer-guard.ps1" -InstallRoot $root -AppExecutable '__morrowbyte_guard_absent_fixture__.exe' -WaitSeconds 0
     Assert-Equal 0 $LASTEXITCODE
+    $fixturePhase = 'pre-held'
+    Write-FixtureBoundary $fixturePhase
+    Assert-FixtureCimIdentity $fixturePhase
     & $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PSScriptRoot\morrowbyte-installer-guard.ps1" -InstallRoot $fixtureRoot -AppExecutable $fixtureName -WaitSeconds 0
-    Assert-Equal 10 $LASTEXITCODE
+    $heldGuardExit = $LASTEXITCODE
+    $fixturePhase = 'post-held'
+    Write-Output ('Morrowbyte fixture held query: exit={0}' -f $heldGuardExit)
+    Write-FixtureBoundary $fixturePhase
+    Assert-FixtureCimIdentity $fixturePhase
+    Assert-Equal 10 $heldGuardExit
     Assert-Equal $false $fixtureProcess.HasExited
 
+    $fixturePhase = 'release'
+    $fixtureReleaseAttempted = $true
     $fixtureInput = $fixtureProcess.StandardInput.BaseStream
     $fixtureInput.Write($fixtureReleaseBytes, 0, $fixtureReleaseBytes.Length)
     $fixtureInput.Flush()
     $fixtureInput.Close()
     if (-not $fixtureProcess.WaitForExit($fixtureBoundaryTimeoutMs)) { throw 'Owned fixture exit was not observed.' }
+    if (-not $fixtureTerminal.Wait($fixtureBoundaryTimeoutMs)) { throw 'Owned fixture terminal classification unavailable.' }
+    $fixturePhase = 'post-release'
+    Write-FixtureBoundary $fixturePhase
+    Assert-Equal 'MORROWBYTE_GUARD_FIXTURE_MATCHED' $fixtureTerminal.Result
     Write-Output ('Morrowbyte guard fixture: release_exit={0}' -f $fixtureProcess.ExitCode)
     Assert-Equal 0 $fixtureProcess.ExitCode
     & $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PSScriptRoot\morrowbyte-installer-guard.ps1" -InstallRoot $fixtureRoot -AppExecutable $fixtureName -WaitSeconds 0
     Assert-Equal 0 $LASTEXITCODE
 } catch {
-    $fixtureFailure = $_
+    # Never print raw CIM/exception data. Keep the original failure semantics.
+    $fixtureFailure = 'Owned fixture failed at static phase: ' + $fixturePhase
 } finally {
+    Write-FixtureBoundary ('before-cleanup-' + $fixturePhase)
     $env:PSModulePath = $priorModulePath
     $env:WinPSModulePath = $priorWinModulePath
     if ($fixtureStarted) {
