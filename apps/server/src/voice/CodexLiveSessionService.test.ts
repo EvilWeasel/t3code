@@ -1454,7 +1454,7 @@ it.effect.each([
     } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
     let workRuntime: Option.Option<ProviderAdapter.ProviderAdapterV2SessionRuntime> =
       Option.some(runtime);
-    const decodeObserverReceipt = Schema.decodeSync(
+    const decodeObserverReceipt = Schema.decodeEffect(
       Schema.fromJsonString(
         Schema.Struct({
           state: Schema.String,
@@ -1836,7 +1836,7 @@ it.effect.each([
                 "two coalesced progress updates and one child/checkpoint-gated final",
               );
               yield* observe!(request);
-              const finalReceipt = decodeObserverReceipt(
+              const finalReceipt = yield* decodeObserverReceipt(
                 yield* observe!({ ...request, callId: "final-evidence" }),
               );
               assert.deepEqual(
