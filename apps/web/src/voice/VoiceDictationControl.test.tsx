@@ -174,7 +174,9 @@ it("retries a reviewed recording with its captured provider after settings chang
   expect(renderer!.root.findByType("audio").props.src).toBe("blob:fixture-recording");
   const audio = new Blob(["fixture audio"], { type: "audio/webm" });
   const options = { signal: new AbortController().signal };
-  await expect(captured.input!.transcribe(audio, options)).resolves.toBe("original provider words");
+  const transcribe = captured.input?.transcribe;
+  if (!transcribe) throw new Error("Expected the reviewed recording to retain its transcriber");
+  await expect(transcribe(audio, options)).resolves.toBe("original provider words");
   expect(original).toHaveBeenCalledWith(audio, options);
   expect(replacement).not.toHaveBeenCalled();
 });
