@@ -42,10 +42,16 @@ export async function makeAutofillMenu(
           ? [{ label: "Private entry — sharing paused", enabled: false }]
           : []),
         { label: `Linked logins for ${label(target.origin)}`, enabled: false },
-        ...linked.map((entry) => ({
-          label: `Fill ${label(entry.title)}`,
-          click: action(() => service.fill(target, entry)),
-        })),
+        ...linked.flatMap((entry) => [
+          {
+            label: `Fill ${label(entry.title)}`,
+            click: action(() => service.fill(target, entry)),
+          },
+          {
+            label: `Remove linked login: ${label(entry.title)}`,
+            click: action(() => service.unlink(target, entry)),
+          },
+        ]),
         {
           label: "Link a login to this site…",
           click: action(async () => {
@@ -72,7 +78,7 @@ export async function makeAutofillMenu(
           ? [
               {
                 label: "Clear login fields and resume sharing",
-                click: action(() => target.clearAndResume()),
+                click: action(() => service.clearAndResume(target)),
               },
             ]
           : []),

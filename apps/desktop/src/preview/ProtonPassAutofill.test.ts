@@ -20,6 +20,7 @@ const fixture = () => {
     partition: "persist:profile-a",
     privateEntry: false,
     current: () => true,
+    holdPrivate: () => () => {},
     enterPrivate: vi.fn(async () => {
       order.push("private");
     }),
@@ -111,4 +112,48 @@ it("persists only reference fields even if an input object contains extra secret
   } finally {
     await NodeFSP.rm(directory, { recursive: true, force: true });
   }
+});
+
+it("removes only the selected origin/profile/share/item association without reading credentials or resuming", async () => {
+  const { target, provider } = fixture();
+  const selected = { ...login, origin: target.origin, partition: target.partition };
+  const preserved = [
+    { ...selected, origin: "https://other.test" },
+    { ...selected, partition: "persist:profile-b" },
+    { ...selected, shareId: "other-vault" },
+    { ...selected, itemId: "other-item" },
+  ];
+  let entries: readonly LinkedLogin[] = [selected, ...preserved];
+  const service = makeAutofill(provider, {
+    read: async () => entries,
+    write: async (value) => {
+      entries = value;
+    },
+  });
+  await service.unlink(target, login);
+  expect(entries).toEqual(preserved);
+  expect(await service.linked(target)).toEqual(preserved.slice(2));
+  await expect(service.fill(target, login)).rejects.toThrow();
+  expect(provider.credentials).not.toHaveBeenCalled();
+  expect(target.enterPrivate).not.toHaveBeenCalled();
+  expect(target.clearAndResume).not.toHaveBeenCalled();
+});
+
+it("refuses clear/resume while a selected credential read is pending", async () => {
+  const { target, provider, service } = fixture();
+  const started = Promise.withResolvers<void>();
+  const pending = Promise.withResolvers<{ username: string; password: string }>();
+  provider.credentials.mockImplementationOnce(() => {
+    started.resolve();
+    return pending.promise;
+  });
+  const filling = service.fill(target, login);
+  await started.promise;
+  await expect(service.clearAndResume(target)).rejects.toThrow();
+  expect(target.clearAndResume).not.toHaveBeenCalled();
+  pending.resolve({ username: "fake-user", password: "fake-password" });
+  await filling;
+  await service.clearAndResume(target);
+  expect(target.clearAndResume).toHaveBeenCalledOnce();
+  expect(provider.credentials).toHaveBeenCalledOnce();
 });

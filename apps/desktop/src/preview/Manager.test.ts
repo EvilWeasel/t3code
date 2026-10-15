@@ -5,6 +5,7 @@ import type {
   DesktopPreviewRecordingFrame,
   DesktopPreviewRecordingInputEvent,
 } from "@t3tools/contracts";
+import * as NodeVM from "node:vm";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { parseKeybindingShortcut } from "@t3tools/shared/keybindings";
 import * as Cause from "effect/Cause";
@@ -2449,6 +2450,7 @@ describe("PreviewManager", () => {
           } as unknown as Electron.WebFrameMain;
           const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
             mainFrame: frame,
+            executeJavaScriptInIsolatedWorld: frame.executeJavaScript,
             isFocused: () => true,
             session: { fetch: vi.fn(), getStoragePath: () => "/synthetic/profile-a" },
             capturePage,
@@ -2471,10 +2473,11 @@ describe("PreviewManager", () => {
           yield* Effect.promise(() => target.enterPrivate());
           const before = capturePage.mock.calls.length;
           for (const operation of [
-            manager.captureScreenshot("private_tab"),
-            manager.startRecording("private_tab"),
-            manager.openPictureInPicture("private_tab"),
-            manager.setColorScheme("private_tab", "dark"),
+            manager.captureScreenshot("private_tab").pipe(Effect.asVoid),
+            manager.startRecording("private_tab").pipe(Effect.asVoid),
+            manager.openPictureInPicture("private_tab").pipe(Effect.asVoid),
+            manager.pickElement("private_tab").pipe(Effect.asVoid),
+            manager.setColorScheme("private_tab", "dark").pipe(Effect.asVoid),
           ]) {
             expect(Exit.isFailure(yield* Effect.exit(operation))).toBe(true);
           }
@@ -2503,6 +2506,7 @@ describe("PreviewManager", () => {
         } as unknown as Electron.WebFrameMain;
         const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
           mainFrame: frame,
+          executeJavaScriptInIsolatedWorld: frame.executeJavaScript,
           isFocused: () => focused,
           session: { fetch: vi.fn(), getStoragePath: () => storagePath },
         });
@@ -2530,6 +2534,168 @@ describe("PreviewManager", () => {
         expect(frame.executeJavaScript).not.toHaveBeenCalled();
       }),
     ),
+  );
+
+  for (const boundary of ["focus", "insert"] as const) {
+    effectIt.effect(`keeps sharing private until a pending native ${boundary} has settled`, () =>
+      withManager((manager) =>
+        Effect.gen(function* () {
+          const started = Promise.withResolvers<void>();
+          const pending = Promise.withResolvers<boolean>();
+          const preview = makeFaviconWebContents({ url: "https://example.com/login" });
+          const frame = {
+            origin: "https://example.com",
+            isDestroyed: () => false,
+          } as Electron.WebFrameMain;
+          let gatePending = true;
+          const execute = vi.fn(async (_world: number, scripts: readonly { code: string }[]) => {
+            if (
+              boundary === "focus" &&
+              scripts[0]?.code === PreviewManager.protonPassAutofillScripts.focusPassword &&
+              gatePending
+            ) {
+              gatePending = false;
+              started.resolve();
+              return pending.promise;
+            }
+            return true;
+          });
+          const insertText = vi.fn(async (value: string) => {
+            if (boundary === "insert" && value === "fake-password" && gatePending) {
+              gatePending = false;
+              started.resolve();
+              await pending.promise;
+            }
+          });
+          const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
+            mainFrame: frame,
+            isFocused: () => true,
+            session: { getStoragePath: () => "/synthetic/profile-a" },
+            executeJavaScriptInIsolatedWorld: execute,
+            insertText,
+          });
+          fromId.mockReturnValue(wc);
+          yield* manager.createTab("private_tab");
+          yield* manager.registerWebview("private_tab", 42);
+          const target = yield* manager.getAutofillTarget(wc, frame);
+          if (!target) throw new Error("Missing target");
+          yield* Effect.promise(() => target.enterPrivate());
+          const releaseRead = target.holdPrivate();
+          expect(
+            Exit.isFailure(yield* Effect.exit(Effect.tryPromise(() => target.clearAndResume()))),
+          ).toBe(true);
+          releaseRead();
+          const fill = yield* Effect.promise(() => target.fill("fake-user", "fake-password")).pipe(
+            Effect.forkScoped,
+          );
+          yield* Effect.promise(() => started.promise);
+          expect(
+            Exit.isFailure(yield* Effect.exit(Effect.tryPromise(() => target.clearAndResume()))),
+          ).toBe(true);
+          expect(Exit.isFailure(yield* Effect.exit(manager.captureScreenshot("private_tab")))).toBe(
+            true,
+          );
+          expect(
+            execute.mock.calls.some(
+              ([, scripts]) => scripts[0]?.code === PreviewManager.protonPassAutofillScripts.clear,
+            ),
+          ).toBe(false);
+          pending.resolve(true);
+          yield* Fiber.join(fill);
+          yield* Effect.promise(() => target.clearAndResume());
+          expect(target.current()).toBe(false);
+          expect(
+            Exit.isFailure(
+              yield* Effect.exit(
+                Effect.tryPromise(() => target.fill("fake-user", "fake-password")),
+              ),
+            ),
+          ).toBe(true);
+          expect(insertText).toHaveBeenCalledTimes(2);
+          expect(execute).toHaveBeenCalledWith(PreviewManager.PROTON_PASS_AUTOFILL_WORLD_ID, [
+            { code: PreviewManager.protonPassAutofillScripts.clear },
+          ]);
+        }),
+      ),
+    );
+  }
+
+  effectIt.effect(
+    "keeps a cancelled annotation capture admitted until its pending image drains",
+    () =>
+      withManager((manager) =>
+        Effect.gen(function* () {
+          const overlay = Promise.withResolvers<void>();
+          const started = Promise.withResolvers<void>();
+          const pending = Promise.withResolvers<{
+            getSize: () => { width: number; height: number };
+          }>();
+          let picked: ((event: unknown, ...args: unknown[]) => void) | undefined;
+          const preview = makeFaviconWebContents({ url: "https://example.com/login" });
+          const frame = {
+            origin: "https://example.com",
+            isDestroyed: () => false,
+          } as Electron.WebFrameMain;
+          const send = vi.fn((channel: string) => {
+            if (channel === "preview:start-pick") overlay.resolve();
+          });
+          const wc = Object.assign(preview.webContents as unknown as Electron.WebContents, {
+            mainFrame: frame,
+            isFocused: () => true,
+            once: vi.fn(),
+            session: { getStoragePath: () => "/synthetic/profile-a" },
+            executeJavaScriptInIsolatedWorld: vi.fn(async () => true),
+            send,
+            ipc: {
+              on: (channel: string, listener: typeof picked) => {
+                if (channel === "preview:element-picked") picked = listener;
+              },
+              removeListener: vi.fn(),
+              off: vi.fn(),
+            },
+            capturePage: vi.fn(() => {
+              started.resolve();
+              return pending.promise;
+            }),
+          });
+          fromId.mockReturnValue(wc);
+          yield* manager.createTab("private_tab");
+          yield* manager.registerWebview("private_tab", 42);
+          const target = yield* manager.getAutofillTarget(wc, frame);
+          if (!target) throw new Error("Missing target");
+          const pick = yield* manager.pickElement("private_tab").pipe(Effect.forkScoped);
+          yield* Effect.promise(() => overlay.promise);
+          picked?.(
+            {},
+            {
+              id: "annotation_1",
+              pageUrl: "https://example.com/login",
+              pageTitle: "Fake",
+              comment: "Fake",
+              elements: [],
+              regions: [],
+              strokes: [],
+              styleChanges: [],
+              screenshot: null,
+              createdAt: "2026-06-11T00:00:00.000Z",
+            },
+          );
+          yield* Effect.promise(() => started.promise);
+          expect(
+            Exit.isFailure(yield* Effect.exit(Effect.tryPromise(() => target.enterPrivate()))),
+          ).toBe(true);
+          yield* manager.cancelPickElement("private_tab");
+          expect(yield* Fiber.join(pick)).toBeNull();
+          expect(
+            Exit.isFailure(yield* Effect.exit(Effect.tryPromise(() => target.enterPrivate()))),
+          ).toBe(true);
+          pending.resolve({ getSize: () => ({ width: 1, height: 1 }) });
+          yield* Effect.yieldNow;
+          expect(
+            send.mock.calls.some(([channel]) => channel === "preview:annotation-captured"),
+          ).toBe(false);
+        }),
+      ),
   );
 
   effectIt.effect("captures a PNG screenshot into browser artifacts", () =>
@@ -4587,4 +4753,65 @@ describe("PreviewOperationError", () => {
     expect(error.message).not.toContain(cause.message);
     expect(PreviewManager.PreviewOperationError.toTimelineMessage(error)).toBe(cause.message);
   });
+});
+
+it("refuses a different form until isolated bookkeeping clears the original revealed fields", () => {
+  const document: { activeElement?: FakeInput } = {};
+  class FakeInput {
+    disabled = false;
+    autocomplete = "";
+    isConnected = true;
+    private storedValue = "";
+    constructor(
+      public type: string,
+      public form: { querySelectorAll: (selector: string) => FakeInput[] },
+    ) {}
+    get value() {
+      return this.storedValue;
+    }
+    set value(value: string) {
+      this.storedValue = value;
+    }
+    getClientRects() {
+      return [1];
+    }
+    focus() {
+      document.activeElement = this;
+    }
+    select() {}
+  }
+  const form = () => {
+    const fields: FakeInput[] = [];
+    const owner = {
+      querySelectorAll: (selector: string) =>
+        fields.filter((field) =>
+          selector === 'input[type="password"]'
+            ? field.type === "password"
+            : selector.includes("autocomplete")
+              ? false
+              : field.type === "text",
+        ),
+    };
+    const username = new FakeInput("text", owner);
+    const password = new FakeInput("password", owner);
+    fields.push(username, password);
+    return { username, password };
+  };
+  const a = form();
+  const b = form();
+  const isolated = NodeVM.createContext({ document, HTMLInputElement: FakeInput });
+  const run = (code: string): unknown => NodeVM.runInContext(code, isolated);
+  document.activeElement = a.username;
+  expect(run(PreviewManager.protonPassAutofillScripts.prepare)).toBe(true);
+  // Link -> fill on the same pair remains supported.
+  expect(run(PreviewManager.protonPassAutofillScripts.prepare)).toBe(true);
+  a.username.value = "fake-user";
+  a.password.value = "fake-password";
+  a.password.type = "text";
+  document.activeElement = b.username;
+  expect(run(PreviewManager.protonPassAutofillScripts.prepare)).toBe(false);
+  expect(run(PreviewManager.protonPassAutofillScripts.clear)).toBe(true);
+  expect(a.username.value).toBe("");
+  expect(a.password.value).toBe("");
+  expect(run(PreviewManager.protonPassAutofillScripts.prepare)).toBe(true);
 });

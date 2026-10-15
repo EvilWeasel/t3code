@@ -8,6 +8,7 @@ export interface AutofillTarget {
   readonly privateEntry: boolean;
   current(): boolean;
   enterPrivate(): Promise<void>;
+  holdPrivate(): () => void;
   fill(username: string, password: string): Promise<void>;
   clearAndResume(): Promise<void>;
 }
@@ -135,6 +136,39 @@ export function makeAutofill(provider: ProtonPassProvider, store: BindingStore) 
         busy = false;
       }
     },
+    async clearAndResume(target: AutofillTarget) {
+      // Refuse while metadata selection, a selected read, or native input is pending.
+      if (busy) throw new AutofillUnavailable();
+      busy = true;
+      try {
+        if (!target.current()) throw new AutofillUnavailable();
+        await target.clearAndResume();
+      } finally {
+        busy = false;
+      }
+    },
+    async unlink(target: AutofillTarget, reference: ProtonLoginReference) {
+      if (busy) throw new AutofillUnavailable();
+      busy = true;
+      try {
+        check(target);
+        const entries = await store.read();
+        check(target);
+        await store.write(
+          entries.filter(
+            (entry) =>
+              !(
+                entry.origin === target.origin &&
+                entry.partition === target.partition &&
+                entry.shareId === reference.shareId &&
+                entry.itemId === reference.itemId
+              ),
+          ),
+        );
+      } finally {
+        busy = false;
+      }
+    },
     async fill(target: AutofillTarget, reference: ProtonLoginReference) {
       if (busy) throw new AutofillUnavailable();
       busy = true;
@@ -151,9 +185,14 @@ export function makeAutofill(provider: ProtonPassProvider, store: BindingStore) 
         check(target);
         await target.enterPrivate();
         check(target);
-        const credentials = await provider.credentials(reference);
-        check(target);
-        await target.fill(credentials.username, credentials.password);
+        const release = target.holdPrivate();
+        try {
+          const credentials = await provider.credentials(reference);
+          check(target);
+          await target.fill(credentials.username, credentials.password);
+        } finally {
+          release();
+        }
       } finally {
         busy = false;
       }

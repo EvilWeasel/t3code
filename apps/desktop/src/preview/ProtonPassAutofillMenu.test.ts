@@ -3,9 +3,9 @@ import { makeAutofillMenu } from "./ProtonPassAutofillMenu.ts";
 import { makeAutofill, type AutofillTarget, type LinkedLogin } from "./ProtonPassAutofill.ts";
 import { ProtonPassUnavailable } from "./ProtonPassCli.ts";
 
-const setup = () => {
+const setup = (initialEntries: readonly LinkedLogin[] = []) => {
   const order: string[] = [];
-  let entries: readonly LinkedLogin[] = [];
+  let entries = initialEntries;
   const provider = {
     vaults: vi.fn(async () => [{ shareId: "v", title: "Personal" }]),
     logins: vi.fn(async () => [{ shareId: "v", itemId: "i", title: "Site" }]),
@@ -19,6 +19,7 @@ const setup = () => {
     partition: "persist:p",
     privateEntry: true,
     current: () => true,
+    holdPrivate: () => () => {},
     enterPrivate: async () => {
       order.push("private");
     },
@@ -85,4 +86,34 @@ it("keeps explicit clear/resume reachable even if the reference store is unreada
   )();
   expect(target.clearAndResume).toHaveBeenCalledOnce();
   expect(provider.credentials).not.toHaveBeenCalled();
+});
+
+it("removing a saved login updates the next native menu without reading secrets or resuming sharing", async () => {
+  const { target, service, provider, ui } = setup([
+    {
+      origin: "https://site.test",
+      partition: "persist:p",
+      shareId: "v",
+      itemId: "i",
+      title: "Site",
+    },
+  ]);
+  const menu = await makeAutofillMenu(target, service, ui);
+  const submenu = menu[0]!.submenu;
+  if (!Array.isArray(submenu)) throw new Error("Missing submenu");
+  await (
+    submenu.find((item) => item.label === "Remove linked login: Site")!.click as () => Promise<void>
+  )();
+  const nextMenu = await makeAutofillMenu(target, service, ui);
+  const nextSubmenu = nextMenu[0]!.submenu;
+  if (!Array.isArray(nextSubmenu)) throw new Error("Missing submenu");
+  expect(nextSubmenu.some((item) => item.label === "Fill Site")).toBe(false);
+  expect(nextSubmenu.some((item) => item.label === "Remove linked login: Site")).toBe(false);
+  expect(nextSubmenu.some((item) => item.label === "Clear login fields and resume sharing")).toBe(
+    true,
+  );
+  expect(provider.credentials).not.toHaveBeenCalled();
+  expect(provider.vaults).not.toHaveBeenCalled();
+  expect(provider.logins).not.toHaveBeenCalled();
+  expect(target.clearAndResume).not.toHaveBeenCalled();
 });
