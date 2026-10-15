@@ -1056,16 +1056,19 @@ export const layer: Layer.Layer<
                 runId: task.id,
                 status: task.status,
                 resultReady: inspectReadback(projection, task.id).type === "ready",
-                commentary:
-                  projection.messages
-                    .filter(
-                      (message) =>
-                        message.threadId === row.thread_id &&
-                        message.runId === task.id &&
-                        message.role === "assistant",
-                    )
-                    .slice(-1)
-                    .map((message) => message.text.slice(-2_000))[0] ?? null,
+                commentary: !["preparing", "queued", "starting", "running", "waiting"].includes(
+                  task.status,
+                )
+                  ? null
+                  : (projection.messages
+                      .filter(
+                        (message) =>
+                          message.threadId === row.thread_id &&
+                          message.runId === task.id &&
+                          message.role === "assistant",
+                      )
+                      .slice(-1)
+                      .map((message) => message.text.slice(-2_000))[0] ?? null),
               })),
             });
           }
