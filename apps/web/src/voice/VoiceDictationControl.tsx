@@ -180,6 +180,18 @@ export function VoiceDictationControl(props: {
   const audioUrl = state.audioUrl;
   const busy = state.phase === "transcribing";
   const error = state.phase === "error" ? state.message : null;
+  const retryWithCurrentSettings = (delivery: "insert" | "send") => {
+    if (
+      busy ||
+      !props.transcribe ||
+      recordedTargetKey.current !== props.targetKey ||
+      props.currentTargetKey() !== props.targetKey
+    )
+      return;
+    // Rebind only on an explicit retry, never while a recording/request is active.
+    recordingTranscriber.current = props.transcribe;
+    void dictation.transcribe(delivery);
+  };
   return (
     <Popover defaultOpen>
       <PopoverTrigger
@@ -208,13 +220,17 @@ export function VoiceDictationControl(props: {
               Processing voice message…
             </span>
           ) : null}
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            Insert text and Send use this environment’s current voice settings. Your recording stays
+            in its original draft until inserted or sent.
+          </p>
           <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
             <Button
               type="button"
               variant="default"
               size="sm"
               disabled={busy || !props.transcribe}
-              onClick={() => void dictation.transcribe()}
+              onClick={() => retryWithCurrentSettings("insert")}
             >
               Insert text
             </Button>
@@ -223,7 +239,7 @@ export function VoiceDictationControl(props: {
               variant="secondary"
               size="sm"
               disabled={busy || !props.transcribe || !props.onSend}
-              onClick={() => void dictation.transcribe("send")}
+              onClick={() => retryWithCurrentSettings("send")}
             >
               Send
             </Button>

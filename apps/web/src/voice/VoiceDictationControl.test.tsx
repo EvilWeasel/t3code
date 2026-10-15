@@ -4,6 +4,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 import type { VoiceDictationState, useVoiceDictation } from "./useVoiceDictation";
 
 const captured = vi.hoisted(() => ({
+  useActualHook: false,
   input: null as Parameters<typeof useVoiceDictation>[0] | null,
   state: { phase: "idle" } as VoiceDictationState,
   start: vi.fn(),
@@ -17,6 +18,7 @@ vi.mock("./useVoiceDictation", async (importOriginal) => {
     ...actual,
     useVoiceDictation: (input: Parameters<typeof useVoiceDictation>[0]) => {
       captured.input = input;
+      if (captured.useActualHook) return actual.useVoiceDictation(input);
       return {
         state: captured.state,
         start: captured.start,
@@ -46,6 +48,7 @@ import { VoiceDictationControl } from "./VoiceDictationControl";
 let renderer: ReactTestRenderer | undefined;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  captured.useActualHook = false;
   captured.state = { phase: "idle" };
   vi.clearAllMocks();
 });
@@ -114,7 +117,7 @@ it("keeps a failed recording available for review, insertion, sending and discar
   await act(async () =>
     buttons.find((button) => button.children.includes("Insert text"))!.props.onClick(),
   );
-  expect(captured.transcribe).toHaveBeenLastCalledWith();
+  expect(captured.transcribe).toHaveBeenLastCalledWith("insert");
   await act(async () =>
     buttons.find((button) => button.children.includes("Send"))!.props.onClick(),
   );
@@ -156,7 +159,7 @@ it("keeps a no-audio error in a disclosure and allows recording again", () => {
   expect(captured.start).toHaveBeenCalledOnce();
 });
 
-it("retries a reviewed recording with its captured provider after settings change", async () => {
+it("keeps the captured callback until an explicit current-settings retry", async () => {
   captured.state = { phase: "review", audioUrl: "blob:fixture-recording", audioType: "audio/webm" };
   const original = vi.fn(async () => "original provider words");
   const replacement = vi.fn(async () => "replacement provider words");
@@ -179,4 +182,167 @@ it("retries a reviewed recording with its captured provider after settings chang
   await expect(transcribe(audio, options)).resolves.toBe("original provider words");
   expect(original).toHaveBeenCalledWith(audio, options);
   expect(replacement).not.toHaveBeenCalled();
+});
+
+class SyntheticMediaRecorder {
+  state: RecordingState = "inactive";
+  mimeType = "audio/webm";
+  ondataavailable: ((event: BlobEvent) => void) | null = null;
+  onstop: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  constructor(readonly stream: MediaStream) {}
+  start() {
+    this.state = "recording";
+  }
+  stop() {
+    if (this.state !== "recording") return;
+    this.ondataavailable?.({ data: new Blob(["synthetic fixture"]) } as BlobEvent);
+    this.state = "inactive";
+    this.onstop?.();
+  }
+}
+
+function installSyntheticCapture() {
+  captured.useActualHook = true;
+  const getUserMedia = vi.fn(
+    async () => ({ getTracks: () => [{ stop: vi.fn() }] }) as unknown as MediaStream,
+  );
+  vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+  vi.stubGlobal("MediaRecorder", SyntheticMediaRecorder);
+  vi.stubGlobal("URL", {
+    ...URL,
+    createObjectURL: vi.fn(() => "blob:synthetic-retry"),
+    revokeObjectURL: vi.fn(),
+  });
+  return getUserMedia;
+}
+
+function action(label: string) {
+  return renderer!.root
+    .findAllByType("button")
+    .find((button) => button.props["aria-label"] === label || button.children.includes(label))!;
+}
+
+it("retries the same retained Blob after a missing callback becomes available", async () => {
+  const getUserMedia = installSyntheticCapture();
+  const insert = vi.fn(() => true);
+  const targetKey = "control:missing-callback-retry";
+  const currentTargetKey = () => targetKey;
+  await act(async () => {
+    renderer = create(
+      <VoiceDictationControl
+        targetKey={targetKey}
+        currentTargetKey={currentTargetKey}
+        transcribe={null}
+        onTranscript={insert}
+      />,
+    );
+  });
+  await act(async () => action("Record voice message").props.onClick());
+  await act(async () => action("Stop recording").props.onClick());
+  const { readRecordingDraft } = await import("./recordingDraftStore");
+  const originalAudio = (await readRecordingDraft(targetKey))!.audio;
+  const replacement = vi.fn(async () => "recovered words");
+  await act(async () =>
+    renderer!.update(
+      <VoiceDictationControl
+        targetKey={targetKey}
+        currentTargetKey={currentTargetKey}
+        transcribe={replacement}
+        onTranscript={insert}
+      />,
+    ),
+  );
+  expect(replacement).not.toHaveBeenCalled();
+  expect(renderer!.root.findByType("audio").props.src).toBe("blob:synthetic-retry");
+  await act(async () => action("Insert text").props.onClick());
+  expect(replacement).toHaveBeenCalledExactlyOnceWith(
+    originalAudio,
+    expect.objectContaining({ signal: expect.any(AbortSignal) }),
+  );
+  expect(insert).toHaveBeenCalledExactlyOnceWith("recovered words", targetKey);
+  expect(getUserMedia).toHaveBeenCalledOnce();
+});
+
+it("does not replace an in-flight callback or automatically resubmit after settings change", async () => {
+  const getUserMedia = installSyntheticCapture();
+  const targetKey = "control:pending-settings-retry";
+  const currentTargetKey = () => targetKey;
+  let rejectOriginal!: (error: Error) => void;
+  const original = vi.fn(
+    (_audio: Blob, _options: { signal: AbortSignal }) =>
+      new Promise<string>((_resolve, reject) => {
+        rejectOriginal = reject;
+      }),
+  );
+  const replacement = vi.fn(async () => "new settings words");
+  const insert = vi.fn(() => true);
+  await act(async () => {
+    renderer = create(
+      <VoiceDictationControl
+        targetKey={targetKey}
+        currentTargetKey={currentTargetKey}
+        transcribe={original}
+        onTranscript={insert}
+      />,
+    );
+  });
+  await act(async () => action("Record voice message").props.onClick());
+  await act(async () => action("Stop recording").props.onClick());
+  const originalAudio = original.mock.calls[0]![0];
+  await act(async () =>
+    renderer!.update(
+      <VoiceDictationControl
+        targetKey={targetKey}
+        currentTargetKey={currentTargetKey}
+        transcribe={replacement}
+        onTranscript={insert}
+      />,
+    ),
+  );
+  expect(replacement).not.toHaveBeenCalled();
+  expect(action("Insert text").props.disabled).toBe(true);
+  await act(async () => rejectOriginal(new Error("synthetic provider refusal")));
+  expect(replacement).not.toHaveBeenCalled();
+  await act(async () => action("Insert text").props.onClick());
+  expect(replacement).toHaveBeenCalledExactlyOnceWith(
+    originalAudio,
+    expect.objectContaining({ signal: expect.any(AbortSignal) }),
+  );
+  expect(original).toHaveBeenCalledOnce();
+  expect(insert).toHaveBeenCalledExactlyOnceWith("new settings words", targetKey);
+  expect(getUserMedia).toHaveBeenCalledOnce();
+});
+
+it("ignores a stale retry handler after the selected draft changes", () => {
+  captured.state = { phase: "review", audioUrl: "blob:fixture-recording", audioType: "audio/webm" };
+  let currentTarget = "draft-a";
+  const transcribe = vi.fn(async () => "words");
+  const insert = vi.fn(() => true);
+  act(() => {
+    renderer = create(
+      <VoiceDictationControl
+        targetKey={currentTarget}
+        currentTargetKey={() => currentTarget}
+        transcribe={transcribe}
+        onTranscript={insert}
+      />,
+    );
+  });
+  const staleRetry = action("Insert text").props.onClick;
+  currentTarget = "draft-b";
+  act(() =>
+    renderer!.update(
+      <VoiceDictationControl
+        targetKey={currentTarget}
+        currentTargetKey={() => currentTarget}
+        transcribe={transcribe}
+        onTranscript={insert}
+      />,
+    ),
+  );
+  act(() => staleRetry());
+  expect(captured.transcribe).not.toHaveBeenCalled();
+  expect(transcribe).not.toHaveBeenCalled();
+  expect(insert).not.toHaveBeenCalled();
 });
