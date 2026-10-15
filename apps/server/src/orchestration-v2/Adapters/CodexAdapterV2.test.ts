@@ -147,9 +147,31 @@ describe("Codex Live explicit observer native routing", () => {
       let plannerRequest: unknown;
       let nativeClient: CodexClient.CodexAppServerClient["Service"] | undefined;
       const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "unused" });
-      const initial = (yield* Schema.decodeUnknownEffect(
-        Schema.Struct({ frame: Schema.Struct({ result: CodexSchema.V2ThreadStartResponse }) }),
-      )(preamble[4])).frame.result;
+      // This harness decodes before replay's legacy normalization. Supply the
+      // complete current native response rather than decoding the old preamble.
+      const initial = yield* Schema.decodeUnknownEffect(CodexSchema.V2ThreadStartResponse)({
+        thread: {
+          id: nativeThreadId,
+          sessionId: nativeThreadId,
+          projectId: null,
+          preview: "",
+          ephemeral: false,
+          modelProvider: "openai",
+          createdAt: 1782622440,
+          updatedAt: 1782622440,
+          status: { type: "idle" },
+          cwd: "/workspace",
+          cliVersion: "0.144.0",
+          source: "vscode",
+          turns: [],
+        },
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/workspace",
+        approvalPolicy: "on-request",
+        approvalsReviewer: "user",
+        sandbox: { type: "workspaceWrite", writableRoots: [], networkAccess: false },
+      } satisfies CodexSchema.V2ThreadStartResponse);
       const transcript = makeCodexReplayTranscript({
         scenario: `live-observer-${enabled}`,
         entries: [
