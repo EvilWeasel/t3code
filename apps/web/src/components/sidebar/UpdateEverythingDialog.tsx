@@ -98,6 +98,7 @@ function LastUpdateOutcomeContent({ history, onClear }: Pick<LastOutcomeDialogPr
             <span className="font-medium">{row.machineLabel}</span>
             {` · ${row.component === "provider" ? `${row.driver} (${row.instanceId})` : row.component}: ${row.status}`}
             {row.reason !== "none" ? ` — ${row.reason.replaceAll("-", " ")}` : ""}
+            <div>{`Target: ${row.targetVersion ?? "unknown"}; observed: ${row.observedVersion ?? "unknown"}`}</div>
           </li>)}
         </ul> : null}
         {clearFailed ? <p role="status" className="pt-2 text-sm">The saved result could not be cleared.</p> : null}

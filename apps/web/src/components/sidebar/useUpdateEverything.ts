@@ -4,6 +4,7 @@ import { Atom } from "effect/reactivity";
 import { useMemo } from "react";
 
 import { APP_VERSION } from "~/branding";
+import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
 import { isElectron } from "~/env";
 import { useEnvironments } from "~/state/environments";
@@ -111,6 +112,12 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
       installLocal?: (reportError: ReportLocalUpdateError) => Promise<boolean>;
     }) => {
       const capturedScope = historyScope;
+      const providerTargets = new Map(providers.machines.map((machine) => [
+        machine.environmentId,
+        new Map(machine.candidates.map((candidate) => [
+          candidate.instanceId, candidate.versionAdvisory.latestVersion,
+        ] as const)),
+      ] as const));
       const outcomeId = crypto.randomUUID();
       const localFailures: Array<string> = [];
       const reportLocalError: ReportLocalUpdateError = (title, description) => {
@@ -150,7 +157,9 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
           updateProviders: async () => {
             const runs = await providers.updateAll({ quiet: true });
             const outcomes = runs.map((run) => {
-              const runOutcome = getProviderUpdateRunOutcome(run);
+              const runOutcome = getProviderUpdateRunOutcome({ ...run,
+                targetVersion: providerTargets.get(run.environmentId)?.get(run.instanceId) ?? null,
+              });
               if (runOutcome.status === "failed") failedProviderMachines.add(run.environmentId);
               if (runOutcome.status === "interrupted") {
                 interruptedProviderMachines.add(run.environmentId);
@@ -183,7 +192,10 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
                         interruptedProviderMachines.has(server.environmentId)
                       ? "skipped" : "done",
                 );
-                return { environmentId: server.environmentId, label: server.serverLabel, outcome: serverOutcome };
+                // Read the existing client observation; never infer installation from the requested version.
+                const observed = appAtomRegistry.get(serverEnvironment.configValueAtom(server.environmentId));
+                return { environmentId: server.environmentId, label: server.serverLabel, outcome: serverOutcome,
+                  targetVersion: server.targetVersion, observedVersion: observed?.environment.serverVersion ?? null };
               }),
             ),
         });
@@ -222,7 +234,8 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
           localReason = localFailures.length > 0 ? "install-failed" : "not-started";
         }
         const completedRows = rows && capturedScope
-          ? [...rows, ...(installLocal ? [localUpdateOutcomeRow(capturedScope, localStatus, localReason)] : [])]
+          ? [...rows, ...(installLocal ? [localUpdateOutcomeRow(capturedScope, localStatus, localReason,
+              localVersion, APP_VERSION)] : [])]
           : null;
         const completedSaved = completedRows !== null && saveCompletedUpdateOutcome(capturedScope, {
           id: outcomeId, completedAt: Date.now(), clientVersion: APP_VERSION,

@@ -17,6 +17,7 @@ import {
   completeUpdateOutcome,
   readUpdateOutcomeHistory,
   resolvePendingUpdateOutcome,
+  reservePendingUpdateOutcome,
   updateOutcomeScope,
   writeUpdateOutcomeHistory,
   type UpdateOutcomeScope,
@@ -127,10 +128,10 @@ export function saveCompletedUpdateOutcome(
 }
 
 export function prepareUpdateOutcome(
-  scope: UpdateOutcomeScope | null, pending: PendingUpdateInstall,
+  scope: UpdateOutcomeScope | null, pending: Omit<PendingUpdateInstall, "previousCompletedId">,
 ): boolean {
   const saved = changeHistory(scope, (previous) => previous.pendingInstall && liveInstallIds.has(previous.pendingInstall.id) ? null
-    : { ...previous, pendingInstall: pending });
+    : reservePendingUpdateOutcome(previous, pending));
   if (saved) liveInstallIds.add(pending.id);
   return saved;
 }
@@ -165,12 +166,12 @@ export function useLastUpdateOutcome() {
     const fresh = readHistory(scope);
     if (fresh.status !== "ready") return;
     const pending = fresh.value.pendingInstall;
-    if (pending && desktop && (!liveInstallIds.has(pending.id) ||
-        (desktop.status === "error" && desktop.errorContext === "install"))) {
-      const next = resolvePendingUpdateOutcome(fresh.value, desktop, Date.now());
+    if (pending && desktop && desktop.currentVersion === APP_VERSION && !liveInstallIds.has(pending.id)) {
+      // Error snapshots have no attempt generation. Never use them to retire a live/retried handoff.
+      const next = resolvePendingUpdateOutcome(fresh.value, desktop, Date.now(), pending.id);
       if (next) {
         const saved = changeHistory(scope, (current) => current.pendingInstall?.id === pending.id
-          ? resolvePendingUpdateOutcome(current, desktop, Date.now()) : null);
+          ? resolvePendingUpdateOutcome(current, desktop, Date.now(), pending.id) : null);
         if (saved) liveInstallIds.delete(pending.id);
         return;
       }

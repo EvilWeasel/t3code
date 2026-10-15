@@ -337,6 +337,8 @@ export interface ProviderUpdateRun {
   readonly machineLabel: string;
   readonly driver: ProviderDriverKind;
   readonly instanceId: ProviderInstanceId;
+  /** Captured before dispatch; absent when the caller did not observe a target. */
+  readonly targetVersion?: string | null;
   readonly result: AtomCommandResult<
     { readonly providers: ReadonlyArray<ServerProvider> },
     unknown
@@ -352,6 +354,8 @@ export type ProviderUpdateRunOutcome =
     | { readonly status: "updated" }
     | { readonly status: "failed" | "interrupted"; readonly line: string }
   ) & {
+    readonly targetVersion?: string | null;
+    readonly observedVersion?: string | null;
     readonly identity?: {
       readonly environmentId: EnvironmentId;
       readonly machineLabel: string;
@@ -370,14 +374,21 @@ export function getProviderUpdateRunOutcome(
     driver: run.driver,
     instanceId: run.instanceId,
   };
+  const versions = {
+    targetVersion: run.targetVersion ?? null,
+    observedVersion: run.result._tag === "Success"
+      ? run.result.value.providers.find((provider) => provider.instanceId === run.instanceId)?.version ?? null
+      : null,
+  };
   if (isAtomCommandInterrupted(run.result)) {
-    return { status: "interrupted", line: `${label}: Update was interrupted.`, identity };
+    return { status: "interrupted", line: `${label}: Update was interrupted.`, identity, ...versions };
   }
   if (run.result._tag === "Failure") {
     const error = squashAtomCommandFailure(run.result);
     return {
       status: "failed",
       identity,
+      ...versions,
       line: `${label}: ${error instanceof Error ? error.message : "Provider update failed."}`,
     };
   }
@@ -385,10 +396,11 @@ export function getProviderUpdateRunOutcome(
     (provider) => provider.instanceId === run.instanceId,
   )?.updateState;
   return updateState?.status === "succeeded"
-    ? { status: "updated", identity }
+    ? { status: "updated", identity, ...versions }
     : {
         status: "failed",
         identity,
+        ...versions,
         line: `${label}: ${updateState?.message ?? "Provider update did not finish."}`,
       };
 }

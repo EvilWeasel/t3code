@@ -1125,6 +1125,7 @@ describe("getProviderUpdateRunToastView", () => {
     const interrupted = run("Laptop", "codex", AsyncResult.failure(Cause.interrupt()));
     expect(getProviderUpdateRunOutcome(interrupted)).toEqual({
       status: "interrupted",
+      targetVersion: null, observedVersion: null,
       line: "Laptop · Codex: Update was interrupted.",
       identity: {
         environmentId: EnvironmentId.make("Laptop"), machineLabel: "Laptop",
@@ -1144,8 +1145,9 @@ describe("getProviderUpdateRunToastView", () => {
       ],
     });
 
-    expect(getProviderUpdateRunOutcome(run("Laptop", "codex", succeeded))).toMatchObject({
+    expect(getProviderUpdateRunOutcome({ ...run("Laptop", "codex", succeeded), targetVersion: "1.0.1" })).toMatchObject({
       status: "updated",
+      targetVersion: "1.0.1", observedVersion: "1.0.0",
       identity: {
         environmentId: EnvironmentId.make("Laptop"), machineLabel: "Laptop",
         driver: driver("codex"), instanceId: instanceId("codex"),

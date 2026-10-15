@@ -499,6 +499,8 @@ const HistoryRow = Schema.Struct({
     "install-failed", "install-not-applied", "unverified-install", "different-channel",
     "no-permission", "already-updating", "manual-update",
   ]),
+  targetVersion: Schema.NullOr(HistoryText),
+  observedVersion: Schema.NullOr(HistoryText),
 });
 const HistoryRows = Schema.Array(HistoryRow).check(Schema.isMaxLength(512));
 const CompletedUpdate = Schema.Struct({
@@ -514,6 +516,7 @@ const PendingInstall = Schema.Struct({
   fromVersion: HistoryText,
   targetVersion: HistoryText,
   previousNotAppliedVersion: Schema.NullOr(HistoryText),
+  previousCompletedId: Schema.NullOr(HistoryText),
   rows: HistoryRows,
 });
 const UpdateHistory = Schema.Struct({
@@ -608,6 +611,11 @@ export function completeUpdateOutcome(
   previous: UpdateOutcomeHistory, completed: LastCompletedUpdate, pendingId?: string,
 ): UpdateOutcomeHistory | null {
   if (pendingId !== undefined && previous.pendingInstall?.id !== pendingId) return null;
+  if (pendingId !== undefined && previous.pendingInstall?.previousCompletedId !==
+      (previous.lastCompleted?.id ?? null)) {
+    // A later independent completion owns LAST and its notice. Only retire the verified handoff.
+    return { ...previous, pendingInstall: null };
+  }
   return { ...previous, lastCompleted: completed,
     pendingInstall: pendingId === undefined ? previous.pendingInstall : null,
     pendingNoticeId: completed.id };
@@ -633,26 +641,57 @@ export function clearUpdateOutcomeHistory(storage: ResultStorage, scope: UpdateO
 
 export function localUpdateOutcomeRow(
   scope: UpdateOutcomeScope, status: LastUpdateRow["status"], reason: LastUpdateRow["reason"],
+  targetVersion: string | null = null, observedVersion: string | null = null,
 ): LastUpdateRow {
   return { environmentId: scope.primaryEnvironmentId, machineLabel: "This app", component: "client",
-    driver: null, instanceId: null, status, reason };
+    driver: null, instanceId: null, status, reason, targetVersion, observedVersion };
+}
+
+/** Validate the actual handoff AND its mandatory terminal client row before installation. */
+export function reservePendingUpdateOutcome(
+  previous: UpdateOutcomeHistory,
+  input: Omit<PendingUpdateInstall, "previousCompletedId">,
+): UpdateOutcomeHistory | null {
+  const pending = { ...input, previousCompletedId: previous.lastCompleted?.id ?? null };
+  const staged = { ...previous, pendingInstall: pending };
+  const fits = (value: UpdateOutcomeHistory | null) => {
+    const checked = validateHistory(value, previous.scope);
+    return checked !== null && new TextEncoder().encode(JSON.stringify(checked)).length <= HISTORY_MAX_BYTES;
+  };
+  if (!fits(staged)) return null;
+  // Reserve the longest terminal metadata, including numeric timestamp width and exact version bytes.
+  for (const observedVersion of [pending.fromVersion, pending.targetVersion]) {
+    const terminal = completeUpdateOutcome(staged, {
+      id: pending.id, completedAt: Number.MAX_SAFE_INTEGER,
+      clientVersion: observedVersion, targetVersion: pending.targetVersion,
+      rows: [...pending.rows, localUpdateOutcomeRow(previous.scope, "interrupted", "install-not-applied",
+        pending.targetVersion, observedVersion)],
+    }, pending.id);
+    if (!fits(terminal)) return null;
+  }
+  return staged;
 }
 
 /** No raw command output or exception text is copied into durable rows. */
 export function buildUpdateOutcomeRows(input: {
   readonly providers: ReadonlyArray<ProviderUpdateRunOutcome>;
-  readonly servers: ReadonlyArray<{ readonly environmentId: string; readonly label: string; readonly outcome: ServerUpdateOutcome }>;
+  readonly servers: ReadonlyArray<{
+    readonly environmentId: string; readonly label: string; readonly outcome: ServerUpdateOutcome;
+    readonly targetVersion?: string | null; readonly observedVersion?: string | null;
+  }>;
   readonly skipped: ReadonlyArray<SkippedMachine>;
 }): ReadonlyArray<LastUpdateRow> | null {
   const rows: LastUpdateRow[] = [];
   for (const provider of input.providers) {
     if (!provider.identity) return null;
     rows.push({ ...provider.identity, component: "provider", status: provider.status,
+      targetVersion: provider.targetVersion ?? null, observedVersion: provider.observedVersion ?? null,
       reason: provider.status === "updated" ? "none" : provider.status === "interrupted" ? "interrupted" : "update-failed" });
   }
   for (const server of input.servers) {
     const interrupted = server.outcome.status === "skipped" && server.outcome.message === "Update was interrupted.";
     rows.push({ environmentId: server.environmentId, machineLabel: server.label, component: "server",
+      targetVersion: server.targetVersion ?? null, observedVersion: server.observedVersion ?? null,
       driver: null, instanceId: null, status: interrupted ? "interrupted" : server.outcome.status,
       reason: interrupted ? "interrupted" : server.outcome.status === "updated" ? "none"
         : server.outcome.status === "failed" ? "update-failed" : "not-started" });
@@ -663,7 +702,7 @@ export function buildUpdateOutcomeRows(input: {
       : machine.reason === "already updating" ? "already-updating"
       : machine.reason.startsWith("on the ") ? "different-channel" : "manual-update";
     rows.push({ environmentId: machine.environmentId, machineLabel: machine.label, component: "server",
-      driver: null, instanceId: null, status: "skipped", reason });
+      driver: null, instanceId: null, status: "skipped", reason, targetVersion: null, observedVersion: null });
   }
   return rows;
 }
@@ -679,28 +718,27 @@ export function resolvePendingUpdateOutcome(
     readonly downloadedVersion?: string | null;
   },
   now: number,
+  expectedPendingId = history.pendingInstall?.id,
 ): UpdateOutcomeHistory | null {
   const pending = history.pendingInstall;
-  if (!pending) return null;
+  if (!pending || pending.id !== expectedPendingId) return null;
+  if (observation.status === "error" && observation.errorContext === "install") return null;
   let status: LastUpdateRow["status"];
   let reason: LastUpdateRow["reason"];
   if (observation.currentVersion === pending.targetVersion) {
     status = "updated"; reason = "none";
-  } else if (observation.currentVersion === pending.fromVersion && observation.status === "error" &&
-      observation.errorContext === "install" && observation.downloadedVersion === pending.targetVersion) {
-    status = "failed"; reason = "install-failed";
   } else if (observation.currentVersion === pending.fromVersion &&
       observation.notAppliedVersion === pending.targetVersion &&
       pending.previousNotAppliedVersion !== pending.targetVersion) {
     status = "failed"; reason = "install-not-applied";
-  } else if (observation.currentVersion !== pending.fromVersion) {
-    status = "skipped"; reason = "unverified-install";
   } else {
+    // Neither an unrelated version nor an install-error snapshot identifies this attempt.
     return null;
   }
   return completeUpdateOutcome(history, {
     id: pending.id, completedAt: now, clientVersion: observation.currentVersion,
     targetVersion: pending.targetVersion,
-    rows: [...pending.rows, localUpdateOutcomeRow(history.scope, status, reason)],
+    rows: [...pending.rows, localUpdateOutcomeRow(history.scope, status, reason,
+      pending.targetVersion, observation.currentVersion)],
   }, pending.id);
 }

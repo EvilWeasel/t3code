@@ -30,6 +30,7 @@ import {
   completeUpdateOutcome,
   readUpdateOutcomeHistory,
   resolvePendingUpdateOutcome,
+  reservePendingUpdateOutcome,
   updateOutcomeScope,
   writeUpdateOutcomeHistory,
   type LastCompletedUpdate,
@@ -550,11 +551,12 @@ describe("durable last completed Update all outcome", () => {
   const completed = (id = "completed-1"): LastCompletedUpdate => ({
     id, completedAt: 1_000, clientVersion: "1.2.3", targetVersion: null,
     rows: [{ environmentId: "primary-A", machineLabel: "ready", component: "server",
-      driver: null, instanceId: null, status: "updated", reason: "none" }],
+      driver: null, instanceId: null, status: "updated", reason: "none",
+      targetVersion: null, observedVersion: null }],
   });
   const pending = (): PendingUpdateInstall => ({
     id: "install-1", startedAt: 2_000, fromVersion: "1.2.3", targetVersion: "1.2.4",
-    previousNotAppliedVersion: null, rows: completed().rows,
+    previousNotAppliedVersion: null, previousCompletedId: null, rows: completed().rows,
   });
   const read = (store: ReturnType<typeof makeStore>, selected = scope): UpdateOutcomeHistory => {
     const result = readUpdateOutcomeHistory(store, selected);
@@ -569,11 +571,11 @@ describe("durable last completed Update all outcome", () => {
     });
     const rows = buildUpdateOutcomeRows({
       providers: [
-        { status: "updated", identity: identity("updated") },
+        { status: "updated", identity: identity("updated"), targetVersion: "2.0", observedVersion: "2.0" },
         { status: "failed", line: "DO NOT PERSIST token=secret / draft / raw stderr", identity: identity("failed") },
         interrupted,
       ],
-      servers: [{ environmentId: "ready", label: "ready", outcome: { status: "updated" } }],
+      servers: [{ environmentId: "ready", label: "ready", targetVersion: "3.0", observedVersion: "2.9", outcome: { status: "updated" } }],
       skipped: [{ environmentId: EnvironmentId.make("offline"), label: "offline", reason: "not connected" }],
     });
     if (rows === null) throw new Error("Missing identity");
@@ -598,18 +600,21 @@ describe("durable last completed Update all outcome", () => {
     expect(bytes).not.toContain("secret");
     expect(bytes).not.toContain("raw stderr");
     expect(last.rows[0]?.instanceId).toBe("codex-updated");
+    expect(afterRelaunch.lastCompleted?.rows.map((row) => [row.targetVersion, row.observedVersion])).toEqual([
+      ["2.0", "2.0"], [null, null], [null, null], ["3.0", "2.9"], [null, null],
+    ]);
   });
 
   it("keeps previous completed data inside pending install and only finalizes observed versions", () => {
     const store = makeStore();
     const prior = completed();
     expect(writeUpdateOutcomeHistory(store, scope, (old) => completeUpdateOutcome(old, prior))).toBe(true);
-    expect(writeUpdateOutcomeHistory(store, scope, (old) => ({ ...old, pendingInstall: pending() }))).toBe(true);
+    expect(writeUpdateOutcomeHistory(store, scope, (old) => reservePendingUpdateOutcome(old, pending()))).toBe(true);
     const staged = read(store);
     expect(staged.lastCompleted).toEqual(prior);
     const remoteOnly = completeUpdateOutcome(staged, completed("remote-completed"));
     expect(remoteOnly?.lastCompleted?.id).toBe("remote-completed");
-    expect(remoteOnly?.pendingInstall).toEqual(pending());
+    expect(remoteOnly?.pendingInstall).toEqual(staged.pendingInstall);
     expect(resolvePendingUpdateOutcome(staged, { currentVersion: "1.2.3" }, 3_000)).toBeNull();
     const applied = resolvePendingUpdateOutcome(staged, { currentVersion: "1.2.4" }, 3_000);
     expect(applied?.lastCompleted).toMatchObject({ id: "install-1", targetVersion: "1.2.4", completedAt: 3_000 });
@@ -619,15 +624,104 @@ describe("durable last completed Update all outcome", () => {
     const asyncFailure = resolvePendingUpdateOutcome(staged, {
       currentVersion: "1.2.3", status: "error", errorContext: "install", downloadedVersion: "1.2.4",
     }, 3_000);
-    expect(asyncFailure?.lastCompleted?.rows.at(-1)?.reason).toBe("install-failed");
+    expect(asyncFailure).toBeNull();
     expect(resolvePendingUpdateOutcome(staged, {
       currentVersion: "1.2.3", status: "error", errorContext: "install", downloadedVersion: "different",
     }, 3_000)).toBeNull();
-    const staleFlag = { ...staged, pendingInstall: { ...pending(), previousNotAppliedVersion: "1.2.4" } };
+    const staleFlag = { ...staged, pendingInstall: { ...staged.pendingInstall!, previousNotAppliedVersion: "1.2.4" } };
     expect(resolvePendingUpdateOutcome(staleFlag, { currentVersion: "1.2.3", notAppliedVersion: "1.2.4" }, 3_000)).toBeNull();
     const unrelated = resolvePendingUpdateOutcome(staged, { currentVersion: "1.2.5" }, 3_000);
-    expect(unrelated?.lastCompleted?.rows.at(-1)).toMatchObject({ status: "skipped", reason: "unverified-install" });
+    expect(unrelated).toBeNull();
+    expect(read(store)).toEqual(staged);
     expect(staged.lastCompleted).toEqual(prior);
+    expect(staged.pendingInstall?.previousCompletedId).toBe(prior.id);
+  });
+
+  it("rejects queued old observations and indistinguishable install errors on a same-target retry", () => {
+    const store = makeStore();
+    const empty = read(store);
+    const first = reservePendingUpdateOutcome(empty, pending())!;
+    const queuedId = first.pendingInstall!.id;
+    const retry = reservePendingUpdateOutcome(empty, { ...pending(), id: "retry-2" })!;
+    const staleError = { currentVersion: "1.2.3", status: "error", errorContext: "install",
+      downloadedVersion: "1.2.4", notAppliedVersion: "1.2.4" };
+    expect(resolvePendingUpdateOutcome(retry, staleError, 4_000, queuedId)).toBeNull();
+    expect(resolvePendingUpdateOutcome(retry, staleError, 4_000, "retry-2")).toBeNull();
+    // Even an exact version observation captured for A cannot retire retry B.
+    expect(resolvePendingUpdateOutcome(retry, { currentVersion: "1.2.4" }, 4_000, queuedId)).toBeNull();
+    expect(retry.pendingInstall?.id).toBe("retry-2");
+    expect(retry.lastCompleted).toBeNull();
+  });
+
+  it("retires verified pending A without replacing later completed B or its notice", () => {
+    const store = makeStore();
+    const staged = reservePendingUpdateOutcome(read(store), pending())!;
+    const b = completed("independent-B");
+    for (const acknowledged of [false, true]) {
+      const newer = completeUpdateOutcome(staged, b)!;
+      const before = { ...newer, pendingNoticeId: acknowledged ? null : b.id };
+      const resolved = resolvePendingUpdateOutcome(before, { currentVersion: "1.2.4" }, 5_000, "install-1");
+      expect(resolved).toEqual({ ...before, pendingInstall: null });
+      expect(writeUpdateOutcomeHistory(store, scope, () => resolved)).toBe(true);
+      expect(read(store).lastCompleted).toEqual(b);
+      expect(read(store).pendingNoticeId).toBe(before.pendingNoticeId);
+    }
+  });
+
+  it("reserves the final client machine and row before calling the installer", async () => {
+    let installs = 0;
+    const row = completed().rows[0]!;
+    const cases = [
+      Array.from({ length: 512 }, () => ({ ...row, environmentId: "remote" })),
+      Array.from({ length: 128 }, (_, i) => ({ ...row, environmentId: `remote-${i}` })),
+    ];
+    for (const rows of cases) {
+      const store = makeStore();
+      expect(await installAfterUpdateEverything({
+        result: { localVersion: "1.2.4", updatedServers: rows.length, updatedProviders: 0, failures: [] },
+        localReady: true,
+        save: () => writeUpdateOutcomeHistory(store, scope, (old) => reservePendingUpdateOutcome(old, { ...pending(), rows })),
+        install: async () => { installs += 1; return true; },
+        clear: () => { throw new Error("No failed save may clear history"); },
+      })).toBe("storage-failed");
+      expect(store.values.size).toBe(0);
+    }
+    expect(installs).toBe(0);
+    const store = makeStore();
+    const rows = Array.from({ length: 127 }, (_, i) => ({ ...row, environmentId: `remote-${i}` }));
+    const reserved = reservePendingUpdateOutcome(read(store), { ...pending(), rows });
+    expect(reserved).not.toBeNull();
+    const resolved = resolvePendingUpdateOutcome(reserved!, { currentVersion: "1.2.4" }, 5_000);
+    expect(new Set(resolved!.lastCompleted!.rows.map((item) => item.environmentId)).size).toBe(128);
+    expect(writeUpdateOutcomeHistory(store, scope, () => resolved)).toBe(true);
+  });
+
+  it("rejects a staged UTF8 envelope that fits but cannot fit its exact terminal version metadata", async () => {
+    const store = makeStore();
+    const empty = read(store);
+    const row = completed().rows[0]!;
+    // Find the first real UTF8 boundary deterministically; no timing or mocked capacity check.
+    let input: PendingUpdateInstall | null = null;
+    for (let count = 1; count <= 128; count += 1) {
+      const candidate = { ...pending(), fromVersion: "旧".repeat(256), targetVersion: "新".repeat(256),
+        rows: Array.from({ length: count }, () => ({ ...row, machineLabel: "猫".repeat(128) })) };
+      const staged = { ...empty, pendingInstall: candidate };
+      const bytes = new TextEncoder().encode(JSON.stringify(staged)).length;
+      if (bytes <= 65_536 && reservePendingUpdateOutcome(empty, candidate) === null) {
+        input = candidate; break;
+      }
+    }
+    expect(input).not.toBeNull();
+    let installs = 0;
+    expect(await installAfterUpdateEverything({
+      result: { localVersion: input!.targetVersion, updatedServers: 1, updatedProviders: 0, failures: [] },
+      localReady: true,
+      save: () => writeUpdateOutcomeHistory(store, scope, (old) => reservePendingUpdateOutcome(old, input!)),
+      install: async () => { installs += 1; return true; },
+      clear: () => { throw new Error("No destructive clear"); },
+    })).toBe("storage-failed");
+    expect(installs).toBe(0);
+    expect(store.values.size).toBe(0);
   });
 
   it("never replays an install when reading, acknowledging or clearing the completed result", async () => {
@@ -636,7 +730,7 @@ describe("durable last completed Update all outcome", () => {
     expect(await installAfterUpdateEverything({
       result: { localVersion: "1.2.4", updatedServers: 1, updatedProviders: 0, failures: [] },
       localReady: true,
-      save: () => writeUpdateOutcomeHistory(store, scope, (old) => ({ ...old, pendingInstall: pending() })),
+      save: () => writeUpdateOutcomeHistory(store, scope, (old) => reservePendingUpdateOutcome(old, pending())),
       install: async () => { installs += 1; return true; },
       clear: () => { throw new Error("Accepted install must retain its pending handoff"); },
     })).toBe("relaunching");
@@ -695,6 +789,8 @@ describe("durable last completed Update all outcome", () => {
     const cases = [
       Array.from({ length: 129 }, (_, i) => ({ ...row, environmentId: `env-${i}` })),
       Array.from({ length: 513 }, () => row),
+      [{ ...row, targetVersion: "x".repeat(257) }],
+      [{ ...row, observedVersion: "x".repeat(257) }],
       Array.from({ length: 128 }, () => ({ ...row, machineLabel: "猫".repeat(256) })),
     ];
     for (const rows of cases) {
@@ -718,7 +814,7 @@ describe("durable last completed Update all outcome", () => {
       expect(await installAfterUpdateEverything({
         result: { localVersion: "1.2.4", updatedServers: 1, updatedProviders: 0, failures: [] },
         localReady: true,
-        save: () => writeUpdateOutcomeHistory(storage, scope, (old) => ({ ...old, pendingInstall: pending() })),
+        save: () => writeUpdateOutcomeHistory(storage, scope, (old) => reservePendingUpdateOutcome(old, pending())),
         install: async () => { installs += 1; return true; },
         clear: () => { throw new Error("Failed saves must not clear old history"); },
       })).toBe("storage-failed");
