@@ -8,8 +8,12 @@ const state = vi.hoisted(() => ({
   scopeKind: "environment" as "environment" | "all" | "project" | "checkout",
   request: vi.fn(),
   editable: true,
+  errorMessage: vi.fn(() => "Could not save voice settings. Check the connection."),
 }));
-vi.mock("../../voice/voiceSettingsClient", () => ({ voiceSettingsRequest: state.request }));
+vi.mock("../../voice/voiceSettingsClient", () => ({
+  voiceSettingsRequest: state.request,
+  voiceSettingsErrorMessage: state.errorMessage,
+}));
 vi.mock("./SettingsScopeContext", () => ({
   useSettingsScope: () => ({
     target: { environmentId: state.environmentId },
@@ -31,11 +35,13 @@ vi.mock("./settingsLayout", async () => {
       children,
       description,
       control,
+      status,
     }: {
       children: ReactNode;
       description: ReactNode;
       control: ReactNode;
-    }) => createElement("div", null, description, control, children),
+      status: ReactNode;
+    }) => createElement("div", null, description, status, control, children),
   };
 });
 vi.mock("../ui/button", async () => {
@@ -91,6 +97,9 @@ beforeEach(() => {
   state.scopeKind = "environment";
   state.editable = true;
   state.request.mockReset();
+  state.errorMessage
+    .mockReset()
+    .mockReturnValue("Could not save voice settings. Check the connection.");
 });
 afterEach(() => {
   act(() => renderer?.unmount());
@@ -343,6 +352,26 @@ it("does not allow changes through a read-only connection", async () => {
   );
   expect(renderer!.root.findByType("select").props.disabled).toBe(true);
   expect(renderer!.root.findByType("button").props.disabled).toBe(true);
+  expect(renderer!.root.findByProps({ role: "note" }).children.join("")).toContain(
+    "settings:write",
+  );
   await act(async () => renderer!.root.findByType("button").props.onClick());
   expect(state.request).toHaveBeenCalledOnce();
+});
+
+it("uses sanitized diagnostics for settings read failures without exposing the thrown message", async () => {
+  const failure = new Error("fixture-private-upstream-body");
+  state.request.mockRejectedValue(failure);
+  state.errorMessage.mockReturnValue(
+    "This connection does not have permission to change settings.",
+  );
+  await act(async () => {
+    renderer = create(<VoiceTranscriptionSettingsPanel />);
+  });
+  expect(state.errorMessage).toHaveBeenCalledWith(failure);
+  expect(renderer!.root.findByProps({ role: "status" }).children.join("")).toContain(
+    "does not have permission",
+  );
+  expect(JSON.stringify(renderer!.toJSON())).not.toContain("fixture-private-upstream-body");
+  expect(renderer!.root.findByType("button").props.disabled).toBe(true);
 });

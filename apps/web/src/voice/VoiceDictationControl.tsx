@@ -126,7 +126,7 @@ export function VoiceDictationControl(props: {
               <PopoverTitle>Could not record</PopoverTitle>
               <VoiceRecordingError message={state.message} />
               <p className="text-xs leading-relaxed text-muted-foreground">
-                Check microphone permissions, then try recording again.
+                Use the microphone button to try recording again.
               </p>
             </div>
           </PopoverPopup>

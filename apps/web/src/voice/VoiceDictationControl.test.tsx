@@ -156,15 +156,25 @@ it("keeps a no-audio error in a disclosure and allows recording again", () => {
   expect(captured.start).toHaveBeenCalledOnce();
 });
 
-it("retains explicit stop, send and discard during recording", () => {
-  captured.state = { phase: "recording" };
-  mountRecording();
-  act(() => renderer!.root.findByProps({ "aria-label": "Stop recording" }).props.onClick());
-  expect(captured.stop).toHaveBeenLastCalledWith();
+it("retries a reviewed recording with its captured provider after settings change", async () => {
+  captured.state = { phase: "review", audioUrl: "blob:fixture-recording", audioType: "audio/webm" };
+  const original = vi.fn(async () => "original provider words");
+  const replacement = vi.fn(async () => "replacement provider words");
+  mountRecording(original);
   act(() =>
-    renderer!.root.findByProps({ "aria-label": "Transcribe and send recording" }).props.onClick(),
+    renderer!.update(
+      <VoiceDictationControl
+        targetKey="draft-a"
+        currentTargetKey={() => "draft-a"}
+        transcribe={replacement}
+        onTranscript={() => true}
+      />,
+    ),
   );
-  expect(captured.stop).toHaveBeenLastCalledWith("send");
-  act(() => renderer!.root.findByProps({ "aria-label": "Discard recording" }).props.onClick());
-  expect(captured.cancel).toHaveBeenCalledOnce();
+  expect(renderer!.root.findByType("audio").props.src).toBe("blob:fixture-recording");
+  const audio = new Blob(["fixture audio"], { type: "audio/webm" });
+  const options = { signal: new AbortController().signal };
+  await expect(captured.input!.transcribe(audio, options)).resolves.toBe("original provider words");
+  expect(original).toHaveBeenCalledWith(audio, options);
+  expect(replacement).not.toHaveBeenCalled();
 });

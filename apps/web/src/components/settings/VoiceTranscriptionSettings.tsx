@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { AuthSettingsWriteScope, type VoiceTranscriptionSettings } from "@t3tools/contracts";
-import { voiceSettingsRequest } from "../../voice/voiceSettingsClient";
+import { voiceSettingsRequest, voiceSettingsErrorMessage } from "../../voice/voiceSettingsClient";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { readEnvironmentScope } from "../../state/session";
 import { SettingsSection, SettingsRow } from "./settingsLayout";
@@ -41,9 +41,8 @@ export function VoiceTranscriptionSettingsPanel() {
           setInstanceId(value.instanceId ?? "");
           setModel(value.model);
         })
-        .catch(() => {
-          if (generationRef.current === generation)
-            setError("Could not read voice settings from this environment.");
+        .catch((error: unknown) => {
+          if (generationRef.current === generation) setError(voiceSettingsErrorMessage(error));
         });
     return () => {
       if (generationRef.current === generation) generationRef.current += 1;
@@ -79,11 +78,9 @@ export function VoiceTranscriptionSettingsPanel() {
       if (generationRef.current !== generation) return;
       setApiKey("");
       setSettings(value);
-    } catch {
+    } catch (error: unknown) {
       if (generationRef.current !== generation) return;
-      setError(
-        "Could not save voice settings. Check this environment's connection and settings permission.",
-      );
+      setError(voiceSettingsErrorMessage(error));
     } finally {
       if (generationRef.current === generation) setBusy(false);
     }
@@ -133,7 +130,7 @@ export function VoiceTranscriptionSettingsPanel() {
       {provider === "codex-account" ? (
         <SettingsRow
           title="Codex account"
-          description="Uses the enabled Codex instance and its existing sign-in. Transcription access depends on the account service; signing in does not confirm access. If it returns HTTP 403, you can explicitly choose OpenAI API key instead."
+          description="Uses this environment’s Codex sign-in. Transcription access depends on the account service. For HTTP 403, you can choose OpenAI API key instead."
           control={
             <div className="w-full min-w-0 @min-[32rem]/settings-row:w-60">
               <Select
@@ -221,6 +218,14 @@ export function VoiceTranscriptionSettingsPanel() {
           <span role="status" className="wrap-anywhere">
             {error || settings?.message || "Reading voice settings from this environment…"}
           </span>
+        }
+        status={
+          environmentId && !editable ? (
+            <span role="note">
+              This connection is read-only. Use a connection with settings:write permission to
+              change voice settings.
+            </span>
+          ) : undefined
         }
         control={
           <div className="flex flex-wrap items-center gap-2">
