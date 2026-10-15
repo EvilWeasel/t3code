@@ -6,11 +6,14 @@ import {
   DesktopPendingSnapShot,
   type ClientSettings,
   type DesktopSnapShotEvent,
+  type DesktopCaptureExtensionState,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Exit from "effect/Exit";
+import * as Scope from "effect/Scope";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
@@ -23,6 +26,9 @@ import type { PortalShortcutState } from "./PortalCaptureShortcut.ts";
 import { beforeEach, vi } from "vite-plus/test";
 
 beforeEach(() => {
+  gnomeConstructMock.mockClear();
+  gnomeStateMock.mockReset().mockResolvedValue({ status: "enabled", message: "Extension running" });
+  gnomeCloseMock.mockClear();
   portalShortcutInstances.length = 0;
   nextPortalState.value = undefined;
   vi.stubEnv("NIRI_SOCKET", "");
@@ -37,6 +43,9 @@ beforeEach(() => {
 });
 
 const {
+  gnomeConstructMock,
+  gnomeStateMock,
+  gnomeCloseMock,
   activeWindowMock,
   animationSettingsMock,
   accessibilityProcessWarmMock,
@@ -79,6 +88,9 @@ const {
   transitionShowMock,
   transitionSnapshotMock,
 } = vi.hoisted(() => ({
+  gnomeConstructMock: vi.fn(),
+  gnomeStateMock: vi.fn<() => Promise<DesktopCaptureExtensionState>>(async () => ({ status: "enabled", message: "Extension running" })),
+  gnomeCloseMock: vi.fn(),
   activeWindowMock: vi.fn(),
   animationSettingsMock: vi.fn(() => ({
     prefersReducedMotion: true,
@@ -483,9 +495,10 @@ accessibilityProcessReadMock.mockImplementation((request) => ({
 vi.mock("./GnomeCaptureSetup.ts", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./GnomeCaptureSetup.ts")>()),
   GnomeCaptureSetup: class {
-    state = async () => ({ status: "enabled" as const, message: "Extension running" });
+    constructor() { gnomeConstructMock(); }
+    state = gnomeStateMock;
     perform = async () => undefined;
-    close = () => undefined;
+    close = gnomeCloseMock;
   },
 }));
 
@@ -4130,7 +4143,7 @@ it.effect("denies configure, permissions and every setup action before their fir
     yield* service.requestPermissions(true);
     for (const action of ["test-mac-capture", "allow-accessibility", "allow-screen-recording", "install-kde-helper", "remove-kde-helper", "install-hyprland-helper", "remove-hyprland-helper", "install-extension", "enable-extension", "disable-extension", "retry-shortcut"] as const) {
       const error = yield* service.setup(action).pipe(Effect.flip);
-      assert.equal(error.reason, "setup-failed", action);
+      assert.equal(error.reason, ["test-mac-capture", "allow-accessibility", "allow-screen-recording", "retry-shortcut"].includes(action) ? "setup-failed" : "unsupported-session", action);
     }
     assert.deepEqual({
       warm: accessibilityProcessWarmMock.mock.calls.length,
@@ -4250,5 +4263,111 @@ it.effect("keeps UNKNOWN admission on rejected helper retirement rather than tre
     Effect.provide(layerTest("win32")),
     Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: gate.tryReserveRuntimeActivity } as ElectronWindow.ElectronWindow["Service"]),
     Effect.ensuring(Effect.sync(() => { helperWarmRetirementMock.mockReset().mockResolvedValue(undefined); })),
+  );
+});
+
+it.effect.each([true, false])("fences service finalization while held=%s and retains admitted unacknowledged shortcut shutdown", (heldInstall) => {
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  const quiet = Promise.withResolvers<void>();
+  let active = 0;
+  const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
+    const token = gate.tryReserveRuntimeActivity(request);
+    if (token === undefined) return undefined;
+    active++;
+    return { release: () => { token.release(); if (--active === 0) quiet.resolve(); } };
+  };
+  return Effect.scoped(Effect.gen(function* () {
+    const child = yield* Scope.make();
+    const service = yield* DesktopSnapShot.make.pipe(Scope.provide(child));
+    yield* service.configure(enabledSettings({ snapShotShortcut: { kind: "both-shift-keys" } }));
+    yield* Effect.promise(() => quiet.promise);
+    const poller = shortcutProcesses.at(-1);
+    assert.isDefined(poller);
+    const kills = poller!.kill.mock.calls.length;
+    const closes = accessibilityProcessCloseMock.mock.calls.length;
+    const held = heldInstall ? gate.acquire(200) : undefined;
+    if (heldInstall) assert.isDefined(held);
+    yield* Scope.close(child, Exit.void);
+    assert.equal(poller!.kill.mock.calls.length, kills + (heldInstall ? 0 : 1));
+    assert.equal(accessibilityProcessCloseMock.mock.calls.length, closes + (heldInstall ? 0 : 1));
+    if (heldInstall) held!.release();
+    if (heldInstall) {
+      const after = gate.acquire(200);
+      assert.isDefined(after); // Denied teardown started no work and added no hold.
+      after!.release();
+    } else {
+      // Logical cleanup/kill is not native exit; this close API supplies no ACK.
+      assert.isUndefined(gate.acquire(200));
+    }
+  })).pipe(
+    Effect.provide(layerTest("win32")),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: reserve } as ElectronWindow.ElectronWindow["Service"]),
+  );
+});
+
+it.effect("returns deferred GNOME state without opening a bus while install admission is held", () => {
+  vi.stubEnv("XDG_SESSION_TYPE", "wayland");
+  vi.stubEnv("XDG_CURRENT_DESKTOP", "GNOME");
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  const held = gate.acquire(200);
+  assert.isDefined(held);
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    const state = yield* service.state;
+    assert.equal(state.mode, "portal");
+    assert.isUndefined(state.gnomeExtension);
+    assert.equal(gnomeConstructMock.mock.calls.length, 0);
+    assert.equal(gnomeStateMock.mock.calls.length, 0);
+    assert.equal(gnomeCloseMock.mock.calls.length, 0);
+  })).pipe(
+    Effect.provide(layerTest("linux")),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: gate.tryReserveRuntimeActivity } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => held!.release())),
+  );
+});
+
+it.effect("retains admitted GNOME probe UNKNOWN after logical timeout and bus close", () => {
+  vi.stubEnv("XDG_SESSION_TYPE", "wayland");
+  vi.stubEnv("XDG_CURRENT_DESKTOP", "GNOME");
+  const started = Promise.withResolvers<void>();
+  const logicalResult = Promise.withResolvers<DesktopCaptureExtensionState>();
+  gnomeStateMock.mockImplementation(() => { started.resolve(); return logicalResult.promise; });
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    const probing = yield* service.state.pipe(Effect.forkScoped);
+    yield* Effect.promise(() => started.promise);
+    assert.isUndefined(gate.acquire(200));
+    logicalResult.resolve({ status: "error", message: "Logical timeout without remote retirement" });
+    const state = yield* Fiber.join(probing);
+    assert.equal(state.gnomeExtension?.status, "error");
+    assert.equal(gnomeCloseMock.mock.calls.length, 1);
+    assert.isUndefined(gate.acquire(200));
+  })).pipe(
+    Effect.provide(layerTest("linux")),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: gate.tryReserveRuntimeActivity } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => logicalResult.resolve({ status: "error", message: "cleanup" }))),
+  );
+});
+
+it.effect.each([
+  ["win32", "test-mac-capture"],
+  ["darwin", "install-kde-helper"],
+] as const)("releases known no-work unsupported setup on %s", (platform, action) => {
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    const starts = activeWindowMock.mock.calls.length;
+    const warm = accessibilityProcessWarmMock.mock.calls.length;
+    const error = yield* service.setup(action).pipe(Effect.flip);
+    assert.equal(error.reason, "unsupported-session");
+    assert.equal(activeWindowMock.mock.calls.length, starts);
+    assert.equal(accessibilityProcessWarmMock.mock.calls.length, warm);
+    const after = gate.acquire(200);
+    assert.isDefined(after);
+    after!.release();
+  })).pipe(
+    Effect.provide(layerTest(platform)),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: gate.tryReserveRuntimeActivity } as ElectronWindow.ElectronWindow["Service"]),
   );
 });

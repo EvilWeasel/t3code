@@ -1518,7 +1518,18 @@ export const make = Effect.gen(function* () {
       } else yield* applySettings(yield* Ref.get(settingsRef), null, true);
     }
   });
-  const setup = (action: DesktopSnapShotSetupAction) => configurationMutex.withPermits(1)(withNativeActivity(
+  const setup = (action: DesktopSnapShotSetupAction) => Effect.suspend(() => {
+    // Side-effect-free support checks precede reservation. Rejected no-work
+    // requests must not be mistaken for started native work of unknown lifetime.
+    const supported = action === "test-mac-capture" || action === "allow-screen-recording" || action === "allow-accessibility"
+      ? environment.platform === "darwin"
+      : action === "install-kde-helper" || action === "remove-kde-helper"
+        ? captureMode(environment.platform) === "portal" && isKdeCaptureSession()
+        : action === "install-hyprland-helper" || action === "remove-hyprland-helper"
+          ? captureMode(environment.platform) === "portal" && isHyprlandCaptureSession()
+          : action === "retry-shortcut" || hasGnomeSetup();
+    if (!supported) return Effect.fail(new DesktopSnapShotSetupError({ action, reason: "unsupported-session" }));
+    return configurationMutex.withPermits(1)(withNativeActivity(
     setupOperation(action),
     Effect.fail(new DesktopSnapShotSetupError({ action, reason: "setup-failed" })),
     // GNOME calls and portal reconfiguration can time out before the remote
@@ -1527,16 +1538,23 @@ export const make = Effect.gen(function* () {
     action !== "retry-shortcut" && (action === "test-mac-capture" || action === "allow-screen-recording" ||
       action === "allow-accessibility" ||
       action === "install-hyprland-helper" || action === "remove-hyprland-helper"),
-  ));
+    ));
+  });
 
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
+      const token = reserveActivity?.({ kind: "snapshot-capture" });
+      if (reserveActivity !== undefined && token === undefined) return;
+      const unknownClose = portalShortcut !== undefined || stopShiftShortcut !== undefined || linuxFeedback !== undefined;
       releaseShortcut();
       flash.dispose();
       transition.dispose();
       closeLinuxFeedback();
       accessibilityProcessPool.close();
       regionSnapShotPool.close();
+      // Windows and helper lifetimes have independent closed/exit holds.
+      // These legacy shortcut/feedback closes have no retirement ACK.
+      if (!unknownClose) token?.release();
     }),
   );
 
@@ -1663,7 +1681,7 @@ export const make = Effect.gen(function* () {
                   )
               : undefined;
           const gnomeExtension = hasGnomeSetup()
-            ? yield* Effect.promise(async () => {
+            ? yield* withNativeActivity(Effect.promise(async () => {
                 const { GnomeCaptureSetup } = await import("./GnomeCaptureSetup.ts");
                 const setup = new GnomeCaptureSetup(gnomeSetupPaths);
                 try {
@@ -1671,7 +1689,7 @@ export const make = Effect.gen(function* () {
                 } finally {
                   setup.close();
                 }
-              })
+              }), Effect.succeed(state.gnomeExtension), false)
             : undefined;
           const kdeHelper =
             state.linuxBackend === "kde"
