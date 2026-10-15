@@ -1,7 +1,12 @@
 import * as Schema from "effect/Schema";
 
 import { SnapShotSource } from "./chatAttachment.ts";
-import { EnvironmentId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  EnvironmentId,
+  NonNegativeInt,
+  PositiveInt,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { BrowserProfileId } from "./browserProfile.ts";
 import type {
   BrowserImportResult,
@@ -1138,7 +1143,137 @@ export const DesktopPreviewRecordingSaveInputSchema = Schema.Struct({
 export const SystemSettingsPaneSchema = Schema.Literals(["full-disk-access"]);
 export type SystemSettingsPane = typeof SystemSettingsPaneSchema.Type;
 
+// First privacy scope is deliberately closed to this Root thread and local environment.
+export const MainRendererDiagnosticsTarget = Schema.Struct({
+  environmentId: Schema.Literal("24efa85c-862c-4de4-9b5e-aaaa041e28a4"),
+  threadId: Schema.Literal("7cd05d6b-5e09-4691-a664-0b56c6283f12"),
+  providerInstanceId: Schema.NullOr(
+    TrimmedNonEmptyString.check(Schema.makeFilter((s) => s.length <= 128)),
+  ),
+});
+export type MainRendererDiagnosticsTarget = typeof MainRendererDiagnosticsTarget.Type;
+const MainRendererDiagnosticsNonce = Schema.String.check(
+  Schema.makeFilter((s) => /^[a-zA-Z0-9:_-]{1,128}$/.test(s)),
+);
+export const MainRendererDiagnosticsRequest = Schema.Struct({
+  version: Schema.Literal(1),
+  requestId: MainRendererDiagnosticsNonce,
+  requestNonce: MainRendererDiagnosticsNonce,
+  target: MainRendererDiagnosticsTarget,
+  mainSession: MainRendererDiagnosticsNonce,
+  windowId: PositiveInt,
+  frameProcessId: NonNegativeInt,
+  frameRoutingId: NonNegativeInt,
+  navigationGeneration: NonNegativeInt,
+  expiresAtMs: NonNegativeInt,
+});
+export type MainRendererDiagnosticsRequest = typeof MainRendererDiagnosticsRequest.Type;
+export const MainRendererDiagnosticsFacts = Schema.Struct({
+  driver: Schema.Literals(["codex", "other", "unknown"]),
+  setupMode: Schema.Literals(["managed", "existing", "missing", "invalid", "unknown"]),
+  providerEnabled: Schema.NullOr(Schema.Boolean),
+  providerAvailable: Schema.NullOr(Schema.Boolean),
+  projectOverride: Schema.Literals(["enabled", "disabled", "unset", "unknown"]),
+  catalogState: Schema.Literals(["pending", "ready", "failed", "scope-mismatch"]),
+  settingsKnown: Schema.Boolean,
+  permissionState: Schema.Literals(["known", "pending", "unavailable"]),
+  canOperate: Schema.NullOr(Schema.Boolean),
+  selectionCurrent: Schema.Boolean,
+});
+export const MainRendererDiagnosticsReason = Schema.NullOr(
+  Schema.Literals([
+    "Open an existing thread to start Live voice.",
+    "Provider information could not be loaded. Reconnect this environment.",
+    "Waiting for this environment's provider information.",
+    "Waiting for this environment's provider settings.",
+    "Waiting for this environment's thread permissions.",
+    "Thread permissions could not be verified. Reconnect this environment.",
+    "You need permission to operate this thread.",
+    "The selected provider instance is missing from this environment. Choose a configured provider.",
+    "Configure a Codex provider in this environment's Settings.",
+    "Enable the selected provider for this project in Settings.",
+    "The selected provider is unavailable. Check its setup in Settings.",
+    "Select a managed Codex provider to use Live voice.",
+    "Waiting for this thread's provider selection to update.",
+    "The selected Codex instance has no saved settings. Complete its setup in Settings.",
+    "Codex setup mode is missing. Complete its setup in Settings.",
+    "Codex setup mode is invalid or missing. Check its setup in Settings.",
+    "This Codex provider uses an existing installation. Live voice requires managed setup.",
+    "Codex setup mode is invalid. Check its setup in Settings.",
+    "Waiting for this environment's voice availability to update.",
+    "This browser does not provide WebRTC. Use a browser with WebRTC support.",
+    "Microphone access is unavailable in this browser context. Open the app in a trusted secure context.",
+    "Open a thread for a voice call",
+    "Live voice is unavailable for this thread. Check the selected provider and permissions.",
+  ]),
+);
+export const MainRendererDiagnosticsGate = Schema.Struct({
+  ...MainRendererDiagnosticsTarget.fields,
+  phase: Schema.Literals([
+    "idle",
+    "preparing",
+    "prepared",
+    "connecting",
+    "live",
+    "reconnecting",
+    "playback-blocked",
+    "stopping",
+    "ended",
+    "error",
+  ]),
+  targetPresent: Schema.Boolean,
+  active: Schema.Boolean,
+  busy: Schema.Boolean,
+  webRtcAvailable: Schema.Boolean,
+  microphoneApiAvailable: Schema.Boolean,
+  canStart: Schema.Boolean,
+  reason: MainRendererDiagnosticsReason,
+  facts: Schema.NullOr(MainRendererDiagnosticsFacts),
+  prepareFailure: Schema.NullOr(
+    Schema.Literals([
+      "unsupported_provider",
+      "managed_account_required",
+      "session_not_found",
+      "stale_lease",
+      "planner_restriction_failed",
+      "invalid_state",
+      "dispatch_conflict",
+      "runtime_unavailable",
+      "unclassified",
+    ]),
+  ),
+});
+export type MainRendererDiagnosticsGate = typeof MainRendererDiagnosticsGate.Type;
+export const MainRendererDiagnosticsResponse = Schema.Struct({
+  binding: MainRendererDiagnosticsRequest,
+  rendererEpoch: PositiveInt,
+  revision: PositiveInt,
+  result: Schema.Union([
+    Schema.Struct({ status: Schema.Literal("ready"), gate: MainRendererDiagnosticsGate }),
+    Schema.Struct({
+      status: Schema.Literal("unavailable"),
+      reason: Schema.Literals(["target-mismatch", "context-changed", "unmounted"]),
+    }),
+  ]),
+});
+export type MainRendererDiagnosticsResponse = typeof MainRendererDiagnosticsResponse.Type;
+export const MainRendererDiagnosticsInvalidation = Schema.Struct({
+  binding: MainRendererDiagnosticsRequest,
+  rendererEpoch: PositiveInt,
+  revision: PositiveInt,
+});
+export type MainRendererDiagnosticsInvalidation = typeof MainRendererDiagnosticsInvalidation.Type;
+
 export interface DesktopBridge {
+  /** Passive, finite request only; absence means no diagnostic capability. */
+  onMainRendererDiagnosticsRequest?: (
+    listener: (request: MainRendererDiagnosticsRequest) => void,
+  ) => () => void;
+  respondMainRendererDiagnostics?: (response: MainRendererDiagnosticsResponse) => Promise<boolean>;
+  invalidateMainRendererDiagnostics?: (
+    input: MainRendererDiagnosticsInvalidation,
+  ) => Promise<boolean>;
+
   getAppBranding: () => DesktopAppBranding | null;
   /** Absolute path of a dropped or picked file; absent on desktop builds predating it. */
   getPathForFile?: (file: File) => string;
