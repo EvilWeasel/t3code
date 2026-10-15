@@ -6767,37 +6767,39 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ensureThread: (threadInput) =>
             ensureInitialized.pipe(
               Effect.andThen(mcpSessions.read(threadInput.threadId)),
-              Effect.flatMap((mcpSession) => {
-                const params = codexThreadRuntimeParams({
-                  mcpSession,
-                  modelSelection: threadInput.modelSelection,
-                  runtimePolicy: threadInput.runtimePolicy,
-                });
-                if (threadInput.observatoryAvailable !== true)
-                  return client.request("thread/start", params);
-                const document = Schema.toJsonSchemaDocument(AgentObservatoryIntent);
-                return client.raw
-                  .request("thread/start", {
-                    ...params,
-                    dynamicTools: [
-                      {
-                        type: "function",
-                        name: "t3_observatory",
-                        description:
-                          "Read or publish your own bounded declarative dashboard. Host invocation supplies owner; layout never grants rights.",
-                        inputSchema: { ...document.schema, $defs: document.definitions },
-                      },
-                    ],
-                  })
-                  .pipe(
-                    Effect.flatMap(Schema.decodeUnknownEffect(CodexSchema.V2ThreadStartResponse)),
-                    Effect.tap((response) =>
-                      Effect.sync(() => {
-                        observatoryRegisteredThreads.add(response.thread.id);
-                      }),
-                    ),
-                  );
-              }),
+              Effect.flatMap((mcpSession) =>
+                Effect.gen(function* () {
+                  const params = codexThreadRuntimeParams({
+                    mcpSession,
+                    modelSelection: threadInput.modelSelection,
+                    runtimePolicy: threadInput.runtimePolicy,
+                  });
+                  if (threadInput.observatoryAvailable !== true)
+                    return yield* client.request("thread/start", params);
+                  const document = Schema.toJsonSchemaDocument(AgentObservatoryIntent);
+                  return yield* client.raw
+                    .request("thread/start", {
+                      ...params,
+                      dynamicTools: [
+                        {
+                          type: "function",
+                          name: "t3_observatory",
+                          description:
+                            "Read or publish your own bounded declarative dashboard. Host invocation supplies owner; layout never grants rights.",
+                          inputSchema: { ...document.schema, $defs: document.definitions },
+                        },
+                      ],
+                    })
+                    .pipe(
+                      Effect.flatMap(Schema.decodeUnknownEffect(CodexSchema.V2ThreadStartResponse)),
+                      Effect.tap((response) =>
+                        Effect.sync(() => {
+                          observatoryRegisteredThreads.add(response.thread.id);
+                        }),
+                      ),
+                    );
+                }),
+              ),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
                   appThreadId: threadInput.threadId,

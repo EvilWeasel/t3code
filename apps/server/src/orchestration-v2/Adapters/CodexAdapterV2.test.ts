@@ -4021,7 +4021,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             };
             publishText = yield* Schema.encodeEffect(
               Schema.fromJsonString(AgentObservatoryInvocationResult),
-            )(result);
+            )(result).pipe(Effect.orDie);
             return result;
           });
         yield* harness.runtime.startTurn({
