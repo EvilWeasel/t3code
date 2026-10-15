@@ -92,6 +92,9 @@ const encodeInstallRecord = Schema.encodeEffect(DesktopUpdateInstallRecord);
 export const DESKTOP_UPDATE_DEFER_RECORD_PREFIX = "desktop-update-deferred-";
 const DEFER_RECORD_MAX_BYTES = 16_384;
 const deferEncoder = new TextEncoder();
+const encodeDeferOrigin = Schema.encodeEffect(Schema.fromJsonString(Schema.Tuple([
+  Schema.Literal("desktop-update-defer"), Schema.Literal(1), Schema.String, Schema.Boolean, Schema.NullOr(Schema.String),
+])));
 const deferText = (bytes: number) => Schema.String.check(Schema.makeFilter(
   (text) => text.length > 0 && deferEncoder.encode(text).length <= bytes && !/[\u0000-\u001f\u007f]/.test(text),
   { expected: `bounded update metadata (${bytes} UTF-8 bytes)` },
@@ -121,7 +124,7 @@ const sameDeferMeaning = (a: DeferRecord, b: DeferRecord) => a.profileKey === b.
   a.runningVersion === b.runningVersion && a.targetVersion === b.targetVersion && a.channel === b.channel &&
   a.phase === b.phase && a.reason === b.reason && a.stopState === b.stopState && a.peers.length === b.peers.length &&
   a.peers.every((peer, index) => { const other = b.peers[index]; return other !== undefined && peer.instanceId === other.instanceId && peer.status === other.status && peer.shutdown === other.shutdown; });
-const deferMessage = (record: DeferRecord) => `Recorded update deferral for ${record.targetVersion}: ${record.reason} (${new Date(record.observedAt).toISOString()}).${record.peers.length === 0 ? "" : ` Peers: ${record.peers.map((peer) => `${peer.instanceId}=${peer.shutdown}/${peer.status}`).join(", ")}.`}`;
+const deferMessage = (record: DeferRecord) => `Recorded update deferral for ${record.targetVersion}: ${record.reason} (${DateTime.formatIso(DateTime.makeUnsafe(record.observedAt))}).${record.peers.length === 0 ? "" : ` Peers: ${record.peers.map((peer) => `${peer.instanceId}=${peer.shutdown}/${peer.status}`).join(", ")}.`}`;
 
 const decodeAppUpdateYmlConfig = Schema.decodeUnknownEffect(AppUpdateYmlConfig);
 const decodeUpdateInfo = Schema.decodeUnknownEffect(UpdateInfo);
@@ -458,7 +461,9 @@ export const make = Effect.gen(function* () {
     if (expectedAppData !== environment.appDataDirectory) return Option.none();
     const profile = Option.getOrNull(environment.profileId);
     if (profile !== Option.getOrNull(config.desktopProfile) || (profile !== null && !/^[A-Za-z0-9_-]{1,64}$/.test(profile))) return Option.none();
-    const origin = deferEncoder.encode(JSON.stringify(["desktop-update-defer", 1, environment.appDataDirectory, environment.isDevelopment, profile]));
+    const serializedOrigin = yield* encodeDeferOrigin(["desktop-update-defer", 1, environment.appDataDirectory, environment.isDevelopment, profile]).pipe(Effect.option);
+    if (Option.isNone(serializedOrigin)) return Option.none();
+    const origin = deferEncoder.encode(serializedOrigin.value);
     const digest = yield* crypto.digest("SHA-256", origin).pipe(Effect.option);
     if (Option.isNone(digest) || digest.value.length !== 32) return Option.none();
     const profileKey = Array.from(digest.value, (byte) => byte.toString(16).padStart(2, "0")).join("");
