@@ -875,6 +875,11 @@ describe("orchestrator MCP toolkit", () => {
                     },
                   ],
                 });
+                expect(
+                  (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+                    (candidate) => candidate.id === active.id,
+                  )?.rootNodeId,
+                ).toBe(changedId);
               } else if (change === "mode") {
                 yield* orchestrator.dispatch({
                   type: "thread.runtime-mode.set",
@@ -904,7 +909,9 @@ describe("orchestrator MCP toolkit", () => {
               }
               yield* Deferred.succeed(gate.release, undefined);
               const refused = yield* Fiber.join(pending);
-              expect(refused.isError).toBe(true);
+              expect(refused.isError, `canonical refusal after awaited ${change} change`).toBe(
+                true,
+              );
               expect(
                 (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
               ).toHaveLength(before.subagents.length);
