@@ -39,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix='upstream-main-source-tests-') as tempor
     upstream = git('rev-parse', 'HEAD')
     git('switch', 'main')
     ledger = root / 'ledger.json'
-    ledger.write_text(json.dumps({'schemaVersion': 1, 'repository': 'morrowbyte/t3code', 'initialized': True, 'pairs': []}))
+    ledger.write_text(json.dumps({'schemaVersion': 1, 'repository': 'morrowbyte/t3code', 'initialized': True, 'expiresAt': 4000000000, 'pairs': []}))
     original_index = (repo / '.git/index').read_bytes()
     counter = 0
     def run(fork_sha=fork, upstream_sha=upstream, *, state=ledger, overrides=None, ok=True):
@@ -68,16 +68,18 @@ with tempfile.TemporaryDirectory(prefix='upstream-main-source-tests-') as tempor
     contained, out = run(fork_sha=candidate)
     assert contained['status'] == 'no_change' and not (out / 'candidate.bundle').exists()
     for status in ('active', 'failed', 'success'):
-        ledger.write_text(json.dumps({'schemaVersion': 1, 'repository': 'morrowbyte/t3code', 'initialized': True, 'pairs': [{'forkSha': fork, 'upstreamSha': upstream, 'status': status}]}))
+        ledger.write_text(json.dumps({'schemaVersion': 1, 'repository': 'morrowbyte/t3code', 'initialized': True, 'expiresAt': 4000000000, 'pairs': [{'forkSha': fork, 'upstreamSha': upstream, 'status': status}]}))
         skipped, out = run()
         assert skipped['status'] == 'skipped_known_pair' and skipped['candidateSha'] is None and not (out / 'candidate.bundle').exists()
-    for content in ('{', '{}', '{"schemaVersion":1,"schemaVersion":1}', json.dumps({'schemaVersion': 1, 'repository': 'morrowbyte/t3code', 'initialized': False, 'pairs': []}), json.dumps({'schemaVersion': 1, 'repository': 'pingdotgg/t3code', 'initialized': True, 'pairs': []})):
+    for content in ('{', '{}', '{"schemaVersion":1,"schemaVersion":1}', json.dumps({'schemaVersion': 1, 'repository': 'morrowbyte/t3code', 'initialized': False, 'expiresAt': 4000000000, 'pairs': []}), json.dumps({'schemaVersion': 1, 'repository': 'pingdotgg/t3code', 'initialized': True, 'expiresAt': 4000000000, 'pairs': []})):
         ledger.write_text(content)
         failed, out = run(ok=False)
         assert failed['status'] == 'error' and not (out / 'candidate.bundle').exists()
+    ledger.write_text(json.dumps({'schemaVersion': 1, 'repository': 'morrowbyte/t3code', 'initialized': True, 'expiresAt': 1, 'pairs': []}))
+    assert run(ok=False)[0]['reason'] == 'ledger-expired-or-invalid-expiry'
     missing, _ = run(state=root / 'expired-or-missing-artifact.json', ok=False)
     assert missing['reason'] == 'ledger-missing'
-    ledger.write_text(json.dumps({'schemaVersion': 1, 'repository': 'morrowbyte/t3code', 'initialized': True, 'pairs': []}))
+    ledger.write_text(json.dumps({'schemaVersion': 1, 'repository': 'morrowbyte/t3code', 'initialized': True, 'expiresAt': 4000000000, 'pairs': []}))
     for key, value in [('remote.origin.pushurl', 'https://github.com/pingdotgg/t3code.git'), ('remote.origin.mirror', 'true')]:
         git('config', key, value)
         failed, _ = run(ok=False)

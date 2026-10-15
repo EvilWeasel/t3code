@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO = 'morrowbyte/t3code'
 UPSTREAM = 'https://github.com/pingdotgg/t3code.git'
@@ -111,8 +112,10 @@ try:
         if not state_path.is_absolute() or not state_path.is_file() or state_path.stat().st_size > 2_097_152:
             raise Refusal('ledger-missing')
         ledger = json.loads(state_path.read_text(), object_pairs_hook=strict_object)
-        if set(ledger) != {'schemaVersion', 'repository', 'initialized', 'pairs'} or type(ledger['schemaVersion']) is not int or ledger['schemaVersion'] != 1 or ledger['repository'] != REPO or ledger['initialized'] is not True or not isinstance(ledger['pairs'], list) or len(ledger['pairs']) > 10000:
+        if set(ledger) != {'schemaVersion', 'repository', 'initialized', 'expiresAt', 'pairs'} or type(ledger['schemaVersion']) is not int or ledger['schemaVersion'] != 1 or ledger['repository'] != REPO or ledger['initialized'] is not True or not isinstance(ledger['pairs'], list) or len(ledger['pairs']) > 10000:
             raise Refusal('ledger-invalid')
+        if type(ledger['expiresAt']) is not int or not 0 < ledger['expiresAt'] <= 9007199254740991 or ledger['expiresAt'] <= time.time():
+            raise Refusal('ledger-expired-or-invalid-expiry')
         seen = set()
         for entry in ledger['pairs']:
             if not isinstance(entry, dict) or set(entry) != {'forkSha', 'upstreamSha', 'status'} or not isinstance(entry['forkSha'], str) or not SHA.fullmatch(entry['forkSha']) or not isinstance(entry['upstreamSha'], str) or not SHA.fullmatch(entry['upstreamSha']) or entry['status'] not in ('active', 'failed', 'success'):
