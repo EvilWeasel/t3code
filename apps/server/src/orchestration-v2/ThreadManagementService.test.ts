@@ -702,9 +702,126 @@ it.effect("waitForThread reads the run again only when the run updates", () =>
     const result = yield* Fiber.join(fiber);
 
     expect(result).toMatchObject({ timedOut: false, run: { id: runId, status: "completed" } });
-    // The first read plus one for this run's update. The other run caused none.
-    expect(reads).toBe(2);
+    // Initial read, this run's update, and the terminal chain refresh after
+    // observing its effect nonpending. The unrelated run caused no read.
+    expect(reads).toBe(3);
   }),
+);
+
+it.effect.each(["initial", "stream", "timeout"] as const)(
+  "waitForThread refreshes a continuation admitted between projection and effect reads (%s)",
+  (path) =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make(`project:split-read:${path}`);
+      const threadId = ThreadId.make(`thread:split-read:${path}`);
+      const runId = RunId.make(`run:split-read:${path}`);
+      const continuationId = RunId.make(`run:split-read:${path}:continued`);
+      const subscribed = yield* Deferred.make<void>();
+      const pendingRead = yield* Deferred.make<void>();
+      const releasePendingRead = yield* Deferred.make<void>();
+      const refreshedChain = yield* Deferred.make<void>();
+      const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+      let admissionOccurred = false;
+      let interleaved = false;
+      let runs: Array<{
+        id: RunId;
+        status: OrchestrationV2Run["status"];
+        restartContinuationOfRunId?: RunId;
+      }> = [{ id: runId, status: path === "initial" ? "cancelled" : "running" }];
+      const stored = (id: RunId, status: OrchestrationV2Run["status"]) =>
+        ({
+          sequence: id === runId ? 1 : 2,
+          event: {
+            type: "run.updated",
+            threadId,
+            payload: {
+              id,
+              status,
+              ...(id === continuationId ? { restartContinuationOfRunId: runId } : {}),
+            },
+          },
+        }) as unknown as OrchestrationV2StoredEvent;
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadEventSequence: () => Effect.succeed(0),
+            restartContinuationPending: () =>
+              Effect.gen(function* () {
+                if (!interleaved) {
+                  interleaved = true;
+                  yield* Deferred.succeed(pendingRead, undefined);
+                  yield* Deferred.await(releasePendingRead);
+                }
+                return false;
+              }),
+            awaitRestartContinuation: () => Effect.never,
+            streamStoredEventsFrom: (input) =>
+              input?.eventType === "run.updated"
+                ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                    Stream.drain,
+                    Stream.concat(Stream.fromQueue(events)),
+                  )
+                : Stream.never,
+            getThreadRecords: () =>
+              Effect.gen(function* () {
+                const snapshot = runs;
+                if (admissionOccurred && snapshot.some((run) => run.id === continuationId))
+                  yield* Deferred.succeed(refreshedChain, undefined);
+                return {
+                  thread: { id: threadId, projectId, deletedAt: null },
+                  runs: snapshot,
+                } as unknown as OrchestrationV2ThreadProjection;
+              }),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(layerReceiptsTest),
+      );
+      const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+        Effect.provide(layerTest),
+      );
+      const waiter = yield* service
+        .waitForThread({
+          projectId,
+          threadId,
+          runId,
+          timeoutMs: path === "timeout" ? 1 : 60 * 60 * 1_000,
+        })
+        .pipe(Effect.forkChild);
+      if (path !== "initial") {
+        yield* Deferred.await(subscribed);
+        runs = [{ id: runId, status: "cancelled" }];
+        if (path === "stream") yield* Queue.offer(events, stored(runId, "cancelled"));
+        else yield* TestClock.adjust(Duration.millis(1));
+      }
+      yield* Deferred.await(pendingRead);
+      // Model the worker's durable admission of C, followed by settling R's
+      // continuation effect, while the waiter still owns the old R-only snapshot.
+      const continuation = { id: continuationId, restartContinuationOfRunId: runId };
+      runs = [
+        { id: runId, status: "cancelled" },
+        { ...continuation, status: "running" },
+      ];
+      admissionOccurred = true;
+      yield* Deferred.succeed(releasePendingRead, undefined);
+      if (path === "timeout") {
+        expect(yield* Fiber.join(waiter)).toMatchObject({
+          timedOut: true,
+          run: { id: continuationId, status: "running" },
+        });
+      } else {
+        yield* Deferred.await(refreshedChain);
+        yield* Deferred.await(subscribed);
+        expect(waiter.pollUnsafe()).toBeUndefined();
+        runs = [runs[0]!, { ...continuation, status: "completed" }];
+        yield* Queue.offer(events, stored(continuationId, "completed"));
+        expect(yield* Fiber.join(waiter)).toMatchObject({
+          timedOut: false,
+          run: { id: continuationId, status: "completed" },
+        });
+      }
+    }),
 );
 
 it.effect("waitForThread follows a restart continuation instead of the cut run", () =>

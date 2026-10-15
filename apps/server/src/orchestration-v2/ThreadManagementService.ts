@@ -862,18 +862,39 @@ const make = Effect.gen(function* () {
       // so a cut run is not the answer while its continuation is pending.
       const outcome = (runs: ReadonlyArray<OrchestrationV2Run>) =>
         Effect.gen(function* () {
-          const current = runs.find((candidate) => candidate.id === selectedRun.id);
-          if (current === undefined) {
-            return yield* new ThreadManagementRunNotFoundError({
-              threadId: input.threadId,
-              runId: selectedRun.id,
-            });
+          let snapshot = runs;
+          while (true) {
+            const current = snapshot.find((candidate) => candidate.id === selectedRun.id);
+            if (current === undefined) {
+              return yield* new ThreadManagementRunNotFoundError({
+                threadId: input.threadId,
+                runId: selectedRun.id,
+              });
+            }
+            const run = latestRestartContinuation(snapshot, current);
+            if (!isTerminalRunStatus(run.status)) return { run, pending: false, settled: false };
+            if (yield* orchestrator.restartContinuationPending(run))
+              return { run, pending: true, settled: false };
+            // The effect can dispatch its continuation and settle after this
+            // snapshot was read. Refresh after observing nonpending before
+            // accepting a terminal outcome, and follow an advanced chain.
+            const refreshed = yield* getProjectThreadRecords(input, ["runs"]);
+            const refreshedSource = refreshed.runs.find(
+              (candidate) => candidate.id === selectedRun.id,
+            );
+            if (refreshedSource === undefined) {
+              return yield* new ThreadManagementRunNotFoundError({
+                threadId: input.threadId,
+                runId: selectedRun.id,
+              });
+            }
+            const latest = latestRestartContinuation(refreshed.runs, refreshedSource);
+            if (latest.id !== run.id) {
+              snapshot = refreshed.runs;
+              continue;
+            }
+            return { run: latest, pending: false, settled: isTerminalRunStatus(latest.status) };
           }
-          const run = latestRestartContinuation(runs, current);
-          const pending =
-            isTerminalRunStatus(run.status) &&
-            (yield* orchestrator.restartContinuationPending(run));
-          return { run, pending, settled: isTerminalRunStatus(run.status) && !pending };
         });
       const initial = yield* outcome(target.runs);
       if (initial.settled) {
