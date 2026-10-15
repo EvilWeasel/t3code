@@ -337,16 +337,18 @@ effectIt.effect(
       });
     // Pinned Vitest TestContext hook; registration precedes all asynchronous work.
     // It reads this sanitized record only, never the registry or the failure object.
-    testContext.onTestFailed(() => {
-      console.error("observatory-stream-diagnostic", {
-        ...diagnostic,
-        enteredAwaits: [...enteredAwaits],
-        completedAwaits: [...completedAwaits],
-        // No existing test read exposes the Layer runtime result. Do not infer it
-        // from a shell/detail stream result or add a diagnostic-only Atom read.
-        runtimeAsyncResultTag: "UNKNOWN",
-      });
-    });
+    testContext.onTestFailed(() =>
+      Effect.runPromise(
+        Effect.logError("observatory-stream-diagnostic", {
+          ...diagnostic,
+          enteredAwaits: [...enteredAwaits],
+          completedAwaits: [...completedAwaits],
+          // No existing test read exposes the Layer runtime result. Do not infer it
+          // from a shell/detail stream result or add a diagnostic-only Atom read.
+          runtimeAsyncResultTag: "UNKNOWN",
+        }),
+      ),
+    );
     return Effect.scoped(
       Effect.gen(function* () {
         const controlled = yield* Effect.all({
