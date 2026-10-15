@@ -101,6 +101,7 @@ native_integration_tests=(
   packages/contracts/src/jarvis.test.ts
   apps/server/src/mcp/OrchestratorMcpService.test.ts
   apps/server/src/mcp/OrchestratorMcpToolkit.integration.test.ts
+  apps/server/src/integrations/jarvis/JarvisClient.test.ts
 )
 for native_integration_test in "${native_integration_tests[@]}"; do
   if [[ ! -f "$native_integration_test" ]]; then

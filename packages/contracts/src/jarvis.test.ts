@@ -5,6 +5,8 @@ import {
   JarvisCapabilityJobRequest,
   JarvisCapabilityObserveRequest,
   JarvisSubmitCapability,
+  JarvisNativeRequest,
+  JarvisNativeResponse,
 } from "./jarvis.ts";
 
 // Byte-identical Rust serde_json golden from signed checkpoint 18bb46c813.
@@ -45,6 +47,41 @@ describe("canonical Jarvis data boundary", () => {
         ...submit.invocation,
         target: { ...submit.invocation.target, windowId: "untrusted" },
       }),
+    ).toThrow();
+  });
+});
+
+// Canonical serde_json transport golden from signed candidate 72e964b9cc.
+// SHA-256 d1ff85bcd48e321aeee930a1955c6ac81b9af339905f31ce9ba5b4074ca3fbd0.
+const observeRpcGolden =
+  '{"jsonrpc":"2.0","id":"rpc-1","method":"jarvis.observe","params":{"binding":{"engineSessionId":"engine-1","origin":{"environmentId":"environment-1","projectId":"project-1","parentThreadId":"parent-1","parentRunId":"run-1","parentRootNodeId":"root-1","taskId":"task-1","childThreadId":"child-1","childRunId":"child-run-1","childRootNodeId":"child-root-1"}},"query":{"engineSessionId":"engine-1"}}}';
+
+describe("canonical Jarvis native transport", () => {
+  it("round-trips Rust JSON-RPC bytes with the actual separate child root binding", () => {
+    const codec = Schema.fromJsonString(JarvisNativeRequest);
+    const request = Schema.decodeUnknownSync(codec)(observeRpcGolden);
+    expect(Schema.encodeSync(codec)(request)).toBe(observeRpcGolden);
+    expect(request.params.binding.origin.childRootNodeId).toBe("child-root-1");
+    expect(request.params.binding.origin.childRootNodeId).not.toBe(
+      request.params.binding.origin.taskId,
+    );
+  });
+  it("rejects caller-chosen methods, numeric IDs and missing actual child roots", () => {
+    const decode = Schema.decodeUnknownSync(JarvisNativeRequest);
+    const request = Schema.decodeUnknownSync(Schema.fromJsonString(JarvisNativeRequest))(
+      observeRpcGolden,
+    );
+    expect(() => decode({ ...request, method: "jarvis.launch_shell" })).toThrow();
+    expect(() => decode({ ...request, id: 1 })).toThrow();
+    const { childRootNodeId: _childRoot, ...origin } = request.params.binding.origin;
+    expect(() =>
+      decode({
+        ...request,
+        params: { ...request.params, binding: { ...request.params.binding, origin } },
+      }),
+    ).toThrow();
+    expect(() =>
+      Schema.decodeUnknownSync(JarvisNativeResponse)({ jsonrpc: "2.0", id: 1, result: {} }),
     ).toThrow();
   });
 });
