@@ -48,6 +48,14 @@ jobs:
         run: node apps/desktop/scripts/ensure-electron-runtime.mjs
       - name: Run focused source gates
         run: bash scripts/weasel/check.sh
+      - name: Lint conversational work-control slice
+        run: >-
+          vp lint --report-unused-disable-directives
+          apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
+          apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
+          apps/server/src/voice/CodexLiveSessionService.test.ts
+          apps/server/src/voice/CodexLiveSessionService.ts
+          packages/provider-core/src/server/ProviderAdapter.ts
   product_bundle:
     needs: [check, windows_installer_guard]
     if: github.event_name == 'workflow_dispatch'
