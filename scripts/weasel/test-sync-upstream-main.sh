@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 
 source = Path('scripts/weasel/sync-upstream-main.sh').resolve()
+root_mapping = Path('.gitmodules').resolve().read_bytes()
+vendored_mapping = Path('.repos/alchemy-effect/.gitmodules').resolve().read_bytes()
 real_git = shutil.which('git')
 bash = shutil.which('bash')
 assert real_git and bash
@@ -127,5 +129,33 @@ sys.exit(subprocess.call([os.environ['REAL_GIT'],*args]))
     # Public env intentionally excludes REAL_GIT too; stub only needs it for local commands.
     subprocess.run([bash, str(source), 'probe', '--output', str(probe)], cwd=repo, env=probe_env, check=True, capture_output=True)
     assert json.loads((probe / 'receipt.json').read_text())['status'] == 'probed'
+    # Checkout's persist-credentials:false cleanup traverses gitlinks even with
+    # submodules:false. Exercise the root-relative metadata using owned local objects.
+    metadata_repo = root / 'checkout-metadata'; metadata_repo.mkdir()
+    git('init', '--initial-branch=main', cwd=metadata_repo)
+    nested = metadata_repo / '.repos/alchemy-effect'; nested.mkdir(parents=True)
+    (nested / '.gitmodules').write_bytes(vendored_mapping)
+    git('add', '.', cwd=metadata_repo)
+    for name in ('distilled', 'floci'):
+        git('update-index', '--add', '--cacheinfo', '160000,' + fork + ',.repos/alchemy-effect/submodules/' + name, cwd=metadata_repo)
+    git('commit', '-m', 'fixture nested vendored gitlinks', cwd=metadata_repo)
+    immutable_links = git('ls-files', '--stage', '.repos/alchemy-effect/submodules/', cwd=metadata_repo)
+    cleanup = ['submodule', 'foreach', '--recursive', 'git config --local --name-only --get-regexp "core\\.sshCommand" && git config --local --unset-all core.sshCommand || :']
+    no_network_env = {**env, 'GIT_ALLOW_PROTOCOL': ''}
+    before = subprocess.run([real_git, *cleanup], cwd=metadata_repo, env=no_network_env, capture_output=True)
+    assert before.returncode != 0 and b'No url found for submodule path' in before.stderr
+    (metadata_repo / '.gitmodules').write_bytes(root_mapping)
+    git('add', '.gitmodules', cwd=metadata_repo)
+    for name in ('distilled', 'floci'):
+        assert git('config', '-f', '.gitmodules', 'submodule.' + name + '.path', cwd=metadata_repo) == '.repos/alchemy-effect/submodules/' + name
+        assert git('config', '-f', '.gitmodules', 'submodule.' + name + '.url', cwd=metadata_repo) == 'https://github.com/alchemy-run/' + name + '.git'
+    for key, value in [('shallow', 'true'), ('update', 'none'), ('ignore', 'all')]:
+        assert git('config', '-f', '.gitmodules', 'submodule.floci.' + key, cwd=metadata_repo) == value
+    for command in [cleanup, ['submodule', 'foreach', '--recursive', 'git config --local --name-only --get-regexp "http\\.https\\:\\/\\/github\\.com\\/\\.extraheader" && git config --local --unset-all "http.https://github.com/.extraheader" || :']]:
+        result = subprocess.run([real_git, *command], cwd=metadata_repo, env=no_network_env, capture_output=True)
+        assert result.returncode == 0, 'Root metadata must allow recursive auth cleanup'
+    assert git('ls-files', '--stage', '.repos/alchemy-effect/submodules/', cwd=metadata_repo) == immutable_links
+    assert not (metadata_repo / '.git/modules').exists()
+    assert all(not (nested / 'submodules' / name).exists() for name in ('distilled', 'floci'))
     print('PASS: deterministic real Git fixture matrix; not product/platform qualification')
 PY
