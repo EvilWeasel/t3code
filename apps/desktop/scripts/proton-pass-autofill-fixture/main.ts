@@ -123,6 +123,9 @@ type FocusPhase =
   | "key-before"
   | "key-callback"
   | "key-after"
+  | "annotation-selection-before"
+  | "annotation-selection-callback"
+  | "annotation-selection-after"
   | "field-js-before"
   | "field-js-after"
   | "page-event-before"
@@ -140,7 +143,7 @@ type FatalCategory =
   | "focus-operation-failed"
   | "receipt-write-failed";
 type OsStatus = {
-  operation: "windowfocus" | "key";
+  operation: "windowfocus" | "key" | "annotation-selection";
   pid: number | null;
   window: number;
   xid: number;
@@ -223,18 +226,27 @@ const flush = (partial: boolean) => {
     if (NodeFS.existsSync(pending)) NodeFS.unlinkSync(pending);
   }
 };
-const latchFatal = (category: FatalCategory) => {
+const latchFatal = (category: FatalCategory, persist = true): void => {
   if (receipt.fatalCategory !== null) return;
   receipt.fatal = true;
   receipt.passed = false;
   receipt.fatalCategory = category;
   receipt.fatalSubphase = receipt.focus.subphase;
+  if (persist) writeReceipt(true, false);
+  partialFrozen = true;
+};
+const writeReceipt = (partial: boolean, initiateFinish = true): boolean => {
   try {
-    flush(true);
+    flush(partial);
+    return true;
   } catch {
     receipt.diagnosticsWriteFailed = true;
+    receipt.passed = false;
+    // No I/O on this path: a failed write cannot recursively attempt another fatal snapshot.
+    latchFatal("receipt-write-failed", false);
+    if (initiateFinish) void finish(true, "receipt-write-failed");
+    return false;
   }
-  partialFrozen = true;
 };
 const assertRunning = () => {
   if (receipt.fatal || finishing) throw new Error("Fixture stopped");
@@ -242,7 +254,8 @@ const assertRunning = () => {
 const progress = (subphase: FocusPhase) => {
   assertRunning();
   receipt.focus.subphase = subphase;
-  flush(true);
+  writeReceipt(true);
+  assertRunning();
 };
 // Own this before creating ANY windows: receipts must survive last-window destruction.
 app.on("window-all-closed", () => {});
@@ -261,12 +274,7 @@ async function finish(fatal: boolean, category: FatalCategory = "main-rejected")
   clearTimeout(watchdog);
   receipt.fatal ||= fatal;
   receipt.cleanup = "pending";
-  try {
-    flush(true);
-  } catch {
-    receipt.diagnosticsWriteFailed = true;
-    latchFatal("receipt-write-failed");
-  }
+  writeReceipt(true, false);
   let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
@@ -305,11 +313,8 @@ async function finish(fatal: boolean, category: FatalCategory = "main-rejected")
     receipt.cleanup === "complete" &&
     receipt.counts.blockedNetwork === 0 &&
     required.every((name) => checks[name] === "PASS");
-  try {
-    flush(false);
-  } catch {
-    receipt.passed = false;
-  }
+  // One bounded attempt to persist the newly latched write failure if the first final write fails.
+  if (!writeReceipt(false, false)) writeReceipt(false, false);
   app.exit(receipt.passed ? 0 : 1);
 }
 watchdog = setTimeout(() => {
@@ -362,7 +367,11 @@ const rejected = async (operation: Promise<unknown>) => {
     return true;
   }
 };
-const os = async (window: BrowserWindow, keys: readonly string[]) => {
+const ownedOsCall = async (
+  window: BrowserWindow,
+  operation: OsStatus["operation"],
+  args: (xid: number) => string[],
+) => {
   assertRunning();
   const native = window.getNativeWindowHandle();
   const xid = native.length >= 8 ? Number(native.readBigUInt64LE()) : native.readUInt32LE();
@@ -372,92 +381,93 @@ const os = async (window: BrowserWindow, keys: readonly string[]) => {
   }
   const normalizeSignal = (signal: NodeJS.Signals | null): OsStatus["signal"] =>
     signal === null ? null : signal === "SIGTERM" || signal === "SIGKILL" ? signal : "other";
-  const call = (operation: OsStatus["operation"], args: string[]) =>
-    new Promise<void>((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
+    assertRunning();
+    const status: OsStatus = {
+      operation,
+      pid: null,
+      window: window.id,
+      xid,
+      completed: false,
+      exited: false,
+      closed: false,
+      exitCode: null,
+      signal: null,
+      // execFile's internal timeout is not observable; neither duration nor error.killed proves it.
+      timedOut: null,
+      spawnFailure: false,
+      callbackSucceeded: null,
+    };
+    receipt.os = status;
+    receipt.counts.osCommands += 1;
+    progress(`${operation}-before`);
+    const closed = deferred<void>();
+    let child: NodeChildProcess.ChildProcess;
+    let spawned = false;
+    try {
       assertRunning();
-      const status: OsStatus = {
-        operation,
-        pid: null,
-        window: window.id,
-        xid,
-        completed: false,
-        exited: false,
-        closed: false,
-        exitCode: null,
-        signal: null,
-        // execFile's internal timeout is not observable; neither duration nor error.killed proves it.
-        timedOut: null,
-        spawnFailure: false,
-        callbackSucceeded: null,
-      };
-      receipt.os = status;
-      receipt.counts.osCommands += 1;
-      progress(operation === "windowfocus" ? "windowfocus-before" : "key-before");
-      const closed = deferred<void>();
-      let child: NodeChildProcess.ChildProcess;
-      let spawned = false;
-      try {
-        child = NodeChildProcess.execFile(
-          "/usr/bin/xdotool",
-          args,
-          {
-            timeout: 5000,
-            env: {
-              PATH: "/usr/bin:/bin",
-              DISPLAY: process.env.DISPLAY!,
-              XAUTHORITY: process.env.XAUTHORITY!,
-            },
+      child = NodeChildProcess.execFile(
+        "/usr/bin/xdotool",
+        args(xid),
+        {
+          timeout: 5000,
+          env: {
+            PATH: "/usr/bin:/bin",
+            DISPLAY: process.env.DISPLAY!,
+            XAUTHORITY: process.env.XAUTHORITY!,
           },
-          (error) => {
-            status.completed = true;
-            status.callbackSucceeded = error === null;
-            if (!receipt.fatal && !finishing)
-              progress(operation === "windowfocus" ? "windowfocus-callback" : "key-callback");
-            if (error || receipt.fatal || finishing) {
-              if (error)
-                void finish(true, status.spawnFailure ? "os-spawn-failed" : "os-command-failed");
-              reject(new Error("Owned X11 input failed"));
-            } else resolve();
-          },
-        );
-      } catch {
-        status.spawnFailure = true;
-        void finish(true, "os-spawn-failed");
-        reject(new Error("Owned X11 spawn failed"));
-        return;
-      }
-      ownedOs.set(child, closed.promise);
-      child.once("spawn", () => {
-        spawned = true;
-        status.pid = child.pid ?? null;
-        if (receipt.fatal || finishing) child.kill("SIGKILL");
-        else flush(true);
-      });
-      child.once("error", () => {
-        status.spawnFailure = !spawned;
-        void finish(true, spawned ? "os-command-failed" : "os-spawn-failed");
-      });
-      child.once("exit", (code, signal) => {
-        status.exited = true;
-        status.exitCode = code;
-        status.signal = normalizeSignal(signal);
-        if (!receipt.fatal) flush(true);
-      });
-      child.once("close", (code, signal) => {
-        status.closed = true;
-        status.exitCode = code;
-        status.signal = normalizeSignal(signal);
-        ownedOs.delete(child);
-        closed.resolve();
-        if (!receipt.fatal) flush(true);
-      });
+        },
+        (error) => {
+          status.completed = true;
+          status.callbackSucceeded = error === null;
+          if (!receipt.fatal && !finishing) progress(`${operation}-callback`);
+          if (error || receipt.fatal || finishing) {
+            if (error)
+              void finish(true, status.spawnFailure ? "os-spawn-failed" : "os-command-failed");
+            reject(new Error("Owned X11 input failed"));
+          } else resolve();
+        },
+      );
+    } catch {
+      status.spawnFailure = true;
+      void finish(true, "os-spawn-failed");
+      reject(new Error("Owned X11 spawn failed"));
+      return;
+    }
+    ownedOs.set(child, closed.promise);
+    child.once("spawn", () => {
+      spawned = true;
+      status.pid = child.pid ?? null;
+      if (receipt.fatal || finishing) child.kill("SIGKILL");
+      else writeReceipt(true);
     });
-  await call("windowfocus", ["windowfocus", "--sync", String(xid)]);
-  progress("windowfocus-after");
-  if (keys.length) {
-    await call("key", ["key", "--clearmodifiers", ...keys]);
-    progress("key-after");
-  }
+    child.once("error", () => {
+      status.spawnFailure = !spawned;
+      void finish(true, spawned ? "os-command-failed" : "os-spawn-failed");
+    });
+    child.once("exit", (code, signal) => {
+      status.exited = true;
+      status.exitCode = code;
+      status.signal = normalizeSignal(signal);
+      if (!receipt.fatal) writeReceipt(true);
+    });
+    child.once("close", (code, signal) => {
+      status.closed = true;
+      status.exitCode = code;
+      status.signal = normalizeSignal(signal);
+      ownedOs.delete(child);
+      closed.resolve();
+      if (!receipt.fatal) writeReceipt(true);
+    });
+  });
+  assertRunning();
+  progress(`${operation}-after`);
+};
+const os = async (window: BrowserWindow, keys: readonly string[]) => {
+  await ownedOsCall(window, "windowfocus", (xid) => ["windowfocus", "--sync", String(xid)]);
+  assertRunning();
+  if (keys.length) await ownedOsCall(window, "key", () => ["key", "--clearmodifiers", ...keys]);
+  assertRunning();
 };
 
 let primary = "";
@@ -607,7 +617,7 @@ async function exercise(
       navigationObserved = true;
       if (!receipt.fatal && !finishing) {
         receipt.focus.documentUnchanged = false;
-        flush(true);
+        writeReceipt(true);
       }
     };
     guest.wc.on("did-start-navigation", navigating);
@@ -636,7 +646,7 @@ async function exercise(
       const observed = event(`focus-${field}`).then(() => {
         if (!receipt.fatal && !finishing) {
           receipt.focus.pageEventObserved = true;
-          flush(true);
+          writeReceipt(true);
         }
       });
       mark("owner-focus-before");
@@ -1193,6 +1203,7 @@ async function exercise(
     A.wc.ipc.once("preview:element-picked", onPicked);
     picking = run(manager.pickElement(A.id));
     await overlay;
+    assertRunning();
     const point = (await A.wc.executeJavaScript(
       "(()=>{const r=document.getElementById('u').getBoundingClientRect();return {x:Math.round(r.x+r.width/2),y:Math.round(r.y+r.height/2)}})()",
     )) as { x: number; y: number };
@@ -1207,32 +1218,21 @@ async function exercise(
     )
       return false;
     await os(A.owner, []);
-    receipt.counts.osCommands += 1;
-    await new Promise<void>((resolve, reject) =>
-      NodeChildProcess.execFile(
-        "/usr/bin/xdotool",
-        [
-          "mousemove",
-          "--sync",
-          String(bounds.x + point.x),
-          String(bounds.y + point.y),
-          "click",
-          "1",
-        ],
-        {
-          timeout: 5000,
-          env: {
-            PATH: "/usr/bin:/bin",
-            DISPLAY: process.env.DISPLAY!,
-            XAUTHORITY: process.env.XAUTHORITY!,
-          },
-        },
-        (error) => (error ? reject(new Error("Owned annotation selection failed")) : resolve()),
-      ),
-    );
+    await ownedOsCall(A.owner, "annotation-selection", () => [
+      "mousemove",
+      "--sync",
+      String(bounds.x + point.x),
+      String(bounds.y + point.y),
+      "click",
+      "1",
+    ]);
+    assertRunning();
     await editor;
+    assertRunning();
     await os(A.owner, ["Return"]);
+    assertRunning();
     const result = await captured.promise;
+    assertRunning();
     A.wc.ipc.removeListener("preview:element-picked", onPicked);
     // A failed overlap observation remains FAIL; no retry, shim or capture-method replacement.
     if (host.isPrivateEntry(A.wc)) {
