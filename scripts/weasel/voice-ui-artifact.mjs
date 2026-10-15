@@ -45,10 +45,12 @@ const mockPlugin = {
   load(id) { if (id.startsWith("\0voice-fixture:")) return mocks.get(id.slice("\0voice-fixture:".length)); },
 };
 await writeFile(join(fixture, "index.html"), '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body><div id="root"></div><script type="module" src="/main.tsx"></script></body></html>');
+// The fixture root is gitignored; Tailwind needs explicit real-component sources.
+await writeFile(join(fixture, "fixture.css"), `@import ${JSON.stringify(join(web, "src/index.css"))};\n@source ${JSON.stringify(join(web, "src"))};\n@source "./main.tsx";\n`);
 await writeFile(join(fixture, "main.tsx"), `
 import React from "react";
 import {createRoot} from "react-dom/client";
-import ${JSON.stringify(join(web, "src/index.css"))};
+import "./fixture.css";
 import {VoiceTranscriptionSettingsPanel} from ${JSON.stringify(join(web, "src/components/settings/VoiceTranscriptionSettings.tsx"))};
 import {VoiceDictationControl} from ${JSON.stringify(join(web, "src/voice/VoiceDictationControl.tsx"))};
 document.documentElement.className=new URLSearchParams(location.search).get("theme")==="dark"?"dark":"light";
@@ -57,7 +59,7 @@ createRoot(document.getElementById("root")!).render(<main className="min-h-scree
 let browser;
 const server = await createServer({
   configFile: false, root: fixture, plugins: [mockPlugin, react(), tailwind()],
-  resolve: { alias: { "~": join(web, "src"), "react-dom/client": webRequire.resolve("react-dom/client"), "react": dirname(webRequire.resolve("react/package.json")) } },
+  resolve: { alias: { "~": join(web, "src"), "react-dom": dirname(webRequire.resolve("react-dom/package.json")), "react": dirname(webRequire.resolve("react/package.json")) } },
   server: { host: "127.0.0.1", port: 0, fs: { allow: [repo] } },
 });
 const results = [];
@@ -76,6 +78,7 @@ try {
     await page.getByRole("button", {name:"Save voice settings"}).waitFor({state:"visible"});
     await page.getByText("Synthetic configured provider", {exact:true}).waitFor();
     await page.evaluate(() => document.fonts.ready);
+    if (await page.locator("main").evaluate((element) => getComputedStyle(element).paddingTop) !== "16px") throw Error("Fixture Tailwind utilities are missing");
     const name = `${width}-${theme}-${provider}-${phase}`;
     await page.screenshot({path:join(output,name+".png"),fullPage:true});
     if (phase === "error") {
