@@ -7,6 +7,7 @@ import * as PlatformError from "effect/PlatformError";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
 import * as DesktopConfig from "../app/DesktopConfig.ts";
@@ -22,6 +23,21 @@ import * as DesktopUpdates from "./DesktopUpdates.ts";
     DesktopUpdates.test.ts and DesktopRemoteUpdates.test.ts. */
 
 export const flushCallbacks = Effect.yieldNow;
+
+/** Subscribe atomically before checking the snapshot, so already-published and
+    subsequent outcomes both satisfy the same wait. */
+export const awaitUpdateState = (
+  updates: DesktopUpdates.DesktopUpdates["Service"],
+  predicate: (state: DesktopUpdateState) => boolean,
+) => Effect.gen(function* () {
+  const { latest, changes } = yield* updates.subscribe;
+  if (predicate(latest)) return latest;
+  const observed = yield* changes.pipe(Stream.filter(predicate), Stream.runHead);
+  if (Option.isNone(observed)) {
+    return yield* Effect.die("Update state subscription ended before the expected outcome");
+  }
+  return observed.value;
+});
 
 export interface UpdatesHarnessOptions {
   readonly checkForUpdates?: Effect.Effect<
@@ -317,7 +333,7 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
       };
       return file;
     }),
-    readFileString: (path) => {
+    readFileString: (path) => Effect.suspend(() => {
       const installRecord = isInstallRecord(path)
         ? (installRecords.get(path) ?? previousInstallRecord)
         : undefined;
@@ -335,7 +351,7 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
               pathOrDescriptor: path,
             }),
           );
-    },
+    }),
     makeDirectory: () => Effect.void,
     writeFileString: (path, data) =>
       (isInstallRecord(path) ? options.beforeWriteInstallRecord ?? Effect.void : Effect.void).pipe(Effect.andThen(Effect.sync(() => {

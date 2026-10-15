@@ -32,7 +32,7 @@ import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublish
 import * as DesktopBrowserHost from "../preview/DesktopBrowserHost.ts";
 import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
 import * as DesktopUpdates from "../updates/DesktopUpdates.ts";
-import { makeHarness, flushCallbacks } from "../updates/updatesTestHarness.ts";
+import { awaitUpdateState, makeHarness, flushCallbacks } from "../updates/updatesTestHarness.ts";
 
 const decodeDesktopBackendBootstrap = Schema.decodeEffect(
   Schema.fromJsonString(DesktopBackendBootstrap),
@@ -1801,8 +1801,7 @@ it.effect.each(["slow-close", "disconnected-survivor"] as const)("reports actual
         yield* Deferred.await(closeStarted);
         yield* TestClock.adjust(Duration.seconds(5));
       }
-      const { changes } = yield* updates.subscribe;
-      yield* changes.pipe(Stream.filter((state) => state.errorContext === "install"), Stream.runHead);
+      yield* awaitUpdateState(updates, (state) => state.errorContext === "install");
       const state = yield* updates.getState;
       assert.include(state.message ?? "", "Recovery remains held");
       assert.include(state.message ?? "", "survivor");

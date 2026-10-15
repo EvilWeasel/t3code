@@ -21,7 +21,7 @@ import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopState from "../app/DesktopState.ts";
 import * as DesktopUpdates from "./DesktopUpdates.ts";
-import { flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
+import { awaitUpdateState, flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
 
 function ownedBackendFixture(
   name: string,
@@ -54,6 +54,35 @@ function ownedBackendFixture(
 }
 
 describe("DesktopUpdates", () => {
+  it.effect("observes both already-published and later update outcomes without replaying an action", () => {
+    const harness = makeHarness({ omitInstallQualification: true });
+    return Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      const { changes } = yield* updates.subscribe;
+      const firstPublished = yield* changes.pipe(
+        Stream.filter((state) => state.downloadedVersion === "1.2.4"),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      assert.isTrue(Option.isSome(yield* Fiber.join(firstPublished)));
+      const alreadyPublished = yield* awaitUpdateState(updates, (state) => state.downloadedVersion === "1.2.4");
+      assert.equal(alreadyPublished.downloadedVersion, "1.2.4");
+
+      const later = yield* awaitUpdateState(updates, (state) => state.downloadedVersion === "1.2.5").pipe(
+        Effect.forkScoped({ startImmediately: true }),
+      );
+      harness.emit("update-available", { version: "1.2.5" });
+      yield* awaitUpdateState(updates, (state) => state.availableVersion === "1.2.5");
+      harness.emit("update-downloaded", { version: "1.2.5" });
+      assert.equal((yield* Fiber.join(later)).downloadedVersion, "1.2.5");
+      assert.equal(harness.checkCount(), 0);
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.equal(harness.stopCount(), 0);
+    })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
   it.effect("keeps the production default staged when the qualification service is completely absent", () => {
     const harness = makeHarness({ clientOnlyInventory: [], omitInstallQualification: true });
     return Effect.scoped(Effect.gen(function* () {
@@ -241,11 +270,10 @@ describe("DesktopUpdates", () => {
       yield* TestClock.adjust(Duration.seconds(45));
       assert.equal(harness.quitAndInstalls(), 1);
       assert.isFalse(released);
-      const { changes } = yield* updates.subscribe;
-      const recovered = yield* changes.pipe(
-        Stream.filter((state) => state.errorContext === "install" && state.installLease === undefined),
-        Stream.runHead, Effect.forkScoped,
-      );
+      const recovered = yield* awaitUpdateState(
+        updates,
+        (state) => state.errorContext === "install" && state.installLease === undefined,
+      ).pipe(Effect.forkScoped);
       yield* flushCallbacks;
       harness.emit("error", new Error("installer failed after accepting the handoff"));
       assert.isTrue(Option.isSome(yield* Fiber.join(recovered)));
@@ -1659,8 +1687,7 @@ it.effect("releases the held pool lane before canonical backend recovery after i
       yield* flushCallbacks;
       yield* TestClock.adjust(Duration.seconds(45));
       yield* Deferred.await(recovered);
-      const { changes } = yield* updates.subscribe;
-      yield* changes.pipe(Stream.filter((state) => state.errorContext === "install"), Stream.runHead);
+      yield* awaitUpdateState(updates, (state) => state.errorContext === "install");
       assert.isTrue(steps.includes("stop:primary"));
       assert.isTrue(steps.includes("recovered"));
       assert.isFalse(steps.includes("abort:primary")); // A committed/stopped peer is never reopened by abort.
@@ -1685,8 +1712,7 @@ it.effect("uses explicit recovery after partial shutdown and never falsely repor
       yield* flushCallbacks;
       yield* TestClock.adjust(Duration.seconds(45));
       yield* Deferred.await(recovered);
-      const { changes } = yield* updates.subscribe;
-      yield* changes.pipe(Stream.filter((state) => state.errorContext === "install"), Stream.runHead);
+      yield* awaitUpdateState(updates, (state) => state.errorContext === "install");
       assert.isTrue(steps.includes("stop:primary"));
       assert.isTrue(steps.includes("stop:wsl"));
       assert.isFalse(steps.some((step) => step.startsWith("abort:")));
@@ -1698,7 +1724,7 @@ it.effect("uses explicit recovery after partial shutdown and never falsely repor
 );
 
 const previousDefer = (path: string) => JSON.stringify({ version: 1, profileKey: path.split(/[\\/]/).at(-1)!.slice(DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX.length, -5), profile: null, attemptId: "previous-owner:1", observedAt: 0,
-  runningVersion: "1.2.3", targetVersion: "1.2.4", channel: "stable", phase: "deferred", reason: "runtime-busy", stopState: "not-started", peers: [] });
+  runningVersion: "1.2.3", targetVersion: "1.2.4", channel: "latest", phase: "deferred", reason: "runtime-busy", stopState: "not-started", peers: [] });
 function completedDefer(harness: ReturnType<typeof makeHarness>) {
   const entries = [...harness.deferFiles].filter(([path]) => !path.includes(`.${DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX}`));
   assert.lengthOf(entries, 1);
@@ -1759,6 +1785,9 @@ it.effect.each(["write", "readback", "rename"] as const)("pre-stop defer storage
     yield* Effect.scoped(Effect.gen(function* () {
       const updates = yield* DesktopUpdates.DesktopUpdates;
       yield* updates.configure;
+      const hydrated = yield* updates.getState;
+      assert.include(hydrated.message ?? "", "runtime-busy");
+      assert.notInclude(hydrated.message ?? "", "storage is unavailable");
       yield* TestClock.adjust(Duration.seconds(15));
       harness.emit("update-downloaded", { version: "1.2.4" });
       yield* flushCallbacks;
@@ -1848,8 +1877,7 @@ it.effect("reports actual stopped/unconfirmed peers when recovery-held storage f
       harness.emit("update-downloaded", { version: "1.2.4" });
       yield* flushCallbacks;
       yield* TestClock.adjust(Duration.seconds(45));
-      const { changes } = yield* updates.subscribe;
-      yield* changes.pipe(Stream.filter((state) => state.errorContext === "install"), Stream.runHead);
+      yield* awaitUpdateState(updates, (state) => state.errorContext === "install");
       const state = yield* updates.getState;
       assert.equal(harness.quitAndInstalls(), 0);
       assert.isTrue(steps.includes("stop:stopped-peer"));
@@ -1881,9 +1909,10 @@ it.effect("a newer captured attempt supersedes an old delayed refusal without re
       yield* flushCallbacks;
       const older = yield* updates.installPrepared("1.2.4").pipe(Effect.forkScoped);
       yield* Deferred.await(commitStarted);
+      harness.emit("update-available", { version: "1.2.5" });
+      yield* awaitUpdateState(updates, (state) => state.availableVersion === "1.2.5");
       harness.emit("update-downloaded", { version: "1.2.5" });
-      const { changes } = yield* updates.subscribe;
-      yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.5"), Stream.runHead);
+      yield* awaitUpdateState(updates, (state) => state.downloadedVersion === "1.2.5");
       const newer = yield* updates.installPrepared("1.2.5").pipe(Effect.forkScoped({ startImmediately: true }));
       yield* Deferred.succeed(finishCommit, undefined);
       yield* Fiber.join(newer);
@@ -1910,8 +1939,7 @@ it.effect("isolates actual SDK origins and development while the legitimate abse
         const updates = yield* DesktopUpdates.DesktopUpdates;
         yield* updates.configure;
         harness.emit("update-downloaded", { version: "1.2.4" });
-        const { changes } = yield* updates.subscribe;
-        yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.4"), Stream.runHead);
+        yield* awaitUpdateState(updates, (state) => state.downloadedVersion === "1.2.4");
         yield* updates.installPrepared("1.2.4");
         yield* Deferred.await(released);
         assert.equal(harness.quitAndInstalls(), 0);
@@ -1958,8 +1986,7 @@ it.effect.each(["profile", "development", "appData", "filename-digest"] as const
       const updates = yield* DesktopUpdates.DesktopUpdates;
       yield* updates.configure;
       harness.emit("update-downloaded", { version: "1.2.4" });
-      const { changes } = yield* updates.subscribe;
-      yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.4"), Stream.runHead);
+      yield* awaitUpdateState(updates, (state) => state.downloadedVersion === "1.2.4");
       yield* updates.installPrepared("1.2.4");
       assert.equal(harness.quitAndInstalls(), 0);
       assert.isFalse(steps.some((step) => step.startsWith("stop:")));
@@ -1983,8 +2010,7 @@ it.effect("persists partial-shutdown recovery-held peer identities across a fres
       const updates = yield* DesktopUpdates.DesktopUpdates;
       yield* updates.configure;
       first.emit("update-downloaded", { version: "1.2.4" });
-      const { changes } = yield* updates.subscribe;
-      yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.4"), Stream.runHead);
+      yield* awaitUpdateState(updates, (state) => state.downloadedVersion === "1.2.4");
       yield* updates.installPrepared("1.2.4");
       const record = completedDefer(first).record;
       assert.equal(record.phase, "recovery-held");
@@ -2019,8 +2045,7 @@ it.effect("reports unavailable after published readback corruption without claim
       const updates = yield* DesktopUpdates.DesktopUpdates;
       yield* updates.configure;
       harness.emit("update-downloaded", { version: "1.2.4" });
-      const { changes } = yield* updates.subscribe;
-      yield* changes.pipe(Stream.filter((state) => state.downloadedVersion === "1.2.4"), Stream.runHead);
+      yield* awaitUpdateState(updates, (state) => state.downloadedVersion === "1.2.4");
       yield* updates.installPrepared("1.2.4");
       const published = completedDefer(harness);
       assert.notEqual(published.text, previousDefer(published.path));

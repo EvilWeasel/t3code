@@ -4010,9 +4010,10 @@ it.effect("retains a pending native capture hold after Effect interruption until
   });
   const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
   let acquisitions = 0;
+  let observeCapturePhase = false;
   const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
     const token = gate.tryReserveRuntimeActivity(request);
-    const native = ++acquisitions === 2;
+    const native = observeCapturePhase && ++acquisitions === 2;
     return token === undefined ? undefined : { release: () => {
       token.release();
       if (native) nativeRetired.resolve();
@@ -4022,6 +4023,7 @@ it.effect("retains a pending native capture hold after Effect interruption until
     const service = yield* DesktopSnapShot.make;
     yield* service.configure(enabledSettings({ snapShotFlash: false, snapShotAnimations: false }));
     acquisitions = 0;
+    observeCapturePhase = true;
     const capturing = yield* service.capture.pipe(Effect.forkScoped);
     yield* Effect.promise(() => nativeStarted.promise);
     assert.isUndefined(gate.acquire(200));
@@ -4049,9 +4051,10 @@ it.effect.each([false, true])("joins outstanding reveal preparation after captur
   activeWindowMock.mockReset().mockImplementation(() => interrupt ? active.promise : Promise.resolve(undefined));
   const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
   let reservations = 0;
+  let observeCapturePhase = false;
   const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
     const token = gate.tryReserveRuntimeActivity(request);
-    const native = ++reservations === 2;
+    const native = observeCapturePhase && ++reservations === 2;
     return token === undefined ? undefined : { release: () => {
       token.release();
       if (native) nativeRetired.resolve();
@@ -4061,6 +4064,7 @@ it.effect.each([false, true])("joins outstanding reveal preparation after captur
     const service = yield* DesktopSnapShot.make;
     yield* service.configure(enabledSettings({ snapShotFlash: false, snapShotAnimations: false }));
     reservations = 0;
+    observeCapturePhase = true;
     const capture = yield* service.capture.pipe(Effect.exit, Effect.forkScoped);
     yield* Effect.promise(() => started.promise);
     if (interrupt) {
@@ -4097,15 +4101,17 @@ it.effect("retains timed-out region capture admission while actual helper exit i
   });
   const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
   let reservations = 0;
+  let observeCapturePhase = false;
   const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
     const token = gate.tryReserveRuntimeActivity(request);
-    const native = ++reservations === 2;
+    const native = observeCapturePhase && ++reservations === 2;
     return token === undefined ? undefined : { release: () => { token.release(); if (native) retired.resolve(); } };
   };
   return Effect.scoped(Effect.gen(function* () {
     const service = yield* DesktopSnapShot.make;
     yield* service.configure(enabledSettings({ snapShotFlash: false, snapShotAnimations: false }));
     reservations = 0;
+    observeCapturePhase = true;
     const capture = yield* service.capture.pipe(Effect.exit, Effect.forkScoped);
     yield* Effect.promise(() => started.promise);
     result.reject(new Error("logical timeout; kill requested"));
