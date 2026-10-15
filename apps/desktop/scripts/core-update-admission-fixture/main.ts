@@ -954,9 +954,12 @@ async function exercise(
     // Keep this exact hold in the application scope until owned cleanup closes it.
     return (
       receipt.finalInventory.tokenValid &&
-      JSON.stringify(productionIds) === JSON.stringify([host.id]) &&
-      JSON.stringify(windowIds) === JSON.stringify([main.id]) &&
-      JSON.stringify(contentsIds) === JSON.stringify([host.id])
+      productionIds.length === 1 &&
+      productionIds[0] === host.id &&
+      windowIds.length === 1 &&
+      windowIds[0] === main.id &&
+      contentsIds.length === 1 &&
+      contentsIds[0] === host.id
     );
   });
 }
