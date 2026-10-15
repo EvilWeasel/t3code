@@ -324,3 +324,68 @@ it("retires a successful native capture on its actual result acknowledgement", a
   // The request ACK is sufficient even before the single-use child exits.
   assert.lengthOf(fake.kill.mock.calls, 1);
 });
+
+it("separates warm ACK retirement from cool exit and isolates replacement generations", async () => {
+  const children: ReturnType<typeof fakeChild>[] = [];
+  const starts: Array<Promise<void>> = [];
+  const pool = makeRegionSnapShotPool("worker.cjs", () => {
+    const child = fakeChild();
+    children.push(child);
+    return startRegionSnapShotProcess("worker.cjs", () => child.child);
+  }, (start) => { const retired = start(); starts.push(retired); return retired; });
+  const warm = pool.warmWithRetirement!();
+  const repeatedWarm = pool.warmWithRetirement!();
+  assert.lengthOf(children, 1);
+  children[0]!.emit("ready");
+  await warm;
+  await repeatedWarm;
+  let cooled = false;
+  const cool = pool.coolWithRetirement!().then(() => { cooled = true; });
+  const repeatedCool = pool.coolWithRetirement!();
+  assert.equal(children[0]!.kill.mock.calls.length, 1);
+  assert.isFalse(cooled); // kill requested, actual exit withheld.
+  const replacement = pool.warmWithRetirement!();
+  let replacementReady = false;
+  void replacement.then(() => { replacementReady = true; });
+  assert.lengthOf(children, 2);
+  children[0]!.exit();
+  await cool;
+  await repeatedCool;
+  assert.isFalse(replacementReady); // Old exit cannot retire the new startup.
+  children[1]!.emit("ready");
+  await replacement;
+  const last = pool.coolWithRetirement!();
+  children[1]!.exit();
+  await last;
+  assert.lengthOf(starts, 4); // Two startups and two actual shutdown lifetimes.
+  pool.close();
+});
+
+it("observes internal post-capture replenishment until its own ready ACK", async () => {
+  const children: ReturnType<typeof fakeChild>[] = [];
+  const observed: Array<Promise<void>> = [];
+  const pool = makeRegionSnapShotPool("worker.cjs", () => {
+    const child = fakeChild(); children.push(child);
+    return startRegionSnapShotProcess("worker.cjs", () => child.child);
+  }, (start) => { const retired = start(); observed.push(retired); return retired; });
+  const warm = pool.warmWithRetirement!();
+  children[0]!.emit("ready");
+  await warm;
+  const capture = pool.capture(region);
+  // ready was observed before capture; the await resumes at the send milestone.
+  await Promise.resolve();
+  children[0]!.emit({ type: "result", width: 2, height: 1, png: Buffer.from([1]).toString("base64") });
+  await capture;
+  assert.lengthOf(children, 2);
+  assert.lengthOf(observed, 2);
+  let replacementReady = false;
+  void observed[1]!.then(() => { replacementReady = true; });
+  children[0]!.exit();
+  assert.isFalse(replacementReady);
+  children[1]!.emit("ready");
+  await observed[1];
+  const cool = pool.coolWithRetirement!();
+  children[1]!.exit();
+  await cool;
+  pool.close();
+});

@@ -219,3 +219,66 @@ it("retains admission after the real reader's inner timeout result while native 
     vi.useRealTimers();
   }
 });
+
+it("retires warm on ready but cool only on actual exit across overlapping replacements", async () => {
+  const first = makeWorker();
+  const second = makeWorker();
+  forkMock.mockReset().mockReturnValueOnce(first).mockReturnValueOnce(second);
+  const observed: Array<Promise<void>> = [];
+  const pool = makeSnapShotAccessibilityProcessPool("accessibility.cjs", (start) => {
+    const retired = start(); observed.push(retired); return retired;
+  });
+  const warm = pool.warmWithRetirement!();
+  const repeated = pool.warmWithRetirement!();
+  assert.lengthOf(forkMock.mock.calls, 1);
+  first.emit("message", "ready");
+  await warm;
+  await repeated;
+  let cooled = false;
+  const cool = pool.coolWithRetirement!().then(() => { cooled = true; });
+  const repeatedCool = pool.coolWithRetirement!();
+  assert.equal(first.kill.mock.calls.length, 1);
+  assert.isFalse(cooled);
+  const replacement = pool.warmWithRetirement!();
+  let replacementReady = false;
+  void replacement.then(() => { replacementReady = true; });
+  first.emit("exit", 0);
+  await cool;
+  await repeatedCool;
+  assert.isFalse(replacementReady);
+  second.emit("message", "ready");
+  await replacement;
+  const end = pool.coolWithRetirement!();
+  second.emit("exit", 0);
+  await end;
+  assert.lengthOf(observed, 4);
+  pool.close();
+});
+
+it("keeps internally replenished startup separate from a completed read", async () => {
+  const first = makeWorker();
+  const replacement = makeWorker();
+  forkMock.mockReset().mockReturnValueOnce(first).mockReturnValueOnce(replacement);
+  const observed: Array<Promise<void>> = [];
+  const pool = makeSnapShotAccessibilityProcessPool("accessibility.cjs", (start) => {
+    const retired = start(); observed.push(retired); return retired;
+  });
+  const warm = pool.warmWithRetirement!();
+  first.emit("message", "ready");
+  await warm;
+  const read = pool.read(request);
+  first.emit("message", { type: "result", context: { accessibleText: "Ready" } });
+  await read.result;
+  assert.lengthOf(observed, 2);
+  let replacementReady = false;
+  void observed[1]!.then(() => { replacementReady = true; });
+  first.emit("exit", 0);
+  await read.nativeRetired;
+  assert.isFalse(replacementReady);
+  replacement.emit("message", "ready");
+  await observed[1];
+  const end = pool.coolWithRetirement!();
+  replacement.emit("exit", 0);
+  await end;
+  pool.close();
+});

@@ -32,12 +32,16 @@ beforeEach(() => {
   prepareCaptureRevealMock.mockReset();
   regionCaptureWithRetirementMock.mockReset();
   accessibilityListMock.mockReset().mockResolvedValue([]);
+  helperWarmRetirementMock.mockReset().mockResolvedValue(undefined);
+  helperCoolRetirementMock.mockReset().mockResolvedValue(undefined);
 });
 
 const {
   activeWindowMock,
   animationSettingsMock,
   accessibilityProcessWarmMock,
+  helperWarmRetirementMock,
+  helperCoolRetirementMock,
   accessibilityProcessCloseMock,
   accessibilityProcessCoolMock,
   accessibilityProcessReadMock,
@@ -80,6 +84,8 @@ const {
     prefersReducedMotion: true,
     shouldRenderRichAnimation: false,
   })),
+  helperWarmRetirementMock: vi.fn(() => Promise.resolve()),
+  helperCoolRetirementMock: vi.fn(() => Promise.resolve()),
   accessibilityProcessWarmMock: vi.fn(),
   accessibilityProcessCloseMock: vi.fn(),
   accessibilityProcessCoolMock: vi.fn(),
@@ -172,9 +178,9 @@ const {
 }));
 
 vi.mock("./SnapShotAccessibilityProcess.ts", () => ({
-  makeSnapShotAccessibilityProcessPool: () => ({
-    warm: accessibilityProcessWarmMock,
-    cool: accessibilityProcessCoolMock,
+  makeSnapShotAccessibilityProcessPool: (_path: string, observe: (start: () => Promise<void>) => Promise<void> = (start) => start()) => ({
+    warm: () => { void observe(() => { accessibilityProcessWarmMock(); return helperWarmRetirementMock(); }).catch(() => undefined); },
+    cool: () => { void observe(() => { accessibilityProcessCoolMock(); return helperCoolRetirementMock(); }).catch(() => undefined); },
     read: accessibilityProcessReadMock,
     close: accessibilityProcessCloseMock,
   }),
@@ -2718,6 +2724,8 @@ it("reads Flatpak app text from the AT-SPI proxy when the compositor PID misses"
     assert.lengthOf(tree.mock.calls, 1);
   } finally {
     accessibilityListMock.mockReset().mockResolvedValue([]);
+  helperWarmRetirementMock.mockReset().mockResolvedValue(undefined);
+  helperCoolRetirementMock.mockReset().mockResolvedValue(undefined);
     vi.unstubAllEnvs();
   }
 });
@@ -2743,6 +2751,8 @@ it("reads GTK4 app text from one unnamed PID-scoped window of the captured size"
     ],
   });
   accessibilityListMock.mockReset().mockResolvedValue([]);
+  helperWarmRetirementMock.mockReset().mockResolvedValue(undefined);
+  helperCoolRetirementMock.mockReset().mockResolvedValue(undefined);
   try {
     assert.strictEqual(
       await readAccessibleWindowText(
@@ -2761,6 +2771,8 @@ it("reads GTK4 app text from one unnamed PID-scoped window of the captured size"
     assert.lengthOf(tree.mock.calls, 1);
   } finally {
     accessibilityListMock.mockReset().mockResolvedValue([]);
+  helperWarmRetirementMock.mockReset().mockResolvedValue(undefined);
+  helperCoolRetirementMock.mockReset().mockResolvedValue(undefined);
     vi.unstubAllEnvs();
   }
 });
@@ -2797,6 +2809,8 @@ it("does not guess GTK4 app text when two unnamed PID windows share the captured
     assert.lengthOf(tree.mock.calls, 0);
   } finally {
     accessibilityListMock.mockReset().mockResolvedValue([]);
+  helperWarmRetirementMock.mockReset().mockResolvedValue(undefined);
+  helperCoolRetirementMock.mockReset().mockResolvedValue(undefined);
     vi.unstubAllEnvs();
   }
 });
@@ -3994,6 +4008,7 @@ it.effect("retains a pending native capture hold after Effect interruption until
   return Effect.scoped(Effect.gen(function* () {
     const service = yield* DesktopSnapShot.make;
     yield* service.configure(enabledSettings({ snapShotFlash: false, snapShotAnimations: false }));
+    acquisitions = 0;
     const capturing = yield* service.capture.pipe(Effect.forkScoped);
     yield* Effect.promise(() => nativeStarted.promise);
     assert.isUndefined(gate.acquire(200));
@@ -4032,6 +4047,7 @@ it.effect.each([false, true])("joins outstanding reveal preparation after captur
   return Effect.scoped(Effect.gen(function* () {
     const service = yield* DesktopSnapShot.make;
     yield* service.configure(enabledSettings({ snapShotFlash: false, snapShotAnimations: false }));
+    reservations = 0;
     const capture = yield* service.capture.pipe(Effect.exit, Effect.forkScoped);
     yield* Effect.promise(() => started.promise);
     if (interrupt) {
@@ -4076,6 +4092,7 @@ it.effect("retains timed-out region capture admission while actual helper exit i
   return Effect.scoped(Effect.gen(function* () {
     const service = yield* DesktopSnapShot.make;
     yield* service.configure(enabledSettings({ snapShotFlash: false, snapShotAnimations: false }));
+    reservations = 0;
     const capture = yield* service.capture.pipe(Effect.exit, Effect.forkScoped);
     yield* Effect.promise(() => started.promise);
     result.reject(new Error("logical timeout; kill requested"));
@@ -4091,5 +4108,147 @@ it.effect("retains timed-out region capture admission while actual helper exit i
     Effect.provide(layerTest("win32", { makeDirectory: () => Effect.void })),
     Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: reserve } as ElectronWindow.ElectronWindow["Service"]),
     Effect.ensuring(Effect.sync(() => { exit.resolve(); regionCaptureWithRetirementMock.mockReset(); activeWindowMock.mockReset(); })),
+  );
+});
+
+it.effect("denies configure, permissions and every setup action before their first side effect while held", () => {
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  const held = gate.acquire(200);
+  assert.isDefined(held);
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    const before = {
+      warm: accessibilityProcessWarmMock.mock.calls.length,
+      cool: accessibilityProcessCoolMock.mock.calls.length,
+      capture: activeWindowMock.mock.calls.length,
+      sources: getSourcesMock.mock.calls.length,
+      trusted: accessibilityTrustedMock.mock.calls.length,
+      external: openExternalMock.mock.calls.length,
+      register: registerShortcutMock.mock.calls.length,
+    };
+    yield* service.configure(enabledSettings());
+    yield* service.requestPermissions(true);
+    for (const action of ["test-mac-capture", "allow-accessibility", "allow-screen-recording", "install-kde-helper", "remove-kde-helper", "install-hyprland-helper", "remove-hyprland-helper", "install-extension", "enable-extension", "disable-extension", "retry-shortcut"] as const) {
+      const error = yield* service.setup(action).pipe(Effect.flip);
+      assert.equal(error.reason, "setup-failed", action);
+    }
+    assert.deepEqual({
+      warm: accessibilityProcessWarmMock.mock.calls.length,
+      cool: accessibilityProcessCoolMock.mock.calls.length,
+      capture: activeWindowMock.mock.calls.length,
+      sources: getSourcesMock.mock.calls.length,
+      trusted: accessibilityTrustedMock.mock.calls.length,
+      external: openExternalMock.mock.calls.length,
+      register: registerShortcutMock.mock.calls.length,
+    }, before);
+  })).pipe(
+    Effect.provide(layerTest("darwin")),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: gate.tryReserveRuntimeActivity } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => held!.release())),
+  );
+});
+
+it.effect("keeps permission admission held through cancellation until the actual Electron request completes", () => {
+  const started = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<Electron.DesktopCapturerSource[]>();
+  const retired = Promise.withResolvers<void>();
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  mediaAccessStatusMock.mockReset().mockReturnValue("not-determined");
+  getSourcesMock.mockImplementation(() => { started.resolve(); return finish.promise; });
+  const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
+    const token = gate.tryReserveRuntimeActivity(request);
+    return token === undefined ? undefined : { release: () => { token.release(); retired.resolve(); } };
+  };
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    const requesting = yield* service.requestPermissions(false).pipe(Effect.forkScoped);
+    yield* Effect.promise(() => started.promise);
+    const interrupting = yield* Fiber.interrupt(requesting).pipe(Effect.forkScoped);
+    assert.isUndefined(gate.acquire(200));
+    finish.resolve([]);
+    yield* Effect.promise(() => retired.promise);
+    yield* Fiber.join(interrupting);
+    const after = gate.acquire(200);
+    assert.isDefined(after);
+    after!.release();
+  })).pipe(
+    Effect.provide(layerTest("darwin")),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: reserve } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => { finish.resolve([]); getSourcesMock.mockReset(); })),
+  );
+});
+
+it.effect("retains configure's helper startup hold after configure returns until real ready retirement", () => {
+  const started = Promise.withResolvers<void>();
+  const ready = Promise.withResolvers<void>();
+  const retired = Promise.withResolvers<void>();
+  helperWarmRetirementMock.mockImplementation(() => { started.resolve(); return ready.promise; });
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  let count = 0;
+  const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
+    const token = gate.tryReserveRuntimeActivity(request);
+    const startup = ++count === 2; // configure, then actual helper startup.
+    return token === undefined ? undefined : { release: () => { token.release(); if (startup) retired.resolve(); } };
+  };
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    yield* service.configure(enabledSettings());
+    yield* Effect.promise(() => started.promise);
+    assert.isUndefined(gate.acquire(200));
+    ready.resolve();
+    yield* Effect.promise(() => retired.promise);
+    const after = gate.acquire(200);
+    assert.isDefined(after);
+    after!.release();
+  })).pipe(
+    Effect.provide(layerTest("win32")),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: reserve } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => { ready.resolve(); helperWarmRetirementMock.mockReset().mockResolvedValue(undefined); })),
+  );
+});
+
+it.effect("retains a cooling helper hold until its actual exit proof after configure returns", () => {
+  const exit = Promise.withResolvers<void>();
+  const started = Promise.withResolvers<void>();
+  const retired = Promise.withResolvers<void>();
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  let cooling = false;
+  const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
+    const token = gate.tryReserveRuntimeActivity(request);
+    const actualCool = cooling && accessibilityProcessCoolMock.mock.calls.length === 0;
+    return token === undefined ? undefined : { release: () => { token.release(); if (actualCool) retired.resolve(); } };
+  };
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    yield* service.configure(enabledSettings());
+    accessibilityProcessCoolMock.mockClear();
+    helperCoolRetirementMock.mockImplementation(() => { started.resolve(); return exit.promise; });
+    cooling = true;
+    yield* service.configure({ ...DEFAULT_CLIENT_SETTINGS, snapShotEnabled: false });
+    yield* Effect.promise(() => started.promise);
+    assert.isUndefined(gate.acquire(200));
+    exit.resolve();
+    yield* Effect.promise(() => retired.promise);
+    // Shortcut close has no retirement API, so this overall configure is
+    // deliberately UNKNOWN even though the helper's own exit is now proven.
+    assert.isUndefined(gate.acquire(200));
+  })).pipe(
+    Effect.provide(layerTest("win32")),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: reserve } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => { exit.resolve(); helperCoolRetirementMock.mockReset().mockResolvedValue(undefined); })),
+  );
+});
+
+it.effect("keeps UNKNOWN admission on rejected helper retirement rather than treating logical configure success as proof", () => {
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  helperWarmRetirementMock.mockRejectedValue(new Error("missing native retirement proof"));
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    yield* service.configure(enabledSettings());
+    assert.isUndefined(gate.acquire(200));
+  })).pipe(
+    Effect.provide(layerTest("win32")),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: gate.tryReserveRuntimeActivity } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => { helperWarmRetirementMock.mockReset().mockResolvedValue(undefined); })),
   );
 });

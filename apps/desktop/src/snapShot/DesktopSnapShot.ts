@@ -25,6 +25,7 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Base64 from "effect/encoding/Base64";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -779,10 +780,6 @@ export const make = Effect.gen(function* () {
     "snapShot",
     "SnapShotAccessibilityWorker.cjs",
   );
-  const accessibilityProcessPool = makeSnapShotAccessibilityProcessPool(accessibilityWorkerPath);
-  const regionSnapShotPool = makeRegionSnapShotPool(
-    path.join(__dirname, "snapShot", "RegionSnapShotWorker.cjs"),
-  );
   let registeredAccelerator: string | undefined;
   // False until the first applySettings; the first pass must always register.
   let initialized = false;
@@ -791,10 +788,46 @@ export const make = Effect.gen(function* () {
   let shortcutSuppressed = false;
   let lastShortcutAt: bigint | undefined;
   let stopShiftShortcut: (() => void) | undefined;
+  let shortcutRetirementUnknown = false;
   const showCaptureWindow =
     environment.platform === "win32" ? showWindowsCaptureOverlay : undefined;
   const updateWindow = yield* Effect.serviceOption(ElectronWindow.ElectronWindow);
   const reserveActivity = Option.isSome(updateWindow) ? updateWindow.value.tryReserveRuntimeActivity : undefined;
+  // Callback completion is a retirement proof only for APIs that acknowledge
+  // completion. Unknown or rejected lifecycle evidence deliberately keeps the
+  // native hold; requesting a kill or closing a bus is not such evidence.
+  const observeLifecycle = (start: () => Promise<void>) => {
+    const token = reserveActivity?.({ kind: "snapshot-capture" });
+    if (reserveActivity !== undefined && token === undefined) return new Promise<void>(() => {});
+    try {
+      const retired = start();
+      void retired.then(() => token?.release(), () => undefined);
+      return retired;
+    } catch (cause) {
+      return Promise.reject(cause);
+    }
+  };
+  const accessibilityProcessPool = makeSnapShotAccessibilityProcessPool(accessibilityWorkerPath, observeLifecycle);
+  const regionSnapShotPool = makeRegionSnapShotPool(
+    path.join(__dirname, "snapShot", "RegionSnapShotWorker.cjs"), undefined, observeLifecycle,
+  );
+  const withNativeActivity = <A, E, R>(
+    operation: Effect.Effect<A, E, R>,
+    denied: Effect.Effect<A, E, R>,
+    completionIsRetirement: boolean | (() => boolean) = true,
+  ) => Effect.suspend(() => {
+    const token = reserveActivity?.({ kind: "snapshot-capture" });
+    if (reserveActivity !== undefined && token === undefined) return denied;
+    if (token === undefined) return operation;
+    // Defer Effect interruption until the started operation has completed; the
+    // caller's cancellation must not retire an outstanding native Promise.
+    return operation.pipe(
+      Effect.onExit((exit) => Effect.sync(() => {
+        if ((typeof completionIsRetirement === "function" ? completionIsRetirement() : completionIsRetirement) && Exit.isSuccess(exit)) token.release();
+      })),
+      Effect.uninterruptible,
+    );
+  });
   const flash = new SnapShotFlash(showCaptureWindow, reserveActivity);
   const transition = new SnapShotTransition({
     tryReserveRendererCreation: Option.isSome(updateWindow) ? updateWindow.value.tryReserveRendererCreation : undefined,
@@ -827,6 +860,8 @@ export const make = Effect.gen(function* () {
       : startGlobalShiftShortcutProcess(shiftShortcutWorkerPath, modifier, onTrigger, onFailure);
 
   const releaseShortcut = () => {
+    // These existing close APIs do not expose worker exit / remote retirement.
+    if (portalShortcut !== undefined || stopShiftShortcut !== undefined) shortcutRetirementUnknown = true;
     shortcutGeneration++;
     portalShortcut?.close();
     portalShortcut = undefined;
@@ -1071,9 +1106,9 @@ export const make = Effect.gen(function* () {
           () => undefined,
         ),
       ).pipe(
-        Effect.tap((stop) => Effect.sync(stop)),
+        Effect.tap((stop) => Effect.sync(() => { shortcutRetirementUnknown = true; stop(); })),
         Effect.as(true),
-        Effect.orElseSucceed(() => false),
+        Effect.orElseSucceed(() => { shortcutRetirementUnknown = true; return false; }),
       );
       return {
         available,
@@ -1104,7 +1139,10 @@ export const make = Effect.gen(function* () {
         ? { available: true, message: null }
         : probeGlobalShortcut(accelerator);
     return available;
-  });
+  }, (operation) => withNativeActivity(operation,
+    Effect.succeed({ available: false, message: "Desktop update admission is holding native activity." }),
+    () => !shortcutRetirementUnknown,
+  ));
 
   const applySettings = Effect.fn("desktop.snapShot.applySettings")(function* (
     settings: ClientSettings,
@@ -1211,7 +1249,7 @@ export const make = Effect.gen(function* () {
           }),
         ),
         Effect.as(true),
-        Effect.orElseSucceed(() => false),
+        Effect.orElseSucceed(() => { shortcutRetirementUnknown = true; return false; }),
       );
       yield* Ref.set(stateRef, {
         mode,
@@ -1249,6 +1287,7 @@ export const make = Effect.gen(function* () {
       });
       yield* Effect.tryPromise(async () => {
         const { PortalCaptureShortcut } = await import("./PortalCaptureShortcut.ts");
+        shortcutRetirementUnknown = true;
         return new PortalCaptureShortcut(
           linuxAppId,
           isModifierPairShortcut(shortcut)
@@ -1306,7 +1345,7 @@ export const make = Effect.gen(function* () {
           }),
         ),
         Effect.as(true),
-        Effect.orElseSucceed(() => false),
+        Effect.orElseSucceed(() => { shortcutRetirementUnknown = true; return false; }),
       );
     } else {
       const accelerator = toElectronAccelerator(shortcut);
@@ -1325,7 +1364,11 @@ export const make = Effect.gen(function* () {
           : null
         : snapShotShortcutRegistrationFailureMessage(shortcut, environment.platform),
     });
-  });
+  }, (operation) => withNativeActivity(operation, Effect.void,
+    // Portal constructors/shortcut-worker cleanup expose no per-operation
+    // retirement ACK. Keep UNKNOWN rather than infer it from registration.
+    () => !shortcutRetirementUnknown,
+  ));
 
   const setShortcutSuppressed = (suppressed: boolean) =>
     Effect.sync(() => {
@@ -1355,9 +1398,9 @@ export const make = Effect.gen(function* () {
       );
       yield* permissions.showHelper("accessibility", owner);
     }
-  }, configurationMutex.withPermits(1));
+  }, (operation) => configurationMutex.withPermits(1)(withNativeActivity(operation, Effect.void)));
 
-  const setup = Effect.fn("desktop.snapShot.setup")(function* (action: DesktopSnapShotSetupAction) {
+  const setupOperation = Effect.fn("desktop.snapShot.setupOperation")(function* (action: DesktopSnapShotSetupAction) {
     if (action === "test-mac-capture") {
       if (environment.platform !== "darwin")
         return yield* new DesktopSnapShotSetupError({ action, reason: "unsupported-session" });
@@ -1474,7 +1517,17 @@ export const make = Effect.gen(function* () {
         );
       } else yield* applySettings(yield* Ref.get(settingsRef), null, true);
     }
-  }, configurationMutex.withPermits(1));
+  });
+  const setup = (action: DesktopSnapShotSetupAction) => configurationMutex.withPermits(1)(withNativeActivity(
+    setupOperation(action),
+    Effect.fail(new DesktopSnapShotSetupError({ action, reason: "setup-failed" })),
+    // GNOME calls and portal reconfiguration can time out before the remote
+    // work retires; neither a logical result nor bus.close proves retirement.
+    // KDE also swallows systemd-run failure, which can leave its unit running.
+    action !== "retry-shortcut" && (action === "test-mac-capture" || action === "allow-screen-recording" ||
+      action === "allow-accessibility" ||
+      action === "install-hyprland-helper" || action === "remove-hyprland-helper"),
+  ));
 
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
@@ -1534,7 +1587,9 @@ export const make = Effect.gen(function* () {
     });
     if (result.backupPath) shortcutVerified = false;
     return result;
-  });
+  }, (operation) => withNativeActivity(operation,
+    Effect.fail(new DesktopSnapShotSetupError({ action: "apply-config", reason: "setup-failed" })),
+  ));
 
   return DesktopSnapShot.of({
     initialize: configurationMutex.withPermits(1)(

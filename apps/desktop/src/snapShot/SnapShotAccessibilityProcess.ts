@@ -18,12 +18,16 @@ export type AccessibilityRead = {
 };
 
 export type AccessibilityProcess = {
+  readonly startupRetired?: Promise<void>;
+  readonly exited?: Promise<void>;
   readonly alive: boolean;
   readonly read: (request: SnapShotAccessibilityRequest) => AccessibilityRead;
   readonly close: () => void;
 };
 
 export type AccessibilityProcessPool = {
+  readonly warmWithRetirement?: () => Promise<void>;
+  readonly coolWithRetirement?: () => Promise<void>;
   readonly warm: () => void;
   readonly cool: () => void;
   readonly read: (request: SnapShotAccessibilityRequest) => AccessibilityRead;
@@ -43,6 +47,8 @@ const completedRead = (context?: CapturedWindowAccessibilityContext): Accessibil
 
 const unavailableProcess = (): AccessibilityProcess => ({
   alive: false,
+  startupRetired: Promise.resolve(),
+  exited: Promise.resolve(),
   read: () => completedRead(),
   close: () => undefined,
 });
@@ -68,6 +74,8 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
   // A result may be the reader's inner timeout snapshot while native calls
   // continue. Only actual exit retires this single-use child's work.
   const nativeRetired = Promise.withResolvers<void>();
+  const startupRetired = Promise.withResolvers<void>();
+  const exited = Promise.withResolvers<void>();
   let ready = false;
   let request: SnapShotAccessibilityRequest | undefined;
   let startedResolve: (() => void) | undefined;
@@ -106,6 +114,7 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
   worker.on("message", (rawMessage) => {
     const message = rawMessage as AccessibilityMessage;
     if (message === "ready") {
+      startupRetired.resolve();
       ready = true;
       sendRequest();
     } else if (message === "started") {
@@ -116,9 +125,11 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
     }
   });
   worker.once("error", () => finish());
-  worker.once("exit", () => { nativeRetired.resolve(); finish(); });
+  worker.once("exit", () => { startupRetired.resolve(); exited.resolve(); nativeRetired.resolve(); finish(); });
 
   return {
+    startupRetired: startupRetired.promise,
+    exited: exited.promise,
     get alive() {
       return !settled;
     },
@@ -138,23 +149,44 @@ export function startSnapShotAccessibilityProcess(workerPath: string): Accessibi
   };
 }
 
-export function makeSnapShotAccessibilityProcessPool(workerPath: string): AccessibilityProcessPool {
+export function makeSnapShotAccessibilityProcessPool(
+  workerPath: string,
+  observeLifecycle: (start: () => Promise<void>) => Promise<void> = (start) => start(),
+): AccessibilityProcessPool {
   let standby: AccessibilityProcess | undefined;
   const active = new Set<AccessibilityProcess>();
   let closed = false;
 
-  const warm = () => {
-    if (closed || standby?.alive) return;
-    standby = startSnapShotAccessibilityProcess(workerPath);
+  const closing = new Set<Promise<void>>();
+  const unknownRetirement = () => new Promise<void>(() => {});
+  const warmWithRetirement = () => {
+    if (closed) return Promise.resolve();
+    if (standby?.alive) return standby.startupRetired ?? unknownRetirement();
+    return observeLifecycle(() => {
+      standby = startSnapShotAccessibilityProcess(workerPath);
+      return standby.startupRetired ?? unknownRetirement();
+    });
   };
-  const cool = () => {
-    standby?.close();
-    standby = undefined;
+  const coolWithRetirement = () => {
+    const current = standby;
+    const closingNow = current === undefined ? Promise.resolve() : observeLifecycle(() => {
+      standby = undefined;
+      const exit = current.exited ?? unknownRetirement();
+      closing.add(exit);
+      void exit.then(() => closing.delete(exit), () => undefined);
+      current.close();
+      return exit;
+    });
+    return Promise.all([...closing, closingNow]).then(() => undefined);
   };
+  const warm = () => { void warmWithRetirement().catch(() => undefined); };
+  const cool = () => { void coolWithRetirement().catch(() => undefined); };
 
   return {
     warm,
     cool,
+    warmWithRetirement,
+    coolWithRetirement,
     read: (request) => {
       if (closed) return completedRead();
       const workerProcess = standby?.alive
