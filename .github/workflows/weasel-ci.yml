@@ -75,6 +75,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: product-bundle-${{ github.sha }}
+          include-hidden-files: true
           path: |
             apps/server/dist
             apps/desktop/dist-electron

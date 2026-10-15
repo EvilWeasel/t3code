@@ -45,6 +45,8 @@ focused_tests=(
   apps/desktop/src/backend/DesktopBackendConfiguration.test.ts \
   apps/desktop/src/wsl/DesktopWslBackend.test.ts
   apps/desktop/src/updates/DesktopUpdates.test.ts
+  apps/desktop/src/updates/DesktopRemoteUpdates.test.ts
+  apps/desktop/src/updates/updateChannels.test.ts
   apps/desktop/src/updates/remoteUpdateFlow.test.ts
   apps/desktop/src/updates/updateMachine.test.ts
   apps/desktop/src/electron/ElectronUpdater.test.ts
