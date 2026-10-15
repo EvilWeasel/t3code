@@ -215,9 +215,6 @@ const layerDesktopSnapShot = DesktopSnapShot.layer.pipe(
   Layer.provideMerge(layerDesktopWindow),
   Layer.provideMerge(layerDesktopFoundation),
 );
-const layerDesktopAppActivation = DesktopAppActivation.layer.pipe(
-  Layer.provide(layerDesktopWindow),
-);
 
 // Pool layer instantiates the backend factory once for the Windows
 // primary instance and exposes it via pool.primary. Consumers go through
@@ -226,6 +223,10 @@ const layerDesktopAppActivation = DesktopAppActivation.layer.pipe(
 // DesktopBackendPool.ts header for the full rollout plan.
 const layerMainRendererDiagnostics = MainRendererDiagnostics.layer.pipe(
   Layer.provideMerge(layerDesktopWindow),
+);
+
+const layerDesktopAppActivation = DesktopAppActivation.layer.pipe(
+  Layer.provide(layerMainRendererDiagnostics),
 );
 
 const layerDesktopBackend = DesktopBackendPool.layer.pipe(

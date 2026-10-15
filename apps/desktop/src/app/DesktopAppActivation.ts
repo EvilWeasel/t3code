@@ -9,11 +9,18 @@ import * as NodePath from "node:path";
 import {
   DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION,
   DesktopAppActivationRequest,
+  MainRendererLocalDiagnosticsHello,
+  MainRendererLocalDiagnosticsCapability,
+  MainRendererLocalDiagnosticsRead,
+  MainRendererLocalDiagnosticsResult,
+  type MainRendererDiagnosticsReadInput,
+  type MainRendererDiagnosticsReadResult,
   type DesktopAppActivationResponse,
 } from "@t3tools/contracts";
 import { resolveDesktopAppControlAddress } from "@t3tools/shared/desktopAppControl";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -26,6 +33,7 @@ import type * as Electron from "electron";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import { DESKTOP_APP_ACTIVATION_REQUEST_CHANNEL } from "../ipc/channels.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
+import * as MainRendererDiagnostics from "../ipc/methods/mainRendererDiagnostics.ts";
 import { DesktopAppActivationBroker } from "./DesktopAppActivationBroker.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import { makeComponentLogger } from "./DesktopObservability.ts";
@@ -123,8 +131,33 @@ export async function startDesktopAppControlServer(input: {
   readonly handle: (request: DesktopAppActivationRequest) => Promise<DesktopAppActivationResponse>;
   readonly cancel: (requestId: string) => void;
   readonly onReclaimError: (error: unknown) => void;
+  readonly diagnostics?: {
+    readonly mainPid: number;
+    readonly stateDir: string;
+    readonly appVersion: string;
+    readonly read: (
+      source: string,
+      alive: () => boolean,
+      input: MainRendererDiagnosticsReadInput,
+    ) => Promise<MainRendererDiagnosticsReadResult>;
+    readonly cancel: (source: string) => void;
+  };
 }): Promise<RunningControlServer> {
   const sockets = new Set<NodeNet.Socket>();
+  let diagnosticOwner: NodeNet.Socket | undefined;
+  const decodeHello = Schema.decodeUnknownOption(MainRendererLocalDiagnosticsHello, {
+    onExcessProperty: "error",
+  });
+  const decodeRead = Schema.decodeUnknownOption(MainRendererLocalDiagnosticsRead, {
+    onExcessProperty: "error",
+  });
+  const encodeDiagnostic = Schema.encodeSync(
+    Schema.fromJsonString(
+      Schema.Union([MainRendererLocalDiagnosticsCapability, MainRendererLocalDiagnosticsResult]),
+    ),
+  );
+  const sameTarget = Schema.toEquivalence(MainRendererLocalDiagnosticsHello.fields.target);
+  const now = () => DateTime.toEpochMillis(DateTime.nowUnsafe());
   const handleConnection = (socket: NodeNet.Socket) => {
     sockets.add(socket);
     socket.setEncoding("utf8");
@@ -132,6 +165,12 @@ export async function startDesktopAppControlServer(input: {
     let handled = false;
     let responseSent = false;
     let activeRequestId: string | null = null;
+    let hello: MainRendererLocalDiagnosticsHello | undefined;
+    let capabilityNonce: string | undefined;
+    let source: string | undefined;
+    const connectedAt = now();
+    let diagnosticStartedAt = 0;
+    let diagnosticTimer: ReturnType<typeof setTimeout> | undefined;
 
     socket.setTimeout(5_000, () => socket.destroy());
 
@@ -151,9 +190,8 @@ export async function startDesktopAppControlServer(input: {
 
       const newline = buffer.indexOf("\n");
       if (newline === -1) return;
-      handled = true;
-      socket.setTimeout(0);
       const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
       let parsed: unknown;
       try {
         parsed = JSON.parse(line);
@@ -162,6 +200,116 @@ export async function startDesktopAppControlServer(input: {
         return;
       }
 
+      // A new typed passive operation must never enter the activation broker.
+      if (
+        hello ||
+        (typeof parsed === "object" &&
+          parsed !== null &&
+          "type" in parsed &&
+          (parsed.type === "main-renderer-diagnostics-hello" ||
+            parsed.type === "main-renderer-diagnostics-read"))
+      ) {
+        const bridge = input.diagnostics;
+        if (!bridge || input.directory === null) {
+          socket.destroy();
+          return;
+        }
+        if (!hello) {
+          const decoded = decodeHello(parsed);
+          if (Option.isNone(decoded) || diagnosticOwner || buffer.length !== 0) {
+            socket.destroy();
+            return;
+          }
+          const request = decoded.value;
+          const started = now();
+          if (
+            started < connectedAt ||
+            started - connectedAt >= 2_000 ||
+            request.expectedMainPid !== bridge.mainPid ||
+            request.stateDir !== bridge.stateDir ||
+            request.expiresAtMs <= started ||
+            request.expiresAtMs - started > 5_000
+          ) {
+            socket.destroy();
+            return;
+          }
+          diagnosticOwner = socket;
+          hello = request;
+          diagnosticStartedAt = connectedAt;
+          capabilityNonce = NodeCrypto.randomUUID();
+          source = `local:${capabilityNonce}`;
+          socket.setTimeout(0);
+          diagnosticTimer = setTimeout(
+            () => socket.destroy(),
+            Math.min(2_000 - (started - connectedAt), request.expiresAtMs - started),
+          );
+          socket.write(
+            `${encodeDiagnostic({
+              version: 1,
+              type: "main-renderer-diagnostics-capability",
+              requestId: request.requestId,
+              requestNonce: request.requestNonce,
+              capabilityNonce,
+              mainPid: bridge.mainPid,
+              stateDir: bridge.stateDir,
+              appVersion: bridge.appVersion,
+            })}\n`,
+          );
+          return;
+        }
+        const decoded = decodeRead(parsed);
+        handled = true;
+        const bound = hello;
+        const cap = capabilityNonce;
+        const ownedSource = source;
+        const current = now();
+        if (
+          Option.isNone(decoded) ||
+          !cap ||
+          !ownedSource ||
+          buffer.length !== 0 ||
+          decoded.value.capabilityNonce !== cap ||
+          decoded.value.input.requestId !== bound.requestId ||
+          decoded.value.input.requestNonce !== bound.requestNonce ||
+          decoded.value.input.expiresAtMs !== bound.expiresAtMs ||
+          !sameTarget(decoded.value.input.target, bound.target) ||
+          current < diagnosticStartedAt ||
+          current >= bound.expiresAtMs ||
+          current - diagnosticStartedAt >= 2_000
+        ) {
+          socket.destroy();
+          return;
+        }
+        const alive = () =>
+          !socket.destroyed &&
+          diagnosticOwner === socket &&
+          now() >= diagnosticStartedAt &&
+          now() - diagnosticStartedAt < 2_000 &&
+          now() < bound.expiresAtMs;
+        void bridge.read(ownedSource, alive, decoded.value.input).then(
+          (result) => {
+            if (!alive()) {
+              socket.destroy();
+              return;
+            }
+            responseSent = true;
+            socket.end(
+              `${encodeDiagnostic({
+                version: 1,
+                type: "main-renderer-diagnostics-result",
+                requestId: bound.requestId,
+                requestNonce: bound.requestNonce,
+                capabilityNonce: cap,
+                result,
+              })}\n`,
+            );
+          },
+          () => socket.destroy(),
+        );
+        return;
+      }
+      handled = true;
+      socket.setTimeout(0);
       if (!isDesktopAppActivationRequest(parsed)) {
         finish(
           invalidResponse(requestIdFromUnknown(parsed), "The desktop app request is invalid."),
@@ -178,6 +326,9 @@ export async function startDesktopAppControlServer(input: {
     socket.on("error", () => socket.destroy());
     socket.on("close", () => {
       sockets.delete(socket);
+      if (diagnosticTimer) clearTimeout(diagnosticTimer);
+      if (diagnosticOwner === socket) diagnosticOwner = undefined;
+      if (source) input.diagnostics?.cancel(source);
       if (!responseSent && activeRequestId !== null) input.cancel(activeRequestId);
     });
   };
@@ -316,6 +467,7 @@ export const make = Effect.gen(function* () {
   const electronWindow = yield* ElectronWindow.ElectronWindow;
   const path = yield* Path.Path;
   const userId = yield* HostProcess.UserId;
+  const diagnostics = yield* Effect.serviceOption(MainRendererDiagnostics.MainRendererDiagnostics);
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
   const address = resolveDesktopAppControlAddress({
     stateDir: path.resolve(desktopEnvironment.stateDir),
@@ -352,6 +504,26 @@ export const make = Effect.gen(function* () {
           startDesktopAppControlServer({
             ...address,
             userId,
+            ...(desktopEnvironment.platform === "linux" &&
+            Option.getOrUndefined(desktopEnvironment.profileId) === "weasel" &&
+            desktopEnvironment.isPackaged &&
+            Option.isSome(diagnostics)
+              ? {
+                  diagnostics: {
+                    mainPid: process.pid,
+                    stateDir: path.resolve(desktopEnvironment.stateDir),
+                    appVersion: desktopEnvironment.appVersion,
+                    read: (
+                      source: string,
+                      alive: () => boolean,
+                      request: MainRendererDiagnosticsReadInput,
+                    ) => runPromise(diagnostics.value.read(source, alive, request)),
+                    cancel: (source: string) => {
+                      void runPromise(diagnostics.value.cancelSource(source));
+                    },
+                  },
+                }
+              : {}),
             handle: (request) => broker.request(request),
             cancel: (requestId) => broker.cancel(requestId),
             onReclaimError: (cause) =>
