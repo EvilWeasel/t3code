@@ -9,7 +9,13 @@ import {
 } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
-import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  ProjectId,
+  ServerProvider,
+  ServerSettings,
+  ThreadId,
+} from "@t3tools/contracts";
 import type { LiveVoiceEvent } from "@t3tools/contracts";
 import {
   LiveVoiceController,
@@ -30,6 +36,30 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { randomUUID } from "~/lib/utils";
 import { LiveVoiceTranscript } from "./LiveVoiceTranscript";
 import { unwrapLiveVoiceCommand } from "./LiveVoiceCommands";
+import {
+  applyProviderInstanceSettings,
+  deriveProviderInstanceEntries,
+  sortProviderInstanceEntries,
+} from "../providerInstances";
+
+export function deriveLiveVoiceProviderEntries(
+  providers: ReadonlyArray<ServerProvider>,
+  settings: Pick<ServerSettings, "providerInstances" | "projectSettingsOverrides">,
+  projectId: ProjectId | null,
+) {
+  return sortProviderInstanceEntries(
+    applyProviderInstanceSettings(deriveProviderInstanceEntries(providers), settings, projectId),
+  );
+}
+
+/** A cached successful config must not hide a current projection failure. */
+export function resolveLiveVoiceConfigState(result: AsyncResult.AsyncResult<unknown, unknown>) {
+  return AsyncResult.isFailure(result)
+    ? "failed"
+    : AsyncResult.isInitial(result)
+      ? "pending"
+      : "ready";
+}
 
 type LiveVoiceAvailability = {
   readonly environmentId: EnvironmentId;
@@ -44,6 +74,7 @@ export function resolveLiveVoiceAvailability(input: {
   readonly threadId: ThreadId | null;
   readonly providerInstanceId: string | null;
   readonly catalogEnvironmentId: EnvironmentId | null;
+  readonly configState: "pending" | "ready" | "failed";
   readonly settingsKnown: boolean;
   readonly canOperate: boolean;
   readonly permissionState: "known" | "pending" | "unavailable";
@@ -59,6 +90,10 @@ export function resolveLiveVoiceAvailability(input: {
 }): LiveVoiceAvailability {
   let reason: string | null = null;
   if (!input.threadId) reason = "Open an existing thread to start Live voice.";
+  else if (input.configState === "failed")
+    reason = "Provider information could not be loaded. Reconnect this environment.";
+  else if (input.configState === "pending")
+    reason = "Waiting for this environment's provider information.";
   else if (input.catalogEnvironmentId !== input.environmentId)
     reason = "Waiting for this environment's provider information.";
   else if (!input.settingsKnown) reason = "Waiting for this environment's provider settings.";

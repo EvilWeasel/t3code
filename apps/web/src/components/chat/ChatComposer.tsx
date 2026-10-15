@@ -272,7 +272,12 @@ import { CompactComposerControlsMenu } from "./CompactComposerControlsMenu";
 import { ComposerImageThumbnail } from "./ComposerImageThumbnail";
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
 import { VoiceDictationControl } from "../../voice/VoiceDictationControl";
-import { LiveVoiceControl, resolveLiveVoiceAvailability } from "../../voice/LiveVoiceControl";
+import {
+  deriveLiveVoiceProviderEntries,
+  LiveVoiceControl,
+  resolveLiveVoiceAvailability,
+  resolveLiveVoiceConfigState,
+} from "../../voice/LiveVoiceControl";
 import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
 import * as Option from "effect/Option";
@@ -2211,6 +2216,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     selectedProviderEntry?.driverKind ?? requestedDriverKind;
   const liveVoiceEnvironmentId = activeThreadEnvironmentId ?? environmentId;
   const liveVoiceConfig = useAtomValue(serverEnvironment.configValueAtom(liveVoiceEnvironmentId));
+  const liveVoiceConfigProjection = useAtomValue(
+    serverEnvironment.configProjection({ environmentId: liveVoiceEnvironmentId, input: {} }),
+  );
   const liveVoiceCanOperate = useEnvironmentScope(
     liveVoiceEnvironmentId,
     AuthOrchestrationOperateScope,
@@ -2220,8 +2228,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
   // Do not qualify a newly selected environment using the previous composer's props.
   const liveVoiceEntries = liveVoiceConfig
-    ? applyProviderInstanceSettings(
-        deriveProviderInstanceEntries(liveVoiceConfig.providers),
+    ? deriveLiveVoiceProviderEntries(
+        liveVoiceConfig.providers,
         liveVoiceConfig.settings,
         activeProjectId,
       )
@@ -2253,6 +2261,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     threadId: activeThreadId,
     providerInstanceId: liveVoiceInstanceId,
     catalogEnvironmentId: liveVoiceConfig?.environment.environmentId ?? null,
+    configState: resolveLiveVoiceConfigState(liveVoiceConfigProjection),
     settingsKnown: liveVoiceConfig?.settings !== undefined,
     canOperate: canOperateThread && liveVoiceCanOperate,
     permissionState: AsyncResult.isFailure(liveVoiceSession)
