@@ -7,6 +7,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
+import type * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -124,7 +125,7 @@ it.effect(
   "requires advertised paired support and exact request nonces on the actual NDJSON receiver",
   () =>
     Effect.gen(function* () {
-      const inputQueue = yield* Queue.unbounded<string>();
+      const inputQueue = yield* Queue.unbounded<string, Cause.Done>();
       const inputStream = yield* NodeStream.toReadable(Stream.fromQueue(inputQueue));
       const requestSeen =
         yield* Deferred.make<
