@@ -4738,6 +4738,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               turn !== undefined &&
               turn.status === "completed"))
         ) {
+          if (dispatchMode.onInactive === "reject") {
+            return yield* new OrchestratorDispatchError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: `Target run ${targetRunId} no longer accepts steering.`,
+            });
+          }
           dispatchMode = { type: "start_immediately" };
         }
       }

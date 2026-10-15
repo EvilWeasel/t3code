@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 
 import {
+  OrchestrationV2Command,
   OrchestratorMcpCreateThreadsInput,
   OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpDelegateTaskResult,
@@ -209,4 +210,32 @@ describe("orchestrator MCP contracts", () => {
       }).reason,
     ).toBe("Loop converged.");
   });
+});
+
+it("preserves explicit atomic late-steer rejection while leaving ordinary delivery unchanged", () => {
+  const decode = Schema.decodeUnknownSync(OrchestrationV2Command);
+  const command = {
+    type: "message.dispatch",
+    commandId: "strict-steer",
+    threadId: "child",
+    messageId: "message",
+    text: "Keep the exact run",
+    attachments: [],
+    createdBy: "agent",
+    creationSource: "mcp",
+    dispatchMode: { type: "steer_active", targetRunId: "child-run", onInactive: "reject" },
+  };
+  expect(decode(command)).toMatchObject({
+    dispatchMode: { type: "steer_active", targetRunId: "child-run", onInactive: "reject" },
+  });
+  const ordinary = decode({
+    ...command,
+    createdBy: "user",
+    creationSource: "web",
+    dispatchMode: { type: "steer_active", targetRunId: "child-run" },
+  });
+  expect(ordinary).not.toHaveProperty("dispatchMode.onInactive");
+  expect(() =>
+    decode({ ...command, dispatchMode: { ...command.dispatchMode, onInactive: "retarget" } }),
+  ).toThrow();
 });

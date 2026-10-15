@@ -577,7 +577,39 @@ describe("orchestrator MCP toolkit", () => {
             release: Deferred.Deferred<void>;
           }>();
           const preparedRuns = yield* Ref.make(0);
+          const steerGate = yield* Ref.make<
+            | {
+                readonly childThreadId: ThreadId;
+                readonly started: Deferred.Deferred<void>;
+                readonly release: Deferred.Deferred<void>;
+              }
+            | undefined
+          >(undefined);
+          const controlledThreads = Layer.effect(
+            ThreadManagementService.ThreadManagementService,
+            Effect.gen(function* () {
+              const actual = yield* ThreadManagementService.ThreadManagementService;
+              return ThreadManagementService.ThreadManagementService.of({
+                ...actual,
+                dispatch: (command) =>
+                  Effect.gen(function* () {
+                    const gate = yield* Ref.modify(steerGate, (current) =>
+                      command.type === "message.dispatch" &&
+                      current?.childThreadId === command.threadId
+                        ? ([current, undefined] as const)
+                        : ([undefined, current] as const),
+                    );
+                    if (gate !== undefined) {
+                      yield* Deferred.succeed(gate.started, undefined);
+                      yield* Deferred.await(gate.release);
+                    }
+                    return yield* actual.dispatch(command);
+                  }),
+              });
+            }),
+          ).pipe(Layer.provide(domain));
           const layer = McpHttpServer.layerOrchestratorToolkit.pipe(
+            Layer.provide(controlledThreads),
             Layer.provide(
               Layer.mock(ThreadLaunchService.ThreadLaunchService)({
                 prepareRun: () => Ref.update(preparedRuns, (count) => count + 1),
@@ -840,44 +872,49 @@ describe("orchestrator MCP toolkit", () => {
               clientRequestId: "completed-steer-target",
             });
             const completedTask = yield* decodeDelegateTaskResult(completedCall.structuredContent);
-            const completedChild = yield* orchestrator.getThreadProjection(
+            const markCompleted = (
+              childThreadId: ThreadId,
+              childRunId: RunId | null,
+              key: string,
+            ) =>
+              Effect.gen(function* () {
+                const projection = yield* orchestrator.getThreadProjection(childThreadId);
+                const run = projection.runs.find((candidate) => candidate.id === childRunId);
+                const root = projection.nodes.find((node) => node.id === run?.rootNodeId);
+                if (run === undefined || root === undefined)
+                  return yield* Effect.die("Missing actual completed-target run/root");
+                const finishedAt = yield* DateTime.now;
+                yield* (yield* EventSink.EventSinkV2).write({
+                  commandId: CommandId.make(`external:${key}:complete`),
+                  events: [
+                    {
+                      id: EventId.make(`external:${key}:root`),
+                      type: "node.updated",
+                      threadId: childThreadId,
+                      occurredAt: finishedAt,
+                      payload: { ...root, status: "completed", completedAt: finishedAt },
+                    },
+                    {
+                      id: EventId.make(`external:${key}:run`),
+                      type: "run.updated",
+                      threadId: childThreadId,
+                      occurredAt: finishedAt,
+                      payload: {
+                        ...run,
+                        status: "completed",
+                        startedAt: finishedAt,
+                        completedAt: finishedAt,
+                      },
+                    },
+                  ],
+                });
+                return projection;
+              });
+            const completedChild = yield* markCompleted(
               completedTask.childThreadId,
+              completedTask.childRunId,
+              "already-completed",
             );
-            const completedRun = completedChild.runs.find(
-              (candidate) => candidate.id === completedTask.childRunId,
-            );
-            if (completedRun === undefined)
-              return yield* Effect.die("Missing completed-target run");
-            const completedRoot = completedChild.nodes.find(
-              (node) => node.id === completedRun.rootNodeId,
-            );
-            if (completedRoot === undefined)
-              return yield* Effect.die("Missing completed-target root");
-            const finishedAt = yield* DateTime.now;
-            yield* (yield* EventSink.EventSinkV2).write({
-              commandId: CommandId.make("external:complete-steer-target"),
-              events: [
-                {
-                  id: EventId.make("external:complete-child-root"),
-                  type: "node.updated",
-                  threadId: completedTask.childThreadId,
-                  occurredAt: finishedAt,
-                  payload: { ...completedRoot, status: "completed", completedAt: finishedAt },
-                },
-                {
-                  id: EventId.make("external:complete-child-run"),
-                  type: "run.updated",
-                  threadId: completedTask.childThreadId,
-                  occurredAt: finishedAt,
-                  payload: {
-                    ...completedRun,
-                    status: "completed",
-                    startedAt: finishedAt,
-                    completedAt: finishedAt,
-                  },
-                },
-              ],
-            });
             const completedSteer = yield* invoke("external_task_steer", {
               ...binding,
               taskId: completedTask.taskId,
@@ -893,6 +930,70 @@ describe("orchestrator MCP toolkit", () => {
               completedSteer.isError,
               "completed target must reject strict external steering",
             ).toBe(true);
+            const outbox = yield* EffectOutbox.EffectOutboxV2;
+            const externalSteerCommand = (key: string) =>
+              CommandId.make(
+                `command:mcp:${encodeURIComponent(scope.requestNamespace)}:external-task-steer:${encodeURIComponent(key)}`,
+              );
+            expect(
+              yield* outbox.listByCommandId(externalSteerCommand("completed-target-steer")),
+            ).toHaveLength(0);
+
+            // An omitted option preserves the existing UI's late-input fallback.
+            const uiCommandId = CommandId.make("external:normal-ui-late-steer");
+            if (completedTask.childRunId === null)
+              return yield* Effect.die("Missing UI fallback target");
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: uiCommandId,
+              threadId: completedTask.childThreadId,
+              messageId: MessageId.make("external:normal-ui-late-steer"),
+              text: "Normal UI preserves this late input",
+              createdBy: "user",
+              creationSource: "web",
+              attachments: [],
+              dispatchMode: { type: "steer_active", targetRunId: completedTask.childRunId },
+            });
+            expect(
+              (yield* orchestrator.getThreadProjection(completedTask.childThreadId)).runs,
+            ).toHaveLength(completedChild.runs.length + 1);
+            expect((yield* outbox.listByCommandId(uiCommandId)).length).toBeGreaterThan(0);
+
+            const racingCall = yield* invoke("external_delegate_task", {
+              ...request,
+              clientRequestId: "completion-race-target",
+            });
+            const racingTask = yield* decodeDelegateTaskResult(racingCall.structuredContent);
+            const gate = {
+              childThreadId: racingTask.childThreadId,
+              started: yield* Deferred.make<void>(),
+              release: yield* Deferred.make<void>(),
+            };
+            yield* Ref.set(steerGate, gate);
+            const racingSteer = yield* invoke("external_task_steer", {
+              ...binding,
+              taskId: racingTask.taskId,
+              childRunId: racingTask.childRunId,
+              clientRequestId: "complete-after-preflight",
+              message: "Refuse this if completion wins the dispatch race",
+            }).pipe(Effect.forkChild);
+            yield* Deferred.await(gate.started);
+            const racingChild = yield* markCompleted(
+              racingTask.childThreadId,
+              racingTask.childRunId,
+              "completion-between-preflight-dispatch",
+            );
+            yield* Deferred.succeed(gate.release, undefined);
+            expect(
+              (yield* Fiber.join(racingSteer)).isError,
+              "completion after service preflight must reject at canonical dispatch",
+            ).toBe(true);
+            expect(
+              (yield* orchestrator.getThreadProjection(racingTask.childThreadId)).runs,
+            ).toHaveLength(racingChild.runs.length);
+            expect(
+              yield* outbox.listByCommandId(externalSteerCommand("complete-after-preflight")),
+            ).toHaveLength(0);
             // Stop, a replacement run, and a changed attempt root all happen after
             // the real service's preflight while its Git boundary is awaiting.
             for (const change of ["root", "run", "mode", "interaction", "stop"] as const) {
@@ -2566,6 +2667,49 @@ describe("orchestrator MCP toolkit", () => {
               model: codexModel,
               options: [{ id: "reasoning", value: "low" }],
             });
+            // A real running provider fixture remains steerable under the
+            // existing native/restart capability decision, to exactly this run.
+            const activeParentTask = (yield* orchestrator.getThreadProjection(
+              parentThreadId,
+            )).subagents.find((candidate) => candidate.id === cancellable.taskId);
+            if (activeParentTask?.runId == null || cancellable.childRunId === null)
+              return yield* Effect.die("Missing active targeted-steer binding");
+            const externalActiveScope: McpInvocationContext.McpInvocationScope = {
+              ...invocation,
+              requestNamespace: "client:active-targeted-steer",
+              thread: undefined,
+              client: {
+                sessionId: "active-targeted-steer",
+                label: "Jarvis fixture",
+                access: "full-access",
+              },
+            };
+            const activeSteer = yield* invokeAs(externalActiveScope, "external_task_steer", {
+              environmentId: invocation.environmentId,
+              projectId,
+              parentThreadId,
+              parentRunId: activeParentTask.runId,
+              parentRootNodeId: activeParentTask.parentNodeId,
+              taskId: cancellable.taskId,
+              childRunId: cancellable.childRunId,
+              clientRequestId: "active-exact-run",
+              message: cancellationPrompt,
+            });
+            expect(activeSteer.isError).not.toBe(true);
+            expect(activeSteer.structuredContent).toMatchObject({
+              runId: cancellable.childRunId,
+              delivery: "steered",
+            });
+            const afterActiveSteer = yield* orchestrator.getThreadProjection(
+              cancellable.childThreadId,
+            );
+            expect(afterActiveSteer.runs).toHaveLength(optionedChild.runs.length);
+            expect(
+              afterActiveSteer.messages.filter(
+                (message) =>
+                  message.runId === cancellable.childRunId && message.text === cancellationPrompt,
+              ),
+            ).toHaveLength(2);
             const cancelCall = yield* invoke("task_cancel", {
               taskId: cancellable.taskId,
               reason: "Parent no longer needs this work.",

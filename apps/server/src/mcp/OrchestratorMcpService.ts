@@ -2221,7 +2221,11 @@ const make = Effect.gen(function* () {
             creationSource: "mcp",
             text: input.message,
             attachments: [],
-            dispatchMode: { type: "steer_active", targetRunId: input.childRunId },
+            dispatchMode: {
+              type: "steer_active",
+              targetRunId: input.childRunId,
+              onInactive: "reject",
+            },
           })
           .pipe(
             Effect.provideService(DispatchModeLimit, {
