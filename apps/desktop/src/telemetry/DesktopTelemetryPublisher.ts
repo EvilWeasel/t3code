@@ -1,5 +1,6 @@
 import {
   DesktopHostTelemetryMessage,
+  type DesktopMainRendererDiagnosticsReply,
   type DesktopHostTelemetrySnapshot,
   type DesktopTelemetryControlMessage,
   type DesktopTelemetryCancelDesktopUpdate,
@@ -8,6 +9,9 @@ import {
   type DesktopUpdateStatusReport,
   type HostPowerSnapshot,
 } from "@t3tools/contracts";
+import * as Crypto from "effect/Crypto";
+import * as Scope from "effect/Scope";
+import * as MainRendererDiagnostics from "../ipc/methods/mainRendererDiagnostics.ts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -58,12 +62,21 @@ interface HostPowerIntervals {
   readonly idle: Duration.Duration;
 }
 
+export interface DesktopTelemetryDiagnosticConnection {
+  readonly encoded: Stream.Stream<Uint8Array>;
+  readonly handleControl: (message: DesktopTelemetryControlMessage) => Effect.Effect<void>;
+  readonly closed: Effect.Effect<void>;
+}
+
 export class DesktopTelemetryPublisher extends Context.Service<
   DesktopTelemetryPublisher,
   {
     readonly latest: Effect.Effect<Option.Option<DesktopHostTelemetrySnapshot>>;
     readonly changes: Stream.Stream<DesktopHostTelemetrySnapshot>;
     readonly encoded: Stream.Stream<Uint8Array>;
+    readonly createDiagnosticsConnection?: (
+      sourceId: string,
+    ) => Effect.Effect<DesktopTelemetryDiagnosticConnection>;
     readonly handleControlForSource: (
       sourceId: string,
       message: DesktopTelemetryControlMessage,
@@ -147,6 +160,11 @@ function sampleInterval(
 
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
+  const diagnosticService = yield* Effect.serviceOption(
+    MainRendererDiagnostics.MainRendererDiagnostics,
+  );
+  const crypto = yield* Effect.serviceOption(Crypto.Crypto);
+  const scope = yield* Scope.Scope;
   const electronApp = yield* ElectronApp.ElectronApp;
   const powerMonitor = yield* ElectronPowerMonitor.ElectronPowerMonitor;
   const rendererHistory = yield* DesktopRendererHistory.DesktopRendererHistory;
@@ -325,6 +343,9 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
     message,
   ) => {
     switch (message.type) {
+      case "mainRendererDiagnosticsPeer":
+      case "mainRendererDiagnosticsRequest":
+        return Effect.void; // Legacy shared channel never negotiates or emits diagnostics.
       case "setDiagnosticsDemand":
         return Ref.modify(diagnosticsDemandSources, (sources) => {
           const previous = sources.size > 0;
@@ -418,6 +439,99 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
     latest: Ref.get(latest),
     changes: Stream.fromPubSub(changes),
     encoded,
+    createDiagnosticsConnection: (legacySourceId) =>
+      Effect.gen(function* () {
+        if (Option.isNone(diagnosticService) || Option.isNone(crypto))
+          return {
+            encoded,
+            handleControl: (message) => handleControlForSource(legacySourceId, message),
+            closed: Effect.void,
+          };
+        const nonce = yield* crypto.value.randomUUIDv4.pipe(Effect.option);
+        if (Option.isNone(nonce))
+          return {
+            encoded,
+            handleControl: (message) => handleControlForSource(legacySourceId, message),
+            closed: Effect.void,
+          };
+        const desktopNonce = nonce.value;
+        const service = diagnosticService.value;
+        const replies = yield* PubSub.unbounded<DesktopMainRendererDiagnosticsReply>();
+        let alive = true;
+        let serverNonce: string | undefined;
+        let busy = false;
+        const closed = Effect.gen(function* () {
+          if (!alive) return;
+          alive = false;
+          serverNonce = undefined;
+          yield* service.cancelSource(desktopNonce);
+          yield* PubSub.shutdown(replies);
+        });
+        const handleControl = (message: DesktopTelemetryControlMessage): Effect.Effect<void> =>
+          Effect.gen(function* () {
+            if (!alive) return;
+            if (message.type === "mainRendererDiagnosticsPeer") {
+              if (message.desktopNonce === desktopNonce && serverNonce === undefined)
+                serverNonce = message.serverNonce;
+              return;
+            }
+            if (message.type !== "mainRendererDiagnosticsRequest")
+              return yield* handleControlForSource(legacySourceId, message);
+            if (
+              message.desktopNonce !== desktopNonce ||
+              serverNonce !== message.serverNonce ||
+              busy
+            )
+              return;
+            busy = true;
+            const peer = serverNonce;
+            yield* service
+              .read(desktopNonce, () => alive && serverNonce === peer, message.input)
+              .pipe(
+                Effect.flatMap((result) =>
+                  alive && serverNonce === peer
+                    ? PubSub.publish(replies, {
+                        version: 1,
+                        type: "mainRendererDiagnosticsReply",
+                        desktopNonce,
+                        serverNonce: message.serverNonce,
+                        requestId: message.input.requestId,
+                        requestNonce: message.input.requestNonce,
+                        result,
+                      }).pipe(Effect.asVoid)
+                    : Effect.void,
+                ),
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    busy = false;
+                  }),
+                ),
+                Effect.forkIn(scope),
+                Effect.asVoid,
+              );
+          });
+        const boundEncoded = Stream.unwrap(
+          Effect.gen(function* () {
+            const subscription = yield* PubSub.subscribe(replies);
+            return Stream.concat(
+              Stream.make({
+                version: 1,
+                type: "desktopTelemetryHello",
+                electronPid: process.pid,
+                mainRendererDiagnostics: { revision: 1, desktopNonce },
+              } as const),
+              Stream.merge(
+                Stream.merge(snapshots, updateReports),
+                Stream.fromSubscription(subscription),
+              ),
+            );
+          }),
+        ).pipe(
+          Stream.filter(() => alive),
+          Stream.map((message) => textEncoder.encode(`${encodeMessage(message)}\n`)),
+        );
+        return { encoded: boundEncoded, handleControl, closed };
+      }),
     handleControlForSource,
     removeControlSource,
     publishUpdateReport,

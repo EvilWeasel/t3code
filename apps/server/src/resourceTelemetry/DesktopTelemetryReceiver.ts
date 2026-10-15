@@ -1,10 +1,13 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeNet from "node:net";
+import type { Readable } from "node:stream";
 
 import * as NodeStream from "@effect/platform-node/NodeStream";
 import {
   DesktopHostTelemetryMessage,
+  MainRendererDiagnosticsReadInput,
+  type MainRendererDiagnosticsReadResult,
   type DesktopHostTelemetryMessage as DesktopHostTelemetryMessageValue,
   type DesktopHostTelemetrySnapshot,
   DesktopTelemetryControlMessage,
@@ -12,6 +15,8 @@ import {
   type ResourceTelemetrySourceStatus,
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
+import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -151,6 +156,10 @@ export interface DesktopTelemetryReceiverHealth {
 export class DesktopTelemetryReceiver extends Context.Service<
   DesktopTelemetryReceiver,
   {
+    readonly readMainRendererDiagnostics?: (
+      input: MainRendererDiagnosticsReadInput,
+      servingEnvironmentId: string,
+    ) => Effect.Effect<MainRendererDiagnosticsReadResult>;
     readonly latest: Effect.Effect<Option.Option<DesktopHostTelemetrySnapshot>>;
     readonly changes: Stream.Stream<DesktopHostTelemetrySnapshot>;
     readonly subscribe: Effect.Effect<
@@ -329,9 +338,30 @@ export function requireDesktopTelemetryWriteProgress(
 }
 
 /** @public Service construction is part of the canonical Effect module API. */
-export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")(function* () {
+export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")(function* (io?: {
+  readonly readable?: Readable;
+  readonly write?: typeof writeAllToFileDescriptor;
+}) {
   const config = yield* ServerConfig.ServerConfig;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const crypto = yield* Effect.serviceOption(Crypto.Crypto);
+  let desktopNonce: string | undefined;
+  let serverNonce: string | undefined;
+  let diagnosticPending:
+    | {
+        readonly input: MainRendererDiagnosticsReadInput;
+        readonly deferred: Deferred.Deferred<MainRendererDiagnosticsReadResult>;
+      }
+    | undefined;
+  const unavailable = (
+    reason: Extract<MainRendererDiagnosticsReadResult, { status: "unavailable" }>["reason"],
+  ): MainRendererDiagnosticsReadResult => ({ status: "unavailable", reason });
+  const closeDiagnostics = () => {
+    desktopNonce = undefined;
+    serverNonce = undefined;
+    if (diagnosticPending)
+      Deferred.doneUnsafe(diagnosticPending.deferred, Effect.succeed(unavailable("source-closed")));
+  };
   const latest = yield* Ref.make(Option.none<DesktopHostTelemetrySnapshot>());
   const receiverStartedAt = yield* DateTime.now;
   const lastContactAtMs = yield* Ref.make(
@@ -392,7 +422,7 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
               }),
           ),
         );
-        yield* writeAllToFileDescriptor(fd, Buffer.from(`${encoded}\n`)).pipe(
+        yield* (io?.write ?? writeAllToFileDescriptor)(fd, Buffer.from(`${encoded}\n`)).pipe(
           Effect.tapError((error) =>
             updateHealth((current) => ({
               ...current,
@@ -468,7 +498,7 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
     // can be cancelled; filesystem reads would keep process.exit waiting.
     const readable = yield* Effect.acquireRelease(
       Effect.try({
-        try: () => new NodeNet.Socket({ fd, readable: true, writable: false }),
+        try: () => io?.readable ?? new NodeNet.Socket({ fd, readable: true, writable: false }),
         catch: (cause) => new DesktopTelemetryStreamFailed({ fd, cause }),
       }),
       (stream) =>
@@ -516,6 +546,10 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
           ),
         );
         if (message.type === "desktopTelemetryHello") {
+          if (message.mainRendererDiagnostics?.revision === 1 && desktopNonce === undefined)
+            desktopNonce = message.mainRendererDiagnostics.desktopNonce;
+          else if (desktopNonce !== message.mainRendererDiagnostics?.desktopNonce)
+            closeDiagnostics();
           return recordContact.pipe(
             Effect.andThen(
               updateHealth((current): DesktopTelemetryReceiverHealth => ({
@@ -527,6 +561,35 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
           );
         }
 
+        if (message.type === "mainRendererDiagnosticsReply") {
+          return Effect.gen(function* () {
+            const p = diagnosticPending;
+            if (
+              !p ||
+              desktopNonce !== message.desktopNonce ||
+              serverNonce !== message.serverNonce ||
+              p.input.requestId !== message.requestId ||
+              p.input.requestNonce !== message.requestNonce
+            )
+              return;
+            if (message.result.status === "ready") {
+              const response = message.result.response;
+              const target = p.input.target;
+              if (
+                response.binding.requestId !== p.input.requestId ||
+                response.binding.target.environmentId !== target.environmentId ||
+                response.binding.target.threadId !== target.threadId ||
+                response.binding.target.providerInstanceId !== target.providerInstanceId ||
+                response.result.status !== "ready" ||
+                response.result.gate.environmentId !== target.environmentId ||
+                response.result.gate.threadId !== target.threadId ||
+                response.result.gate.providerInstanceId !== target.providerInstanceId
+              )
+                return;
+            }
+            yield* Deferred.succeed(p.deferred, message.result);
+          });
+        }
         // Not a resource sample: do not touch `latest` or sample health.
         if (message.type === "desktopUpdateStatus") {
           return recordContact.pipe(
@@ -560,6 +623,7 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
           lastError: Option.some(error.message),
         })),
       ),
+      Effect.ensuring(Effect.sync(closeDiagnostics)),
       Effect.forkScoped,
     );
 
@@ -629,7 +693,68 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
     ).pipe(Effect.forkScoped);
   }
 
+  const readMainRendererDiagnostics: NonNullable<
+    DesktopTelemetryReceiver["Service"]["readMainRendererDiagnostics"]
+  > = (input, environmentId) =>
+    Effect.gen(function* () {
+      if (input.target.environmentId !== environmentId) return unavailable("target-mismatch");
+      const start = DateTime.toEpochMillis(yield* DateTime.now);
+      if (input.expiresAtMs <= start || input.expiresAtMs - start > 5_000)
+        return unavailable("expired");
+      if (
+        desktopNonce === undefined ||
+        config.desktopTelemetryControlFd === undefined ||
+        Option.isNone(crypto)
+      )
+        return unavailable("unsupported");
+      if (diagnosticPending) return unavailable("busy");
+      const nonce = yield* crypto.value.randomUUIDv4.pipe(Effect.option);
+      if (Option.isNone(nonce)) return unavailable("unsupported");
+      const pair = desktopNonce;
+      const peer = serverNonce ?? nonce.value;
+      serverNonce = peer;
+      const deferred = yield* Deferred.make<MainRendererDiagnosticsReadResult>();
+      const p = { input, deferred };
+      if (diagnosticPending) return unavailable("busy");
+      diagnosticPending = p;
+      return yield* Effect.gen(function* () {
+        yield* sendControlMessage({
+          version: 1,
+          type: "mainRendererDiagnosticsPeer",
+          desktopNonce: pair,
+          serverNonce: peer,
+        });
+        yield* sendControlMessage({
+          version: 1,
+          type: "mainRendererDiagnosticsRequest",
+          desktopNonce: pair,
+          serverNonce: peer,
+          input,
+        });
+        const result = yield* Deferred.await(deferred).pipe(Effect.timeoutOption("2 seconds"));
+        const now = DateTime.toEpochMillis(yield* DateTime.now);
+        if (now < start) return unavailable("clock-anomaly");
+        if (desktopNonce !== pair || serverNonce !== peer) return unavailable("source-closed");
+        if (Option.isNone(result)) return unavailable("timeout");
+        if (
+          result.value.status === "ready" &&
+          (now >= result.value.expiresAtMs ||
+            result.value.observedAtMs > now ||
+            result.value.expiresAtMs - result.value.observedAtMs > 5_000)
+        )
+          return unavailable("expired");
+        return result.value;
+      }).pipe(
+        Effect.catch(() => Effect.succeed(unavailable("source-closed"))),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (diagnosticPending === p) diagnosticPending = undefined;
+          }),
+        ),
+      );
+    });
   return DesktopTelemetryReceiver.of({
+    readMainRendererDiagnostics,
     latest: Ref.get(latest),
     changes: Stream.fromPubSub(changes),
     subscribe: snapshotMutex.withPermits(1)(

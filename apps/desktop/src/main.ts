@@ -64,6 +64,7 @@ import * as DesktopSshPasswordPrompts from "./ssh/DesktopSshPasswordPrompts.ts";
 import * as DesktopState from "./app/DesktopState.ts";
 import * as DesktopLegacyLocalStorage from "./app/DesktopLegacyLocalStorage.ts";
 import * as DesktopTelemetryPublisher from "./telemetry/DesktopTelemetryPublisher.ts";
+import * as MainRendererDiagnostics from "./ipc/methods/mainRendererDiagnostics.ts";
 import * as DesktopRendererHistory from "./telemetry/DesktopRendererHistory.ts";
 import * as DesktopUpdates from "./updates/DesktopUpdates.ts";
 import * as BrowserImport from "./preview/BrowserImport/BrowserImport.ts";
@@ -223,12 +224,18 @@ const layerDesktopAppActivation = DesktopAppActivation.layer.pipe(
 // the pool now; the legacy DesktopBackendManager service is gone. The
 // WSL second instance gets registered later in the migration. See
 // DesktopBackendPool.ts header for the full rollout plan.
+const layerMainRendererDiagnostics = MainRendererDiagnostics.layer.pipe(
+  Layer.provideMerge(layerDesktopWindow),
+);
+
 const layerDesktopBackend = DesktopBackendPool.layer.pipe(
   Layer.provideMerge(DesktopAppIdentity.layer),
   Layer.provideMerge(DesktopBackendConfiguration.layer),
   Layer.provideMerge(DesktopWslEnvironment.layer),
   Layer.provideMerge(DesktopWslServerTree.layer),
-  Layer.provideMerge(DesktopTelemetryPublisher.layer),
+  Layer.provideMerge(
+    DesktopTelemetryPublisher.layer.pipe(Layer.provideMerge(layerMainRendererDiagnostics)),
+  ),
   Layer.provideMerge(layerDesktopWindow),
 );
 

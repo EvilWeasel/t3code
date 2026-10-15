@@ -1,5 +1,6 @@
 import {
   CLIENT_GUARDED_RPC_SCOPES,
+  ServerTraceDiagnosticsInput,
   type DeviceListInput,
   clientRpcRequiredScopes,
   authScopeRequiredResponse,
@@ -253,6 +254,12 @@ const requiredScopesForRpcCall = (
   method: string,
   payload: unknown,
 ): ReadonlyArray<AuthEnvironmentScope> => {
+  if (method === WS_METHODS.serverGetTraceDiagnostics) {
+    const input = Schema.decodeUnknownSync(ServerTraceDiagnosticsInput)(payload);
+    return input.mainRendererSnapshot === undefined
+      ? [AuthDiagnosticsReadScope]
+      : [AuthDiagnosticsReadScope, AuthOrchestrationReadScope];
+  }
   if (method === WS_METHODS.serverRetryResourceTelemetry) {
     return [AuthEnvironmentMaintainScope, AuthDiagnosticsReadScope];
   }

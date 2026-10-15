@@ -1,5 +1,6 @@
 import type {
   DesktopBridge,
+  MainRendererDiagnosticsRequest,
   DesktopPreviewOpenLinkEvent,
   DesktopPreviewPointerEvent,
   DesktopPreviewRecordingInputEvent,
@@ -440,4 +441,15 @@ contextBridge.exposeInMainWorld("desktopBridge", {
         ipcRenderer.removeListener(IpcChannels.PREVIEW_OPEN_LINK_CHANNEL, wrappedListener);
     },
   },
+  onMainRendererDiagnosticsRequest: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, request: MainRendererDiagnosticsRequest) =>
+      listener(request);
+    ipcRenderer.on(IpcChannels.MAIN_RENDERER_DIAGNOSTICS_REQUEST_CHANNEL, handler);
+    return () =>
+      ipcRenderer.removeListener(IpcChannels.MAIN_RENDERER_DIAGNOSTICS_REQUEST_CHANNEL, handler);
+  },
+  respondMainRendererDiagnostics: (response) =>
+    ipcRenderer.invoke(IpcChannels.MAIN_RENDERER_DIAGNOSTICS_RESPONSE_CHANNEL, response),
+  invalidateMainRendererDiagnostics: (input) =>
+    ipcRenderer.invoke(IpcChannels.MAIN_RENDERER_DIAGNOSTICS_INVALIDATE_CHANNEL, input),
 } satisfies DesktopBridge);

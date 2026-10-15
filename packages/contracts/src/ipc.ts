@@ -1148,12 +1148,12 @@ export const MainRendererDiagnosticsTarget = Schema.Struct({
   environmentId: Schema.Literal("24efa85c-862c-4de4-9b5e-aaaa041e28a4"),
   threadId: Schema.Literal("7cd05d6b-5e09-4691-a664-0b56c6283f12"),
   providerInstanceId: Schema.NullOr(
-    TrimmedNonEmptyString.check(Schema.makeFilter((s) => s.length <= 128)),
+    TrimmedNonEmptyString.check(Schema.makeFilter((s: string) => s.length <= 128)),
   ),
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type MainRendererDiagnosticsTarget = typeof MainRendererDiagnosticsTarget.Type;
 const MainRendererDiagnosticsNonce = Schema.String.check(
-  Schema.makeFilter((s) => /^[a-zA-Z0-9:_-]{1,128}$/.test(s)),
+  Schema.makeFilter((s: string) => /^[a-zA-Z0-9:_-]{1,128}$/.test(s)),
 );
 export const MainRendererDiagnosticsRequest = Schema.Struct({
   version: Schema.Literal(1),
@@ -1167,7 +1167,7 @@ export const MainRendererDiagnosticsRequest = Schema.Struct({
   frameRoutingId: NonNegativeInt,
   navigationGeneration: NonNegativeInt,
   expiresAtMs: NonNegativeInt,
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type MainRendererDiagnosticsRequest = typeof MainRendererDiagnosticsRequest.Type;
 export const MainRendererDiagnosticsFacts = Schema.Struct({
   driver: Schema.Literals(["codex", "other", "unknown"]),
@@ -1180,7 +1180,7 @@ export const MainRendererDiagnosticsFacts = Schema.Struct({
   permissionState: Schema.Literals(["known", "pending", "unavailable"]),
   canOperate: Schema.NullOr(Schema.Boolean),
   selectionCurrent: Schema.Boolean,
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export const MainRendererDiagnosticsReason = Schema.NullOr(
   Schema.Literals([
     "Open an existing thread to start Live voice.",
@@ -1243,7 +1243,7 @@ export const MainRendererDiagnosticsGate = Schema.Struct({
       "unclassified",
     ]),
   ),
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type MainRendererDiagnosticsGate = typeof MainRendererDiagnosticsGate.Type;
 export const MainRendererDiagnosticsResponse = Schema.Struct({
   binding: MainRendererDiagnosticsRequest,
@@ -1256,14 +1256,49 @@ export const MainRendererDiagnosticsResponse = Schema.Struct({
       reason: Schema.Literals(["target-mismatch", "context-changed", "unmounted"]),
     }),
   ]),
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type MainRendererDiagnosticsResponse = typeof MainRendererDiagnosticsResponse.Type;
 export const MainRendererDiagnosticsInvalidation = Schema.Struct({
   binding: MainRendererDiagnosticsRequest,
   rendererEpoch: PositiveInt,
   revision: PositiveInt,
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type MainRendererDiagnosticsInvalidation = typeof MainRendererDiagnosticsInvalidation.Type;
+
+export const MainRendererDiagnosticsReadInput = Schema.Struct({
+  requestId: MainRendererDiagnosticsNonce,
+  requestNonce: MainRendererDiagnosticsNonce,
+  target: MainRendererDiagnosticsTarget,
+  optIn: Schema.Literal(true),
+  expiresAtMs: NonNegativeInt,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type MainRendererDiagnosticsReadInput = typeof MainRendererDiagnosticsReadInput.Type;
+export const MainRendererDiagnosticsReadResult = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("ready"),
+    response: MainRendererDiagnosticsResponse,
+    appVersion: TrimmedNonEmptyString,
+    observedAtMs: NonNegativeInt,
+    expiresAtMs: NonNegativeInt,
+  }),
+  Schema.Struct({
+    status: Schema.Literal("unavailable"),
+    reason: Schema.Literals([
+      "unsupported",
+      "off",
+      "busy",
+      "target-mismatch",
+      "expired",
+      "clock-anomaly",
+      "timeout",
+      "not-main",
+      "context-changed",
+      "source-closed",
+      "invalid-response",
+    ]),
+  }),
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type MainRendererDiagnosticsReadResult = typeof MainRendererDiagnosticsReadResult.Type;
 
 export interface DesktopBridge {
   /** Passive, finite request only; absence means no diagnostic capability. */

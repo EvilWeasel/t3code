@@ -233,6 +233,7 @@ interface RunBackendProcessOptions extends DesktopBackendStartConfig {
   readonly onDesktopTelemetryControl?: (
     message: DesktopTelemetryControlMessageValue,
   ) => Effect.Effect<void>;
+  readonly onDesktopTelemetryControlClosed?: Effect.Effect<void>;
   readonly readinessTimeout?: Duration.Duration;
   readonly outputDrainTimeout?: Duration.Duration;
   readonly onStarted?: (pid: number) => Effect.Effect<void>;
@@ -556,6 +557,7 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
           cause: Cause.pretty(cause),
         }),
       ),
+      Effect.ensuring(options.onDesktopTelemetryControlClosed ?? Effect.void),
       Effect.ensuring(
         handleControl({
           version: 1,
@@ -957,14 +959,23 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           );
         });
 
+        const diagnosticConnection = yield* (
+          desktopTelemetryPublisher.createDiagnosticsConnection?.(spec.id) ??
+            Effect.succeed(undefined)
+        );
         const program = runBackendProcess({
           ...config.value,
-          desktopTelemetryStream: desktopTelemetryPublisher.encoded,
+          desktopTelemetryStream:
+            diagnosticConnection?.encoded ?? desktopTelemetryPublisher.encoded,
           // Only a bootstrap that names the browser fds (the local primary) gets them.
           desktopBrowserStream: desktopBrowserHost.events,
           onDesktopBrowserCommand: desktopBrowserHost.handleCommandLine,
           onDesktopTelemetryControl: (message) =>
+            diagnosticConnection?.handleControl(message) ??
             desktopTelemetryPublisher.handleControlForSource(spec.id, message),
+          ...(diagnosticConnection === undefined
+            ? {}
+            : { onDesktopTelemetryControlClosed: diagnosticConnection.closed }),
           onStarted: Effect.fn("desktop.backendInstance.onStarted")(function* (pid) {
             yield* updateActiveRun(runId, (run) => ({
               ...run,
@@ -1029,6 +1040,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
             onFailure: (error) => finalizeRun(error.message),
             onSuccess: (exit) => finalizeRun(exit.reason, Option.getOrUndefined(exit.code)),
           }),
+          Effect.ensuring(diagnosticConnection?.closed ?? Effect.void),
           Effect.ensuring(Scope.close(runScope, Exit.void).pipe(Effect.ignore)),
         );
 

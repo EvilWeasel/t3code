@@ -2,7 +2,11 @@ import * as Schema from "effect/Schema";
 
 import { NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { HostPowerSnapshot } from "./background.ts";
-import { DesktopUpdateStateSchema } from "./ipc.ts";
+import {
+  MainRendererDiagnosticsReadInput,
+  MainRendererDiagnosticsReadResult,
+  DesktopUpdateStateSchema,
+} from "./ipc.ts";
 
 export const RESOURCE_MONITOR_PROTOCOL_VERSION = 3 as const;
 
@@ -272,10 +276,17 @@ export const DesktopHostTelemetrySnapshot = Schema.Struct({
 });
 export type DesktopHostTelemetrySnapshot = typeof DesktopHostTelemetrySnapshot.Type;
 
+const DesktopDiagnosticsNonce = Schema.String.check(
+  Schema.makeFilter((value: string) => /^[a-zA-Z0-9:_-]{1,128}$/.test(value)),
+);
+
 export const DesktopHostTelemetryHello = Schema.Struct({
   version: Schema.Literal(1),
   type: Schema.Literal("desktopTelemetryHello"),
   electronPid: PositiveInt,
+  mainRendererDiagnostics: Schema.optionalKey(
+    Schema.Struct({ revision: Schema.Literal(1), desktopNonce: DesktopDiagnosticsNonce }),
+  ),
 });
 export type DesktopHostTelemetryHello = typeof DesktopHostTelemetryHello.Type;
 
@@ -306,10 +317,35 @@ export const DesktopUpdateStatusReport = Schema.Struct({
 });
 export type DesktopUpdateStatusReport = typeof DesktopUpdateStatusReport.Type;
 
+export const DesktopMainRendererDiagnosticsReply = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("mainRendererDiagnosticsReply"),
+  desktopNonce: DesktopDiagnosticsNonce,
+  serverNonce: DesktopDiagnosticsNonce,
+  requestId: TrimmedNonEmptyString,
+  requestNonce: TrimmedNonEmptyString,
+  result: MainRendererDiagnosticsReadResult,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type DesktopMainRendererDiagnosticsReply = typeof DesktopMainRendererDiagnosticsReply.Type;
+export const DesktopMainRendererDiagnosticsPeer = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("mainRendererDiagnosticsPeer"),
+  desktopNonce: DesktopDiagnosticsNonce,
+  serverNonce: DesktopDiagnosticsNonce,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export const DesktopMainRendererDiagnosticsRequest = Schema.Struct({
+  version: Schema.Literal(1),
+  type: Schema.Literal("mainRendererDiagnosticsRequest"),
+  desktopNonce: DesktopDiagnosticsNonce,
+  serverNonce: DesktopDiagnosticsNonce,
+  input: MainRendererDiagnosticsReadInput,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+
 export const DesktopHostTelemetryMessage = Schema.Union([
   DesktopHostTelemetryHello,
   DesktopHostTelemetrySnapshot,
   DesktopUpdateStatusReport,
+  DesktopMainRendererDiagnosticsReply,
 ]);
 export type DesktopHostTelemetryMessage = typeof DesktopHostTelemetryMessage.Type;
 
@@ -357,6 +393,8 @@ export type DesktopTelemetryCancelDesktopUpdate = typeof DesktopTelemetryCancelD
 
 export const DesktopTelemetryControlMessage = Schema.Union([
   DesktopTelemetrySetDiagnosticsDemand,
+  DesktopMainRendererDiagnosticsPeer,
+  DesktopMainRendererDiagnosticsRequest,
   DesktopTelemetrySetHostPowerIntervals,
   DesktopTelemetryRequestDesktopUpdate,
   DesktopTelemetryCommitDesktopUpdate,

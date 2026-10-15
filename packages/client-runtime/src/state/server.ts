@@ -1,6 +1,7 @@
 import {
   type EnvironmentId,
   type ServerConfig,
+  ServerTraceDiagnosticsResult,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
   type ServerLifecycleStreamReadyEvent,
@@ -1067,9 +1068,12 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:provider:install-remove",
       tag: WS_METHODS.providerInstallRemove,
     }),
-    traceDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {
+    traceDiagnostics: createEnvironmentQueryAtomFamily(runtime, {
       label: "environment-data:server:trace-diagnostics",
-      tag: WS_METHODS.serverGetTraceDiagnostics,
+      execute: (_input: Record<string, never>) =>
+        request(WS_METHODS.serverGetTraceDiagnostics, {}).pipe(
+          Effect.flatMap(Schema.decodeUnknownEffect(ServerTraceDiagnosticsResult)),
+        ),
     }),
     processDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:process-diagnostics",

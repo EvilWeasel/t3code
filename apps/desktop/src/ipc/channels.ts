@@ -124,3 +124,10 @@ export const CANCEL_PROVIDER_AUTH_CALLBACK_CHANNEL = "desktop:cancel-provider-au
 export const TAKE_LEGACY_LOCAL_STORAGE_CHANNEL = "desktop:take-legacy-local-storage";
 export const COMPLETE_LEGACY_LOCAL_STORAGE_CHANNEL = "desktop:complete-legacy-local-storage";
 export const UPDATE_READINESS_CHANNEL = "desktop:update-readiness";
+
+export const MAIN_RENDERER_DIAGNOSTICS_REQUEST_CHANNEL =
+  "desktop:main-renderer-diagnostics:request";
+export const MAIN_RENDERER_DIAGNOSTICS_RESPONSE_CHANNEL =
+  "desktop:main-renderer-diagnostics:response";
+export const MAIN_RENDERER_DIAGNOSTICS_INVALIDATE_CHANNEL =
+  "desktop:main-renderer-diagnostics:invalidate";

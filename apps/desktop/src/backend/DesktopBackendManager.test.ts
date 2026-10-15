@@ -1673,3 +1673,50 @@ describe("DesktopBackendManager", () => {
     ),
   );
 });
+
+it.effect(
+  "closes the bound diagnostic attempt on command EOF while its input consumer remains alive",
+  () =>
+    Effect.gen(function* () {
+      const inputStarted = yield* Deferred.make<void>();
+      const inputRelease = yield* Deferred.make<void>();
+      const controlClosed = yield* Deferred.make<void>();
+      const exit = yield* Deferred.make<void>();
+      let inputEnded = false;
+      const layerSpawner = Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() =>
+          Effect.succeed(
+            makeProcess({
+              getOutputFd: () => Stream.fromEffect(Deferred.await(inputStarted)).pipe(Stream.drain),
+              exitCode: Deferred.await(exit).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+            }),
+          ),
+        ),
+      );
+      const running = yield* DesktopBackendManager.runBackendProcess({
+        ...baseConfig,
+        desktopTelemetryStream: Stream.fromEffect(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(inputStarted, undefined);
+            yield* Deferred.await(inputRelease);
+            inputEnded = true;
+            return new Uint8Array();
+          }),
+        ),
+        onDesktopTelemetryControl: () => Effect.void,
+        onDesktopTelemetryControlClosed: Deferred.succeed(controlClosed, undefined).pipe(
+          Effect.asVoid,
+        ),
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(Layer.merge(layerSpawner, layerHealthyHttpClient)),
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(controlClosed);
+      assert.equal(inputEnded, false);
+      yield* Deferred.succeed(inputRelease, undefined);
+      yield* Deferred.succeed(exit, undefined);
+      assert.equal((yield* Fiber.join(running)).code.pipe(Option.getOrUndefined), 0);
+    }).pipe(Effect.scoped),
+);

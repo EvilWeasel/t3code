@@ -228,6 +228,7 @@ import * as HostResources from "./resourceTelemetry/HostResources.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as UsageService from "./usage/UsageService.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
+import * as DesktopTelemetryReceiver from "./resourceTelemetry/DesktopTelemetryReceiver.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
 import * as PullRequestReviewGuideService from "./pullRequest/PullRequestReviewGuideService.ts";
 import { listLinkedPullRequestThreads } from "./pullRequest/linkedThreads.ts";
@@ -1306,6 +1307,7 @@ const layerWsRpc = (
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+      const desktopDiagnostics = yield* DesktopTelemetryReceiver.DesktopTelemetryReceiver;
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
       yield* Effect.addFinalizer(() =>
@@ -2438,11 +2440,43 @@ const layerWsRpc = (
             return ServerSettings.redactServerSettingsForClient(settings);
           }),
         [WS_METHODS.serverDiscoverSourceControl]: (_input) => sourceControlDiscovery.discover,
-        [WS_METHODS.serverGetTraceDiagnostics]: (_input) =>
-          TraceDiagnostics.readTraceDiagnostics({
-            traceFilePath: config.serverTracePath,
-            maxFiles: config.traceMaxFiles,
-          }),
+        [WS_METHODS.serverGetTraceDiagnostics]: (input) => {
+          const request = input.mainRendererSnapshot;
+          if (request === undefined)
+            return TraceDiagnostics.readTraceDiagnostics({
+              traceFilePath: config.serverTracePath,
+              maxFiles: config.traceMaxFiles,
+            });
+          return authorizeEffect(
+            AuthOrchestrationReadScope,
+            Effect.gen(function* () {
+              const environmentId = yield* serverEnvironment.getEnvironmentId;
+              if (environmentId !== request.target.environmentId)
+                return {
+                  mainRendererSnapshot: {
+                    status: "unavailable" as const,
+                    reason: "target-mismatch" as const,
+                  },
+                };
+              // Exact authorized thread read, metadata only: no transcript or provider work.
+              const thread = yield* threadManagement
+                .getThreadRecords(ThreadId.make(request.target.threadId), [])
+                .pipe(Effect.option);
+              if (Option.isNone(thread))
+                return {
+                  mainRendererSnapshot: {
+                    status: "unavailable" as const,
+                    reason: "target-mismatch" as const,
+                  },
+                };
+              const result =
+                desktopDiagnostics.readMainRendererDiagnostics === undefined
+                  ? { status: "unavailable" as const, reason: "unsupported" as const }
+                  : yield* desktopDiagnostics.readMainRendererDiagnostics(request, environmentId);
+              return { mainRendererSnapshot: result };
+            }),
+          );
+        },
         [WS_METHODS.serverGetProcessDiagnostics]: (_input) => processDiagnostics.read,
         [WS_METHODS.serverGetHostResources]: (_input) => hostResources.read,
         [WS_METHODS.serverGetProcessResourceHistory]: (input) =>

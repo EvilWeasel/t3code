@@ -451,3 +451,75 @@ it.effect("denies manual cleanup before the handler without settings permission"
     expect(handled).toBe(false);
   }).pipe(Effect.scoped),
 );
+
+it.effect(
+  "requires independent diagnostics and orchestration read grants for the exact renderer selector",
+  () =>
+    Effect.gen(function* () {
+      const group = WsRpcGroup.omit(
+        ...[...WsRpcGroup.requests.keys()].filter(
+          (
+            tag,
+          ): tag is Exclude<
+            keyof typeof RPC_REQUIRED_SCOPES,
+            typeof WS_METHODS.serverGetTraceDiagnostics
+          > => tag !== WS_METHODS.serverGetTraceDiagnostics,
+        ),
+      );
+      const input = {
+        mainRendererSnapshot: {
+          requestId: "read",
+          requestNonce: "nonce",
+          optIn: true as const,
+          expiresAtMs: 5_000,
+          target: {
+            environmentId: "24efa85c-862c-4de4-9b5e-aaaa041e28a4" as const,
+            threadId: "7cd05d6b-5e09-4691-a664-0b56c6283f12" as const,
+            providerInstanceId: "codex",
+          },
+        },
+      };
+      for (const scopes of [
+        [AuthDiagnosticsReadScope],
+        [AuthOrchestrationReadScope],
+        [AuthDiagnosticsReadScope, AuthOrchestrationReadScope],
+      ]) {
+        let handled = 0;
+        const client = yield* RpcTest.makeClient(group).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              group.toLayerHandler(WS_METHODS.serverGetTraceDiagnostics, () =>
+                Effect.sync(() => {
+                  handled++;
+                  return {
+                    mainRendererSnapshot: {
+                      status: "unavailable" as const,
+                      reason: "unsupported" as const,
+                    },
+                  };
+                }),
+              ),
+              RpcAuthorization.layer(scopes),
+            ),
+          ),
+        );
+        if (scopes.length === 1) {
+          const error = yield* client[WS_METHODS.serverGetTraceDiagnostics](input).pipe(
+            Effect.flip,
+          );
+          expect(error).toMatchObject({
+            requiredPermission:
+              scopes[0] === AuthDiagnosticsReadScope
+                ? AuthOrchestrationReadScope
+                : AuthDiagnosticsReadScope,
+          });
+          expect(handled).toBe(0);
+        } else {
+          expect(yield* client[WS_METHODS.serverGetTraceDiagnostics](input)).toEqual({
+            mainRendererSnapshot: { status: "unavailable", reason: "unsupported" },
+          });
+          expect(handled).toBe(1);
+        }
+      }
+    }).pipe(Effect.scoped),
+);

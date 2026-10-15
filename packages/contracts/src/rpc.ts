@@ -25,6 +25,7 @@ import * as Schema from "effect/Schema";
 import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
+import { MainRendererDiagnosticsReadInput, MainRendererDiagnosticsReadResult } from "./ipc.ts";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import {
   CodexAuthCallbackInput,
@@ -870,9 +871,15 @@ const WsServerLogoutAcpRegistryRpc = Rpc.make(WS_METHODS.serverLogoutAcpRegistry
   error: Schema.Union([AcpRegistryOperationError, EnvironmentAuthorizationError]),
 });
 
+export const ServerTraceDiagnosticsInput = Schema.Struct({
+  mainRendererSnapshot: Schema.optionalKey(MainRendererDiagnosticsReadInput),
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 const WsServerGetTraceDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetTraceDiagnostics, {
-  payload: Schema.Struct({}),
-  success: ServerTraceDiagnosticsResult,
+  payload: ServerTraceDiagnosticsInput,
+  success: Schema.Union([
+    ServerTraceDiagnosticsResult,
+    Schema.Struct({ mainRendererSnapshot: MainRendererDiagnosticsReadResult }),
+  ]),
   error: EnvironmentAuthorizationError,
 });
 

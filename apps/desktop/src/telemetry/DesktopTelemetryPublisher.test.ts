@@ -9,6 +9,7 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -18,6 +19,7 @@ import * as TestClock from "effect/testing/TestClock";
 import type * as Electron from "electron";
 import * as NodeEvents from "node:events";
 
+import * as MainRendererDiagnostics from "../ipc/methods/mainRendererDiagnostics.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronPowerMonitor from "../electron/ElectronPowerMonitor.ts";
@@ -788,3 +790,125 @@ describe("DesktopRendererHistory", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
+
+it.effect(
+  "keeps legacy streams diagnostic-free and binds replies to exactly one negotiated attempt",
+  () =>
+    Effect.gen(function* () {
+      const readStarted = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let reads = 0;
+      let closed = 0;
+      const layer = DesktopTelemetryPublisher.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            layerElectronApp([]),
+            layerHistory,
+            Layer.mock(ElectronPowerMonitor.ElectronPowerMonitor)({
+              isOnBatteryPower: Effect.succeed(false),
+              getSystemIdleTime: Effect.succeed(0),
+              getSystemIdleState: () => Effect.succeed("active"),
+              getCurrentThermalState: Effect.succeed("nominal"),
+              onSimpleEvent: () => Effect.void,
+              onThermalStateChange: () => Effect.void,
+              onSpeedLimitChange: () => Effect.void,
+            }),
+            Layer.mock(MainRendererDiagnostics.MainRendererDiagnostics)({
+              read: () =>
+                Effect.gen(function* () {
+                  reads++;
+                  yield* Deferred.succeed(readStarted, undefined);
+                  yield* Deferred.await(release);
+                  return { status: "unavailable" as const, reason: "off" as const };
+                }),
+              cancelSource: () =>
+                Effect.sync(() => {
+                  closed++;
+                }),
+            }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* DesktopTelemetryPublisher.DesktopTelemetryPublisher;
+        const old = Option.getOrThrow(yield* Stream.runHead(service.encoded));
+        const decode = Schema.decodeUnknownSync(Schema.fromJsonString(DesktopHostTelemetryMessage));
+        const oldHello = decode(new TextDecoder().decode(old));
+        assert.equal(oldHello.type, "desktopTelemetryHello");
+        if (oldHello.type === "desktopTelemetryHello")
+          assert.equal(oldHello.mainRendererDiagnostics, undefined);
+        const connection = yield* service.createDiagnosticsConnection!("same-backend");
+        const received = yield* Queue.unbounded<DesktopHostTelemetryMessage>();
+        yield* connection.encoded.pipe(
+          Stream.runForEach((bytes) =>
+            Queue.offer(received, decode(new TextDecoder().decode(bytes))),
+          ),
+          Effect.forkScoped,
+        );
+        const hello = yield* Queue.take(received);
+        assert.equal(hello.type, "desktopTelemetryHello");
+        if (hello.type !== "desktopTelemetryHello" || !hello.mainRendererDiagnostics)
+          return assert.fail("missing paired hello");
+        const nonce = hello.mainRendererDiagnostics.desktopNonce;
+        const input = {
+          requestId: "read",
+          requestNonce: "nonce",
+          optIn: true as const,
+          expiresAtMs: 5_000,
+          target: {
+            environmentId: "24efa85c-862c-4de4-9b5e-aaaa041e28a4" as const,
+            threadId: "7cd05d6b-5e09-4691-a664-0b56c6283f12" as const,
+            providerInstanceId: "codex",
+          },
+        };
+        yield* connection.handleControl({
+          version: 1,
+          type: "mainRendererDiagnosticsRequest",
+          desktopNonce: nonce,
+          serverNonce: "server",
+          input,
+        });
+        assert.equal(reads, 0);
+        yield* connection.handleControl({
+          version: 1,
+          type: "mainRendererDiagnosticsPeer",
+          desktopNonce: nonce,
+          serverNonce: "server",
+        });
+        yield* connection.handleControl({
+          version: 1,
+          type: "mainRendererDiagnosticsRequest",
+          desktopNonce: nonce,
+          serverNonce: "server",
+          input,
+        });
+        yield* Deferred.await(readStarted);
+        yield* connection.closed;
+        yield* Deferred.succeed(release, undefined);
+        assert.equal(closed, 1);
+        const replacement = yield* service.createDiagnosticsConnection!("same-backend");
+        const replacementHello = decode(
+          new TextDecoder().decode(Option.getOrThrow(yield* Stream.runHead(replacement.encoded))),
+        );
+        assert.equal(replacementHello.type, "desktopTelemetryHello");
+        if (replacementHello.type === "desktopTelemetryHello")
+          assert.notEqual(replacementHello.mainRendererDiagnostics?.desktopNonce, nonce);
+        yield* replacement.handleControl({
+          version: 1,
+          type: "mainRendererDiagnosticsPeer",
+          desktopNonce: nonce,
+          serverNonce: "server",
+        });
+        yield* replacement.handleControl({
+          version: 1,
+          type: "mainRendererDiagnosticsRequest",
+          desktopNonce: nonce,
+          serverNonce: "server",
+          input,
+        });
+        assert.equal(reads, 1);
+        yield* replacement.closed;
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.scoped),
+);
