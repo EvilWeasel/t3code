@@ -1,5 +1,13 @@
-import { EnvironmentId, type ServerSelfUpdateCapability } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ServerSelfUpdateCapability,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import * as Cause from "effect/Cause";
+import { AsyncResult } from "effect/reactivity";
+import { getProviderUpdateRunOutcome } from "../ProviderUpdateLaunchNotification.logic";
 
 import {
   collectRestartingMachines,
@@ -236,7 +244,7 @@ describe("update everything summary", () => {
     ],
     providers: [
       { status: "updated" },
-      { status: "interrupted" },
+      { status: "interrupted", line: "Laptop · Codex: Update was interrupted." },
       { status: "failed", line: "box · Codex: npm exited with code 1." },
     ],
   });
@@ -251,7 +259,7 @@ describe("update everything summary", () => {
         "alvin: Download failed.",
         "box · Codex: npm exited with code 1.",
       ],
-      skipped: ["busy: Update was not started."],
+      skipped: ["busy: Update was not started.", "Laptop · Codex: Update was interrupted."],
     });
   });
 
@@ -264,12 +272,13 @@ describe("update everything summary", () => {
         "alvin: Download failed.",
         "box · Codex: npm exited with code 1.",
         "Skipped busy: Update was not started.",
+        "Skipped Laptop · Codex: Update was interrupted.",
       ].join("\n"),
     });
     expect(getUpdateEverythingToastView({ ...result, failures: [] }, "0.0.40")).toEqual({
       type: "success",
       title: "Updated 2 servers and 1 provider",
-      description: "Skipped busy: Update was not started.",
+      description: "Skipped busy: Update was not started.\nSkipped Laptop · Codex: Update was interrupted.",
     });
   });
 
@@ -297,6 +306,61 @@ describe("update everything relaunch handoff", () => {
     updatedProviders: 1,
     failures: ["offline: Could not connect"],
   };
+
+  it("preserves labelled provider interruptions beside successes and failures after relaunch", async () => {
+    const baseRun = {
+      environmentId: EnvironmentId.make("Laptop"),
+      machineLabel: "Laptop",
+      driver: ProviderDriverKind.make("codex"),
+      instanceId: ProviderInstanceId.make("codex"),
+    };
+    const interrupted = getProviderUpdateRunOutcome({
+      ...baseRun, result: AsyncResult.failure(Cause.interrupt()),
+    });
+    const failed = getProviderUpdateRunOutcome({
+      ...baseRun, machineLabel: "Server",
+      result: AsyncResult.failure(Cause.die(new Error("Installer failed"))),
+    });
+    const remote = await runUpdateEverything({
+      downloadLocal: async () => true,
+      updateProviders: async () => [{ status: "updated" } as const, failed, interrupted],
+      updateServers: async () => [
+        { label: "ready", outcome: { status: "updated" } as const },
+      ],
+    });
+    const result = collectUpdateEverythingResult({
+      localVersion: "0.0.50", localFailures: [],
+      servers: remote.servers, providers: remote.providers,
+    });
+    const storage = makeStorage();
+    expect(await installAfterUpdateEverything({
+      result, localReady: remote.localReady,
+      save: (value) => persistUpdateEverythingResult(value, storage, 1_000),
+      install: async () => true,
+      clear: () => clearUpdateEverythingResult(storage),
+    })).toBe("relaunching");
+    const restored = takeUpdateEverythingResult(storage, 2_000);
+    expect(restored).toMatchObject({
+      localVersion: "0.0.50", updatedServers: 1, updatedProviders: 1,
+      failures: ["Server · Codex: Installer failed"],
+      skipped: ["Laptop · Codex: Update was interrupted."],
+    });
+    if (restored === null) throw new Error("The saved summary was lost");
+    expect(getUpdateEverythingToastView(restored, "0.0.50")).toEqual({
+      type: "error", title: "Updated this app, 1 server, and 1 provider",
+      description: "Server · Codex: Installer failed\nSkipped Laptop · Codex: Update was interrupted.",
+    });
+    const onlyInterrupted = collectUpdateEverythingResult({
+      localVersion: null, localFailures: [], servers: [], providers: [interrupted],
+    });
+    expect(persistUpdateEverythingResult(onlyInterrupted, storage, 3_000)).toBe(true);
+    const restoredInterruption = takeUpdateEverythingResult(storage, 4_000);
+    if (restoredInterruption === null) throw new Error("The interruption summary was lost");
+    expect(getUpdateEverythingToastView(restoredInterruption, "0.0.50")).toEqual({
+      type: "error", title: "Updates skipped",
+      description: "Skipped Laptop · Codex: Update was interrupted.",
+    });
+  });
 
   it("retains partial remote results and local intent across a successful relaunch", async () => {
     const storage = makeStorage();

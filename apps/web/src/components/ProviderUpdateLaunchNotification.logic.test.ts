@@ -22,6 +22,7 @@ import {
   getProviderUpdateProgressToastView,
   getProviderUpdateRejectedToastView,
   getProviderUpdateRunToastView,
+  getProviderUpdateRunOutcome,
   getProviderUpdateSidebarPillView,
   hasOneClickUpdateProviderCandidate,
   isProviderUpdateCandidate,
@@ -1118,6 +1119,15 @@ describe("getProviderUpdateRunToastView", () => {
       title: "2 of 3 provider updates failed",
       description: "Mac Studio · Claude: npm exited with code 1.\nLaptop · Codex: WebSocket closed",
     });
+  });
+
+  it("retains the machine and provider of an interrupted update for aggregate results", () => {
+    const interrupted = run("Laptop", "codex", AsyncResult.failure(Cause.interrupt()));
+    expect(getProviderUpdateRunOutcome(interrupted)).toEqual({
+      status: "interrupted",
+      line: "Laptop · Codex: Update was interrupted.",
+    });
+    expect(getProviderUpdateRunToastView([interrupted])).toBeNull();
   });
 
   it("reports success when every update succeeded", () => {

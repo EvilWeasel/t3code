@@ -344,16 +344,20 @@ export interface ProviderUpdateRun {
 }
 
 /**
- * What one provider update in a cross-machine run did. A failure carries a
+ * What one provider update in a cross-machine run did. An unfinished update carries a
  * line that names the machine and provider, such as "alvin · Codex: npm exited".
  */
+export type ProviderUpdateRunOutcome =
+  | { readonly status: "updated" }
+  | { readonly status: "failed" | "interrupted"; readonly line: string };
+
 export function getProviderUpdateRunOutcome(
   run: ProviderUpdateRun,
-):
-  | { readonly status: "interrupted" | "updated" }
-  | { readonly status: "failed"; readonly line: string } {
-  if (isAtomCommandInterrupted(run.result)) return { status: "interrupted" };
+): ProviderUpdateRunOutcome {
   const label = `${run.machineLabel} · ${PROVIDER_DISPLAY_NAMES[run.driver] ?? run.driver}`;
+  if (isAtomCommandInterrupted(run.result)) {
+    return { status: "interrupted", line: `${label}: Update was interrupted.` };
+  }
   if (run.result._tag === "Failure") {
     const error = squashAtomCommandFailure(run.result);
     return {

@@ -132,6 +132,7 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
         machines: Array.from(machinesById.values()),
       }));
       const failedProviderMachines = new Set<UpdateRunMachine["environmentId"]>();
+      const interruptedProviderMachines = new Set<UpdateRunMachine["environmentId"]>();
       try {
         const outcome = await runUpdateEverything({
           ...(downloadLocal ? { downloadLocal: () => downloadLocal(reportLocalError) } : {}),
@@ -139,15 +140,19 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
             const runs = await providers.updateAll({ quiet: true });
             const outcomes = runs.map((run) => {
               const runOutcome = getProviderUpdateRunOutcome(run);
-              // An interrupted update did not finish either, so its row is not "done".
-              if (runOutcome.status !== "updated") failedProviderMachines.add(run.environmentId);
+              if (runOutcome.status === "failed") failedProviderMachines.add(run.environmentId);
+              if (runOutcome.status === "interrupted") {
+                interruptedProviderMachines.add(run.environmentId);
+              }
               return runOutcome;
             });
             for (const machine of machinesById.values()) {
               if (!machine.updatesServer) {
                 settleUpdateRunMachine(
                   machine.environmentId,
-                  failedProviderMachines.has(machine.environmentId) ? "failed" : "done",
+                  failedProviderMachines.has(machine.environmentId)
+                    ? "failed"
+                    : interruptedProviderMachines.has(machine.environmentId) ? "skipped" : "done",
                 );
               }
             }
@@ -162,7 +167,10 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
                   server.environmentId,
                   serverOutcome.status === "failed" ||
                     failedProviderMachines.has(server.environmentId)
-                    ? "failed" : serverOutcome.status === "skipped" ? "skipped" : "done",
+                    ? "failed"
+                    : serverOutcome.status === "skipped" ||
+                        interruptedProviderMachines.has(server.environmentId)
+                      ? "skipped" : "done",
                 );
                 return { label: server.serverLabel, outcome: serverOutcome };
               }),

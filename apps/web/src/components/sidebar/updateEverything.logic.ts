@@ -11,6 +11,7 @@ import {
   supportsServerUpdateThreadContinuation,
 } from "~/versionSkew";
 import type { ServerUpdateOutcome, ServerUpdateTarget } from "../ServerUpdateAction";
+import type { ProviderUpdateRunOutcome } from "../ProviderUpdateLaunchNotification.logic";
 
 export interface UpdateEverythingMachine {
   readonly environmentId: EnvironmentId;
@@ -343,15 +344,13 @@ export function collectUpdateEverythingResult(input: {
     readonly label: string;
     readonly outcome: ServerUpdateOutcome;
   }>;
-  readonly providers: ReadonlyArray<
-    | { readonly status: "interrupted" | "updated" }
-    | { readonly status: "failed"; readonly line: string }
-  >;
+  readonly providers: ReadonlyArray<ProviderUpdateRunOutcome>;
 }): UpdateEverythingResult {
   const skipped = [
     ...(input.skipped ?? []).map((machine) => `${machine.label}: ${machine.reason}`),
     ...input.servers.flatMap(({ label, outcome }) => outcome.status === "skipped"
       ? [`${label}: ${outcome.message ?? "Update was not started."}`] : []),
+    ...input.providers.flatMap((outcome) => outcome.status === "interrupted" ? [outcome.line] : []),
   ];
   return {
     localVersion: input.localVersion,
@@ -372,8 +371,8 @@ export function collectUpdateEverythingResult(input: {
  * The one toast for a finished pass, such as "Updated this app, 8 servers,
  * and 3 providers" with a line per failure. `appVersion` is the version this
  * app runs now: after the relaunch it tells whether the local install
- * applied. Null when nothing finished, for example every request was
- * interrupted.
+ * applied. Interrupted providers remain visible as skipped outcomes; null
+ * means the pass had no updates, failures, or skipped outcomes to report.
  */
 export function getUpdateEverythingToastView(
   result: UpdateEverythingResult,
