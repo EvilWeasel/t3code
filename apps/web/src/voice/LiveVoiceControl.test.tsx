@@ -12,6 +12,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -43,9 +44,15 @@ import {
   resolveLiveVoiceAvailability,
   resolveLiveVoiceConfigState,
   resolveLiveVoiceControlGate,
+  createLiveVoiceDiagnosticProducer,
 } from "./LiveVoiceControl";
 import { TooltipProvider } from "~/components/ui/tooltip";
 import { unwrapLiveVoiceCommand } from "./LiveVoiceCommands";
+import type {
+  MainRendererDiagnosticsRequest,
+  MainRendererDiagnosticsResponse,
+  MainRendererDiagnosticsInvalidation,
+} from "@t3tools/contracts";
 import { resolveComposerProviderSelection } from "../components/ChatView.logic";
 import {
   applyProviderInstanceSettings,
@@ -79,6 +86,7 @@ const getUserMedia = vi.fn();
 const peer = vi.fn();
 
 beforeEach(() => {
+  Reflect.deleteProperty(window, "desktopBridge");
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal("RTCPeerConnection", peer);
   Object.defineProperty(navigator, "mediaDevices", {
@@ -100,7 +108,238 @@ afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   Reflect.deleteProperty(navigator, "mediaDevices");
+  Reflect.deleteProperty(window, "desktopBridge");
   vi.unstubAllGlobals();
+});
+
+const localEnvironment = EnvironmentId.make("24efa85c-862c-4de4-9b5e-aaaa041e28a4");
+const rootThread = ThreadId.make("7cd05d6b-5e09-4691-a664-0b56c6283f12");
+const localInput: AvailabilityInput = {
+  ...loaded,
+  environmentId: localEnvironment,
+  catalogEnvironmentId: localEnvironment,
+  threadId: rootThread,
+};
+
+function diagnosticBridgeFixture() {
+  let listener: ((request: MainRendererDiagnosticsRequest) => void) | null = null;
+  const unsubscribe = vi.fn();
+  const bridge = {
+    onMainRendererDiagnosticsRequest: vi.fn(
+      (callback: (request: MainRendererDiagnosticsRequest) => void) => {
+        listener = callback;
+        return unsubscribe;
+      },
+    ),
+    respondMainRendererDiagnostics: vi
+      .fn<(response: MainRendererDiagnosticsResponse) => Promise<boolean>>()
+      .mockResolvedValue(true),
+    invalidateMainRendererDiagnostics: vi
+      .fn<(input: MainRendererDiagnosticsInvalidation) => Promise<boolean>>()
+      .mockResolvedValue(true),
+  };
+  const request = (
+    requestId = "request-1",
+    expiresAtMs = 5_000,
+  ): MainRendererDiagnosticsRequest => ({
+    version: 1,
+    requestId,
+    requestNonce: `nonce-${requestId}`,
+    target: {
+      environmentId: "24efa85c-862c-4de4-9b5e-aaaa041e28a4",
+      threadId: "7cd05d6b-5e09-4691-a664-0b56c6283f12",
+      providerInstanceId: "codex",
+    },
+    mainSession: "main-session",
+    windowId: 1,
+    frameProcessId: 2,
+    frameRoutingId: 3,
+    navigationGeneration: 4,
+    expiresAtMs,
+  });
+  return {
+    bridge,
+    unsubscribe,
+    request,
+    send(input: MainRendererDiagnosticsRequest) {
+      listener?.(input);
+    },
+  };
+}
+
+describe("explicit main renderer diagnostic requests", () => {
+  it.each([
+    "onMainRendererDiagnosticsRequest",
+    "respondMainRendererDiagnostics",
+    "invalidateMainRendererDiagnostics",
+  ] as const)("does not create a producer when %s is absent", (missing) => {
+    const fixture = diagnosticBridgeFixture();
+    const partial: NonNullable<Parameters<typeof createLiveVoiceDiagnosticProducer>[0]> = {
+      ...fixture.bridge,
+    };
+    delete partial[missing];
+    const producer = createLiveVoiceDiagnosticProducer(partial, {
+      nowMs: () => 1_000,
+      scheduleExpiry: vi.fn(),
+    });
+    expect(producer).toBeNull();
+    expect(fixture.bridge.onMainRendererDiagnosticsRequest).not.toHaveBeenCalled();
+    expect(fixture.bridge.respondMainRendererDiagnostics).not.toHaveBeenCalled();
+    expectPassive();
+  });
+
+  it("returns the mounted control's current gate only on a valid explicit request and invalidates the original pair", async () => {
+    const fixture = diagnosticBridgeFixture();
+    Object.defineProperty(window, "desktopBridge", { configurable: true, value: fixture.bridge });
+    await render(localInput);
+    expect(fixture.bridge.onMainRendererDiagnosticsRequest).toHaveBeenCalledOnce();
+    expect(fixture.bridge.respondMainRendererDiagnostics).not.toHaveBeenCalled();
+    expectPassive();
+    const request = fixture.request(
+      "mounted-1",
+      DateTime.toEpochMillis(DateTime.nowUnsafe()) + 4_000,
+    );
+    await act(async () => fixture.send(request));
+    const response = fixture.bridge.respondMainRendererDiagnostics.mock.calls[0]![0];
+    expect(response.binding).toEqual(request);
+    expect(response.result.status).toBe("ready");
+    if (response.result.status !== "ready") throw new Error("Expected ready diagnostic");
+    expect(response.result.gate.canStart).toBe(!startButton().disabled);
+    expect(response.result.gate.reason).toBeNull();
+    await render({ ...localInput, canOperate: false });
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).toHaveBeenCalledExactlyOnceWith({
+      binding: request,
+      rendererEpoch: response.rendererEpoch,
+      revision: response.revision,
+    });
+    await act(async () => fixture.send(request));
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledOnce();
+    const second = fixture.request(
+      "mounted-2",
+      DateTime.toEpochMillis(DateTime.nowUnsafe()) + 4_000,
+    );
+    await act(async () => fixture.send(second));
+    const next = fixture.bridge.respondMainRendererDiagnostics.mock.calls[1]![0];
+    expect(next.revision).toBeGreaterThan(response.revision);
+    if (next.result.status !== "ready") throw new Error("Expected ready diagnostic");
+    expect(next.result.gate.canStart).toBe(!startButton().disabled);
+    expect(next.result.gate.reason).toBe(container.querySelector('[role="status"]')?.textContent);
+    expectPassive();
+  });
+
+  it("never sends a gate on target mismatch and invalidates on navigation and unmount", async () => {
+    const fixture = diagnosticBridgeFixture();
+    Object.defineProperty(window, "desktopBridge", { configurable: true, value: fixture.bridge });
+    await render(loaded);
+    const mismatch = fixture.request(
+      "mismatch",
+      DateTime.toEpochMillis(DateTime.nowUnsafe()) + 4_000,
+    );
+    await act(async () => fixture.send(mismatch));
+    expect(fixture.bridge.respondMainRendererDiagnostics.mock.calls[0]![0].result).toEqual({
+      status: "unavailable",
+      reason: "target-mismatch",
+    });
+    await render(localInput);
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).toHaveBeenCalledOnce();
+    const current = fixture.request(
+      "current",
+      DateTime.toEpochMillis(DateTime.nowUnsafe()) + 4_000,
+    );
+    await act(async () => fixture.send(current));
+    await act(async () => root.unmount());
+    expect(fixture.unsubscribe).toHaveBeenCalledOnce();
+    const responses = fixture.bridge.respondMainRendererDiagnostics.mock.calls.length;
+    fixture.send(fixture.request("after-unmount", current.expiresAtMs));
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledTimes(responses);
+    expect(fixture.bridge.invalidateMainRendererDiagnostics.mock.calls.at(-1)?.[0].binding).toEqual(
+      current,
+    );
+    expectPassive();
+  });
+
+  it("rejects malformed, expired, overlong and clock-rollback requests and only schedules expiry after a request", () => {
+    const fixture = diagnosticBridgeFixture();
+    let now = 1_000;
+    const expiries = new Set<() => void>();
+    const scheduleExpiry = vi.fn((callback: () => void, _delay: number) => {
+      expiries.add(callback);
+      return () => {
+        expiries.delete(callback);
+      };
+    });
+    const producer = createLiveVoiceDiagnosticProducer(fixture.bridge, {
+      nowMs: () => now,
+      scheduleExpiry,
+    })!;
+    producer.update(gateFor(localInput));
+    producer.start();
+    expect(scheduleExpiry).not.toHaveBeenCalled();
+    fixture.send(fixture.request("bad request"));
+    fixture.send(fixture.request("expired", now));
+    fixture.send(fixture.request("too-long", now + 5_001));
+    expect(fixture.bridge.respondMainRendererDiagnostics).not.toHaveBeenCalled();
+    const request = fixture.request();
+    fixture.send(request);
+    fixture.send(request);
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledOnce();
+    expect(scheduleExpiry).toHaveBeenCalledOnce();
+    now = 5_001;
+    for (const expire of [...expiries]) expire();
+    fixture.send(request);
+    now = 1_001;
+    fixture.send(fixture.request("rollback", 4_000));
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledOnce();
+    producer.dispose();
+    expectPassive();
+  });
+
+  it("does not let a delayed rejected response invalidate a replacement request", async () => {
+    const fixture = diagnosticBridgeFixture();
+    let reject!: (cause: Error) => void;
+    fixture.bridge.respondMainRendererDiagnostics.mockReturnValueOnce(
+      new Promise((_resolve, fail) => {
+        reject = fail;
+      }),
+    );
+    const producer = createLiveVoiceDiagnosticProducer(fixture.bridge, {
+      nowMs: () => 1_000,
+      scheduleExpiry: () => () => {},
+    })!;
+    producer.update(gateFor(localInput));
+    producer.start();
+    fixture.send(fixture.request("old"));
+    fixture.send(fixture.request("replacement"));
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).toHaveBeenCalledOnce();
+    reject(new Error("private IPC failure"));
+    await Promise.resolve();
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).toHaveBeenCalledOnce();
+    producer.dispose();
+    expect(
+      fixture.bridge.invalidateMainRendererDiagnostics.mock.calls.at(-1)?.[0].binding.requestId,
+    ).toBe("replacement");
+    expectPassive();
+  });
+
+  it("reports an actually observed prepare code without running a provider for a diagnostic request", async () => {
+    const fixture = diagnosticBridgeFixture();
+    Object.defineProperty(window, "desktopBridge", { configurable: true, value: fixture.bridge });
+    await render(localInput);
+    expectPassive();
+    await act(async () => startButton().click());
+    await act(async () =>
+      fixture.send(
+        fixture.request("after-prepare", DateTime.toEpochMillis(DateTime.nowUnsafe()) + 4_000),
+      ),
+    );
+    const result = fixture.bridge.respondMainRendererDiagnostics.mock.calls[0]![0].result;
+    if (result.status !== "ready") throw new Error("Expected ready diagnostic");
+    expect(result.gate.prepareFailure).toBe("managed_account_required");
+    expect(commands.prepare).toHaveBeenCalledOnce();
+    expect(commands.start).not.toHaveBeenCalled();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(peer).not.toHaveBeenCalled();
+  });
 });
 
 async function render(input: AvailabilityInput, targetEnvironment = input.environmentId) {

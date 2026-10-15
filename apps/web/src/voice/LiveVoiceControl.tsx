@@ -1,6 +1,14 @@
 import { AsyncResult } from "effect/reactivity";
 import * as Schema from "effect/Schema";
-import { LiveVoiceError, type LiveVoiceErrorCode } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
+import {
+  LiveVoiceError,
+  MainRendererDiagnosticsGate,
+  MainRendererDiagnosticsRequest,
+  type MainRendererDiagnosticsResponse,
+  type DesktopBridge,
+  type LiveVoiceErrorCode,
+} from "@t3tools/contracts";
 import {
   MicIcon,
   MicOffIcon,
@@ -10,7 +18,7 @@ import {
   VolumeXIcon,
 } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   EnvironmentId,
   ProjectId,
@@ -268,7 +276,7 @@ type LiveVoiceDiagnosticModel = Readonly<{
   gate: ReturnType<typeof resolveLiveVoiceControlGate>;
 }>;
 
-/** Pure model only. No production caller until the explicit request/bridge contract is frozen. */
+/** Renderer-local revisions; Main supplies the separate window/frame/navigation identity. */
 export function advanceLiveVoiceDiagnosticModel(
   previous: LiveVoiceDiagnosticModel | null,
   gate: LiveVoiceDiagnosticModel["gate"],
@@ -281,23 +289,192 @@ export function advanceLiveVoiceDiagnosticModel(
   const before = previous.gate;
   const a = before.facts;
   const b = gate.facts;
-  const sameFacts = a === b || (a !== null && b !== null &&
-    a.driver === b.driver && a.setupMode === b.setupMode &&
-    a.providerEnabled === b.providerEnabled && a.providerAvailable === b.providerAvailable &&
-    a.projectOverride === b.projectOverride && a.catalogState === b.catalogState &&
-    a.settingsKnown === b.settingsKnown && a.permissionState === b.permissionState &&
-    a.canOperate === b.canOperate && a.selectionCurrent === b.selectionCurrent);
-  if (sameContext && sameFacts && before.phase === gate.phase &&
-    before.targetPresent === gate.targetPresent && before.active === gate.active &&
-    before.busy === gate.busy && before.webRtcAvailable === gate.webRtcAvailable &&
+  const sameFacts =
+    a === b ||
+    (a !== null &&
+      b !== null &&
+      a.driver === b.driver &&
+      a.setupMode === b.setupMode &&
+      a.providerEnabled === b.providerEnabled &&
+      a.providerAvailable === b.providerAvailable &&
+      a.projectOverride === b.projectOverride &&
+      a.catalogState === b.catalogState &&
+      a.settingsKnown === b.settingsKnown &&
+      a.permissionState === b.permissionState &&
+      a.canOperate === b.canOperate &&
+      a.selectionCurrent === b.selectionCurrent);
+  if (
+    sameContext &&
+    sameFacts &&
+    before.phase === gate.phase &&
+    before.targetPresent === gate.targetPresent &&
+    before.active === gate.active &&
+    before.busy === gate.busy &&
+    before.webRtcAvailable === gate.webRtcAvailable &&
     before.microphoneApiAvailable === gate.microphoneApiAvailable &&
-    before.canStart === gate.canStart && before.reason === gate.reason &&
-    before.prepareFailure === gate.prepareFailure) return previous;
+    before.canStart === gate.canStart &&
+    before.reason === gate.reason &&
+    before.prepareFailure === gate.prepareFailure
+  )
+    return previous;
   return Object.freeze({
     epoch: sameContext ? previous.epoch : previous.epoch + 1,
     revision: sameContext ? previous.revision + 1 : 1,
     gate,
   });
+}
+
+type MainRendererDiagnosticBridge = Pick<
+  DesktopBridge,
+  | "onMainRendererDiagnosticsRequest"
+  | "respondMainRendererDiagnostics"
+  | "invalidateMainRendererDiagnostics"
+>;
+
+export function createLiveVoiceDiagnosticProducer(
+  bridge: MainRendererDiagnosticBridge | undefined,
+  options: {
+    readonly nowMs: () => number;
+    readonly scheduleExpiry: (callback: () => void, delayMs: number) => () => void;
+  },
+) {
+  const listen = bridge?.onMainRendererDiagnosticsRequest;
+  const respond = bridge?.respondMainRendererDiagnostics;
+  const invalidate = bridge?.invalidateMainRendererDiagnostics;
+  if (
+    typeof listen !== "function" ||
+    typeof respond !== "function" ||
+    typeof invalidate !== "function"
+  )
+    return null;
+  let model: LiveVoiceDiagnosticModel | null = null;
+  let disposed = false;
+  let unsubscribe: (() => void) | null = null;
+  let lastObservedTime = -Infinity;
+  type ActiveBinding = {
+    readonly binding: MainRendererDiagnosticsRequest;
+    readonly epoch: number;
+    readonly revision: number;
+    invalidated: boolean;
+    readonly cancelExpiry: () => void;
+  };
+  let active: ActiveBinding | null = null;
+  const invalidateActive = () => {
+    if (!active || active.invalidated) return;
+    active.invalidated = true;
+    try {
+      void invalidate({
+        binding: active.binding,
+        rendererEpoch: active.epoch,
+        revision: active.revision,
+      }).catch(() => {});
+    } catch {
+      /* The capability can disappear during teardown. No fallback or retry. */
+    }
+  };
+  const clearActive = () => {
+    active?.cancelExpiry();
+    active = null;
+  };
+  const readTime = () => {
+    const now = options.nowMs();
+    if (!Number.isFinite(now) || now < lastObservedTime) return null;
+    lastObservedTime = now;
+    return now;
+  };
+  const onRequest = (raw: unknown) => {
+    if (disposed || model === null) return;
+    let decoded: MainRendererDiagnosticsRequest;
+    try {
+      decoded = Schema.decodeUnknownSync(MainRendererDiagnosticsRequest)(raw);
+    } catch {
+      return;
+    }
+    const now = readTime();
+    if (now === null || decoded.expiresAtMs <= now || decoded.expiresAtMs - now > 5_000) return;
+    if (
+      active &&
+      (active.binding.requestId === decoded.requestId ||
+        active.binding.requestNonce === decoded.requestNonce)
+    )
+      return;
+    invalidateActive();
+    clearActive();
+    const binding = Object.freeze({ ...decoded, target: Object.freeze({ ...decoded.target }) });
+    const captured = model;
+    const targetMatches =
+      binding.target.environmentId === captured.gate.environmentId &&
+      binding.target.threadId === captured.gate.threadId &&
+      binding.target.providerInstanceId === captured.gate.providerInstanceId;
+    const result: MainRendererDiagnosticsResponse["result"] = !targetMatches
+      ? { status: "unavailable", reason: "target-mismatch" }
+      : Schema.is(MainRendererDiagnosticsGate)(captured.gate)
+        ? { status: "ready", gate: captured.gate }
+        : { status: "unavailable", reason: "context-changed" };
+    const current: ActiveBinding = {
+      binding,
+      epoch: captured.epoch,
+      revision: captured.revision,
+      invalidated: false,
+      cancelExpiry: options.scheduleExpiry(() => {
+        if (active === current) {
+          lastObservedTime = Math.max(lastObservedTime, binding.expiresAtMs);
+          active = null;
+        }
+      }, binding.expiresAtMs - now),
+    };
+    active = current;
+    const response = Object.freeze({
+      binding,
+      rendererEpoch: captured.epoch,
+      revision: captured.revision,
+      result: Object.freeze(result),
+    });
+    try {
+      void respond(response).catch(() => {
+        if (active === current) invalidateActive();
+      });
+    } catch {
+      if (active === current) invalidateActive();
+    }
+  };
+  return {
+    update(gate: LiveVoiceDiagnosticModel["gate"]) {
+      if (disposed) return;
+      model = advanceLiveVoiceDiagnosticModel(model, gate);
+      if (active && !active.invalidated) {
+        const now = readTime();
+        if (now === null || now >= active.binding.expiresAtMs) {
+          invalidateActive();
+          clearActive();
+        } else if (active.epoch !== model.epoch || active.revision !== model.revision)
+          invalidateActive();
+      }
+    },
+    start() {
+      if (!disposed && !unsubscribe) {
+        try {
+          unsubscribe = listen(onRequest);
+        } catch {
+          disposed = true;
+          model = null;
+        }
+      }
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      try {
+        unsubscribe?.();
+      } catch {
+        /* No alternate subscription on teardown. */
+      }
+      unsubscribe = null;
+      invalidateActive();
+      clearActive();
+      model = null;
+    },
+  };
 }
 
 type VoiceEventBridge = {
@@ -441,6 +618,29 @@ export function LiveVoiceControl(props: {
         : null,
   });
   const { active, busy, canStart, reason: unavailableNotice, targetPresent } = gate;
+  const diagnosticProducer = useRef<ReturnType<typeof createLiveVoiceDiagnosticProducer>>(null);
+  const committedGate = useRef(gate);
+  const diagnosticBridge = typeof window === "undefined" ? undefined : window.desktopBridge;
+  useLayoutEffect(() => {
+    committedGate.current = gate;
+    diagnosticProducer.current?.update(gate);
+  }, [gate]);
+  useLayoutEffect(() => {
+    const producer = createLiveVoiceDiagnosticProducer(diagnosticBridge, {
+      nowMs: () => DateTime.toEpochMillis(DateTime.nowUnsafe()),
+      scheduleExpiry: (callback, delayMs) => {
+        const handle = window.setTimeout(callback, delayMs);
+        return () => window.clearTimeout(handle);
+      },
+    });
+    diagnosticProducer.current = producer;
+    producer?.update(committedGate.current);
+    producer?.start();
+    return () => {
+      producer?.dispose();
+      if (diagnosticProducer.current === producer) diagnosticProducer.current = null;
+    };
+  }, [diagnosticBridge]);
   const target = useMemo<LiveVoiceTarget | null>(() => {
     if (!props.threadId || !props.providerInstanceId || !targetPresent) return null;
     return {
