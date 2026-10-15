@@ -2,6 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AgentObservatoryOwner,
+  type AgentObservatoryRead,
   AgentObservatoryVisualState,
   CommandId,
   EnvironmentId,
@@ -26,6 +27,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
@@ -284,5 +286,207 @@ it.layer(layer)("Agent observatory service with real persistence", (it) => {
       if (result._tag === "Failure") assert.equal(result.failure.reason, "stale_owner");
       assert.equal(yield* service.read(input.owner.threadId), null);
     }),
+  );
+});
+
+it.layer(layer)("Agent observatory selected feeds with real SQL", (it) => {
+  it.effect(
+    "keeps immutable snapshot sequence distinct from the global cut and replays a write before live subscription",
+    () =>
+      Effect.gen(function* () {
+        const service = yield* AgentObservatoryService.AgentObservatoryService;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const { input, thread, now } = yield* seedObservatoryOwner("feed-gap");
+        const first = yield* eventSink.commitObservatoryUpdate(input);
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make("event:feed-gap:ordinary"),
+              type: "thread.metadata-updated",
+              threadId: thread.id,
+              occurredAt: now,
+              payload: { ...thread, title: "Unrelated metadata" },
+            },
+          ],
+        });
+        const initialSeen = yield* Deferred.make<void>();
+        const continueReading = yield* Deferred.make<void>();
+        const seen: AgentObservatoryRead[] = [];
+        const reading = yield* service.subscribe({ threadId: thread.id }).pipe(
+          Stream.take(2),
+          Stream.tap((value) => {
+            seen.push(value);
+            return seen.length === 1
+              ? Deferred.succeed(initialSeen, undefined).pipe(
+                  Effect.andThen(Deferred.await(continueReading)),
+                )
+              : Effect.void;
+          }),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(initialSeen);
+        assert.equal(seen[0]?.snapshot?.sequence, first.snapshot.sequence);
+        assert.isAbove(seen[0]?.throughSequence ?? 0, first.snapshot.sequence);
+        assert.equal(seen[0]?.status, "stale");
+        const second = yield* eventSink.commitObservatoryUpdate({
+          ...input,
+          update: {
+            ...input.update,
+            requestId: CommandId.make("command:feed-gap:second"),
+            expectedRevision: 1,
+            state: {
+              ...input.update.state,
+              title: "Published while the subscriber has only its SQL bootstrap",
+            },
+          },
+        });
+        yield* Deferred.succeed(continueReading, undefined);
+        yield* Fiber.join(reading);
+        assert.equal(seen.length, 2);
+        assert.deepEqual(seen[1]?.snapshot, second.snapshot);
+        assert.equal(seen[1]?.throughSequence, second.snapshot.sequence);
+        assert.equal(seen[1]?.snapshot?.revision, 2);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("refuses malformed fixed-message provenance rather than retaining a ready feed", () =>
+    Effect.gen(function* () {
+      const service = yield* AgentObservatoryService.AgentObservatoryService;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const eventStore = yield* EventStore.EventStoreV2;
+      const { input } = yield* seedObservatoryOwner("feed-malformed");
+      yield* eventSink.commitObservatoryUpdate(input);
+      const events = yield* eventStore
+        .readByCommandId({ commandId: input.update.requestId })
+        .pipe(Stream.runCollect);
+      const original = events[0];
+      if (!original) return yield* Effect.die("Missing committed fixture event");
+      const initialSeen = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let count = 0;
+      const reading = yield* service.subscribe({ threadId: input.owner.threadId }).pipe(
+        Stream.tap(() => {
+          count += 1;
+          return count === 1
+            ? Deferred.succeed(initialSeen, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Effect.void;
+        }),
+        Stream.runDrain,
+        Effect.result,
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(initialSeen);
+      // The envelope identity deliberately does not match its metadata event/request identity.
+      yield* eventSink.write({
+        events: [{ ...original.event, id: EventId.make("event:feed-malformed:foreign-envelope") }],
+      });
+      yield* Deferred.succeed(release, undefined);
+      const result = yield* Fiber.join(reading);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure.reason, "unavailable");
+      assert.equal(count, 1);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "refreshes only the selected indexed first page and invalidates earlier expanded cursors",
+    () =>
+      Effect.gen(function* () {
+        const service = yield* AgentObservatoryService.AgentObservatoryService;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const { input, now } = yield* seedObservatoryOwner("roster-feed");
+        const makeAgent = (id: string, status: "running" | "completed") => ({
+          id: NodeId.make(id),
+          threadId: input.owner.threadId,
+          runId: input.owner.runId,
+          parentNodeId: input.owner.rootNodeId,
+          origin: "provider_native" as const,
+          createdBy: "agent" as const,
+          driver: providerDriver,
+          providerInstanceId,
+          providerThreadId: input.owner.providerThreadId,
+          childThreadId: null,
+          nativeTaskRef: null,
+          prompt: "PRIVATE FIXTURE PROMPT NEVER IN ROSTER",
+          title: id,
+          model: null,
+          status,
+          result: null,
+          startedAt: now,
+          completedAt: status === "completed" ? now : null,
+          updatedAt: now,
+        });
+        yield* eventSink.write({
+          events: ["node:roster:a", "node:roster:b"].map((id) => ({
+            id: EventId.make(`event:${id}:running`),
+            threadId: input.owner.threadId,
+            occurredAt: now,
+            type: "subagent.updated" as const,
+            payload: makeAgent(id, "running"),
+          })),
+        });
+        const initial = yield* service.readNativeRoster({
+          threadIds: [input.owner.threadId],
+          limit: 1,
+        });
+        assert.equal(initial.status, "partial");
+        assert.equal(initial.agents[0]?.id, "node:roster:a");
+        assert.notProperty(initial.agents[0], "prompt");
+        assert.notProperty(initial.agents[0], "result");
+        const cursor = initial.nextCursor;
+        if (!cursor) return yield* Effect.die("Expected actual expanded cursor");
+        const boot = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let count = 0;
+        const reading = yield* service
+          .subscribeNativeRoster({ threadIds: [input.owner.threadId], limit: 1 })
+          .pipe(
+            Stream.take(2),
+            Stream.tap(() =>
+              ++count === 1
+                ? Deferred.succeed(boot, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                : Effect.void,
+            ),
+            Stream.runCollect,
+            Effect.forkScoped,
+          );
+        yield* Deferred.await(boot);
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make("event:roster:a:completed"),
+              threadId: input.owner.threadId,
+              occurredAt: now,
+              type: "subagent.updated",
+              payload: makeAgent("node:roster:a", "completed"),
+            },
+          ],
+        });
+        yield* Deferred.succeed(release, undefined);
+        const pages = yield* Fiber.join(reading);
+        assert.equal(pages[1]?.agents[0]?.id, "node:roster:b");
+        assert.equal(pages[1]?.status, "complete");
+        assert.equal(pages[1]?.nextCursor, null);
+        assert.equal(pages[1]?.environmentId, input.owner.environmentId);
+        const stale = yield* service.readNativeRoster({
+          threadIds: [input.owner.threadId],
+          limit: 1,
+          cursor,
+        });
+        assert.equal(stale.status, "stale");
+        assert.deepEqual(stale.agents, []);
+        const foreign = yield* service.readNativeRoster({
+          threadIds: [input.owner.threadId],
+          limit: 1,
+          cursor: { ...cursor, environmentId: EnvironmentId.make("env:foreign") },
+        });
+        assert.equal(foreign.status, "stale");
+        assert.deepEqual(foreign.agents, []);
+        const duplicates = yield* service
+          .readNativeRoster({ threadIds: [input.owner.threadId, input.owner.threadId], limit: 1 })
+          .pipe(Effect.result);
+        assert.equal(duplicates._tag, "Failure");
+      }).pipe(Effect.scoped),
   );
 });
