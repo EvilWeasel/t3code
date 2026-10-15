@@ -1,5 +1,10 @@
 import {
   AgentObservatoryUpdate,
+  AgentObservatoryRead,
+  AgentObservatoryNativeRosterPage,
+  type AgentObservatorySubscribeInput,
+  type AgentObservatoryReadNativeRosterInput,
+  type AgentObservatorySubscribeNativeRosterInput,
   AgentObservatorySnapshot,
   type ThreadId,
   MessageId,
@@ -34,9 +39,15 @@ export class AgentObservatoryService extends Context.Service<
     readonly read: (
       threadId: ThreadId,
     ) => Effect.Effect<AgentObservatorySnapshot | null, AgentObservatoryRefusal>;
+    readonly subscribe: (
+      input: AgentObservatorySubscribeInput,
+    ) => Stream.Stream<AgentObservatoryRead, AgentObservatoryRefusal>;
     readonly readNativeRoster: (
-      input: ProjectionStore.NativeAgentRosterQuery,
-    ) => Effect.Effect<ProjectionStore.NativeAgentRosterPage, AgentObservatoryRefusal>;
+      input: AgentObservatoryReadNativeRosterInput,
+    ) => Effect.Effect<AgentObservatoryNativeRosterPage, AgentObservatoryRefusal>;
+    readonly subscribeNativeRoster: (
+      input: AgentObservatorySubscribeNativeRosterInput,
+    ) => Stream.Stream<AgentObservatoryNativeRosterPage, AgentObservatoryRefusal>;
   }
 >()("t3/observatory/AgentObservatoryService") {}
 
@@ -89,8 +100,32 @@ const make = Effect.gen(function* () {
           sequence: stored.sequence,
         });
       }).pipe(Effect.mapError(unavailable)),
+    // Frozen signatures; streams stay unavailable until the transactional cut/replay is installed.
+    subscribe: () => Stream.fail(unavailable()),
+    subscribeNativeRoster: () => Stream.fail(unavailable()),
     readNativeRoster: (input) =>
-      projections.getCurrentNativeAgentRoster(input).pipe(Effect.mapError(unavailable)),
+      Effect.gen(function* () {
+        const environmentId = yield* environment.getEnvironmentId;
+        const threadIds = [...input.threadIds].sort();
+        if (input.cursor && input.cursor.environmentId !== environmentId)
+          return {
+            environmentId,
+            threadIds,
+            source: "canonical-subagent-index" as const,
+            coverage: "recorded-current-only" as const,
+            throughSequence: 0,
+            status: "stale" as const,
+            agents: [],
+            nextCursor: null,
+          };
+        const page = yield* projections.getCurrentNativeAgentRoster(input);
+        return yield* Schema.decodeUnknownEffect(AgentObservatoryNativeRosterPage)({
+          ...page,
+          environmentId,
+          threadIds,
+          nextCursor: page.nextCursor ? { ...page.nextCursor, environmentId } : null,
+        });
+      }).pipe(Effect.mapError(unavailable)),
   });
 });
 

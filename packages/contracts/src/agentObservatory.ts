@@ -14,7 +14,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
-import { ProviderInstanceId } from "./providerInstance.ts";
+import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 
 const LocalId = TrimmedNonEmptyString.check(Schema.isMaxLength(80));
 const Label = TrimmedNonEmptyString.check(Schema.isMaxLength(320));
@@ -170,3 +170,64 @@ export const AgentObservatoryInvocationResult = Schema.Union([
   }),
 ]);
 export type AgentObservatoryInvocationResult = typeof AgentObservatoryInvocationResult.Type;
+
+/** Destination-scoped read only. Owner and environment are never request authority. */
+export const AgentObservatorySubscribeInput = Schema.Struct({ threadId: ThreadId });
+export type AgentObservatorySubscribeInput = typeof AgentObservatorySubscribeInput.Type;
+
+const SelectedThreadIds = Schema.Array(ThreadId).check(
+  Schema.isMaxLength(128),
+  Schema.makeFilter((ids: ReadonlyArray<ThreadId>) => new Set(ids).size === ids.length, {
+    expected: "unique selected thread IDs",
+  }),
+);
+const RosterLimit = PositiveInt.check(Schema.isLessThanOrEqualTo(200));
+export const AgentObservatoryNativeRosterCursor = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadIds: SelectedThreadIds,
+  throughSequence: NonNegativeInt,
+  afterId: NodeId,
+});
+export type AgentObservatoryNativeRosterCursor = typeof AgentObservatoryNativeRosterCursor.Type;
+export const AgentObservatoryReadNativeRosterInput = Schema.Struct({
+  threadIds: SelectedThreadIds,
+  limit: RosterLimit,
+  cursor: Schema.optional(AgentObservatoryNativeRosterCursor),
+});
+export type AgentObservatoryReadNativeRosterInput =
+  typeof AgentObservatoryReadNativeRosterInput.Type;
+export const AgentObservatorySubscribeNativeRosterInput = Schema.Struct({
+  threadIds: SelectedThreadIds,
+  limit: RosterLimit,
+});
+export type AgentObservatorySubscribeNativeRosterInput =
+  typeof AgentObservatorySubscribeNativeRosterInput.Type;
+
+/** Current recorded index only; deliberately excludes prompts, progress and results. */
+export const AgentObservatoryNativeRosterAgent = Schema.Struct({
+  id: NodeId,
+  threadId: ThreadId,
+  runId: Schema.NullOr(RunId),
+  parentNodeId: NodeId,
+  origin: Schema.Literal("provider_native"),
+  driver: ProviderDriverKind,
+  providerInstanceId: ProviderInstanceId,
+  providerThreadId: Schema.NullOr(ProviderThreadId),
+  childThreadId: Schema.NullOr(ThreadId),
+  status: Schema.Literals(["pending", "running", "waiting"]),
+  title: Schema.NullOr(Schema.String.check(Schema.isMaxLength(320))),
+  titleTruncated: Schema.Boolean,
+  updatedAt: Schema.DateTimeUtc,
+});
+export type AgentObservatoryNativeRosterAgent = typeof AgentObservatoryNativeRosterAgent.Type;
+export const AgentObservatoryNativeRosterPage = Schema.Struct({
+  environmentId: EnvironmentId,
+  threadIds: SelectedThreadIds,
+  source: Schema.Literal("canonical-subagent-index"),
+  coverage: Schema.Literal("recorded-current-only"),
+  throughSequence: NonNegativeInt,
+  status: Schema.Literals(["complete", "partial", "stale", "unavailable"]),
+  agents: Schema.Array(AgentObservatoryNativeRosterAgent).check(Schema.isMaxLength(200)),
+  nextCursor: Schema.NullOr(AgentObservatoryNativeRosterCursor),
+});
+export type AgentObservatoryNativeRosterPage = typeof AgentObservatoryNativeRosterPage.Type;

@@ -2,6 +2,8 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import {
   AgentObservatoryCheckpointReached,
+  AgentObservatoryReadNativeRosterInput,
+  AgentObservatorySubscribeNativeRosterInput,
   AgentObservatorySnapshot,
   AgentObservatoryUpdate,
   AgentObservatoryVisualState,
@@ -94,5 +96,26 @@ describe("agent observatory declarative contract", () => {
     expect(reached.owner.attemptId).toBe("attempt:one");
     expect(reached.revision).toBe(2);
     expect(reached.eventId).toBe("event:reached");
+  });
+});
+
+describe("agent observatory bounded roster read inputs", () => {
+  it("rejects repeated selection, over-cap selection, invalid limits and unbound cursors", () => {
+    const decode = Schema.decodeUnknownSync(AgentObservatoryReadNativeRosterInput);
+    expect(decode({ threadIds: ["thread:a"], limit: 1 }).threadIds).toEqual(["thread:a"]);
+    for (const input of [
+      { threadIds: ["thread:a", "thread:a"], limit: 1 },
+      { threadIds: Array.from({ length: 129 }, (_, i) => `thread:${i}`), limit: 1 },
+      { threadIds: ["thread:a"], limit: 0 },
+      { threadIds: ["thread:a"], limit: 201 },
+      { threadIds: ["thread:a"], limit: 1, cursor: { throughSequence: 3, afterId: "node:a" } },
+    ])
+      expect(() => decode(input)).toThrow();
+    const subscribe = Schema.decodeUnknownSync(AgentObservatorySubscribeNativeRosterInput)({
+      threadIds: ["thread:a"],
+      limit: 20,
+      cursor: { afterId: "model-cursor" },
+    });
+    expect(subscribe).not.toHaveProperty("cursor");
   });
 });
