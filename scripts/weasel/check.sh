@@ -69,6 +69,7 @@ focused_tests=(
   apps/web/src/voice/LiveVoiceControl.test.tsx
   apps/web/src/voice/LiveVoiceCommands.test.ts
   apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
+  apps/web/src/voice/voiceSettingsClient.test.ts
 )
 approval_tests=(
   apps/web/src/components/chat/ComposerPendingApprovalPanel.test.tsx
