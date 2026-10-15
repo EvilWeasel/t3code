@@ -274,7 +274,7 @@ export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTa
 export const OrchestratorMcpExternalTaskEventsResult = Schema.Struct({
   task: OrchestratorMcpDelegateTaskResult,
   /** Canonical bounded snapshot recovery; sequence space is never recreated by the bridge. */
-  snapshot: OrchestrationV2ThreadStreamItem,
+  snapshot: Schema.toCodecJson(OrchestrationV2ThreadStreamItem),
   timedOut: Schema.Boolean,
 });
 export type OrchestratorMcpExternalTaskEventsResult =

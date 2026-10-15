@@ -18,6 +18,7 @@ import {
   type OrchestrationV2ThreadProjection,
   OrchestratorMcpCreateThreadsResult,
   OrchestratorMcpDelegateTaskResult,
+  OrchestratorMcpExternalTaskEventsResult,
   OrchestratorMcpTaskCancelResult,
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadListResult,
@@ -753,6 +754,41 @@ describe("orchestrator MCP toolkit", () => {
               snapshot: { kind: "snapshot", projection: { thread: { id: task.childThreadId } } },
               timedOut: false,
             });
+            const initialEvents = yield* Schema.decodeUnknownEffect(
+              OrchestratorMcpExternalTaskEventsResult,
+            )(first.structuredContent);
+            if (initialEvents.snapshot.kind !== "snapshot")
+              return yield* Effect.die("Missing canonical snapshot");
+            // Persisting can race subscription acquisition. The canonical stream
+            // must recover either order without a lost wake or a replay claim.
+            const changedEvents = yield* invoke(
+              "external_task_events",
+              {
+                ...selected,
+                afterSequence: initialEvents.snapshot.snapshotSequence,
+                timeoutMs: 30_000,
+              },
+              readOnly,
+            ).pipe(Effect.forkChild);
+            yield* orchestrator.dispatch({
+              type: "thread.metadata.update",
+              commandId: CommandId.make("external:child-metadata"),
+              threadId: task.childThreadId,
+              title: "Changed while observing",
+            });
+            const observedChange = yield* Schema.decodeUnknownEffect(
+              OrchestratorMcpExternalTaskEventsResult,
+            )((yield* Fiber.join(changedEvents)).structuredContent);
+            expect(observedChange.timedOut).toBe(false);
+            expect(observedChange.snapshot).toMatchObject({
+              kind: "snapshot",
+              projection: { thread: { title: "Changed while observing" } },
+            });
+            if (observedChange.snapshot.kind !== "snapshot")
+              return yield* Effect.die("Missing changed snapshot");
+            expect(observedChange.snapshot.snapshotSequence).toBeGreaterThan(
+              initialEvents.snapshot.snapshotSequence,
+            );
             const ahead = yield* invoke(
               "external_task_events",
               { ...selected, afterSequence: Number.MAX_SAFE_INTEGER },
