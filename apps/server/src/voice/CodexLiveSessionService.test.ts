@@ -27,6 +27,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as RuntimePolicy from "../orchestration-v2/RuntimePolicy.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as CodexLiveSessionService from "./CodexLiveSessionService.ts";
@@ -319,7 +320,11 @@ it.effect.each([false, true])(
                 command.dispatchMode.type !== "steer_active" ||
                 command.dispatchMode.onInactive !== "reject"
               )
-                return yield* Effect.fail(new Error("Expected exact, fail-closed steering."));
+                return yield* new Orchestrator.OrchestratorCommandRejectedError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause: "Expected exact, fail-closed steering.",
+                });
               const targetRunId = command.dispatchMode.targetRunId;
               const run = durableProjection.runs.find((candidate) => candidate.id === targetRunId);
               if (
@@ -327,7 +332,11 @@ it.effect.each([false, true])(
                 !run ||
                 !["running", "starting", "waiting"].includes(run.status)
               )
-                return yield* Effect.fail(new Error("Target run ended at admission."));
+                return yield* new Orchestrator.OrchestratorCommandRejectedError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause: "Target run ended at admission.",
+                });
               steers += 1;
               durableProjection = {
                 ...durableProjection,

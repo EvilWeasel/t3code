@@ -978,6 +978,7 @@ export const layer: Layer.Layer<
         leaseKey(input.leaseId, input.generation),
         Effect.gen(function* () {
           yield* ensurePrincipal(input.principal);
+          const environmentId = yield* environment.getEnvironmentId;
           const row = yield* getOwnedLease(
             input.principal.sessionId,
             input.leaseId,
