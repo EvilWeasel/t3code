@@ -40,6 +40,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -1722,6 +1723,31 @@ describe("orchestrator MCP toolkit", () => {
             expect(delegated.status).toBe("completed");
             expect(delegated.summary).toBe(delegatedResult);
             expect(delegated.providerInstanceId).toBe(claudeInstanceId);
+
+            // An external active-parent binding must remain a root binding at
+            // canonical dispatch, after service/provider resolution has awaited.
+            // This real task node belongs to the same active run but is not its root.
+            const beforeWrongRoot = yield* orchestrator.getThreadProjection(parentThreadId);
+            const wrongRoot = yield* orchestrator
+              .dispatch({
+                type: "delegated_task.request",
+                createdBy: "agent",
+                creationSource: "mcp",
+                commandId: CommandId.make("command:mcp-parent:reject-non-root"),
+                parentThreadId,
+                parentRunId: parentRun.id,
+                parentNodeId: delegated.taskId,
+                task: delegatedPrompt,
+                modelSelection: claudeSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                completionWake: "always",
+              })
+              .pipe(Effect.exit);
+            expect(Exit.isFailure(wrongRoot)).toBe(true);
+            expect(
+              (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+            ).toHaveLength(beforeWrongRoot.subagents.length);
 
             const completedParent = yield* waitForProjection(
               orchestrator,

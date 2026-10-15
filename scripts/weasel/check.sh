@@ -96,6 +96,16 @@ for execution_test in "${execution_tests[@]}"; do
   fi
   focused_tests+=("$execution_test")
 done
+native_integration_tests=(
+  apps/server/src/mcp/OrchestratorMcpToolkit.integration.test.ts
+)
+for native_integration_test in "${native_integration_tests[@]}"; do
+  if [[ ! -f "$native_integration_test" ]]; then
+    echo "Required native integration gate is missing: $native_integration_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$native_integration_test")
+done
 voice_tests=(
   apps/web/src/voice/useVoiceDictation.test.tsx
   packages/client-runtime/src/state/voiceTranscriptionHttp.test.ts
