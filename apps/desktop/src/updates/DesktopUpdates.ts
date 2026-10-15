@@ -163,7 +163,7 @@ export type DesktopUpdateConfigureError = never;
 export class DesktopUpdateInstallQualification extends Context.Service<
   DesktopUpdateInstallQualification,
   { readonly completeRuntimeCreationFence: boolean }
->()("@t3tools/desktop/updates/DesktopUpdateInstallQualification") {}
+>()("@t3tools/desktop/updates/DesktopUpdates/DesktopUpdateInstallQualification") {}
 
 export const DesktopUpdateSetChannelError = Schema.Union([
   DesktopUpdateActionInProgressError,
@@ -841,7 +841,11 @@ export const make = Effect.gen(function* () {
         }
       }
       const currentInventory = yield* inventory;
-      const sameInventory = JSON.stringify(expected) === JSON.stringify(currentInventory);
+      const sameInventory = expected.length === currentInventory.length && expected.every((renderer, index) => {
+        const current = currentInventory[index];
+        return current !== undefined && renderer.id === current.id &&
+          renderer.generation === current.generation && renderer.audible === current.audible;
+      });
       if (!sameInventory || !(yield* isEmpty) ||
         (yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return;
       yield* updateState((current) => ({ ...current, installLease: {
@@ -1082,7 +1086,10 @@ export const make = Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       const completed = yield* Ref.modify(pendingReadiness, (pending) => {
         if (pending === null || now >= pending.lease.expiresAt ||
-          JSON.stringify(pending.lease) !== JSON.stringify(readiness.lease) ||
+          pending.lease.generation !== readiness.lease.generation ||
+          pending.lease.targetVersion !== readiness.lease.targetVersion ||
+          pending.lease.expiresAt !== readiness.lease.expiresAt ||
+          pending.lease.phase !== readiness.lease.phase ||
           !pending.senders.has(senderId)) return [null, pending] as const;
         const senders = new Set(pending.senders);
         senders.delete(senderId);
