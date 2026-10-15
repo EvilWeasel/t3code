@@ -2,6 +2,7 @@ import { describe, it, assert } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Events from "node:events";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -71,19 +72,25 @@ const fixture = Effect.gen(function* () {
     isDestroyed: () => false,
   } as unknown as Electron.BrowserWindow;
   const current = yield* Ref.make(Option.some(window));
+  let beforeMetadata: Effect.Effect<void> = Effect.void;
+  let beforeMain: Effect.Effect<void> = Effect.void;
   const service = yield* make().pipe(
     Effect.provide(
       Layer.mergeAll(
         NodeServices.layer,
-        Layer.mock(ElectronWindow.ElectronWindow)({ main: Ref.get(current) }),
+        Layer.mock(ElectronWindow.ElectronWindow)({
+          main: Effect.suspend(() => beforeMain).pipe(Effect.andThen(Ref.get(current))),
+        }),
         Layer.mock(ElectronApp.ElectronApp)({
-          metadata: Effect.succeed({
-            appVersion: "0.0.47-nightly.20261015.28",
-            appPath: "/fixture",
-            isPackaged: true,
-            resourcesPath: "/fixture",
-            runningUnderArm64Translation: false,
-          }),
+          metadata: Effect.suspend(() => beforeMetadata).pipe(
+            Effect.as({
+              appVersion: "0.0.47-nightly.20261015.28",
+              appPath: "/fixture",
+              isPackaged: true,
+              resourcesPath: "/fixture",
+              runningUnderArm64Translation: false,
+            }),
+          ),
         }),
       ),
     ),
@@ -96,7 +103,25 @@ const fixture = Effect.gen(function* () {
     optIn: true,
     expiresAtMs: now + 5_000,
   };
-  return { service, requests, wc, current, input };
+  return {
+    service,
+    requests,
+    wc,
+    current,
+    input,
+    setMetadataWait: (effect: Effect.Effect<void>) => {
+      beforeMetadata = Effect.suspend(() => {
+        beforeMetadata = Effect.void;
+        return effect;
+      });
+    },
+    setMainWait: (effect: Effect.Effect<void>) => {
+      beforeMain = Effect.suspend(() => {
+        beforeMain = Effect.void;
+        return effect;
+      });
+    },
+  };
 });
 
 describe("passive main renderer diagnostics", () => {
@@ -193,6 +218,41 @@ describe("passive main renderer diagnostics", () => {
         assert.equal((yield* Fiber.join(second)).status, "unavailable");
       }).pipe(Effect.scoped),
   );
+
+  for (const oldOperation of ["respond", "invalidate"] as const) {
+    it.effect(`delayed old ${oldOperation} cannot invalidate the replacement pending request`, () =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const first = yield* f.service.read("A", () => true, f.input).pipe(Effect.forkScoped);
+        const a = yield* Queue.take(f.requests);
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const pause = Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+        );
+        if (oldOperation === "respond") f.setMetadataWait(pause);
+        else f.setMainWait(pause);
+        const old = yield* (
+          oldOperation === "respond"
+            ? f.service.respond(response(a), sender)
+            : f.service.invalidate({ binding: a, rendererEpoch: 1, revision: 1 }, sender)
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(entered);
+        yield* TestClock.adjust("2 seconds");
+        assert.equal((yield* Fiber.join(first)).status, "unavailable");
+        f.setMetadataWait(Effect.void);
+        f.setMainWait(Effect.void);
+        const second = yield* f.service
+          .read("B", () => true, { ...f.input, requestId: "replacement" })
+          .pipe(Effect.forkScoped);
+        const b = yield* Queue.take(f.requests);
+        yield* Deferred.succeed(release, undefined);
+        assert.equal(yield* Fiber.join(old), false);
+        assert.equal(yield* f.service.respond(response(b), sender), true);
+        assert.equal((yield* Fiber.join(second)).status, "ready");
+      }).pipe(Effect.scoped),
+    );
+  }
 
   for (const boundary of [
     "navigation",

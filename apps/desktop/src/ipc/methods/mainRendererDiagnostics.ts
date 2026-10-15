@@ -70,7 +70,9 @@ export const make = Effect.fn("desktop.mainRendererDiagnostics.make")(function* 
   let cache: Extract<MainRendererDiagnosticsReadResult, { status: "ready" }> | undefined;
   const stop = (
     reason: Extract<MainRendererDiagnosticsReadResult, { status: "unavailable" }>["reason"],
+    expected?: Pending,
   ) => {
+    if (expected !== undefined && pending !== expected) return;
     cache = undefined;
     if (pending) {
       pending.replied = true;
@@ -230,27 +232,28 @@ export const make = Effect.fn("desktop.mainRendererDiagnostics.make")(function* 
           p.replied ||
           !sameRequest(response.binding, p.request) ||
           !matchesNative(p, event) ||
-          !(yield* isCurrentMain(p))
+          !(yield* isCurrentMain(p)) ||
+          pending !== p
         )
           return false;
         const now = DateTime.toEpochMillis(yield* DateTime.now);
         if (now < p.startedAtMs || now >= p.request.expiresAtMs) {
-          stop("expired");
+          stop("expired", p);
           return false;
         }
         p.replied = true;
         if (response.result.status !== "ready") {
-          stop("context-changed");
+          stop("context-changed", p);
           return true;
         }
         const gate = response.result.gate;
         if (!sameTarget(gate, p.request.target)) {
-          stop("target-mismatch");
+          stop("target-mismatch", p);
           return false;
         }
         const metadata = yield* app.metadata.pipe(Effect.option);
         if (Option.isNone(metadata) || pending !== p || !matchesNative(p, event)) {
-          stop("context-changed");
+          stop("context-changed", p);
           return false;
         }
         cache = {
@@ -271,7 +274,8 @@ export const make = Effect.fn("desktop.mainRendererDiagnostics.make")(function* 
           !event ||
           !sameRequest(input.binding, p.request) ||
           !matchesNative(p, event) ||
-          !(yield* isCurrentMain(p))
+          !(yield* isCurrentMain(p)) ||
+          pending !== p
         )
           return false;
         if (
@@ -280,7 +284,7 @@ export const make = Effect.fn("desktop.mainRendererDiagnostics.make")(function* 
             input.revision !== cache.response.revision)
         )
           return false;
-        stop("context-changed");
+        stop("context-changed", p);
         return true;
       }),
   });
