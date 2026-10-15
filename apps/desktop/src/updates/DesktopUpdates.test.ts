@@ -21,6 +21,23 @@ import * as DesktopUpdates from "./DesktopUpdates.ts";
 import { flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
 
 describe("DesktopUpdates", () => {
+  it.effect("keeps the production default staged when the qualification service is completely absent", () => {
+    const harness = makeHarness({ clientOnlyInventory: [], omitInstallQualification: true });
+    return Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.equal(harness.stopCount(), 0);
+      const state = yield* updates.getState;
+      assert.equal(state.downloadedVersion, "1.2.4");
+      assert.isUndefined(state.installLease);
+    })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
   it.effect("leaves automatic installation off without complete runtime creation qualification", () => {
     const harness = makeHarness({ clientOnlyInventory: [], clientOnlyInstallQualified: false });
     return Effect.scoped(Effect.gen(function* () {

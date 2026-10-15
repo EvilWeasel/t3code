@@ -40,6 +40,7 @@ export interface UpdatesHarnessOptions {
   readonly appUpdateYml?: string;
   readonly clientOnlyInventory?: ReadonlyArray<{ readonly id: number; readonly generation: string; readonly audible: boolean }>;
   readonly clientOnlyInstallQualified?: boolean;
+  readonly omitInstallQualification?: boolean;
   readonly backendSnapshot?: DesktopBackendPool.DesktopBackendInstance["snapshot"];
 }
 
@@ -255,7 +256,7 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
   });
 
   const layer = DesktopUpdates.layer.pipe(
-    Layer.provideMerge(Layer.succeed(DesktopUpdates.DesktopUpdateInstallQualification, {
+    Layer.provideMerge(options.omitInstallQualification ? Layer.empty : Layer.succeed(DesktopUpdates.DesktopUpdateInstallQualification, {
       completeRuntimeCreationFence: options.clientOnlyInventory !== undefined && options.clientOnlyInstallQualified !== false,
     })),
     Layer.provide(layerFileSystem),
