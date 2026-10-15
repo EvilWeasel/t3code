@@ -60,6 +60,7 @@ import { CodexOrchestratorReplayHarness } from "../orchestration-v2/Adapters/Cod
 import { threadShellFromProjection } from "../orchestration-v2/ProjectionStore.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -560,8 +561,9 @@ describe("orchestrator MCP toolkit", () => {
             registry,
             { runEffectWorker: false },
           );
-          const domain = Layer.merge(
+          const domain = Layer.mergeAll(
             runtime,
+            EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
             ThreadManagementService.layer.pipe(
               Layer.provide(runtime),
               Layer.provide(ServerSettings.layerTest()),
@@ -832,7 +834,7 @@ describe("orchestrator MCP toolkit", () => {
             );
             // Stop, a replacement run, and a changed attempt root all happen after
             // the real service's preflight while its Git boundary is awaiting.
-            for (const change of ["root", "run", "mode", "stop"] as const) {
+            for (const change of ["root", "run", "mode", "interaction", "stop"] as const) {
               const before = yield* orchestrator.getThreadProjection(parentThreadId);
               const active = before.runs.findLast(ThreadManagementService.isActiveRun);
               if (!active || active.rootNodeId === null)
@@ -887,6 +889,13 @@ describe("orchestrator MCP toolkit", () => {
                   threadId: parentThreadId,
                   runtimeMode: "approval-required",
                 });
+              } else if (change === "interaction") {
+                yield* orchestrator.dispatch({
+                  type: "thread.interaction-mode.set",
+                  commandId: CommandId.make("external:lower-parent-interaction"),
+                  threadId: parentThreadId,
+                  interactionMode: "plan",
+                });
               } else {
                 yield* orchestrator.dispatch({
                   type: "thread.stop",
@@ -916,6 +925,11 @@ describe("orchestrator MCP toolkit", () => {
                 (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
               ).toHaveLength(before.subagents.length);
               expect(yield* Ref.get(preparedRuns)).toBe(0);
+              const outbox = yield* EffectOutbox.EffectOutboxV2;
+              const rejectedCommandId = CommandId.make(
+                `command:mcp:${encodeURIComponent(scope.requestNamespace)}:external-delegate-task:await-race-${change}`,
+              );
+              expect(yield* outbox.listByCommandId(rejectedCommandId)).toHaveLength(0);
               if (change === "root")
                 expect(
                   (yield* invoke("external_task_status", selected)).structuredContent,
