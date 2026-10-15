@@ -102,6 +102,11 @@ proton_autofill_tests=(
   apps/desktop/src/preview/DesktopBrowserHost.test.ts
   apps/desktop/src/preview/Manager.test.ts
   apps/desktop/src/window/DesktopWindow.test.ts
+  apps/desktop/src/preview/CdpRelay.test.ts
+  packages/contracts/src/desktopBrowser.test.ts
+  apps/server/src/preview/DesktopBrowserChannel.test.ts
+  apps/server/src/preview/ServerBrowser.test.ts
+  apps/server/src/preview/SessionControl.test.ts
 )
 for proton_autofill_test in "${proton_autofill_tests[@]}"; do
   if [[ ! -f "$proton_autofill_test" ]]; then
