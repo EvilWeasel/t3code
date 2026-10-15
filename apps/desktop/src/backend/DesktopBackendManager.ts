@@ -969,9 +969,13 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           ...config.value,
           desktopTelemetryStream: desktopTelemetryPublisher.encoded,
           // Only a bootstrap that names the browser fds (the local primary) gets them.
-          desktopBrowserStream: browserConnection?.events,
-          onDesktopBrowserCommand: browserConnection?.handleCommandLine,
-          onDesktopBrowserCommandClosed: browserConnection?.closed,
+          ...(browserConnection === undefined
+            ? {}
+            : {
+                desktopBrowserStream: browserConnection.events,
+                onDesktopBrowserCommand: browserConnection.handleCommandLine,
+                onDesktopBrowserCommandClosed: browserConnection.closed,
+              }),
           onDesktopTelemetryControl: (message) =>
             desktopTelemetryPublisher.handleControlForSource(spec.id, message),
           onStarted: Effect.fn("desktop.backendInstance.onStarted")(function* (pid) {

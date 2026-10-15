@@ -652,6 +652,8 @@ describe("DesktopBackendManager", () => {
             ChildProcessSpawner.ChildProcessSpawner,
             ChildProcessSpawner.make((command) =>
               Effect.gen(function* () {
+                if (command._tag !== "StandardCommand")
+                  return yield* Effect.die("unexpected piped browser command");
                 const input = command.options.additionalFds?.fd6;
                 if (input?.type !== "input" || input.stream === undefined)
                   return yield* Effect.die("missing browser input stream");
