@@ -71,7 +71,10 @@ export class MacPermissionHelper {
   private generation = 0;
   private window: Electron.BrowserWindow | undefined;
 
-  constructor(private readonly tryReserveRendererCreation?: ElectronWindow["Service"]["tryReserveRendererCreation"]) {}
+  private readonly tryReserveRendererCreation: ElectronWindow["Service"]["tryReserveRendererCreation"];
+  constructor(tryReserveRendererCreation?: ElectronWindow["Service"]["tryReserveRendererCreation"]) {
+    this.tryReserveRendererCreation = tryReserveRendererCreation;
+  }
 
   close() {
     this.generation++;

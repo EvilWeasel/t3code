@@ -582,12 +582,14 @@ export class SnapShotFlash {
   private animationTimer: ReturnType<typeof setInterval> | undefined;
   private closeTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly showWindow: (window: Electron.BaseWindow) => void;
+  private readonly tryReserveRuntimeActivity: ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"];
 
   constructor(
     showWindow: (window: Electron.BaseWindow) => void = (window) => window.showInactive(),
-    private readonly tryReserveRuntimeActivity?: ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"],
+    tryReserveRuntimeActivity?: ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"],
   ) {
     this.showWindow = showWindow;
+    this.tryReserveRuntimeActivity = tryReserveRuntimeActivity;
   }
 
   showAnimated(bounds: Electron.Rectangle): Promise<void> {

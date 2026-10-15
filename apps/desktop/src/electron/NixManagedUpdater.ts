@@ -21,10 +21,14 @@ export interface NixUpdaterOptions {
 }
 
 export class NixUpdateAdmissionError extends Error {
-  constructor(readonly selectedVersion: string | null, readonly runningVersion: string) {
+  readonly selectedVersion: string | null;
+  readonly runningVersion: string;
+  constructor(selectedVersion: string | null, runningVersion: string) {
     super(selectedVersion === null
       ? "Nix update admission was revoked before activation."
       : "Nix closure activated; running desktop retained because update admission was revoked.");
+    this.selectedVersion = selectedVersion;
+    this.runningVersion = runningVersion;
   }
 }
 
