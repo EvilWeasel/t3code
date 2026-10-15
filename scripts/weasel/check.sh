@@ -53,6 +53,9 @@ focused_tests=(
   apps/desktop/src/electron/NixManagedUpdater.test.ts
   apps/desktop/src/electron/quitAndInstallInPlace.test.ts
   apps/web/src/components/sidebar/updateEverything.logic.test.ts
+  apps/web/src/components/ProviderUpdateLaunchNotification.logic.test.ts
+  apps/web/src/components/ServerUpdateAction.test.tsx
+  apps/web/src/components/desktopUpdate.logic.test.ts
   apps/web/src/branding.test.ts
   apps/web/src/connection/fleetBootstrap.test.ts
   apps/web/src/components/FleetConnectionBootstrap.test.tsx
