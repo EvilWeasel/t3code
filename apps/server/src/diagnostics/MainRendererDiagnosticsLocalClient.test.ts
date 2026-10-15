@@ -29,7 +29,7 @@ import * as RpcAuthorization from "../auth/RpcAuthorization.ts";
 import { RPC_REQUIRED_SCOPES } from "../auth/RpcAuthorization.ts";
 import { readMainRendererDiagnosticsForTarget } from "../ws.ts";
 import { make, inspectLocalMainBinding } from "./MainRendererDiagnosticsLocalClient.ts";
-import { startDesktopAppControlServer } from "../../../desktop/src/app/DesktopAppActivation.ts";
+import { startDesktopAppControlServer } from "../../../desktop/src/app/DesktopAppControlServer.ts";
 import * as MainDiagnostics from "../../../desktop/src/ipc/methods/mainRendererDiagnostics.ts";
 import * as ElectronWindow from "../../../desktop/src/electron/ElectronWindow.ts";
 import * as ElectronApp from "../../../desktop/src/electron/ElectronApp.ts";
@@ -276,7 +276,7 @@ it.live.each([
       Effect.provide(NodeServices.layer),
       Effect.provide(
         ServerConfig.layerTest("/fixture", { prefix: "local-main" }).pipe(
-          Effect.provide(NodeServices.layer),
+          Layer.provide(NodeServices.layer),
         ),
       ),
     ),
@@ -358,7 +358,7 @@ it.live(
       Effect.provide(NodeServices.layer),
       Effect.provide(
         ServerConfig.layerTest("/fixture", { prefix: "local-main-refusal" }).pipe(
-          Effect.provide(NodeServices.layer),
+          Layer.provide(NodeServices.layer),
         ),
       ),
     ),

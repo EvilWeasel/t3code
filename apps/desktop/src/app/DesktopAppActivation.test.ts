@@ -16,7 +16,7 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import { afterEach, describe, expect } from "vite-plus/test";
 
-import { startDesktopAppControlServer } from "./DesktopAppActivation.ts";
+import { startDesktopAppControlServer } from "./DesktopAppControlServer.ts";
 
 const openServers: Array<{ close: () => Promise<void> }> = [];
 
