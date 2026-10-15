@@ -1751,9 +1751,9 @@ it.effect.each(["write", "readback", "rename"] as const)("pre-stop defer storage
     const denied = PlatformError.systemError({ _tag: "PermissionDenied", module: "FileSystem", method: "defer-fixture" });
     const harness = makeHarness({ clientOnlyInventory: [], deferRecord: previousDefer,
       backendInstances: [ownedBackendFixture("primary", steps)],
-      beforeDeferWrite: failure === "write" ? Effect.fail(denied) : undefined,
-      beforeDeferRename: failure === "rename" ? Effect.fail(denied) : undefined,
-      transformDeferRead: failure === "readback" ? (path, text) => path.includes(`.${DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX}`) ? text + "corrupt" : text : undefined,
+      ...(failure === "write" ? { beforeDeferWrite: Effect.fail(denied) } : {}),
+      ...(failure === "rename" ? { beforeDeferRename: Effect.fail(denied) } : {}),
+      ...(failure === "readback" ? { transformDeferRead: (path: string, text: string) => path.includes(`.${DesktopUpdates.DESKTOP_UPDATE_DEFER_RECORD_PREFIX}`) ? text + "corrupt" : text } : {}),
       runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
     });
     yield* Effect.scoped(Effect.gen(function* () {
@@ -1780,7 +1780,7 @@ it.effect.each(["wrong-profile", "corrupt", "oversized", "unknown-scope"] as con
     const released = yield* Deferred.make<void>();
     const steps: string[] = [];
     const harness = makeHarness({ clientOnlyInventory: [], backendInstances: [ownedBackendFixture("primary", steps)],
-      env: failure === "wrong-profile" ? { T3CODE_DESKTOP_PROFILE: "weasel" } : failure === "unknown-scope" ? { T3CODE_DESKTOP_PROFILE: "../invalid" } : undefined,
+      ...(failure === "wrong-profile" ? { env: { T3CODE_DESKTOP_PROFILE: "weasel" } } : failure === "unknown-scope" ? { env: { T3CODE_DESKTOP_PROFILE: "../invalid" } } : {}),
       deferRecord: failure === "corrupt" ? "{" : failure === "oversized" ? "x".repeat(16_385) : previousDefer,
       runtimeReservationReleased: Deferred.succeed(released, undefined).pipe(Effect.asVoid),
     });
@@ -1944,15 +1944,15 @@ it.effect.each(["profile", "development", "appData", "filename-digest"] as const
     const steps: string[] = [];
     const harness = makeHarness({ clientOnlyInventory: [], backendInstances: [ownedBackendFixture("owned", steps)],
       platform: mismatch === "appData" ? "win32" : "darwin",
-      env: mismatch === "appData" ? { APPDATA: "C:\\actual-sdk-appdata" } : undefined,
-      environmentProfileOverride: mismatch === "profile" ? Option.some("unexpected-profile") : undefined,
-      environmentDevelopmentOverride: mismatch === "development" ? true : undefined,
-      environmentAppDataOverride: mismatch === "appData" ? "C:\\different-sdk-appdata" : undefined,
-      deferRecord: mismatch === "filename-digest" ? (path) => {
+      ...(mismatch === "appData" ? { env: { APPDATA: "C:\\actual-sdk-appdata" } } : {}),
+      ...(mismatch === "profile" ? { environmentProfileOverride: Option.some("unexpected-profile") } : {}),
+      ...(mismatch === "development" ? { environmentDevelopmentOverride: true } : {}),
+      ...(mismatch === "appData" ? { environmentAppDataOverride: "C:\\different-sdk-appdata" } : {}),
+      ...(mismatch === "filename-digest" ? { deferRecord: (path: string) => {
         const record = JSON.parse(previousDefer(path));
         record.profileKey = "0".repeat(64);
         return JSON.stringify(record);
-      } : undefined,
+      } } : {}),
     });
     yield* Effect.scoped(Effect.gen(function* () {
       const updates = yield* DesktopUpdates.DesktopUpdates;

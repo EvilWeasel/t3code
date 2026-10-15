@@ -208,7 +208,7 @@ export const make = ElectronUpdater.of({
             isForceRunAfter,
           });
         },
-        catch: (cause) => cause instanceof ElectronUpdaterInstallAdmissionError ? cause :
+        catch: (cause) => Schema.is(ElectronUpdaterInstallAdmissionError)(cause) ? cause :
           cause instanceof NixUpdateAdmissionError
             ? cause.selectedVersion === null
               ? new ElectronUpdaterInstallAdmissionError({ reason: "refused" })

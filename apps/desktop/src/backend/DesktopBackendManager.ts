@@ -1000,7 +1000,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           onDesktopBrowserCommand: desktopBrowserHost.handleCommandLine,
           onDesktopTelemetryControl: (message) =>
             updateSource?.handleControl(message) ?? desktopTelemetryPublisher.handleControlForSource(spec.id, message),
-          onDesktopTelemetryControlClosed: updateSource?.closed,
+          ...(updateSource === undefined ? {} : { onDesktopTelemetryControlClosed: updateSource.closed }),
           onStarted: Effect.fn("desktop.backendInstance.onStarted")(function* (pid) {
             yield* updateActiveRun(runId, (run) => ({
               ...run,

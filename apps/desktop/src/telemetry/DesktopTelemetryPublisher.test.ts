@@ -793,7 +793,7 @@ const backendUpdateTestLayer = DesktopTelemetryPublisher.layer.pipe(Layer.provid
   layerElectronApp([]), layerHistory,
   Layer.succeed(ElectronPowerMonitor.ElectronPowerMonitor, {
     isOnBatteryPower: Effect.succeed(false), getSystemIdleTime: Effect.succeed(0),
-    getSystemIdleState: () => Effect.succeed("active"), getCurrentThermalState: Effect.succeed("nominal"),
+    getSystemIdleState: () => Effect.succeed("active"), getCurrentThermalState: Effect.succeed("nominal" as const),
     onSimpleEvent: () => Effect.void, onThermalStateChange: () => Effect.void, onSpeedLimitChange: () => Effect.void,
   }),
 )));
@@ -813,9 +813,9 @@ it.effect("binds backend update ACKs to the exact scoped bootstrap and rejects s
     const peer = Option.getOrThrow(yield* peerFor("owned-primary"));
     const now = yield* Effect.clockWith((clock) => Effect.succeed(clock.currentTimeMillisUnsafe()));
     const context = { environmentId: "env", bootId: "boot", requestId: "attempt", targetVersion: "1.2.4", admissionGeneration: 1, expiresAt: now + 20_000 };
-    const decode = Schema.decodeUnknownSync(Schema.fromJsonString(DesktopHostTelemetryMessage));
+    const decode = Schema.decodeUnknownEffect(Schema.fromJsonString(DesktopHostTelemetryMessage));
     const request = yield* source.encoded.pipe(
-      Stream.map((bytes) => decode(new TextDecoder().decode(bytes))),
+      Stream.mapEffect((bytes) => decode(new TextDecoder().decode(bytes))),
       Stream.filter((message) => message.type === "prepareBackendUpdate"), Stream.runHead, Effect.forkScoped,
     );
     const response = yield* exchange("owned-primary", peer.sourceGeneration, { version: 1, type: "prepareBackendUpdate", context }).pipe(Effect.forkScoped);
@@ -866,8 +866,8 @@ it.effect("does not accept a missing ACK or a late ACK after its exact exchange 
     yield* source.handleControl({ version: 1, type: "backendUpdateHello", environmentId: "env", bootId: "boot" });
     const peer = Option.getOrThrow(yield* peerFor("owned-primary"));
     const context = { environmentId: "env", bootId: "boot", requestId: "missing-ack", targetVersion: "1.2.4", admissionGeneration: 1, expiresAt: 30_000 };
-    const decode = Schema.decodeUnknownSync(Schema.fromJsonString(DesktopHostTelemetryMessage));
-    const observed = yield* source.encoded.pipe(Stream.map((bytes) => decode(new TextDecoder().decode(bytes))),
+    const decode = Schema.decodeUnknownEffect(Schema.fromJsonString(DesktopHostTelemetryMessage));
+    const observed = yield* source.encoded.pipe(Stream.mapEffect((bytes) => decode(new TextDecoder().decode(bytes))),
       Stream.filter((message) => message.type === "prepareBackendUpdate"), Stream.runHead, Effect.forkScoped);
     const response = yield* exchange("owned-primary", peer.sourceGeneration, { version: 1, type: "prepareBackendUpdate", context }).pipe(Effect.forkScoped);
     yield* Fiber.join(observed);

@@ -3996,7 +3996,7 @@ it.effect("refuses capture before any capture native work while install admissio
     Effect.provide(layerTest("win32")),
     Effect.provideService(ElectronWindow.ElectronWindow, {
       tryReserveRuntimeActivity: () => undefined,
-    } as ElectronWindow.ElectronWindow["Service"]),
+    } as unknown as ElectronWindow.ElectronWindow["Service"]),
   ),
 );
 
@@ -4351,9 +4351,9 @@ it.effect("retains admitted GNOME probe UNKNOWN after logical timeout and bus cl
 });
 
 it.effect.each([
-  ["win32", "test-mac-capture"],
-  ["darwin", "install-kde-helper"],
-] as const)("releases known no-work unsupported setup on %s", (platform, action) => {
+  { platform: "win32", action: "test-mac-capture" },
+  { platform: "darwin", action: "install-kde-helper" },
+] as const)("releases known no-work unsupported setup on $platform", ({ platform, action }) => {
   const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
   return Effect.scoped(Effect.gen(function* () {
     const service = yield* DesktopSnapShot.make;

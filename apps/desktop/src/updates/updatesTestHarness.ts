@@ -6,6 +6,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as PlatformError from "effect/PlatformError";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
 import * as DesktopConfig from "../app/DesktopConfig.ts";
@@ -128,7 +129,7 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
             if (!admitted) throw new ElectronUpdater.ElectronUpdaterInstallAdmissionError({ reason: "refused" });
           }
         },
-        catch: (cause) => cause instanceof ElectronUpdater.ElectronUpdaterInstallAdmissionError
+        catch: (cause) => Schema.is(ElectronUpdater.ElectronUpdaterInstallAdmissionError)(cause)
           ? cause : new ElectronUpdater.ElectronUpdaterInstallAdmissionError({ reason: "probe-failed" }),
       }).pipe(Effect.andThen(Effect.sync(() => {
         quitAndInstallCount += 1;
