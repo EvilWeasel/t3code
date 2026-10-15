@@ -395,6 +395,7 @@ export const make = Effect.gen(function* () {
   const updaterConfiguredRef = yield* Ref.make(false);
   const clientOnlyInstallRef = yield* Ref.make(false);
   const recoveryInstancesRef = yield* Ref.make<ReadonlyArray<DesktopBackendPool.DesktopBackendInstance> | null>(null);
+  const recoveryOutcomesRef = yield* Ref.make<ReadonlyArray<{ readonly instanceId: string; readonly status: "ready" | "held" | "superseded" }>>([]);
   const heldRecoveryRef = yield* Ref.make<OwnedBackendInstallAdmission["deferRecovery"] | null>(null);
   const admissionSequence = yield* Ref.make(0);
   const pendingReadiness = yield* Ref.make<{
@@ -725,6 +726,7 @@ export const make = Effect.gen(function* () {
       Ref.set(desktopState.quitting, false),
       Ref.set(clientOnlyInstallRef, false),
       Ref.set(recoveryInstancesRef, null),
+      Ref.set(recoveryOutcomesRef, []),
       Ref.set(heldRecoveryRef, null),
       removeUpdateRestartMarker,
       removeInstallRecord,
@@ -759,7 +761,10 @@ export const make = Effect.gen(function* () {
         concurrency: "unbounded",
         discard: true,
       }).pipe(Effect.exit);
-      yield* updateState((current) => reduceDesktopUpdateStateOnInstallFailure(current, message));
+      const outcomes = yield* Ref.get(recoveryOutcomesRef);
+      const held = outcomes.filter((outcome) => outcome.status === "held");
+      const recoveryMessage = held.length === 0 ? message : `${message} Recovery remains held for app-owned backends: ${held.slice(0, 128).map((outcome) => outcome.instanceId.slice(0, 128)).join(", ")}. No committed peer was reopened.`;
+      yield* updateState((current) => reduceDesktopUpdateStateOnInstallFailure(current, recoveryMessage));
       if (Exit.isFailure(restartExit)) {
         yield* logUpdaterError("Desktop update install recovery could not restart every backend.");
       }
@@ -824,6 +829,7 @@ export const make = Effect.gen(function* () {
 
         yield* Ref.set(clientOnlyInstallRef, clientOnly);
         yield* Ref.set(recoveryInstancesRef, owned?.instances ?? null);
+        yield* Ref.set(recoveryOutcomesRef, (owned?.instances ?? []).map((instance) => ({ instanceId: instance.id, status: "held" as const })));
         yield* Ref.set(heldRecoveryRef, owned?.deferRecovery ?? null);
         yield* Ref.set(desktopState.quitting, true);
 
@@ -1001,7 +1007,9 @@ export const make = Effect.gen(function* () {
       yield* updateState((current) => ({ ...current, installLease: { generation, targetVersion, expiresAt, phase: "commit" } }));
       const completions = yield* PubSub.subscribe(finishedUpdateActions);
       const owned: OwnedBackendInstallAdmission = {
-        instances: prepared.map(({ instance, proof }) => ({ ...instance, start: proof.recover })),
+        instances: prepared.map(({ instance, proof }) => ({ ...instance, start: proof.recover.pipe(
+          Effect.flatMap((status) => Ref.update(recoveryOutcomesRef, (outcomes) => outcomes.map((outcome) => outcome.instanceId === instance.id ? { ...outcome, status } : outcome))),
+        ) })),
         stopping: () => stopping,
         deferRecovery: (message, preserveInstallRecord = false) => Effect.sync(() => { recovery = { message, preserveInstallRecord }; }),
         stopAll: Effect.gen(function* () {

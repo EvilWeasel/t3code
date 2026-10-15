@@ -26,7 +26,7 @@ import { flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
 function ownedBackendFixture(
   name: string,
   steps: string[],
-  options: { readonly refusal?: "prepare" | "commit" | "stale" | "busy"; readonly commit?: Effect.Effect<boolean>; readonly stop?: Effect.Effect<boolean>; readonly recover?: Effect.Effect<void> } = {},
+  options: { readonly refusal?: "prepare" | "commit" | "stale" | "busy"; readonly commit?: Effect.Effect<boolean>; readonly stop?: Effect.Effect<boolean>; readonly recover?: Effect.Effect<void>; readonly recoveryStatus?: "ready" | "held" | "superseded" } = {},
 ): DesktopBackendPool.DesktopBackendInstance {
   return {
     id: DesktopBackendPool.BackendInstanceId(name), label: Effect.succeed(name),
@@ -42,7 +42,7 @@ function ownedBackendFixture(
         instanceId: DesktopBackendPool.BackendInstanceId(name),
         context: { ...request, environmentId: name, bootId: `boot:${name}` }, persistedRunIds: [`eligible:${name}`],
         isValid: Effect.succeed(options.refusal !== "stale"),
-        recover: options.recover ?? Effect.sync(() => { steps.push(`recover:${name}`); }),
+        recover: (options.recover ?? Effect.sync(() => { steps.push(`recover:${name}`); })).pipe(Effect.as(options.recoveryStatus ?? "ready" as const)),
         commit: (options.commit ?? Effect.succeed(options.refusal !== "commit")).pipe(Effect.tap((accepted) => Effect.sync(() => {
           steps.push(`${accepted ? "committed" : "refused"}:${name}`);
         }))),
@@ -1675,7 +1675,7 @@ it.effect("uses explicit recovery after partial shutdown and never falsely repor
     const steps: string[] = [];
     const harness = makeHarness({ clientOnlyInventory: [], backendInstances: [
       ownedBackendFixture("primary", steps),
-      ownedBackendFixture("wsl", steps, { stop: Effect.succeed(false), recover: Deferred.succeed(recovered, undefined).pipe(Effect.asVoid) }),
+      ownedBackendFixture("wsl", steps, { stop: Effect.succeed(false), recoveryStatus: "held", recover: Deferred.succeed(recovered, undefined).pipe(Effect.asVoid) }),
     ] });
     yield* Effect.scoped(Effect.gen(function* () {
       const updates = yield* DesktopUpdates.DesktopUpdates;
@@ -1692,6 +1692,7 @@ it.effect("uses explicit recovery after partial shutdown and never falsely repor
       assert.isFalse(steps.some((step) => step.startsWith("abort:")));
       assert.equal(harness.quitAndInstalls(), 0);
       assert.equal((yield* updates.getState).errorContext, "install");
+      assert.include((yield* updates.getState).message ?? "", "Recovery remains held for app-owned backends: wsl");
     })).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
   })),
 );

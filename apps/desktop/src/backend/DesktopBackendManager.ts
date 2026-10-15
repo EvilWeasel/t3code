@@ -226,6 +226,7 @@ export const BackendProcessError = Schema.Union([
 export type BackendProcessError = typeof BackendProcessError.Type;
 
 interface RunBackendProcessOptions extends DesktopBackendStartConfig {
+  readonly beforeSpawn?: Effect.Effect<boolean>;
   readonly desktopTelemetryStream: Stream.Stream<Uint8Array>;
   /** Events for the desktop's browser tabs, written to `desktopBrowserFd`. */
   readonly desktopBrowserStream?: Stream.Stream<Uint8Array>;
@@ -278,7 +279,7 @@ export interface DesktopBackendUpdateProof {
   readonly commit: Effect.Effect<boolean>;
   readonly abort: Effect.Effect<boolean>;
   readonly isValid: Effect.Effect<boolean>;
-  readonly recover: Effect.Effect<void>;
+  readonly recover: Effect.Effect<"ready" | "held" | "superseded">;
 }
 
 export interface DesktopBackendInstance {
@@ -337,6 +338,7 @@ interface ActiveBackendRun {
 }
 
 interface BackendManagerState {
+  readonly updateStopRevision: number;
   readonly desiredRunning: boolean;
   readonly ready: boolean;
   readonly config: Option.Option<DesktopBackendStartConfig>;
@@ -350,6 +352,7 @@ interface BackendManagerState {
 }
 
 const initialState: BackendManagerState = {
+  updateStopRevision: 0,
   desiredRunning: false,
   ready: false,
   config: Option.none(),
@@ -528,6 +531,9 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
     ...(options.bootstrapDelivery === "fd3" ? { additionalFds } : {}),
   });
 
+  if (options.beforeSpawn !== undefined && !(yield* options.beforeSpawn)) {
+    return { code: Option.none(), reason: "update recovery superseded before spawn" };
+  }
   const handle = yield* spawner.spawn(command).pipe(
     Effect.mapError(
       (cause) =>
@@ -748,11 +754,14 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     });
   });
 
-  const start: Effect.Effect<void> = Effect.suspend(() =>
+  const startWithRevision = (expectedStopRevision?: number): Effect.Effect<void> => Effect.suspend(() =>
     mutex.withPermits(1)(
       Effect.gen(function* () {
         const current = yield* Ref.get(state);
+        // This check is inside BOTH the pool admission lane and Manager mutex.
+        if (expectedStopRevision !== undefined && current.updateStopRevision !== expectedStopRevision) return;
         if (Option.isSome(current.active)) {
+          if (expectedStopRevision !== undefined) return;
           if (!current.desiredRunning) {
             yield* Ref.update(state, (latest) => ({
               ...latest,
@@ -789,13 +798,15 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
         const resetFatalPreflightCounter =
           !current.desiredRunning && current.preflightFailureAttempt > 0;
         yield* cancelRestart;
-        yield* Ref.update(state, (latest) => ({
-          ...latest,
-          desiredRunning: true,
-          ready: false,
-          config: Option.some(config.value),
-          preflightFailureAttempt: resetFatalPreflightCounter ? 0 : latest.preflightFailureAttempt,
-        }));
+        const accepted = yield* Ref.modify(state, (latest) => {
+          if (expectedStopRevision !== undefined && latest.updateStopRevision !== expectedStopRevision) return [false, latest] as const;
+          return [true, {
+            ...latest, desiredRunning: true, ready: false,
+            config: Option.some(config.value),
+            preflightFailureAttempt: resetFatalPreflightCounter ? 0 : latest.preflightFailureAttempt,
+          }] as const;
+        });
+        if (!accepted) return;
 
         const preflightFailure = config.value.preflightFailure;
         if (Option.isSome(preflightFailure)) {
@@ -870,8 +881,9 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
         }
 
         const runScope = yield* Scope.make("sequential");
-        const runId = yield* Ref.modify(state, (latest) => [
-          latest.nextRunId,
+        const admittedRun = yield* Ref.modify(state, (latest) => expectedStopRevision !== undefined && latest.updateStopRevision !== expectedStopRevision
+          ? [Option.none<number>(), latest] as const : [
+          Option.some(latest.nextRunId),
           {
             ...latest,
             active: Option.some({
@@ -885,6 +897,12 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
             nextRunId: latest.nextRunId + 1,
           },
         ]);
+
+        if (Option.isNone(admittedRun)) {
+          yield* Scope.close(runScope, Exit.void);
+          return;
+        }
+        const runId = admittedRun.value;
 
         const finalizeRun = Effect.fn("desktop.backendInstance.finalizeRun")(function* (
           reason: string,
@@ -975,6 +993,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           : yield* desktopTelemetryPublisher.openBackendUpdateSource(spec.id).pipe(Scope.provide(runScope));
         const program = runBackendProcess({
           ...config.value,
+          ...(expectedStopRevision === undefined ? {} : { beforeSpawn: Ref.get(state).pipe(Effect.map((latest) => latest.updateStopRevision === expectedStopRevision)) }),
           desktopTelemetryStream: updateSource?.encoded ?? desktopTelemetryPublisher.encoded,
           // Only a bootstrap that names the browser fds (the local primary) gets them.
           desktopBrowserStream: desktopBrowserHost.events,
@@ -1061,6 +1080,8 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     Effect.withSpan("desktop.backendInstance.start", { attributes: { id: spec.id } }),
   );
 
+  const start = startWithRevision();
+
   const scheduleRestart = Effect.fn("desktop.backendInstance.scheduleRestart")(function* (
     reason: string,
   ) {
@@ -1121,11 +1142,10 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     });
   });
 
-  const updateStopRevision = yield* Ref.make(0);
   const stop = Effect.fn("desktop.backendInstance.stop")(function* (options?: {
     readonly timeout?: Duration.Duration;
   }, admittedUpdate = false) {
-    if (!admittedUpdate) yield* Ref.update(updateStopRevision, (revision) => revision + 1);
+    if (!admittedUpdate) yield* Ref.update(state, (latest) => ({ ...latest, updateStopRevision: latest.updateStopRevision + 1 }));
     const { active, restartFiber, notifyShutdown } = yield* mutex.withPermits(1)(
       Effect.gen(function* () {
         const result = yield* Ref.modify(state, (latest) => {
@@ -1239,8 +1259,10 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     const exchange = desktopTelemetryPublisher.exchangeBackendUpdate;
     const valid = desktopTelemetryPublisher.backendUpdateProofValid;
     if (peerFor === undefined || exchange === undefined || valid === undefined) return Option.none<DesktopBackendUpdateProof>();
+    const original = yield* Ref.get(state);
+    const originalRun = original.active;
     const before = yield* snapshot;
-    const stopRevision = yield* Ref.get(updateStopRevision);
+    const stopRevision = (yield* Ref.get(state)).updateStopRevision;
     if (!before.ready || !before.desiredRunning || Option.isNone(before.activePid) || before.restartScheduled) return Option.none<DesktopBackendUpdateProof>();
     const peer = yield* peerFor(spec.id);
     if (Option.isNone(peer)) return Option.none<DesktopBackendUpdateProof>();
@@ -1258,13 +1280,31 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
         const phaseSnapshot = phase;
         if (phaseSnapshot === "aborted") return false;
         const current = yield* snapshot;
-        return phase === phaseSnapshot && (yield* Ref.get(updateStopRevision)) === stopRevision && current.ready && current.desiredRunning &&
+        return phase === phaseSnapshot && (yield* Ref.get(state)).updateStopRevision === stopRevision && current.ready && current.desiredRunning &&
           Option.isSome(current.activePid) && Option.isSome(before.activePid) && current.activePid.value === before.activePid.value &&
           !current.restartScheduled && (yield* valid(spec.id, generation, context, phaseSnapshot));
       }),
       recover: Effect.gen(function* () {
-        // A later explicit stop is a takeover, never a reason to restart it.
-        if ((yield* Ref.get(updateStopRevision)) === stopRevision) yield* start;
+        const current = yield* Ref.get(state);
+        if (current.updateStopRevision !== stopRevision) {
+          updateProofs.delete(proof); committedProofs.delete(proof);
+          return "superseded" as const;
+        }
+        // Never treat start's active-process no-op as restoration or reopen an
+        // old committed peer. Its canonical shutdown may still be outstanding.
+        if (Option.isSome(current.active) && Option.isSome(originalRun) && current.active.value.id === originalRun.value.id) return "held" as const;
+        yield* startWithRevision(stopRevision);
+        const restored = yield* Ref.get(state);
+        if (restored.updateStopRevision !== stopRevision) {
+          updateProofs.delete(proof); committedProofs.delete(proof);
+          return "superseded" as const;
+        }
+        const ready = restored.ready && restored.desiredRunning && Option.isSome(restored.active) &&
+          Option.isSome(restored.active.value.pid) && Option.isSome(originalRun) && restored.active.value.id !== originalRun.value.id;
+        if (!ready) return "held" as const;
+        updateProofs.delete(proof);
+        committedProofs.delete(proof);
+        return "ready" as const;
       }),
       commit: Effect.gen(function* () {
         if (phase !== "prepared" || !(yield* valid(spec.id, generation, context, "prepared"))) return false;
@@ -1288,13 +1328,11 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     const committed = committedProofs.get(proof);
     const valid = desktopTelemetryPublisher.backendUpdateProofValid;
     if (!updateProofs.has(proof) || committed === undefined || proof.instanceId !== spec.id || valid === undefined ||
-      (yield* Ref.get(updateStopRevision)) !== committed.stopRevision ||
+      (yield* Ref.get(state)).updateStopRevision !== committed.stopRevision ||
       !(yield* valid(spec.id, committed.generation, proof.context, "committed", true))) return false;
     // The batch already checked expiry before ANY stop. Committed server gates
     // remain held across shutdown; expiry cannot reopen or cancel this phase.
     yield* stop({ timeout: DEFAULT_BACKEND_TERMINATE_GRACE }, true);
-    updateProofs.delete(proof);
-    committedProofs.delete(proof);
     const after = yield* snapshot;
     return Option.isNone(after.activePid) && !after.ready && !after.desiredRunning;
   });

@@ -31,6 +31,8 @@ import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublisher.ts";
 import * as DesktopBrowserHost from "../preview/DesktopBrowserHost.ts";
 import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
+import * as DesktopUpdates from "../updates/DesktopUpdates.ts";
+import { makeHarness, flushCallbacks } from "../updates/updatesTestHarness.ts";
 
 const decodeDesktopBackendBootstrap = Schema.decodeEffect(
   Schema.fromJsonString(DesktopBackendBootstrap),
@@ -121,6 +123,7 @@ function decodeBootstrap(raw: string) {
 }
 
 interface MakeInstanceInput {
+  readonly id?: DesktopBackendManager.BackendInstanceId;
   readonly reserveStart?: DesktopBackendManager.BackendInstanceSpec["reserveStart"];
   readonly spawnerLayer: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>;
   readonly httpClientLayer?: Layer.Layer<HttpClient.HttpClient>;
@@ -186,7 +189,7 @@ function makeTestInstance(input: MakeInstanceInput) {
 
   const instance = DesktopBackendManager.makeBackendInstance({
     ...(input.reserveStart === undefined ? {} : { reserveStart: input.reserveStart }),
-    id: DesktopBackendManager.PRIMARY_INSTANCE_ID,
+    id: input.id ?? DesktopBackendManager.PRIMARY_INSTANCE_ID,
     label: Effect.succeed("Windows"),
     configResolve: input.configResolve ?? Effect.succeed(input.config ?? baseConfig),
     ...(input.onReady ? { onReady: () => input.onReady! } : {}),
@@ -1719,7 +1722,169 @@ it.effect("requires an owned committed proof before canonical stop and preserves
     assert.equal(closes, 1);
     assert.isTrue(Option.isNone((yield* instance.snapshot).activePid));
     yield* instance.stop(); // A later explicit user stop overrides automatic restoration.
-    yield* proof.recover;
+    assert.equal(yield* proof.recover, "superseded");
     assert.equal(starts, 1);
   })),
+);
+
+function updateProtocol() {
+  let phase: "prepared" | "committed" | "aborted" = "prepared";
+  const boundary = { live: true, aborts: 0 };
+  const publisher: Partial<DesktopTelemetryPublisher.DesktopTelemetryPublisher["Service"]> = {
+    openBackendUpdateSource: () => Effect.succeed({ encoded: Stream.empty, closed: Effect.void, handleControl: () => Effect.void }),
+    backendUpdatePeer: (id) => Effect.succeedSome({ sourceGeneration: 1, environmentId: id, bootId: `boot:${id}` }),
+    exchangeBackendUpdate: (_id, _generation, request) => Effect.sync(() => {
+      phase = request.type === "commitBackendUpdate" ? "committed" : request.type === "abortBackendUpdate" ? "aborted" : "prepared";
+      if (phase === "aborted") boundary.aborts++;
+      return Option.some({ version: 1 as const,
+        type: phase === "committed" ? "backendUpdateCommitted" as const : phase === "aborted" ? "backendUpdateAborted" as const : "backendUpdatePrepared" as const,
+        context: request.context, persistedRunIds: ["eligible-run"], reason: phase === "aborted" ? "aborted" as const : "ready" as const,
+      });
+    }),
+    backendUpdateProofValid: (_id, _generation, _context, expected) => Effect.sync(() => boundary.live && phase === expected),
+  };
+  return { publisher, boundary };
+}
+
+it.effect.each(["slow-close", "disconnected-survivor"] as const)("reports actual Manager/coordinator recovery held for %s without reopening or duplicating the peer", (failure) =>
+  Effect.scoped(Effect.gen(function* () {
+    const lane = yield* Semaphore.make(1);
+    const ready = yield* Queue.unbounded<string>();
+    const closeStarted = yield* Deferred.make<void>();
+    const allowClose = yield* Deferred.make<void>();
+    const discarded = yield* Deferred.make<void>();
+    const firstWire = updateProtocol();
+    const survivorWire = updateProtocol();
+    const starts = new Map<string, number>();
+    let survivorProof: DesktopBackendManager.DesktopBackendUpdateProof | undefined;
+    const make = (id: string, wire: ReturnType<typeof updateProtocol>) => makeTestInstance({
+      id: DesktopBackendManager.BackendInstanceId(id), reserveStart: (effect) => lane.withPermits(1)(effect),
+      desktopTelemetryPublisher: wire.publisher,
+      onReady: Queue.offer(ready, id).pipe(Effect.asVoid),
+      backendOutputLog: { discardSession: id === "survivor" ? Deferred.succeed(discarded, undefined).pipe(Effect.asVoid) : Effect.void },
+      spawnerLayer: Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, ChildProcessSpawner.make(() => Effect.gen(function* () {
+        const count = (starts.get(id) ?? 0) + 1;
+        starts.set(id, count);
+        const exited = yield* Deferred.make<void>();
+        const scope = yield* Scope.Scope;
+        yield* Scope.addFinalizer(scope,
+          (id === "survivor" && count === 1 && failure === "slow-close"
+            ? Deferred.succeed(closeStarted, undefined).pipe(Effect.andThen(Deferred.await(allowClose))) : Effect.void).pipe(
+              Effect.andThen(Deferred.succeed(exited, undefined)), Effect.asVoid,
+            ));
+        return { ...makeProcess({ exitCode: Deferred.await(exited).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))), getOutputFd: () => Stream.never }), pid: ChildProcessSpawner.ProcessId(count * 100 + (id === "survivor" ? 2 : 1)) };
+      }))),
+    });
+    const first = yield* make("first", firstWire);
+    const survivor = yield* make("survivor", survivorWire);
+    yield* first.start;
+    yield* survivor.start;
+    yield* Queue.takeN(ready, 2);
+    const firstStopped = yield* Deferred.make<void>();
+    const harness = makeHarness({ clientOnlyInventory: [], inventoryLane: (effect) => lane.withPermits(1)(effect), backendInstances: [
+      { ...first, stopForUpdate: (proof) => first.stopForUpdate!(proof).pipe(Effect.tap(() => Effect.sync(() => {
+        if (failure === "disconnected-survivor") survivorWire.boundary.live = false;
+      })), Effect.tap(() => Deferred.succeed(firstStopped, undefined))) },
+      { ...survivor,
+        prepareUpdate: (request) => survivor.prepareUpdate!(request).pipe(Effect.tap((proof) => Effect.sync(() => { survivorProof = Option.getOrUndefined(proof); }))),
+        stopForUpdate: (proof) => Deferred.await(firstStopped).pipe(Effect.andThen(survivor.stopForUpdate!(proof))),
+      },
+    ] });
+    yield* Effect.scoped(Effect.gen(function* () {
+      const updates = yield* DesktopUpdates.DesktopUpdates;
+      yield* updates.configure;
+      yield* TestClock.adjust(Duration.seconds(15));
+      harness.emit("update-downloaded", { version: "1.2.4" });
+      yield* flushCallbacks;
+      yield* TestClock.adjust(Duration.seconds(45));
+      if (failure === "slow-close") {
+        yield* Deferred.await(closeStarted);
+        yield* TestClock.adjust(Duration.seconds(5));
+      }
+      const { changes } = yield* updates.subscribe;
+      yield* changes.pipe(Stream.filter((state) => state.errorContext === "install"), Stream.runHead);
+      const state = yield* updates.getState;
+      assert.include(state.message ?? "", "Recovery remains held");
+      assert.include(state.message ?? "", "survivor");
+      assert.equal(harness.quitAndInstalls(), 0);
+      assert.equal(firstWire.boundary.aborts + survivorWire.boundary.aborts, 0);
+      assert.equal(starts.get("survivor"), 1);
+      assert.isDefined(survivorProof);
+      assert.equal(yield* survivorProof!.recover, "held");
+      assert.equal(starts.get("survivor"), 1);
+      if (failure === "slow-close") {
+        yield* Deferred.succeed(allowClose, undefined);
+        yield* Deferred.await(discarded); // Actual Manager cleared the old incarnation.
+        yield* survivorProof!.recover; // Explicit canonical repair; no replay/queue.
+        // The first peer's replacement readiness may already be queued.
+        const events = yield* Queue.takeN(ready, 2);
+        assert.isTrue(events.includes("survivor"));
+        assert.equal(yield* survivorProof!.recover, "ready");
+        assert.equal(starts.get("survivor"), 2);
+      }
+    })).pipe(Effect.provide(harness.layer));
+    yield* Deferred.succeed(allowClose, undefined);
+  }).pipe(Effect.provide(TestClock.layer()))),
+);
+
+it.effect.each(["pool-lane", "manager-mutex"] as const)("explicit stop wins recovery waiting for %s", (contention) =>
+  Effect.scoped(Effect.gen(function* () {
+    const lane = yield* Semaphore.make(1);
+    const blocked = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const reachedRecovery = yield* Deferred.make<void>();
+    const ready = yield* Deferred.make<void>();
+    const wire = updateProtocol();
+    let starts = 0;
+    let reservations = 0;
+    let configs = 0;
+    let recoveryRequested = false;
+    const instance = yield* makeTestInstance({
+      reserveStart: (effect) => Effect.gen(function* () {
+        reservations++;
+        if (recoveryRequested) yield* Deferred.succeed(reachedRecovery, undefined);
+        yield* (contention === "pool-lane" ? lane.withPermits(1)(effect) : effect);
+      }),
+      configResolve: Effect.sync(() => { configs++; return baseConfig; }),
+      onReady: Deferred.succeed(ready, undefined).pipe(Effect.asVoid),
+      desktopTelemetryPublisher: wire.publisher,
+      backendOutputLog: { discardSession: contention === "manager-mutex"
+        ? Deferred.succeed(blocked, undefined).pipe(Effect.andThen(Deferred.await(release)), Effect.asVoid) : Effect.void },
+      spawnerLayer: Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, ChildProcessSpawner.make(() => Effect.gen(function* () {
+        starts++;
+        const exited = yield* Deferred.make<void>();
+        const scope = yield* Scope.Scope;
+        yield* Scope.addFinalizer(scope, Deferred.succeed(exited, undefined).pipe(Effect.asVoid));
+        return makeProcess({ exitCode: Deferred.await(exited).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))), getOutputFd: () => Stream.never });
+      }))),
+    });
+    yield* instance.start;
+    yield* Deferred.await(ready);
+    const proof = Option.getOrThrow(yield* instance.prepareUpdate!({ requestId: "stop-race", targetVersion: "1.2.4", admissionGeneration: 1, expiresAt: 30_000 }));
+    assert.isTrue(yield* proof.commit);
+    const stopping = yield* instance.stopForUpdate!(proof).pipe(Effect.forkScoped);
+    if (contention === "manager-mutex") {
+      yield* Deferred.await(blocked);
+      yield* TestClock.adjust(Duration.seconds(5));
+      yield* Fiber.join(stopping);
+    } else yield* Fiber.join(stopping);
+    const holder = contention === "pool-lane" ? yield* lane.withPermits(1)(Deferred.succeed(blocked, undefined).pipe(Effect.andThen(Deferred.await(release)))).pipe(Effect.forkScoped) : undefined;
+    yield* Deferred.await(blocked);
+    recoveryRequested = true;
+    const recovering = yield* proof.recover.pipe(Effect.forkScoped);
+    yield* Deferred.await(reachedRecovery);
+    // Eager start reaches the stop's atomic revision increment before it
+    // suspends on the held Manager mutex; no scheduler polling is needed.
+    const explicitStop = yield* instance.stop().pipe(Effect.forkScoped({ startImmediately: true }));
+    if (contention === "pool-lane") yield* Fiber.join(explicitStop);
+    yield* Deferred.succeed(release, undefined);
+    if (holder) yield* Fiber.join(holder);
+    assert.equal(yield* Fiber.join(recovering), "superseded");
+    yield* Fiber.join(explicitStop);
+    assert.equal(starts, 1);
+    assert.equal(configs, 1);
+    assert.isFalse((yield* instance.snapshot).desiredRunning);
+    assert.equal(wire.boundary.aborts, 0);
+    assert.equal(reservations, 2);
+  }).pipe(Effect.provide(TestClock.layer()))),
 );
