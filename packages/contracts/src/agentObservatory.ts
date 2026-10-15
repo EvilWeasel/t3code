@@ -88,7 +88,10 @@ export const AgentObservatoryVisualState = VisualStateShape.check(
         (state.currentStepId === null || stepIds.has(state.currentStepId))
       );
     },
-    { expected: "unique step/todo/panel IDs and a current step belonging to this state" },
+    {
+      expected: "unique step/todo/panel IDs and a current step belonging to this state",
+      toJsonSchema: () => [{}, true],
+    },
   ),
 );
 export type AgentObservatoryVisualState = typeof AgentObservatoryVisualState.Type;

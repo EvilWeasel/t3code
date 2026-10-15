@@ -1,3 +1,4 @@
+import { AgentObservatoryIntent, AgentObservatoryInvocationResult } from "@t3tools/contracts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
@@ -801,6 +802,7 @@ export function buildCodexTurnStartParams(input: {
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
   readonly modelSelection: ModelSelection;
   readonly hasT3Mcp?: boolean;
+  readonly observatoryAvailable?: boolean;
   readonly browserToolsAvailable?: boolean;
   readonly deviceToolsAvailable?: boolean;
   /** ChatGPT token sharing does not accept service tiers. */
@@ -828,10 +830,18 @@ export function buildCodexTurnStartParams(input: {
       input.omitServiceTier === true
         ? undefined
         : getCodexServiceTierOptionValue(input.modelSelection);
-    const developerInstructions =
+    const ordinaryInstructions =
       input.hasT3Mcp !== true
         ? undefined
         : buildCodexDeveloperInstructions(input.runtimePolicy.interactionMode);
+    const observatoryInstructions =
+      input.observatoryAvailable === true
+        ? "Use t3_observatory to read your own committed dashboard at the start. Publish bounded plan, todos, current step, completed steps and next work at meaningful plan changes and milestones. Use a new stable requestId for each change and the revision returned by read; retry an uncertain result with the same requestId and body. When the user requested a pausepoint, record it as requestedCheckpoint and report reaching it explicitly in your normal reply; a requested checkpoint is not proof you paused or received approval. Before an explicit compaction/handoff, publish a concise current-state handoff. Only publish observed facts and your declared plan, never hidden reasoning. Failed or unavailable publication is not success. Layout cannot grant permission or resolve canonical pending approvals."
+        : undefined;
+    const developerInstructions =
+      [ordinaryInstructions, observatoryInstructions]
+        .filter((value) => value !== undefined)
+        .join("\n\n") || undefined;
     // An app's context is text an MCP server wrote, so it goes in as untrusted
     // context: Codex renders it as quoted user-side input, never as developer
     // instructions. Codex resends it only when it changes.
@@ -1922,6 +1932,18 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           new Map<ProviderThreadId, Extract<OrchestrationV2TurnItem, { type: "error" }>>(),
         );
         const activeTurns = yield* Ref.make(new Map<string, ActiveCodexTurnContext>());
+        const observatoryRegisteredThreads = new Set<string>();
+        const observatoryCalls = new WeakMap<
+          ActiveCodexTurnContext,
+          Map<
+            string,
+            {
+              readonly body: string;
+              readonly result: Deferred.Deferred<CodexSchema.DynamicToolCallResponse>;
+            }
+          >
+        >();
+
         const turnTokenUsageByThread = new Map<string, CodexTurnTokenUsageState>();
         const usageStateForThread = (nativeThreadId: string) => {
           let state = turnTokenUsageByThread.get(nativeThreadId);
@@ -6306,6 +6328,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               runtimePolicy: turnInput.runtimePolicy,
               modelSelection: turnInput.modelSelection,
               hasT3Mcp: mcpSession !== undefined,
+              observatoryAvailable:
+                observatoryRegisteredThreads.has(threadId) &&
+                turnInput.onObservatoryInvocation !== undefined,
               browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
               deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
               omitServiceTier: adapterOptions.resolveRuntime !== undefined,
@@ -6523,6 +6548,115 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }).pipe(Effect.mapError(mcpAppsError("Codex MCP resource read failed."))),
         };
 
+        const routeObservatoryInvocation = (payload: CodexSchema.DynamicToolCallParams) =>
+          Effect.uninterruptibleMask((restore) =>
+            Effect.gen(function* () {
+              const refuse = (message: string): CodexSchema.DynamicToolCallResponse => ({
+                success: false,
+                contentItems: [{ type: "inputText", text: message }],
+              });
+              const context = (yield* Ref.get(activeTurns)).get(payload.turnId);
+              if (
+                (payload.namespace != null && payload.namespace !== "t3") ||
+                !payload.callId.trim() ||
+                payload.callId.length > 512 ||
+                !context ||
+                !observatoryRegisteredThreads.has(payload.threadId) ||
+                context.providerNodeKind !== "root_turn" ||
+                context.providerThread.nativeThreadRef?.nativeId !== payload.threadId ||
+                context.projectionThreadId !== context.input.threadId ||
+                context.projectionRunId !== context.input.runId ||
+                context.rootNodeId !== context.input.rootNodeId ||
+                !context.input.onObservatoryInvocation
+              )
+                return refuse("Agent observatory unavailable for this native invocation.");
+              const callback = context.input.onObservatoryInvocation;
+              const intent = yield* Schema.decodeUnknownEffect(AgentObservatoryIntent)(
+                payload.arguments,
+              );
+              const codec = Schema.fromJsonString(AgentObservatoryIntent);
+              const body = yield* Schema.encodeEffect(codec)(intent);
+              if ((yield* Ref.get(activeTurns)).get(payload.turnId) !== context)
+                return refuse("Agent observatory invocation is stale.");
+              const calls =
+                observatoryCalls.get(context) ??
+                new Map<
+                  string,
+                  {
+                    readonly body: string;
+                    readonly result: Deferred.Deferred<CodexSchema.DynamicToolCallResponse>;
+                  }
+                >();
+              observatoryCalls.set(context, calls);
+              const existing = calls.get(payload.callId);
+              if (existing)
+                return existing.body === body
+                  ? yield* restore(Deferred.await(existing.result))
+                  : refuse("Agent observatory call conflicts with its original body.");
+              if (calls.size >= 128)
+                return refuse("Agent observatory call bound reached for this turn.");
+              const result = yield* Deferred.make<CodexSchema.DynamicToolCallResponse>();
+              // No await between checking and reserving the native call identity.
+              if (calls.has(payload.callId)) {
+                const admitted = calls.get(payload.callId);
+                return admitted?.body === body
+                  ? yield* restore(Deferred.await(admitted.result))
+                  : refuse("Agent observatory call conflicts with its original body.");
+              }
+              if (calls.size >= 128)
+                return refuse("Agent observatory call bound reached for this turn.");
+              calls.set(payload.callId, { body, result });
+              const perform = Effect.gen(function* () {
+                if ((yield* Ref.get(activeTurns)).get(payload.turnId) !== context)
+                  return refuse("Agent observatory invocation is stale.");
+                const response = yield* callback(
+                  {
+                    nativeThreadId: payload.threadId,
+                    nativeTurnId: payload.turnId,
+                    callId: payload.callId,
+                    providerTurnId: context.providerTurnId,
+                  },
+                  intent,
+                );
+                if ((yield* Ref.get(activeTurns)).get(payload.turnId) !== context)
+                  return refuse(
+                    "Agent observatory invocation is stale; reconcile the original request.",
+                  );
+                const text = yield* Schema.encodeEffect(
+                  Schema.fromJsonString(AgentObservatoryInvocationResult),
+                )(response);
+                return {
+                  success: true,
+                  contentItems: [{ type: "inputText", text }],
+                } satisfies CodexSchema.DynamicToolCallResponse;
+              }).pipe(
+                Effect.catch(() =>
+                  Effect.succeed(
+                    refuse("Agent observatory invocation refused; reconcile the original request."),
+                  ),
+                ),
+              );
+              return yield* restore(perform).pipe(
+                Effect.tap((response) => Deferred.succeed(result, response)),
+                Effect.onInterrupt(() =>
+                  Deferred.succeed(
+                    result,
+                    refuse("Agent observatory outcome is unknown; reconcile the original request."),
+                  ),
+                ),
+              );
+            }),
+          ).pipe(
+            Effect.catch(() =>
+              Effect.succeed({
+                success: false,
+                contentItems: [
+                  { type: "inputText" as const, text: "Invalid agent observatory request." },
+                ],
+              }),
+            ),
+          );
+
         const offerLiveVoiceEvent = (event: ProviderAdapter.ProviderAdapterV2LiveVoiceEvent) =>
           Queue.offer(liveVoiceEvents, event).pipe(Effect.asVoid);
         yield* client.handleServerNotification("thread/realtime/started", (payload) =>
@@ -6558,11 +6692,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             : Effect.void,
         );
         yield* client.handleServerRequest("item/tool/call", (payload) =>
-          Ref.get(liveVoicePlanners).pipe(
-            Effect.flatMap((planners) =>
-              routeCodexLiveVoiceTool(planners.get(payload.threadId), payload),
-            ),
-          ),
+          payload.tool === "t3_observatory"
+            ? routeObservatoryInvocation(payload)
+            : Ref.get(liveVoicePlanners).pipe(
+                Effect.flatMap((planners) =>
+                  routeCodexLiveVoiceTool(planners.get(payload.threadId), payload),
+                ),
+              ),
         );
 
         const liveVoiceFailure = (operation: string) => (cause: unknown) =>
@@ -6631,16 +6767,37 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ensureThread: (threadInput) =>
             ensureInitialized.pipe(
               Effect.andThen(mcpSessions.read(threadInput.threadId)),
-              Effect.flatMap((mcpSession) =>
-                client.request(
-                  "thread/start",
-                  codexThreadRuntimeParams({
-                    mcpSession,
-                    modelSelection: threadInput.modelSelection,
-                    runtimePolicy: threadInput.runtimePolicy,
-                  }),
-                ),
-              ),
+              Effect.flatMap((mcpSession) => {
+                const params = codexThreadRuntimeParams({
+                  mcpSession,
+                  modelSelection: threadInput.modelSelection,
+                  runtimePolicy: threadInput.runtimePolicy,
+                });
+                if (threadInput.observatoryAvailable !== true)
+                  return client.request("thread/start", params);
+                const document = Schema.toJsonSchemaDocument(AgentObservatoryIntent);
+                return client.raw
+                  .request("thread/start", {
+                    ...params,
+                    dynamicTools: [
+                      {
+                        type: "function",
+                        name: "t3_observatory",
+                        description:
+                          "Read or publish your own bounded declarative dashboard. Host invocation supplies owner; layout never grants rights.",
+                        inputSchema: { ...document.schema, $defs: document.definitions },
+                      },
+                    ],
+                  })
+                  .pipe(
+                    Effect.flatMap(Schema.decodeUnknownEffect(CodexSchema.V2ThreadStartResponse)),
+                    Effect.tap((response) =>
+                      Effect.sync(() => {
+                        observatoryRegisteredThreads.add(response.thread.id);
+                      }),
+                    ),
+                  );
+              }),
               Effect.map((response): OrchestrationV2ProviderThread =>
                 providerThreadFromCodexThread({
                   appThreadId: threadInput.threadId,
