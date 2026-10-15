@@ -306,7 +306,72 @@ export const DesktopUpdateStatusReport = Schema.Struct({
 });
 export type DesktopUpdateStatusReport = typeof DesktopUpdateStatusReport.Type;
 
+/** Owned bootstrap FD only: correlation is tied to the actual backend incarnation. */
+const strictUpdate = <const Fields extends Schema.Struct.Fields>(fields: Fields) => {
+  const keys = new Set(Object.keys(fields));
+  return Schema.StructWithRest(Schema.Struct(fields), [
+    Schema.Record(Schema.String, Schema.Unknown),
+  ])
+    .check(
+      Schema.makeFilter((value) => Object.keys(value).every((key) => keys.has(key)), {
+        expected: "only owned backend update fields",
+        toJsonSchema: () => [{ additionalProperties: false }, true],
+      }),
+    )
+    .pipe(Schema.decodeTo(Schema.Struct(fields)));
+};
+const UpdateId = TrimmedNonEmptyString.check(Schema.isMaxLength(1024));
+export const DesktopBackendUpdateBinding = strictUpdate({
+  environmentId: UpdateId,
+  bootId: UpdateId,
+  requestId: UpdateId,
+  targetVersion: UpdateId,
+  admissionGeneration: NonNegativeInt,
+  expiresAt: PositiveInt,
+});
+export type DesktopBackendUpdateBinding = typeof DesktopBackendUpdateBinding.Type;
+export const DesktopBackendUpdateRequest = strictUpdate({
+  version: Schema.Literal(1),
+  type: Schema.Literals(["prepareBackendUpdate", "abortBackendUpdate", "commitBackendUpdate"]),
+  context: DesktopBackendUpdateBinding,
+});
+export type DesktopBackendUpdateRequest = typeof DesktopBackendUpdateRequest.Type;
+export const DesktopBackendUpdateResponse = Schema.Union([
+  strictUpdate({
+    version: Schema.Literal(1),
+    type: Schema.Literal("backendUpdateHello"),
+    environmentId: UpdateId,
+    bootId: UpdateId,
+  }),
+  strictUpdate({
+    version: Schema.Literal(1),
+    type: Schema.Literals([
+      "backendUpdatePrepared",
+      "backendUpdateCommitted",
+      "backendUpdateAborted",
+      "backendUpdateRefused",
+      "backendUpdateRevoked",
+    ]),
+    context: DesktopBackendUpdateBinding,
+    persistedRunIds: Schema.Array(UpdateId).check(Schema.isMaxLength(128)),
+    reason: Schema.Literals([
+      "ready",
+      "aborted",
+      "unknown",
+      "optout",
+      "busy",
+      "unsupported",
+      "stale",
+      "expired",
+      "disconnected",
+      "persistence-failed",
+    ]),
+  }),
+]);
+export type DesktopBackendUpdateResponse = typeof DesktopBackendUpdateResponse.Type;
+
 export const DesktopHostTelemetryMessage = Schema.Union([
+  DesktopBackendUpdateRequest,
   DesktopHostTelemetryHello,
   DesktopHostTelemetrySnapshot,
   DesktopUpdateStatusReport,
@@ -356,6 +421,7 @@ export const DesktopTelemetryCancelDesktopUpdate = Schema.Struct({
 export type DesktopTelemetryCancelDesktopUpdate = typeof DesktopTelemetryCancelDesktopUpdate.Type;
 
 export const DesktopTelemetryControlMessage = Schema.Union([
+  DesktopBackendUpdateResponse,
   DesktopTelemetrySetDiagnosticsDemand,
   DesktopTelemetrySetHostPowerIntervals,
   DesktopTelemetryRequestDesktopUpdate,
