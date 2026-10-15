@@ -13,6 +13,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -31,6 +32,24 @@ import { runMigrations } from "../persistence/Migrations.ts";
 import * as CodexLiveSessionService from "./CodexLiveSessionService.ts";
 
 const decodeJson = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeWorkStatus = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      environmentId: Schema.String,
+      threadId: Schema.String,
+      leaseId: Schema.String,
+      generation: Schema.Number,
+      tasks: Schema.Array(
+        Schema.Struct({
+          runId: Schema.String,
+          status: Schema.String,
+          resultReady: Schema.Boolean,
+          commentary: Schema.NullOr(Schema.String),
+        }),
+      ),
+    }),
+  ),
+);
 const readbackState = (json: string) => {
   const decoded = decodeJson(json);
   if (typeof decoded !== "object" || decoded === null) return undefined;
@@ -62,6 +81,14 @@ it.effect.each([false, true])(
       let plannerOptions:
         | { serviceTier?: string | null; reasoningEffort?: string | null }
         | undefined;
+      let controlWork: Parameters<
+        ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]
+      >[0]["onWorkControl"];
+      const workCompletion = yield* Deferred.make<void>();
+      const workFinished = yield* Deferred.make<void>();
+      let completedWork = 0;
+      let steers = 0;
+      let rejectSteerAtAdmission = false;
       let sends = 0;
       let stops = 0;
       const spoken: Array<{ plannerNativeThreadId: string; text: string }> = [];
@@ -106,10 +133,10 @@ it.effect.each([false, true])(
         return principalLookupGate;
       };
       const t3EventQueues = new Map([
-        ["run.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
-        ["subagent.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
-        ["checkpoint.captured", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
-        ["message.updated", Effect.runSync(Queue.unbounded<OrchestrationV2StoredEvent>())],
+        ["run.updated", yield* Queue.unbounded<OrchestrationV2StoredEvent>()],
+        ["subagent.updated", yield* Queue.unbounded<OrchestrationV2StoredEvent>()],
+        ["checkpoint.captured", yield* Queue.unbounded<OrchestrationV2StoredEvent>()],
+        ["message.updated", yield* Queue.unbounded<OrchestrationV2StoredEvent>()],
       ]);
       let plannerCalls = 0;
       const runtime = {
@@ -127,10 +154,12 @@ it.effect.each([false, true])(
               callId: string;
               message: string;
             }) => Effect.Effect<string>;
+            onWorkControl: NonNullable<typeof controlWork>;
           }) =>
             Effect.sync(() => {
               plannerCalls += 1;
               submitWork = input.onSubmitWork;
+              controlWork = input.onWorkControl;
               plannerOptions = {
                 ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
                 ...(input.reasoningEffort === undefined
@@ -265,9 +294,55 @@ it.effect.each([false, true])(
           streamStoredEventsFrom: (input: { eventType?: string }) =>
             Stream.fromQueue(t3EventQueues.get(input.eventType ?? "")!),
           sendToThread: () =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
               sends += 1;
+              if (sends === 1)
+                yield* Deferred.await(workCompletion).pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      completedWork += 1;
+                    }),
+                  ),
+                  Effect.tap(() => Deferred.succeed(workFinished, undefined)),
+                  Effect.forkChild,
+                );
               return { delivery: "queued", run: { id: `durable-run-${sends}` } };
+            }),
+          dispatch: (
+            command: Extract<
+              Parameters<ThreadManagementService.ThreadManagementServiceShape["dispatch"]>[0],
+              { type: "message.dispatch" }
+            >,
+          ) =>
+            Effect.gen(function* () {
+              if (
+                command.dispatchMode.type !== "steer_active" ||
+                command.dispatchMode.onInactive !== "reject"
+              )
+                return yield* Effect.fail(new Error("Expected exact, fail-closed steering."));
+              const targetRunId = command.dispatchMode.targetRunId;
+              const run = durableProjection.runs.find((candidate) => candidate.id === targetRunId);
+              if (
+                rejectSteerAtAdmission ||
+                !run ||
+                !["running", "starting", "waiting"].includes(run.status)
+              )
+                return yield* Effect.fail(new Error("Target run ended at admission."));
+              steers += 1;
+              durableProjection = {
+                ...durableProjection,
+                messages: [
+                  ...durableProjection.messages,
+                  {
+                    id: command.messageId,
+                    threadId,
+                    runId: run.id,
+                    role: "user",
+                    text: command.text,
+                  } as never,
+                ],
+              };
+              return { events: [] };
             }),
         } as unknown as ThreadManagementService.ThreadManagementServiceShape),
         Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
@@ -588,6 +663,137 @@ it.effect.each([false, true])(
               }),
           );
 
+        // The canonical job is held at its completion boundary while this same
+        // conversation admits status, priority changes, and more transcript events.
+        const completedFixture = makeRunProjection("durable-run-1", "running");
+        durableProjection = {
+          ...completedFixture,
+          runs: completedFixture.runs.map((run) => ({
+            ...run,
+            status: "running",
+            completedAt: null,
+          })),
+          messages: completedFixture.messages.filter((message) =>
+            message.id.startsWith("commentary-"),
+          ),
+        };
+        const control = (
+          action: "status" | "steer",
+          callId: string,
+          runId?: string,
+          message?: string,
+        ) =>
+          controlWork!({
+            plannerNativeThreadId: "planner-native-1",
+            plannerTurnId: `conversation-${callId}`,
+            callId,
+            action,
+            ...(runId === undefined ? {} : { runId }),
+            ...(message === undefined ? {} : { message }),
+          });
+        const beforePriority = decodeWorkStatus(
+          yield* control("status", "status-1", "durable-run-1"),
+        );
+        assert.equal(beforePriority.threadId, threadId);
+        assert.equal(beforePriority.environmentId, "env-live-test");
+        assert.equal(beforePriority.leaseId, prepared.leaseId);
+        assert.equal(beforePriority.generation, prepared.generation);
+        assert.deepEqual(beforePriority.tasks, [
+          {
+            runId: "durable-run-1",
+            status: "running",
+            resultReady: false,
+            commentary: "commentary for durable-run-1",
+          },
+        ]);
+        assert.equal(completedWork, 0);
+        yield* Queue.offer(nativeEvents, {
+          type: "transcript",
+          plannerNativeThreadId: "planner-native-1",
+          role: "user",
+          text: "Please prioritize the small fix while we keep talking.",
+        });
+        yield* waitForEvent(
+          (event) => event.type === "transcript" && event.text.includes("prioritize"),
+        );
+        const priority = yield* control(
+          "steer",
+          "priority-1",
+          "durable-run-1",
+          "Prioritize the small fix.",
+        );
+        assert.equal(
+          priority,
+          yield* control("steer", "priority-1", "durable-run-1", "Prioritize the small fix."),
+        );
+        assert.equal(steers, 1);
+        const changedSteerIntent = yield* Effect.exit(
+          control("steer", "priority-1", "durable-run-1", "A different instruction."),
+        );
+        assert.isTrue(Exit.isFailure(changedSteerIntent));
+        const afterPriority = decodeWorkStatus(yield* control("status", "status-2"));
+        assert.equal(afterPriority.tasks[0]!.status, "running");
+        assert.equal(completedWork, 0);
+        assert.equal(sends, 1, "conversational control must never queue a replacement job");
+        assert.equal(spoken.length, 0, "no invented final while canonical work is held");
+        yield* Queue.offer(nativeEvents, {
+          type: "transcript",
+          plannerNativeThreadId: "planner-native-1",
+          role: "assistant",
+          text: "The task is still running; we can keep talking.",
+        });
+        yield* waitForEvent(
+          (event) => event.type === "transcript" && event.text.includes("keep talking"),
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(control("status", "foreign-run", "another-thread-run")),
+          ),
+        );
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              controlWork!({
+                plannerNativeThreadId: "stale-planner",
+                plannerTurnId: "stale",
+                callId: "stale",
+                action: "status",
+              }),
+            ),
+          ),
+        );
+        currentPolicy = { ...currentPolicy, cwd: "/changed-context" };
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              control("steer", "changed-context", "durable-run-1", "Must not cross contexts."),
+            ),
+          ),
+        );
+        currentPolicy = policy;
+        const originalThread = durableProjection.thread;
+        durableProjection = {
+          ...durableProjection,
+          thread: { ...originalThread, id: "other-thread" as never },
+        };
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(control("status", "changed-thread"))));
+        durableProjection = { ...durableProjection, thread: originalThread };
+        yield* sql`UPDATE codex_live_voice_leases SET environment_id = 'other-environment' WHERE lease_id = ${prepared.leaseId}`;
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(control("status", "changed-environment"))));
+        yield* sql`UPDATE codex_live_voice_leases SET environment_id = 'env-live-test' WHERE lease_id = ${prepared.leaseId}`;
+        rejectSteerAtAdmission = true;
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              control("steer", "rollover", "durable-run-1", "Must not reach the next run."),
+            ),
+          ),
+        );
+        rejectSteerAtAdmission = false;
+        assert.equal(steers, 1);
+        assert.equal(sends, 1);
+        yield* Deferred.succeed(workCompletion, undefined);
+
         durableProjection = makeRunProjection("durable-run-1", "running");
         const firstGateRead = waitForGateRead();
         yield* Queue.offer(
@@ -662,6 +868,8 @@ it.effect.each([false, true])(
         );
         yield* checkpointGateRead;
         yield* Effect.promise(() => speechObserved);
+        yield* Deferred.await(workFinished);
+        assert.equal(completedWork, 1, "the held canonical job completes exactly once");
         assert.deepEqual(spoken, [
           {
             plannerNativeThreadId: "planner-native-1",
@@ -806,6 +1014,7 @@ it.effect.each([false, true])(
           clientRequestId: "stop-1",
         });
         assert.equal(stopped.status, "stopping");
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(control("status", "after-end"))));
         assert.equal(stops, 1);
         assert.equal(sends, 4);
         yield* Queue.offer(

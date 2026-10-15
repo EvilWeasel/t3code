@@ -156,6 +156,81 @@ type CodexLiveVoiceSubmitWork = (input: {
   readonly callId: string;
   readonly message: string;
 }) => Effect.Effect<string, ProviderAdapter.ProviderAdapterV2Error>;
+type CodexLiveVoiceWorkControl = NonNullable<
+  Parameters<
+    ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]
+  >[0]["onWorkControl"]
+>;
+
+/** Route only the restricted planner's declared tools, retaining native call correlation. */
+export const routeCodexLiveVoiceTool = (
+  planner:
+    | {
+        readonly onSubmitWork: CodexLiveVoiceSubmitWork;
+        readonly onWorkControl?: CodexLiveVoiceWorkControl;
+      }
+    | undefined,
+  payload: CodexSchema.DynamicToolCallParams,
+): Effect.Effect<CodexSchema.DynamicToolCallResponse> =>
+  Effect.gen(function* () {
+    const refused: CodexSchema.DynamicToolCallResponse = {
+      contentItems: [{ type: "inputText", text: '{"accepted":false}' }],
+      success: false,
+    };
+    const value = payload.arguments;
+    if (
+      !planner ||
+      payload.namespace !== "t3" ||
+      !payload.threadId.trim() ||
+      !payload.turnId.trim() ||
+      !payload.callId.trim() ||
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value)
+    )
+      return refused;
+    const args = value as Schema.JsonObject;
+    let operation: Effect.Effect<string, ProviderAdapter.ProviderAdapterV2Error>;
+    const correlation = {
+      plannerNativeThreadId: payload.threadId,
+      plannerTurnId: payload.turnId,
+      callId: payload.callId,
+    };
+    if (payload.tool === "t3_submit_voice_work") {
+      if (
+        Object.keys(args).length !== 1 ||
+        typeof args.message !== "string" ||
+        !args.message.trim() ||
+        args.message.length > 8_000
+      )
+        return refused;
+      operation = planner.onSubmitWork({ ...correlation, message: args.message });
+    } else if (payload.tool === "t3_voice_work_control" && planner.onWorkControl) {
+      if (
+        Object.keys(args).some((key) => !["action", "runId", "message"].includes(key)) ||
+        (args.action !== "status" && args.action !== "steer") ||
+        (args.runId !== undefined &&
+          (typeof args.runId !== "string" || !args.runId.trim() || args.runId.length > 512)) ||
+        (args.action === "status" && args.message !== undefined) ||
+        (args.action === "steer" &&
+          (typeof args.runId !== "string" ||
+            typeof args.message !== "string" ||
+            !args.message.trim() ||
+            args.message.length > 8_000))
+      )
+        return refused;
+      operation = planner.onWorkControl({
+        ...correlation,
+        action: args.action,
+        ...(typeof args.runId === "string" ? { runId: args.runId } : {}),
+        ...(typeof args.message === "string" ? { message: args.message } : {}),
+      });
+    } else return refused;
+    const result = yield* Effect.result(operation);
+    return result._tag === "Success"
+      ? { contentItems: [{ type: "inputText", text: result.success }], success: true }
+      : refused;
+  });
 export const CODEX_DRIVER_KIND = CODEX_PROVIDER;
 export const CODEX_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(CODEX_DRIVER_KIND);
 
@@ -1828,7 +1903,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const liveVoiceEvents =
           yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2LiveVoiceEvent>();
         const liveVoicePlanners = yield* Ref.make(
-          new Map<string, { readonly onSubmitWork: CodexLiveVoiceSubmitWork }>(),
+          new Map<
+            string,
+            {
+              readonly onSubmitWork: CodexLiveVoiceSubmitWork;
+              readonly onWorkControl?: CodexLiveVoiceWorkControl;
+            }
+          >(),
         );
         const liveVoiceSettingsWaiters = yield* Ref.make(
           new Map<
@@ -6477,45 +6558,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             : Effect.void,
         );
         yield* client.handleServerRequest("item/tool/call", (payload) =>
-          Effect.gen(function* () {
-            const planner = (yield* Ref.get(liveVoicePlanners)).get(payload.threadId);
-            const args = payload.arguments;
-            const message =
-              typeof args === "object" && args !== null && !Array.isArray(args)
-                ? (args as Record<string, unknown>).message
-                : undefined;
-            if (
-              planner === undefined ||
-              payload.namespace !== "t3" ||
-              payload.tool !== "t3_submit_voice_work" ||
-              typeof message !== "string" ||
-              message.trim().length === 0 ||
-              message.length > 8_000 ||
-              Object.keys(args as object).length !== 1
-            ) {
-              return {
-                contentItems: [{ type: "inputText" as const, text: '{"accepted":false}' }],
-                success: false,
-              } satisfies CodexSchema.DynamicToolCallResponse;
-            }
-            const result = yield* Effect.result(
-              planner.onSubmitWork({
-                plannerNativeThreadId: payload.threadId,
-                plannerTurnId: payload.turnId,
-                callId: payload.callId,
-                message,
-              }),
-            );
-            return result._tag === "Success"
-              ? {
-                  contentItems: [{ type: "inputText" as const, text: result.success }],
-                  success: true,
-                }
-              : {
-                  contentItems: [{ type: "inputText" as const, text: '{"accepted":false}' }],
-                  success: false,
-                };
-          }),
+          Ref.get(liveVoicePlanners).pipe(
+            Effect.flatMap((planners) =>
+              routeCodexLiveVoiceTool(planners.get(payload.threadId), payload),
+            ),
+          ),
         );
 
         const liveVoiceFailure = (operation: string) => (cause: unknown) =>
@@ -7332,9 +7379,33 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                         additionalProperties: false,
                       },
                     },
+                    ...(plannerInput.onWorkControl === undefined
+                      ? []
+                      : [
+                          {
+                            type: "function",
+                            name: "t3_voice_work_control",
+                            description:
+                              "Read the selected conversation's background work status, or explicitly steer one exact running task. Status without runId lists active tasks. Steering requires runId and message; it never queues a replacement or cancels work.",
+                            inputSchema: {
+                              type: "object",
+                              properties: {
+                                action: { type: "string", enum: ["status", "steer"] },
+                                runId: { type: "string", minLength: 1, maxLength: 512 },
+                                message: { type: "string", minLength: 1, maxLength: 8_000 },
+                              },
+                              required: ["action"],
+                              additionalProperties: false,
+                            },
+                          },
+                        ]),
                   ],
                   baseInstructions:
-                    "You are a restricted voice planner, not a workspace executor. For workspace work call t3_submit_voice_work exactly once with the request. Do not use any other tool.",
+                    "You are a conversational voice companion with a separate background workspace executor. Keep talking naturally while work is queued or running; never wait for work to finish before answering another conversational turn. Submit each new workspace request once with t3_submit_voice_work; its receipt means admission, not completion. " +
+                    (plannerInput.onWorkControl === undefined
+                      ? ""
+                      : "Use t3_voice_work_control for truthful status and explicit priority changes to the exact task runId. Ask for clarification when the intended task is ambiguous. A rejected steer does not authorize a replacement task. ") +
+                    "Stopping speech or ending this call does not cancel background work. Never claim work is finished from a receipt. Do not execute workspace tools yourself or use any other tool.",
                 });
                 const started = yield* Schema.decodeUnknownEffect(
                   CodexSchema.V2ThreadStartResponse,
@@ -7393,6 +7464,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 yield* Ref.update(liveVoicePlanners, (current) =>
                   new Map(current).set(plannerNativeThreadId, {
                     onSubmitWork: plannerInput.onSubmitWork,
+                    ...(plannerInput.onWorkControl === undefined
+                      ? {}
+                      : { onWorkControl: plannerInput.onWorkControl }),
                   }),
                 );
                 return { plannerNativeThreadId };

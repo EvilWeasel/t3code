@@ -72,6 +72,152 @@ const encodeReplayTranscriptJson = Schema.encodeEffect(replayTranscriptJson);
 const decodeReplayTranscriptJson = Schema.decodeUnknownEffect(replayTranscriptJson);
 const encodeStringJson = Schema.encodeEffect(Schema.fromJsonString(Schema.String));
 
+describe("restricted conversational LiveVoice tools", () => {
+  it.effect("keeps correlated status and steering available while submitted work is held", () =>
+    Effect.gen(function* () {
+      const completion = yield* Deferred.make<void>();
+      const finished = yield* Deferred.make<void>();
+      let submissions = 0;
+      const controls: Array<{
+        action: string;
+        plannerNativeThreadId: string;
+        plannerTurnId: string;
+        callId: string;
+        runId?: string;
+        message?: string;
+      }> = [];
+      const planner = {
+        onSubmitWork: () =>
+          Effect.gen(function* () {
+            submissions += 1;
+            yield* Deferred.await(completion).pipe(
+              Effect.andThen(Deferred.succeed(finished, undefined)),
+              Effect.forkChild,
+            );
+            return '{"accepted":true,"delivery":"queued","runId":"work-1"}';
+          }),
+        onWorkControl: (
+          input: Parameters<
+            NonNullable<
+              Parameters<
+                ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]
+              >[0]["onWorkControl"]
+            >
+          >[0],
+        ) =>
+          Effect.sync(() => {
+            controls.push(input);
+            return '{"status":"running","runId":"work-1"}';
+          }),
+      };
+      const correlation = {
+        threadId: "voice-conversation",
+        turnId: "spoken-turn-1",
+        callId: "work-call",
+        namespace: "t3",
+      };
+      const admitted = yield* CodexAdapterV2.routeCodexLiveVoiceTool(planner, {
+        ...correlation,
+        tool: "t3_submit_voice_work",
+        arguments: { message: "Implement the small fix." },
+      });
+      assert.isTrue(admitted.success);
+      const controlArguments: ReadonlyArray<Schema.Json> = [
+        { action: "status", runId: "work-1" },
+        { action: "steer", runId: "work-1", message: "Prioritize the small fix." },
+        { action: "status", runId: "work-1" },
+      ];
+      for (const [index, args] of controlArguments.entries()) {
+        const reply = yield* CodexAdapterV2.routeCodexLiveVoiceTool(planner, {
+          ...correlation,
+          turnId: `spoken-turn-${index + 2}`,
+          callId: `control-${index}`,
+          tool: "t3_voice_work_control",
+          arguments: args,
+        });
+        assert.isTrue(reply.success);
+        assert.isFalse(yield* Deferred.isDone(finished));
+      }
+      assert.equal(submissions, 1);
+      assert.deepEqual(
+        controls.map((input) => [
+          input.plannerNativeThreadId,
+          input.plannerTurnId,
+          input.callId,
+          input.action,
+        ]),
+        [
+          ["voice-conversation", "spoken-turn-2", "control-0", "status"],
+          ["voice-conversation", "spoken-turn-3", "control-1", "steer"],
+          ["voice-conversation", "spoken-turn-4", "control-2", "status"],
+        ],
+      );
+      yield* Deferred.succeed(completion, undefined);
+      yield* Deferred.await(finished);
+    }),
+  );
+
+  it.effect(
+    "refuses unknown planners, malformed controls and cancellation without invoking work",
+    () =>
+      Effect.gen(function* () {
+        let invoked = 0;
+        const planner = {
+          onSubmitWork: () =>
+            Effect.sync(() => {
+              invoked += 1;
+              return "unexpected";
+            }),
+          onWorkControl: () =>
+            Effect.sync(() => {
+              invoked += 1;
+              return "unexpected";
+            }),
+        };
+        const payload = {
+          threadId: "planner",
+          turnId: "turn",
+          callId: "call",
+          namespace: "t3",
+          tool: "t3_voice_work_control",
+          arguments: { action: "status" },
+        };
+        assert.isFalse((yield* CodexAdapterV2.routeCodexLiveVoiceTool(undefined, payload)).success);
+        assert.isFalse(
+          (yield* CodexAdapterV2.routeCodexLiveVoiceTool(
+            { onSubmitWork: planner.onSubmitWork },
+            payload,
+          )).success,
+        );
+        const invalidArguments: ReadonlyArray<Schema.Json> = [
+          { action: "cancel", runId: "work-1" },
+          { action: "steer", message: "Missing task" },
+          { action: "steer", runId: "work-1", message: " " },
+          { action: "status", runId: "another", threadId: "another-thread" },
+          { action: "status", message: "Implicit work" },
+        ];
+        for (const argumentsValue of invalidArguments)
+          assert.isFalse(
+            (yield* CodexAdapterV2.routeCodexLiveVoiceTool(planner, {
+              ...payload,
+              arguments: argumentsValue,
+            })).success,
+          );
+        assert.isFalse(
+          (yield* CodexAdapterV2.routeCodexLiveVoiceTool(planner, {
+            ...payload,
+            namespace: "other",
+          })).success,
+        );
+        assert.isFalse(
+          (yield* CodexAdapterV2.routeCodexLiveVoiceTool(planner, { ...payload, callId: "" }))
+            .success,
+        );
+        assert.equal(invoked, 0);
+      }),
+  );
+});
+
 describe("Codex context usage compatibility", () => {
   const previous: ModelSelection = {
     instanceId: ProviderInstanceId.make("codex"),
