@@ -2,6 +2,7 @@ import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as NodePath from "@effect/platform-node/NodePath";
 import * as Layer from "effect/Layer";
 import * as Effect from "effect/Effect";
+import * as Data from "effect/Data";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Result from "effect/Result";
@@ -26,11 +27,14 @@ export interface BindingStore {
   read(): Promise<readonly LinkedLogin[]>;
   write(bindings: readonly LinkedLogin[]): Promise<void>;
 }
-export class AutofillUnavailable extends Error {
+export class AutofillUnavailable extends Data.TaggedError("AutofillUnavailable")<{
+  readonly message: string;
+}> {
   constructor() {
-    super(
-      "This login target changed or cannot be filled privately. Focus its main-frame login field and try again.",
-    );
+    super({
+      message:
+        "This login target changed or cannot be filled privately. Focus its main-frame login field and try again.",
+    });
   }
 }
 export const validOrigin = (raw: string) => {
@@ -58,6 +62,7 @@ const validBinding = (value: unknown): value is LinkedLogin => {
     String(entry.partition).startsWith("persist:")
   );
 };
+const bindingJsonCodec = Schema.fromJsonString(Schema.Unknown);
 const bindingIOLayer = Layer.mergeAll(NodeFileSystem.layer, NodePath.layer);
 const runBindingIO = async <A>(
   operation: Effect.Effect<A, AutofillUnavailable, FileSystem.FileSystem | Path.Path>,
@@ -85,7 +90,7 @@ export function makeBindingStore(file: string): BindingStore {
               ),
             );
           if (raw === undefined) return [];
-          const parsed = yield* Schema.decodeUnknownEffect(Schema.UnknownFromJsonString)(raw);
+          const parsed = yield* Schema.decodeUnknownEffect(bindingJsonCodec)(raw);
           return Array.isArray(parsed) ? parsed.filter(validBinding) : [];
         }).pipe(Effect.mapError(() => new AutofillUnavailable())),
       ),
@@ -103,7 +108,7 @@ export function makeBindingStore(file: string): BindingStore {
           }));
           yield* fs.makeDirectory(path.dirname(file), { recursive: true, mode: 0o700 });
           const temporary = `${file}.tmp`;
-          const encoded = yield* Schema.encodeEffect(Schema.UnknownFromJsonString)(data);
+          const encoded = yield* Schema.encodeEffect(bindingJsonCodec)(data);
           yield* fs.writeFileString(temporary, encoded, { mode: 0o600 });
           yield* fs.rename(temporary, file);
         }).pipe(Effect.mapError(() => new AutofillUnavailable())),
