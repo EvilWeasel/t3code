@@ -1,4 +1,6 @@
 import { AsyncResult } from "effect/reactivity";
+import * as Schema from "effect/Schema";
+import { LiveVoiceError, type LiveVoiceErrorCode } from "@t3tools/contracts";
 import {
   MicIcon,
   MicOffIcon,
@@ -41,6 +43,13 @@ import {
   deriveProviderInstanceEntries,
   sortProviderInstanceEntries,
 } from "../providerInstances";
+
+/** Classify only an observed typed prepare failure, never account entitlement. */
+export function classifyLiveVoicePrepareFailure(
+  error: unknown,
+): LiveVoiceErrorCode | "unclassified" {
+  return Schema.is(LiveVoiceError)(error) ? error.code : "unclassified";
+}
 
 export function deriveLiveVoiceProviderEntries(
   providers: ReadonlyArray<ServerProvider>,
@@ -198,6 +207,7 @@ export function resolveLiveVoiceControlGate(input: {
   readonly phase: LiveVoiceState["phase"];
   readonly RTCPeerConnection?: unknown;
   readonly getUserMedia?: unknown;
+  readonly prepareFailure?: LiveVoiceErrorCode | "unclassified" | null;
 }) {
   const availabilityMatchesTarget =
     input.availability.environmentId === input.environmentId &&
@@ -247,6 +257,7 @@ export function resolveLiveVoiceControlGate(input: {
     microphoneApiAvailable,
     canStart,
     reason,
+    prepareFailure: input.prepareFailure ?? null,
     facts: availabilityMatchesTarget ? input.availability.facts : null,
   });
 }
@@ -391,6 +402,12 @@ export function LiveVoiceControl(props: {
     lease: null,
     error: null,
   });
+  const [prepareFailure, setPrepareFailure] = useState<{
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+    readonly providerInstanceId: string | null;
+    readonly code: LiveVoiceErrorCode | "unclassified";
+  } | null>(null);
   const gate = resolveLiveVoiceControlGate({
     environmentId: props.environmentId,
     threadId: props.threadId,
@@ -401,6 +418,13 @@ export function LiveVoiceControl(props: {
     RTCPeerConnection: typeof RTCPeerConnection === "undefined" ? undefined : RTCPeerConnection,
     getUserMedia:
       typeof navigator === "undefined" ? undefined : navigator.mediaDevices?.getUserMedia,
+    prepareFailure:
+      state.phase === "error" &&
+      prepareFailure?.environmentId === props.environmentId &&
+      prepareFailure.threadId === props.threadId &&
+      prepareFailure.providerInstanceId === props.providerInstanceId
+        ? prepareFailure.code
+        : null,
   });
   const { active, busy, canStart, reason: unavailableNotice, targetPresent } = gate;
   const target = useMemo<LiveVoiceTarget | null>(() => {
@@ -416,8 +440,22 @@ export function LiveVoiceControl(props: {
   const signaling = useMemo<LiveVoiceSignalingAdapter>(
     () => ({
       subscribe: bridge.subscribe,
-      prepare: async (input) =>
-        unwrapLiveVoiceCommand(await prepare({ environmentId: props.environmentId, input })),
+      prepare: async (input, signal) => {
+        try {
+          return unwrapLiveVoiceCommand(
+            await prepare({ environmentId: props.environmentId, input }),
+          );
+        } catch (error) {
+          if (!signal.aborted)
+            setPrepareFailure({
+              environmentId: props.environmentId,
+              threadId: input.threadId,
+              providerInstanceId: props.providerInstanceId,
+              code: classifyLiveVoicePrepareFailure(error),
+            });
+          throw error;
+        }
+      },
       start: async (input) =>
         unwrapLiveVoiceCommand(await startRpc({ environmentId: props.environmentId, input })),
       stop: async (input) =>
@@ -425,7 +463,7 @@ export function LiveVoiceControl(props: {
       status: async (input) =>
         unwrapLiveVoiceCommand(await statusRpc({ environmentId: props.environmentId, input })),
     }),
-    [bridge, prepare, props.environmentId, startRpc, statusRpc, stopRpc],
+    [bridge, prepare, props.environmentId, props.providerInstanceId, startRpc, statusRpc, stopRpc],
   );
   const dependencies = useMemo<LiveVoiceControllerDependencies>(
     () => ({
@@ -466,6 +504,7 @@ export function LiveVoiceControl(props: {
     [controller],
   );
   useEffect(() => {
+    setPrepareFailure(null);
     void controller.contextChanged(target);
   }, [controller, target]);
 
@@ -495,7 +534,10 @@ export function LiveVoiceControl(props: {
     [controller, state.outputMuted],
   );
   const onStart = useCallback(() => {
-    if (canStart && target) void controller.start(target);
+    if (canStart && target) {
+      setPrepareFailure(null);
+      void controller.start(target);
+    }
   }, [canStart, controller, target]);
 
   return (

@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import {
   EnvironmentId,
   LiveVoiceError,
+  liveVoicePublicErrorMessage,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -36,6 +37,7 @@ vi.mock("../state/use-atom-command", () => ({
 
 import {
   deriveLiveVoiceProviderEntries,
+  classifyLiveVoicePrepareFailure,
   advanceLiveVoiceDiagnosticModel,
   LiveVoiceControl,
   resolveLiveVoiceAvailability,
@@ -43,6 +45,7 @@ import {
   resolveLiveVoiceControlGate,
 } from "./LiveVoiceControl";
 import { TooltipProvider } from "~/components/ui/tooltip";
+import { unwrapLiveVoiceCommand } from "./LiveVoiceCommands";
 import { resolveComposerProviderSelection } from "../components/ChatView.logic";
 import {
   applyProviderInstanceSettings,
@@ -133,6 +136,7 @@ function expectPassive() {
 function gateFor(
   input: AvailabilityInput,
   phase: Parameters<typeof resolveLiveVoiceControlGate>[0]["phase"] = "idle",
+  prepareFailure: ReturnType<typeof classifyLiveVoicePrepareFailure> | null = null,
 ) {
   return resolveLiveVoiceControlGate({
     environmentId: input.environmentId,
@@ -143,6 +147,7 @@ function gateFor(
     phase,
     RTCPeerConnection: peer,
     getUserMedia,
+    prepareFailure,
   });
 }
 
@@ -268,6 +273,78 @@ describe("Live voice diagnostic producer model (transport absent)", () => {
 });
 
 describe("LiveVoiceControl passive availability", () => {
+  it.each([
+    "unsupported_provider",
+    "managed_account_required",
+    "session_not_found",
+    "stale_lease",
+    "planner_restriction_failed",
+    "invalid_state",
+    "dispatch_conflict",
+    "runtime_unavailable",
+  ] as const)(
+    "classifies only observed typed prepare failure %s after deliberate start",
+    async (code) => {
+      const result = AsyncResult.failure(Cause.fail(new LiveVoiceError({ code })));
+      let classified: ReturnType<typeof classifyLiveVoicePrepareFailure> | null = null;
+      try {
+        unwrapLiveVoiceCommand(result);
+      } catch (error) {
+        classified = classifyLiveVoicePrepareFailure(error);
+      }
+      expect(classified).toBe(code);
+      commands.prepare.mockResolvedValue(result);
+      await render(loaded);
+      expectPassive();
+      await act(async () => startButton().click());
+      expect(container.textContent).toContain(liveVoicePublicErrorMessage(code));
+      expect(commands.prepare).toHaveBeenCalledOnce();
+      expect(commands.start).not.toHaveBeenCalled();
+      expect(getUserMedia).not.toHaveBeenCalled();
+      expect(peer).not.toHaveBeenCalled();
+      const model = advanceLiveVoiceDiagnosticModel(null, gateFor(loaded, "error", classified));
+      expect(model.gate.prepareFailure).toBe(code);
+    },
+  );
+
+  it("never infers a typed account failure from arbitrary text", () => {
+    const raw = new Error(
+      "private detail: " + liveVoicePublicErrorMessage("managed_account_required"),
+    );
+    expect(classifyLiveVoicePrepareFailure(raw)).toBe("unclassified");
+    const model = advanceLiveVoiceDiagnosticModel(
+      null,
+      gateFor(loaded, "error", classifyLiveVoicePrepareFailure(raw)),
+    );
+    expect(JSON.stringify(model)).not.toContain("private detail");
+    expect(model.gate.prepareFailure).toBe("unclassified");
+    expectPassive();
+  });
+
+  it("ignores a late prepare failure from an aborted A context after A to B to A", async () => {
+    let finish!: (result: ReturnType<typeof AsyncResult.failure>) => void;
+    commands.prepare.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    await render(loaded);
+    await act(async () => startButton().click());
+    await render({ ...loaded, environmentId: environmentB, catalogEnvironmentId: environmentB });
+    await render(loaded);
+    await act(async () =>
+      finish(
+        AsyncResult.failure(Cause.fail(new LiveVoiceError({ code: "managed_account_required" }))),
+      ),
+    );
+    expect(startButton().disabled).toBe(false);
+    expect(container.textContent).not.toContain("Sign in");
+    expect(commands.prepare).toHaveBeenCalledOnce();
+    expect(commands.start).not.toHaveBeenCalled();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(peer).not.toHaveBeenCalled();
+  });
+
   it("keeps the production voice fallback identical to the composer for a stale request and custom-first wire order", async () => {
     const driver = ProviderDriverKind.make("codex");
     const provider = (id: string): ServerProvider => ({
