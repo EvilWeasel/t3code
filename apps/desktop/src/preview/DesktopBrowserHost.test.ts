@@ -288,6 +288,45 @@ describe("DesktopBrowserHost", () => {
       }).pipe(Effect.scoped),
   );
 
+  it.effect(
+    "captures old command settlement across private resume, replacement and half-close",
+    () =>
+      Effect.gen(function* () {
+        const host = yield* DesktopBrowserHost.make;
+        const debuggee = makeDebuggee();
+        host.attach(key, debuggee.tab);
+        const old = yield* connect(host);
+        yield* Queue.take(old.messages);
+        const line = (id: number) =>
+          encodeJson({
+            type: "cdp",
+            ...key,
+            message: encodeJson({ id, method: "DOM.enable", sessionId: "t3-preview-page" }),
+          });
+        const pending = yield* old.connection.dispatchCommandLine!(line(200));
+        expect(pending).toBeDefined();
+        host.setPrivateEntry(debuggee.tab.webContents, true);
+        host.setPrivateEntry(debuggee.tab.webContents, false);
+        const replacement = yield* connect(host);
+        yield* Queue.take(replacement.messages);
+        yield* old.connection.closed;
+        yield* old.connection.closed;
+        expect(yield* old.connection.dispatchCommandLine!(line(202))).toBeUndefined();
+        const current = yield* replacement.connection.dispatchCommandLine!(line(201));
+        debuggee.release();
+        yield* Effect.promise(() => pending!.settled);
+        yield* Effect.promise(() => current!.settled);
+        const reply = yield* Queue.take(replacement.messages);
+        expect(reply.type === "cdp" && decodeCdpReply(reply.message).id).toBe(201);
+        expect(yield* Queue.size(replacement.messages)).toBe(0);
+        const halfClosed = yield* replacement.connection.dispatchCommandLine!(line(203));
+        yield* replacement.connection.closed;
+        debuggee.release();
+        yield* Effect.promise(() => halfClosed!.settled);
+        expect(yield* replacement.connection.dispatchCommandLine!(line(204))).toBeUndefined();
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("announces tabs already attached to a backend that starts later", () =>
     Effect.gen(function* () {
       const host = yield* DesktopBrowserHost.make;

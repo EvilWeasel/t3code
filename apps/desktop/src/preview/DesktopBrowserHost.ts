@@ -58,6 +58,9 @@ export interface DesktopBrowserConnection {
   readonly events: Stream.Stream<Uint8Array>;
   readonly handleCommandLine: (line: string) => Effect.Effect<void>;
   readonly closed: Effect.Effect<void>;
+  readonly dispatchCommandLine?: (
+    line: string,
+  ) => Effect.Effect<{ readonly settled: Promise<void> } | undefined>;
 }
 
 export interface NativePrivateEntryLease {
@@ -149,7 +152,9 @@ export const make = Effect.gen(function* () {
     readonly x: number;
     readonly y: number;
   }>(16);
-  const runFork = Effect.runForkWith(yield* Effect.context<never>());
+  const context = yield* Effect.context<never>();
+  const runFork = Effect.runForkWith(context);
+  const runPromise = Effect.runPromiseWith(context);
   const tabs = new Map<string, AttachedTab>();
   const privateContents = new WeakSet<Electron.WebContents>();
   let activeConnection: symbol | null = null;
@@ -340,6 +345,8 @@ export const make = Effect.gen(function* () {
   const relayFor = (tab: AttachedTab) => {
     if (tab.relay) return tab.relay;
     const { webContents, debugger: debuggee } = tab.debuggee;
+    const connection = activeConnection;
+    const closeConnection = closeActiveConnection;
     const relay: CdpRelayConnection = createCdpRelayConnection(
       {
         send: (method, params, sessionId) => {
@@ -371,9 +378,21 @@ export const make = Effect.gen(function* () {
         if (
           !privateContents.has(webContents) &&
           tab.relay === relay &&
+          activeConnection === connection &&
           tabs.get(keyOf(tab.key)) === tab
         ) {
-          emit({ type: "cdp", ...tab.key, message });
+          return runPromise(
+            PubSub.publish(outbox, {
+              connection,
+              event: { type: "cdp", ...tab.key, message },
+            }),
+          ).then(
+            () => {},
+            () => {
+              closeConnection?.();
+              throw unavailable();
+            },
+          );
         }
       },
     );
@@ -438,7 +457,7 @@ export const make = Effect.gen(function* () {
     emit({ type: "attached", ...key, ...(tab.attachment ? { privateEntry: tab.attachment } : {}) });
   };
 
-  const handleCommandLine = (line: string) =>
+  const dispatchCommandLine = (line: string) =>
     Effect.sync(() => {
       // Reservation metadata must survive the private CDP early return.
       const control = decodePrivateResponse(line);
@@ -486,7 +505,16 @@ export const make = Effect.gen(function* () {
       }
       if (command.value.type !== "cdp") return;
       if (AGENT_INPUT_COMMAND.test(command.value.message)) tab.agentInputAt = performance.now();
-      relayFor(tab).receive(command.value.message);
+      const settled = relayFor(tab).receive(command.value.message);
+      return settled ? { settled } : undefined;
+    });
+
+  // The ordinary FD reader starts commands independently; only explicit observers await completion.
+  const handleCommandLine = (line: string) =>
+    Effect.gen(function* () {
+      const closeConnection = closeActiveConnection;
+      const completion = yield* dispatchCommandLine(line);
+      if (completion) void completion.settled.catch(() => closeConnection?.());
     });
 
   const humanStartedDownload = (source: Electron.WebContents) => {
@@ -542,6 +570,16 @@ export const make = Effect.gen(function* () {
         Effect.suspend(() =>
           !closed && activeConnection === token ? handleCommandLine(line) : Effect.void,
         ),
+      dispatchCommandLine: (line) =>
+        Effect.suspend(() => {
+          if (closed || activeConnection !== token) return Effect.succeed(undefined);
+          return dispatchCommandLine(line).pipe(
+            Effect.map((completion) => {
+              if (completion) void completion.settled.catch(close);
+              return completion;
+            }),
+          );
+        }),
       events: Stream.unwrap(
         Effect.gen(function* () {
           if (closed || subscribed) return Stream.empty;

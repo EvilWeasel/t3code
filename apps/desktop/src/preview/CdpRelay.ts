@@ -31,7 +31,7 @@ export interface CdpRelayTarget {
 
 export interface CdpRelayConnection {
   /** Feed one message from the server. */
-  readonly receive: (raw: string) => void;
+  readonly receive: (raw: string) => Promise<void> | undefined;
   /** Feed one debugger event from the tab. */
   readonly event: (method: string, params: unknown, sessionId: string | undefined) => void;
 }
@@ -65,9 +65,13 @@ const ACKNOWLEDGED = new Set([
 
 export function createCdpRelayConnection(
   target: CdpRelayTarget,
-  write: (message: string) => void,
+  write: (message: string) => unknown,
 ): CdpRelayConnection {
   const send = (message: Record<string, unknown>) => write(JSON.stringify(message));
+  const sendEvent = (message: Record<string, unknown>) => {
+    // The sink handles connection failure; debugger events have no completion caller.
+    void Promise.resolve(send(message)).catch(() => {});
+  };
   let attached = false;
   /**
    * Sessions this relay invented. Extra page sessions (Playwright's
@@ -185,40 +189,41 @@ export function createCdpRelayConnection(
       const route = command.sessionId === undefined ? {} : { sessionId: command.sessionId };
       // Replies leave as commands finish, as Chromium's do, so a slow command
       // such as a screenshot never holds up the ones behind it.
-      void result.then(
-        (value) => {
+      return result.then(
+        async (value) => {
           const announce =
             typeof value === "object" && value !== null && ANNOUNCE in value
               ? (value as { [ANNOUNCE]: Record<string, unknown> })[ANNOUNCE]
               : undefined;
-          send({ id: command.id, result: announce ? {} : (value ?? {}), ...route });
-          if (announce) send(announce);
+          await send({ id: command.id, result: announce ? {} : (value ?? {}), ...route });
+          if (announce) await send(announce);
         },
-        (cause: unknown) =>
-          send({
+        async (cause: unknown) => {
+          await send({
             id: command.id,
             error: {
               code: -32000,
               message: cause instanceof Error ? cause.message : String(cause),
             },
             ...route,
-          }),
+          });
+        },
       );
     },
     event: (method, params, sessionId) => {
       if (!attached) return;
       // Download events are the browser's; Playwright listens on its root session.
       if (method.startsWith("Browser.download")) {
-        send({ method, params });
+        sendEvent({ method, params });
         return;
       }
       // Electron reports the page's own events with an empty session id.
       if (sessionId) {
-        send({ method, params, sessionId });
+        sendEvent({ method, params, sessionId });
         return;
       }
       for (const [id, kind] of sessions)
-        if (kind === "page") send({ method, params, sessionId: id });
+        if (kind === "page") sendEvent({ method, params, sessionId: id });
     },
   };
 }

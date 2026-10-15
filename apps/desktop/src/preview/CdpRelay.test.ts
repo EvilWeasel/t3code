@@ -194,3 +194,94 @@ describe("CDP relay downloads", () => {
     ]);
   });
 });
+
+describe("per-command completion", () => {
+  it("settles fast 201 independently of deferred 200 and waits for the actual sink", async () => {
+    const slow = Promise.withResolvers<unknown>();
+    const sink = Promise.withResolvers<void>();
+    const accepted = Promise.withResolvers<void>();
+    const ids: number[] = [];
+    const relay = createCdpRelayConnection(
+      makeTarget((method) => (method === "Runtime.evaluate" ? slow.promise : Promise.resolve({}))),
+      async (raw) => {
+        const id = (JSON.parse(raw) as { id: number }).id;
+        ids.push(id);
+        if (id === 200) {
+          accepted.resolve();
+          await sink.promise;
+        }
+      },
+    );
+    let settled = false;
+    const pending = relay.receive(
+      JSON.stringify({ id: 200, method: "Runtime.evaluate", sessionId: "t3-preview-page" }),
+    )!;
+    void pending.then(() => {
+      settled = true;
+    });
+    await relay.receive(
+      JSON.stringify({ id: 201, method: "DOM.enable", sessionId: "t3-preview-page" }),
+    );
+    expect(ids).toEqual([201]);
+    slow.resolve({});
+    await accepted.promise;
+    expect(settled).toBe(false);
+    sink.resolve();
+    await pending;
+    expect(ids).toEqual([201, 200]);
+  });
+
+  it("waits for reply acceptance before announcement and for announcement acceptance before settlement", async () => {
+    const reply = Promise.withResolvers<void>();
+    const announcement = Promise.withResolvers<void>();
+    const announcing = Promise.withResolvers<void>();
+    const calls: string[] = [];
+    const relay = createCdpRelayConnection(
+      makeTarget(async () => ({})),
+      async (raw) => {
+        if ("id" in JSON.parse(raw)) {
+          calls.push("reply");
+          await reply.promise;
+        } else {
+          calls.push("announcement");
+          announcing.resolve();
+          await announcement.promise;
+        }
+      },
+    );
+    let settled = false;
+    const pending = relay.receive(JSON.stringify({ id: 1, method: "Target.setAutoAttach" }))!;
+    void pending.then(() => {
+      settled = true;
+    });
+    reply.resolve();
+    await announcing.promise;
+    expect(calls).toEqual(["reply", "announcement"]);
+    expect(settled).toBe(false);
+    announcement.resolve();
+    await pending;
+    expect(settled).toBe(true);
+  });
+
+  it("settles a target error only after its error reply is accepted and propagates sink failure", async () => {
+    const accepted = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const relay = createCdpRelayConnection(
+      makeTarget(async () => {
+        throw new Error("synthetic");
+      }),
+      async (raw) => {
+        expect(JSON.parse(raw)).toMatchObject({ id: 200, error: { code: -32000 } });
+        entered.resolve();
+        await accepted.promise;
+      },
+    );
+    const pending = relay.receive(
+      JSON.stringify({ id: 200, method: "Runtime.evaluate", sessionId: "t3-preview-page" }),
+    )!;
+    await entered.promise;
+    accepted.reject(new Error("sink unavailable"));
+    await expect(pending).rejects.toThrow("sink unavailable");
+    expect(relay.receive("invalid")).toBeUndefined();
+  });
+});
