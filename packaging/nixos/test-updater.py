@@ -155,6 +155,51 @@ elif '--verify-path' not in args: sys.exit(88)
         r=self.run_update('--activate',VERSION); self.assertNotEqual(r.returncode,0)
         self.assertFalse(self.data.exists())
 
+    def test_prepare_never_replaces_an_existing_version_identity(self):
+        old = self.previous()
+        version_link = self.data/'versions'/VERSION
+        version_link.symlink_to('/nix/store/' + '1'*32 + '-original-version')
+        (self.data/'current').unlink()
+        (self.data/'current').symlink_to(version_link)
+        (self.data/'previous').symlink_to(old)
+        before = {name: os.readlink(self.data/name) for name in ['current', 'previous']}
+        r = self.run_update('--prepare', VERSION)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('version identity changed', r.stderr)
+        self.assertEqual(os.readlink(version_link), '/nix/store/' + '1'*32 + '-original-version')
+        self.assertEqual({name: os.readlink(self.data/name) for name in before}, before)
+        self.assertFalse(self.log.exists())
+
+    def test_activation_rechecks_prepared_provenance_under_lock(self):
+        if not self.real_store: self.skipTest('Namespace Nix fixture needed for Store path validation')
+        old = self.previous()
+        r = self.run_update('--prepare', VERSION)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        receipt = self.data/'prepared'/f'{VERSION}.json'
+        original = json.loads(receipt.read_text())
+        self.assertEqual(original['repository'], 'morrowbyte/t3code')
+        self.assertEqual(original['channel'], 'nightly')
+        for field, value in [('version','9.9.9'), ('repository','pingdotgg/t3code'), ('channel','stable'), ('storePath','/nix/store/wrong')]:
+            with self.subTest(field=field):
+                receipt.write_text(json.dumps({**original, field:value}))
+                r = self.run_update('--activate', VERSION)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn('provenance changed', r.stderr)
+                self.assertEqual(os.readlink(self.data/'current'), old)
+        receipt.write_text(json.dumps(original))
+        self.env['T3_WEASEL_CHANNEL'] = 'stable'
+        r = self.run_update('--activate', VERSION)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(os.readlink(self.data/'current'), old)
+
+    def test_wrong_repository_is_rejected_without_network_or_install(self):
+        self.env['T3_WEASEL_REPOSITORY'] = 'pingdotgg/t3code'
+        r = self.run_update('--prepare', VERSION)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('approved fork', r.stderr)
+        self.assertFalse(self.data.exists())
+        self.assertFalse(self.log.exists())
+
     def test_stable_does_not_fall_back_to_nightly(self):
         self.env['T3_WEASEL_CHANNEL']='stable'
         r=self.run_update('--check'); self.assertNotEqual(r.returncode,0)

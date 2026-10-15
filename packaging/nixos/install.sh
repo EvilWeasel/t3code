@@ -29,6 +29,7 @@ point_to() {
 }
 
 [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'invalid release repository'
+[[ "$repo" == morrowbyte/t3code ]] || die 'release repository is not the approved fork'
 [[ "$channel" == nightly || "$channel" == stable ]] || die 'channel must be nightly or stable'
 [[ "$base_dir" == /* ]] || die 'data directory must be absolute'
 case "$mode" in
@@ -37,13 +38,17 @@ case "$mode" in
     exit 0 ;;
   --rollback|--activate)
     version="${2:-}"
-    [[ $# -eq 2 ]] && valid_version "$version" && valid_install "$version" || die 'activation requires an installed version'
+    [[ $# -eq 2 ]] && valid_version "$version" || die 'activation requires an installed version'
     mkdir -p "$base_dir"
     exec 9>"$base_dir/.update.lock"
     flock -n 9 || die 'another update is running'
+    valid_install "$version" || die 'activation requires an installed version'
     if [[ "$mode" == --activate ]]; then
       [[ -f "$base_dir/prepared/$version.json" ]] || die 'version has not been prepared'
-      [[ "$(jq -er '.storePath' "$base_dir/prepared/$version.json")" == "$(readlink -f "$install_dir/$version")" ]] || die 'prepared Store root changed'
+      jq -e --arg version "$version" --arg repository "$repo" --arg channel "$channel" \
+        --arg storePath "$(readlink -f "$install_dir/$version")" \
+        '.schemaVersion == 1 and .version == $version and .repository == $repository and .channel == $channel and .system == "x86_64-linux" and .storePath == $storePath' \
+        "$base_dir/prepared/$version.json" >/dev/null || die 'prepared version provenance changed'
     fi
     point_to "$version"
     printf 'Selected installed version %s; running processes unchanged.\n' "$version"
@@ -104,6 +109,11 @@ fi
 mkdir -p "$base_dir" "$install_dir" "$base_dir/prepared" "$base_dir/.gcroots"
 exec 9>"$base_dir/.update.lock"
 flock -n 9 || die 'another update is running'
+# Version links may be the target of current/previous. Replacing one during
+# preparation would activate different bytes indirectly, before --activate.
+if [[ -e "$install_dir/$version" || -L "$install_dir/$version" ]]; then
+  [[ "$(readlink -f "$install_dir/$version")" == "$store_path" ]] || die 'installed version identity changed'
+fi
 if ! valid_install "$version" || [[ "$(readlink -f "$install_dir/$version")" != "$store_path" ]]; then
   fetch "$archive_url" --output "$work_dir/closure.nar.zst"
   [[ "$(sha256sum "$work_dir/closure.nar.zst" | cut -d ' ' -f 1)" == "$archive_digest" ]] || die 'closure download does not match SHA-256'
@@ -119,7 +129,9 @@ nix-store --add-root "$base_dir/.gcroots/$(basename "$store_path")" --indirect \
   --realise "$store_path" --option max-jobs 0 --option builders '' --option substitute false >/dev/null
 ln -s "$store_path" "$install_dir/.candidate.$$"
 mv -Tf "$install_dir/.candidate.$$" "$install_dir/$version"
-install -m 0600 "$work_dir/manifest.json" "$base_dir/prepared/.$version.$$"
+jq --arg repository "$repo" --arg channel "$channel" \
+  '. + {repository:$repository, channel:$channel}' "$work_dir/manifest.json" > "$work_dir/prepared.json"
+install -m 0600 "$work_dir/prepared.json" "$base_dir/prepared/.$version.$$"
 mv -Tf "$base_dir/prepared/.$version.$$" "$base_dir/prepared/$version.json"
 if [[ "$mode" == --prepare ]]; then
   printf 'Prepared %s; running version unchanged.\n' "$version"
