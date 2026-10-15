@@ -50,6 +50,9 @@ jobs:
   # have already run. Scheduled runs also decide here whether a nightly is due.
   resolve_commit:
     name: Resolve release commit
+    # Morrowbyte uses weasel-release.yml for Windows/Linux x64 packages.
+    # Do not start the inherited multi-platform release train in this fork.
+    if: github.repository != 'morrowbyte/t3code'
     runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 5
     outputs:

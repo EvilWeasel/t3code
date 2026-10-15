@@ -31,6 +31,7 @@ jobs:
   resolve:
     name: Verify preview eligibility
     if: >-
+      github.repository != 'morrowbyte/t3code' &&
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'

@@ -100,6 +100,8 @@ permissions:
 jobs:
   build:
     name: Build ${{ inputs.label }}
+    # Fork desktop targets are Windows/Linux x64. Android is a separate lane.
+    if: github.repository != 'morrowbyte/t3code' || (inputs.arch == 'x64' && (inputs.platform == 'win' || inputs.platform == 'linux'))
     runs-on: ${{ inputs.runner }}
     # Windows waits for the Linux CLI archive inside its own budget (see
     # "Wait for Linux CLI archive"), so it gets that wait on top of the usual 30.

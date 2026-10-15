@@ -165,4 +165,4 @@ Architecture and its constraints: `docs/internals/overview.md`. Glossary: `docs/
 
 ## Current CI backend (2026-10-15 owner instruction)
 
-Use Blacksmith for this repository's GitHub Actions CI, compilation, packaging and full suites. This supersedes earlier Namespace-only guidance. Preserve the documented native Windows ARM64 exception where applicable. Never move build pressure to the laptop or Hephaestus. See the existing CI operations guide for exact runner labels and acceptance boundaries.
+Use Blacksmith for this repository's GitHub Actions CI, compilation, packaging and full suites. This supersedes earlier Namespace-only guidance. The Morrowbyte fork targets Windows x64 and Linux x64 desktop, with Android planned separately. Do not enable desktop ARM64 or macOS builds for this fork; Android device ABIs are not subject to that desktop restriction. Never move build pressure to the laptop or Hephaestus. See the existing CI operations guide for exact runner labels and acceptance boundaries.

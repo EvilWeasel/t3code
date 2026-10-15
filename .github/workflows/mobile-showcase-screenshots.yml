@@ -44,7 +44,7 @@ env:
 jobs:
   ios:
     name: iPhone 6.9, iPhone 6.5, and iPad 13
-    if: inputs.platform == 'all' || inputs.platform == 'ios'
+    if: github.repository != 'morrowbyte/t3code' && (inputs.platform == 'all' || inputs.platform == 'ios')
     runs-on: blacksmith-12vcpu-macos-26
     # Capturing every palette multiplies the device matrix by six, and only the
     # Capturing every palette multiplies the device matrix by six, and only the
