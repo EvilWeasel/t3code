@@ -536,6 +536,12 @@ export const make = Effect.gen(function* () {
         event.preventDefault();
         return;
       }
+      // Attach has no immutable operation token: the central inventory keeps
+      // allowed guests UNKNOWN instead of pairing them with a reservation.
+      if (electronWindow.canCreateUncorrelatedRenderer?.() === false) {
+        event.preventDefault();
+        return;
+      }
       webPreferences.sandbox = true;
       webPreferences.nodeIntegration = false;
       webPreferences.nodeIntegrationInSubFrames = false;

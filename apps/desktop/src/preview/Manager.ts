@@ -61,6 +61,7 @@ import * as Scope from "effect/Scope";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopRendererHistory from "../telemetry/DesktopRendererHistory.ts";
 import { MENU_ACTION_CHANNEL, PREVIEW_PICTURE_IN_PICTURE_FRAME_CHANNEL } from "../ipc/channels.ts";
 import * as DesktopBrowserHost from "./DesktopBrowserHost.ts";
@@ -542,6 +543,13 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   artifactDirectory: string,
   pictureInPicturePreloadPath: string,
 ) {
+  const electronWindow = yield* Effect.serviceOption(ElectronWindow.ElectronWindow);
+  const reserveRendererCreation = Option.isSome(electronWindow)
+    ? electronWindow.value.tryReserveRendererCreation
+    : undefined;
+  const canCreateUncorrelatedRenderer = Option.isSome(electronWindow)
+    ? electronWindow.value.canCreateUncorrelatedRenderer
+    : undefined;
   const fileSystem = yield* FileSystem.FileSystem;
   const rendererHistory = yield* DesktopRendererHistory.DesktopRendererHistory;
   const hostPlatform = yield* HostProcess.Platform;
@@ -1617,6 +1625,8 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
         wc.setWindowOpenHandler((details) => {
           const action = previewWindowOpenAction(details);
           if (action === "popup") {
+            // Default popup creation cannot echo an exact reservation token.
+            if (canCreateUncorrelatedRenderer?.() === false) return { action: "deny" };
             return { action: "allow", overrideBrowserWindowOptions: POPUP_WINDOW_OPTIONS };
           }
           if (action === "deny") return { action: "deny" };
@@ -2855,45 +2865,67 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
           yield* releasePictureInPicture(tabId, existing, false);
         }
         const wc = yield* requireWebContents(tabId);
-        const title = yield* attempt(
-          {
-            operation: "pictureInPicture.readTitle",
-            tabId,
-            webContentsId: wc.id,
-          },
-          () => wc.getTitle().trim(),
-        );
         const pictureInPictureWindow = yield* attempt(
           {
             operation: "pictureInPicture.create",
             tabId,
             webContentsId: wc.id,
           },
-          () =>
-            new BrowserWindow({
-              width: PICTURE_IN_PICTURE_INITIAL_WIDTH,
-              height: PICTURE_IN_PICTURE_INITIAL_HEIGHT,
-              minWidth: PICTURE_IN_PICTURE_MIN_WIDTH,
-              minHeight: PICTURE_IN_PICTURE_MIN_HEIGHT,
-              title: title.length > 0 ? `Preview · ${title}` : "Browser preview",
-              show: false,
-              alwaysOnTop: true,
-              autoHideMenuBar: true,
-              fullscreenable: false,
-              maximizable: false,
-              minimizable: false,
-              resizable: true,
-              skipTaskbar: true,
-              backgroundColor: "#111111",
-              ...(hostPlatform === "darwin" ? { type: "panel" as const } : {}),
-              webPreferences: {
-                preload: pictureInPicturePreloadPath,
-                backgroundThrottling: false,
-                contextIsolation: true,
-                nodeIntegration: false,
-                sandbox: true,
-              },
-            }),
+          () => {
+            const reservation = reserveRendererCreation?.({ kind: "preview-pip", owner: wc.id });
+            if (reserveRendererCreation && !reservation) {
+              throw new Error("Renderer creation is held for installation.");
+            }
+            let created: BrowserWindow | undefined;
+            let released = false;
+            const release = () => {
+              if (released) return;
+              released = true;
+              reservation?.release();
+            };
+            try {
+              const title = wc.getTitle().trim();
+              created = new BrowserWindow({
+                width: PICTURE_IN_PICTURE_INITIAL_WIDTH,
+                height: PICTURE_IN_PICTURE_INITIAL_HEIGHT,
+                minWidth: PICTURE_IN_PICTURE_MIN_WIDTH,
+                minHeight: PICTURE_IN_PICTURE_MIN_HEIGHT,
+                title: title.length > 0 ? `Preview · ${title}` : "Browser preview",
+                show: false,
+                alwaysOnTop: true,
+                autoHideMenuBar: true,
+                fullscreenable: false,
+                maximizable: false,
+                minimizable: false,
+                resizable: true,
+                skipTaskbar: true,
+                backgroundColor: "#111111",
+                ...(hostPlatform === "darwin" ? { type: "panel" as const } : {}),
+                webPreferences: {
+                  preload: pictureInPicturePreloadPath,
+                  backgroundThrottling: false,
+                  contextIsolation: true,
+                  nodeIntegration: false,
+                  sandbox: true,
+                },
+              });
+              // Capture this exact construction before any asynchronous publication.
+              created.once("closed", release);
+              if (reservation && !reservation.bind(created.webContents)) {
+                throw new Error("Renderer creation reservation could not bind.");
+              }
+              return created;
+            } catch (cause) {
+              if (created) {
+                if (!created.isDestroyed()) created.close();
+                // A vetoed close is not retirement: keep the reservation until closed.
+                if (created.isDestroyed()) release();
+              } else {
+                release();
+              }
+              throw cause;
+            }
+          },
         );
         yield* rendererHistory.register(pictureInPictureWindow.webContents, {
           surface: "picture-in-picture",

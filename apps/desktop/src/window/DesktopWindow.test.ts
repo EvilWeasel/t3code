@@ -15,7 +15,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as Electron from "electron";
 import * as NodeEvents from "node:events";
-import { vi } from "vite-plus/test";
+import { expect, vi } from "vite-plus/test";
 
 vi.mock("electron", async (importOriginal) => ({
   ...(await importOriginal<typeof import("electron")>()),
@@ -233,6 +233,7 @@ function layerTest(input: {
   readonly previewZoomReapplies?: number[];
   readonly onReveal?: (window: Electron.BrowserWindow) => void;
   readonly focusedWindow?: Electron.BrowserWindow;
+  readonly canCreateUncorrelatedRenderer?: () => boolean;
 }) {
   let desktopSettings = input.desktopSettings ?? DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS;
   const layerDesktopAppSettings = Layer.succeed(DesktopAppSettings.DesktopAppSettings, {
@@ -270,6 +271,9 @@ function layerTest(input: {
   } satisfies DesktopAppSettings.DesktopAppSettings["Service"]);
 
   const layerElectronWindow = Layer.succeed(ElectronWindow.ElectronWindow, {
+    ...(input.canCreateUncorrelatedRenderer
+      ? { canCreateUncorrelatedRenderer: input.canCreateUncorrelatedRenderer }
+      : {}),
     create: (options) =>
       Effect.sync(() => {
         input.createdWindowOptions?.push(options);
@@ -461,6 +465,79 @@ const captureOne = DesktopSnapShotId.make("11111111-1111-4111-8111-111111111111"
 const captureTwo = DesktopSnapShotId.make("22222222-2222-4222-8222-222222222222");
 
 describe("DesktopWindow", () => {
+  it.effect(
+    "vetoes held guest attach synchronously without changing ordinary partition hardening",
+    () =>
+      Effect.gen(function* () {
+        const host = makeFakeBrowserWindow();
+        let held = true;
+        const canCreateUncorrelatedRenderer = vi.fn(() => !held);
+        const layer = layerTest({
+          window: host.window,
+          createCount: yield* Ref.make(0),
+          mainWindow: yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none()),
+          canCreateUncorrelatedRenderer,
+        });
+        yield* Effect.gen(function* () {
+          const desktopWindow = yield* DesktopWindow.DesktopWindow;
+          yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+          const attach = host.webContentsListeners.get("will-attach-webview");
+          assert.isDefined(attach);
+          const invalid = vi.fn();
+          const invalidPreferences: Electron.WebPreferences = {};
+          attach({ preventDefault: invalid }, invalidPreferences, { partition: "untrusted" });
+          expect(invalid).toHaveBeenCalledOnce();
+          expect(canCreateUncorrelatedRenderer).not.toHaveBeenCalled();
+          const denied = vi.fn();
+          const deniedPreferences: Electron.WebPreferences = {};
+          attach({ preventDefault: denied }, deniedPreferences, {
+            partition: "persist:t3code-preview-test",
+          });
+          expect(denied).toHaveBeenCalledOnce();
+          expect(deniedPreferences).toEqual({});
+          held = false;
+          expect(canCreateUncorrelatedRenderer).toHaveBeenCalledOnce();
+          expect(denied).toHaveBeenCalledOnce();
+          const allowed = vi.fn();
+          const allowedPreferences: Electron.WebPreferences = {};
+          attach({ preventDefault: allowed }, allowedPreferences, {
+            partition: "persist:t3code-preview-test",
+          });
+          expect(allowed).not.toHaveBeenCalled();
+          expect(allowedPreferences).toMatchObject({
+            sandbox: true,
+            nodeIntegration: false,
+            nodeIntegrationInSubFrames: false,
+            contextIsolation: false,
+            disableHtmlFullscreenWindowResize: true,
+          });
+        }).pipe(Effect.provide(layer));
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("preserves ordinary guest attach when the optional install guard is absent", () =>
+    Effect.gen(function* () {
+      const host = makeFakeBrowserWindow();
+      const layer = layerTest({
+        window: host.window,
+        createCount: yield* Ref.make(0),
+        mainWindow: yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none()),
+      });
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+        const attach = host.webContentsListeners.get("will-attach-webview");
+        assert.isDefined(attach);
+        const preventDefault = vi.fn();
+        const preferences: Electron.WebPreferences = {};
+        attach({ preventDefault }, preferences, { partition: "persist:t3code-preview-test" });
+        expect(preventDefault).not.toHaveBeenCalled();
+        expect(preferences.sandbox).toBe(true);
+        expect(preferences.nodeIntegration).toBe(false);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("shows native context menus for browser guests and sign-in popups", () =>
     Effect.gen(function* () {
       const host = makeFakeBrowserWindow();

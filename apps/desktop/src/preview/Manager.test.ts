@@ -291,8 +291,14 @@ const layerFileSystem = FileSystem.layerNoop({
     }),
 });
 
-const managerLayer = (platform: NodeJS.Platform = "darwin") =>
+const managerLayer = (
+  platform: NodeJS.Platform = "darwin",
+  electronWindow?: Partial<ElectronWindow.ElectronWindow["Service"]>,
+) =>
   PreviewManager.layer.pipe(
+    Layer.provideMerge(
+      electronWindow ? Layer.mock(ElectronWindow.ElectronWindow)(electronWindow) : Layer.empty,
+    ),
     Layer.provideMerge(
       Layer.succeed(DesktopRendererHistory.DesktopRendererHistory, {
         register: () => Effect.void,
@@ -321,11 +327,12 @@ const withManager = <A>(
     manager: PreviewManager.PreviewManager["Service"],
   ) => Effect.Effect<A, PreviewManager.PreviewManagerError, Scope.Scope>,
   platform: NodeJS.Platform = "darwin",
+  electronWindow?: Partial<ElectronWindow.ElectronWindow["Service"]>,
 ) =>
   Effect.gen(function* () {
     const manager = yield* PreviewManager.PreviewManager;
     return yield* use(manager);
-  }).pipe(Effect.provide(managerLayer(platform)), Effect.scoped);
+  }).pipe(Effect.provide(managerLayer(platform, electronWindow)), Effect.scoped);
 
 interface TestCapturedPreviewImage {
   readonly toJPEG: () => Buffer;
@@ -560,7 +567,11 @@ const makeTestPictureInPictureWindow = (loadURL: () => Promise<void> = async () 
   const pictureInPictureWindow = {
     isDestroyed: vi.fn(() => destroyed),
     once: vi.fn((event: string, listener: () => void) => {
-      listeners.set(event, listener);
+      const previous = listeners.get(event);
+      listeners.set(event, () => {
+        previous?.();
+        listener();
+      });
     }),
     setAlwaysOnTop: vi.fn(),
     setVisibleOnAllWorkspaces: vi.fn(),
@@ -599,6 +610,49 @@ describe("PreviewManager", () => {
     createFromPath.mockClear();
     webviewSend.mockClear();
   });
+
+  effectIt.effect(
+    "denies default popup creation only while the synchronous install guard is held",
+    () => {
+      let held = true;
+      const guard = vi.fn(() => !held);
+      const reserve = vi.fn(() => undefined);
+      return withManager(
+        (manager) =>
+          Effect.gen(function* () {
+            const preview = makeFaviconWebContents();
+            fromId.mockReturnValue(preview.webContents);
+            yield* manager.createTab("tab_held_popup");
+            yield* manager.registerWebview("tab_held_popup", 42);
+            const openHandler = (preview.webContents as Electron.WebContents)
+              .setWindowOpenHandler as ReturnType<typeof vi.fn>;
+            const handler = openHandler.mock.lastCall?.[0] as (
+              details: Partial<Electron.HandlerDetails>,
+            ) => Electron.WindowOpenHandlerResponse;
+            const details = {
+              url: "https://accounts.example.test/login",
+              disposition: "new-window" as const,
+            };
+            expect(handler(details)).toEqual({ action: "deny" });
+            expect(reserve).not.toHaveBeenCalled();
+            expect(browserWindowConstructor).not.toHaveBeenCalled();
+            expect(preview.loadURL).not.toHaveBeenCalled();
+            held = false;
+            yield* Effect.yieldNow;
+            expect(guard).toHaveBeenCalledOnce();
+            expect(browserWindowConstructor).not.toHaveBeenCalled();
+            const allowed = handler(details);
+            expect(allowed.action).toBe("allow");
+            expect(allowed.overrideBrowserWindowOptions).toMatchObject({
+              webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+            });
+            expect(reserve).not.toHaveBeenCalled();
+          }),
+        "linux",
+        { canCreateUncorrelatedRenderer: guard, tryReserveRendererCreation: reserve },
+      );
+    },
+  );
 
   effectIt.effect("opens a target=_blank link as a new tab without navigating the opener", () =>
     withManager((manager) =>
@@ -3646,6 +3700,144 @@ describe("PreviewManager", () => {
       }),
     ),
   );
+
+  effectIt.effect("refuses held PiP creation without effects or a deferred retry", () => {
+    let held = true;
+    const bind = vi.fn(() => true);
+    const release = vi.fn();
+    const reserve = vi.fn(() => (held ? undefined : { bind, release }));
+    return withManager(
+      (manager) =>
+        Effect.gen(function* () {
+          const capturePage = vi.fn(async () => ({
+            toJPEG: () => Buffer.from("synthetic-frame"),
+            getSize: () => ({ width: 1280, height: 720 }),
+          }));
+          fromId.mockReturnValue(makeTestPreviewWebContents(capturePage));
+          const { pictureInPictureWindow } = makeTestPictureInPictureWindow();
+          browserWindowConstructor.mockImplementation(function () {
+            return pictureInPictureWindow;
+          });
+          const states: PreviewManager.PreviewTabState[] = [];
+          yield* manager.subscribeStateChanges((_id, state) =>
+            Effect.sync(() => {
+              states.push(state);
+            }),
+          );
+          yield* manager.createTab("tab_held_pip");
+          yield* manager.registerWebview("tab_held_pip", 42);
+          const denied = yield* Effect.exit(manager.openPictureInPicture("tab_held_pip"));
+          expect(Exit.isFailure(denied)).toBe(true);
+          expect(reserve).toHaveBeenCalledExactlyOnceWith({ kind: "preview-pip", owner: 42 });
+          expect(browserWindowConstructor).not.toHaveBeenCalled();
+          expect(capturePage).not.toHaveBeenCalled();
+          expect(pictureInPictureWindow.loadURL).not.toHaveBeenCalled();
+          expect(states.some((state) => state.pictureInPicture)).toBe(false);
+          held = false;
+          yield* Effect.yieldNow;
+          expect(browserWindowConstructor).not.toHaveBeenCalled();
+          expect(reserve).toHaveBeenCalledOnce();
+          yield* manager.openPictureInPicture("tab_held_pip");
+          expect(browserWindowConstructor).toHaveBeenCalledOnce();
+          expect(bind).toHaveBeenCalledExactlyOnceWith(pictureInPictureWindow.webContents);
+          expect(release).not.toHaveBeenCalled();
+          pictureInPictureWindow.close();
+          expect(release).toHaveBeenCalledOnce();
+        }),
+      "linux",
+      { tryReserveRendererCreation: reserve },
+    );
+  });
+
+  effectIt.effect("closes only the newly constructed PiP when its exact binding is refused", () => {
+    const bind = vi.fn(() => false);
+    const release = vi.fn();
+    return withManager(
+      (manager) =>
+        Effect.gen(function* () {
+          const preview = makeFaviconWebContents();
+          fromId.mockReturnValue(preview.webContents);
+          const { pictureInPictureWindow } = makeTestPictureInPictureWindow();
+          const createdContents = pictureInPictureWindow.webContents;
+          browserWindowConstructor.mockImplementation(function () {
+            return pictureInPictureWindow;
+          });
+          const states: PreviewManager.PreviewTabState[] = [];
+          yield* manager.subscribeStateChanges((_id, state) =>
+            Effect.sync(() => {
+              states.push(state);
+            }),
+          );
+          yield* manager.createTab("tab_refused_pip");
+          yield* manager.registerWebview("tab_refused_pip", 42);
+          expect(
+            Exit.isFailure(yield* Effect.exit(manager.openPictureInPicture("tab_refused_pip"))),
+          ).toBe(true);
+          expect(bind).toHaveBeenCalledExactlyOnceWith(createdContents);
+          expect(pictureInPictureWindow.close).toHaveBeenCalledOnce();
+          expect(release).toHaveBeenCalledOnce();
+          expect(pictureInPictureWindow.loadURL).not.toHaveBeenCalled();
+          expect(pictureInPictureWindow.showInactive).not.toHaveBeenCalled();
+          expect(states.some((state) => state.pictureInPicture)).toBe(false);
+          expect((preview.webContents as Electron.WebContents).isDestroyed()).toBe(false);
+        }),
+      "linux",
+      { tryReserveRendererCreation: () => ({ bind, release }) },
+    );
+  });
+
+  effectIt.effect("keeps a refused PiP reservation until an actual closed event", () => {
+    const release = vi.fn();
+    return withManager(
+      (manager) =>
+        Effect.gen(function* () {
+          fromId.mockReturnValue(makeFaviconWebContents().webContents);
+          const { pictureInPictureWindow } = makeTestPictureInPictureWindow();
+          const finishClose = pictureInPictureWindow.close.getMockImplementation()!;
+          pictureInPictureWindow.close.mockImplementation(() => {});
+          browserWindowConstructor.mockImplementation(function () {
+            return pictureInPictureWindow;
+          });
+          yield* manager.createTab("tab_vetoed_pip_close");
+          yield* manager.registerWebview("tab_vetoed_pip_close", 42);
+          expect(
+            Exit.isFailure(
+              yield* Effect.exit(manager.openPictureInPicture("tab_vetoed_pip_close")),
+            ),
+          ).toBe(true);
+          expect(pictureInPictureWindow.isDestroyed()).toBe(false);
+          expect(release).not.toHaveBeenCalled();
+          finishClose();
+          expect(pictureInPictureWindow.isDestroyed()).toBe(true);
+          expect(release).toHaveBeenCalledOnce();
+        }),
+      "linux",
+      { tryReserveRendererCreation: () => ({ bind: () => false, release }) },
+    );
+  });
+
+  effectIt.effect("retires a PiP reservation on constructor failure before any binding", () => {
+    const bind = vi.fn(() => true);
+    const release = vi.fn();
+    return withManager(
+      (manager) =>
+        Effect.gen(function* () {
+          fromId.mockReturnValue(makeFaviconWebContents().webContents);
+          browserWindowConstructor.mockImplementation(function () {
+            throw new Error("Synthetic creation failure");
+          });
+          yield* manager.createTab("tab_failed_pip");
+          yield* manager.registerWebview("tab_failed_pip", 42);
+          expect(
+            Exit.isFailure(yield* Effect.exit(manager.openPictureInPicture("tab_failed_pip"))),
+          ).toBe(true);
+          expect(bind).not.toHaveBeenCalled();
+          expect(release).toHaveBeenCalledOnce();
+        }),
+      "linux",
+      { tryReserveRendererCreation: () => ({ bind, release }) },
+    );
+  });
 
   effectIt.effect("stops frame capture when the native picture-in-picture window closes", () =>
     withManager((manager) =>
