@@ -77,6 +77,8 @@ focused_tests=(
   apps/web/src/voice/voiceSettingsClient.test.ts
 )
 main_renderer_diagnostics_tests=(
+  apps/desktop/src/ipc/DesktopIpc.test.ts
+  packages/contracts/src/rpc.test.ts
   apps/desktop/src/ipc/methods/mainRendererDiagnostics.test.ts
   apps/desktop/src/telemetry/DesktopTelemetryPublisher.test.ts
   apps/server/src/resourceTelemetry/DesktopTelemetryReceiver.test.ts
