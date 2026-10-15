@@ -611,13 +611,21 @@ const make = (options?: StartupOptions) =>
     const bootId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
     const environmentId = yield* serverEnvironment.getEnvironmentId;
     const unavailable = Effect.fail("unsupported");
+    const prepareForUpdate: Effect.Effect<
+      ProviderRuntimeRecovery.BackendUpdatePreparedContinuations,
+      ProviderRuntimeRecovery.ProviderRuntimeRecoveryError | string
+    > = providerRuntimeRecovery.prepareForUpdate ?? unavailable;
+    const abortPreparedUpdate: Effect.Effect<
+      void,
+      ProviderRuntimeRecovery.ProviderRuntimeRecoveryError | string
+    > = providerRuntimeRecovery.abortPreparedUpdate ?? unavailable;
     const coordinator = yield* makeBackendUpdateCoordinator({
       environmentId,
       bootId,
       gate: updateGate,
-      prepare: providerRuntimeRecovery.prepareForUpdate ?? unavailable,
+      prepare: prepareForUpdate,
       validate: providerRuntimeRecovery.validatePreparedUpdate ?? Effect.succeed(false),
-      clear: providerRuntimeRecovery.abortPreparedUpdate ?? unavailable,
+      clear: abortPreparedUpdate,
       busy: outbox.hasUnsettledForUpdate ?? Effect.succeed(true),
       wake: outbox.notifyAvailable(),
       send: (response) =>
