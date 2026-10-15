@@ -118,6 +118,9 @@ describe("observatory canonical projection view", () => {
           },
         },
       ]);
+      expect(registry.get(view.snapshotAtom).selection).toBeNull();
+      registry.set(view.selectedAtom, ref);
+      expect(registry.get(view.snapshotAtom).selection?.node.ref).toEqual(ref);
       expect(registry.get(view.snapshotAtom).selection?.detail).toBeNull();
       registry.set(details, { ...detail, status: "synchronizing" });
       expect(registry.get(view.snapshotAtom).selection?.detail).toBeNull();
@@ -301,7 +304,7 @@ effectIt.effect(
         yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()));
         const sources = Atom.make((get) => {
           const value = get(raw);
-          return AsyncResult.isSuccess(value) && !value.waiting ? value.value : [];
+          return AsyncResult.isSuccess(value) ? value.value : [];
         });
         const view = createObservatoryViewAtoms({
           catalogReadyAtom: Atom.make(true),
@@ -309,6 +312,8 @@ effectIt.effect(
           selectedAtom: Atom.make<typeof ref | null>(ref),
           detailAtom: () => Atom.make(detail),
         });
+        const unmount = registry.mount(view.snapshotAtom);
+        yield* Effect.addFinalizer(() => Effect.sync(unmount));
         const waitFor = (predicate: (value: Atom.Type<typeof view.snapshotAtom>) => boolean) =>
           Effect.callback<void>((resume) => {
             const cancel = registry.subscribe(
@@ -321,6 +326,10 @@ effectIt.effect(
             return Effect.sync(cancel);
           });
         yield* waitFor((value) => value.nodes.length === 1);
+        registry.set(view.selectedAtom, ref);
+        expect(registry.get(view.snapshotAtom).selection?.detail?.projection.thread.id).toBe(
+          ref.threadId,
+        );
         yield* SubscriptionRef.set(stream, [{ ...source, status: "synchronizing", generation: 2 }]);
         yield* waitFor((value) => value.nodes.length === 0 && value.selection === null);
         yield* SubscriptionRef.set(stream, [

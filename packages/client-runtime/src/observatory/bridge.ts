@@ -145,10 +145,11 @@ export function createLiveObservatory<R, E>(
       ),
     ),
   );
+  // Ongoing Atom streams emit Success(waiting:true); readiness is carried by the inner states.
   const connections = Atom.family((id: EnvironmentId) =>
     Atom.make((get): ObservatoryConnection | null => {
       const result = get(rawConnection(id));
-      if (!AsyncResult.isSuccess(result) || result.waiting) return null;
+      if (!AsyncResult.isSuccess(result)) return null;
       const [state, session] = result.value;
       return {
         generation: state.generation,
@@ -179,14 +180,14 @@ export function createLiveObservatory<R, E>(
       const shellAtoms = Atom.family((id: EnvironmentId) =>
         Atom.make((get) => {
           const result = get(shells.stateAtom(id));
-          return AsyncResult.isSuccess(result) && !result.waiting ? result.value : null;
+          return AsyncResult.isSuccess(result) ? result.value : null;
         }),
       );
       const detailAtoms = Atom.family((id: EnvironmentId) =>
         Atom.family((thread: ScopedThreadRef["threadId"]) =>
           Atom.make((get) => {
             const result = get(details.stateAtom(id, thread));
-            return AsyncResult.isSuccess(result) && !result.waiting ? result.value : null;
+            return AsyncResult.isSuccess(result) ? result.value : null;
           }),
         ),
       );

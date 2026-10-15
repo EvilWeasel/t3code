@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { RegistryContext } from "@effect/atom-react";
 import {
   createObservatoryViewAtoms,
@@ -215,7 +217,7 @@ const details = {
     latestLocalTurnOrdinal: null,
   },
 };
-let root: Root;
+let root: Root | undefined;
 let container: HTMLDivElement;
 let registry: AtomRegistry.AtomRegistry;
 const openThread = vi.fn();
@@ -294,14 +296,17 @@ function searchThreads(text: string) {
 }
 
 beforeEach(async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  root = undefined;
   registry = AtomRegistry.make();
   container = document.createElement("div");
   document.body.append(container);
-  root = createRoot(container);
+  const ownedRoot = createRoot(container);
+  root = ownedRoot;
   openThread.mockClear();
   inspect.mockClear();
   await act(async () =>
-    root.render(
+    ownedRoot.render(
       <RegistryContext.Provider value={registry}>
         <AgentObservatoryPage />
       </RegistryContext.Provider>,
@@ -309,9 +314,15 @@ beforeEach(async () => {
   );
 });
 afterEach(async () => {
-  await act(async () => root.unmount());
-  registry.dispose();
-  container.remove();
+  try {
+    const ownedRoot = root;
+    root = undefined;
+    if (ownedRoot !== undefined) await act(async () => ownedRoot.unmount());
+  } finally {
+    registry?.dispose();
+    container?.remove();
+    vi.unstubAllGlobals();
+  }
 });
 describe("mounted observatory projection dashboard", () => {
   it("shares live graph/list selection, reduces text, lazily inspects a tool, and links canonical request resolution", async () => {
@@ -579,16 +590,14 @@ describe("mounted observatory projection dashboard", () => {
         ...seed.shell!,
         snapshot: Option.map(seed.shell!.snapshot, (snapshot) => ({
           ...snapshot,
-          threads: snapshot.threads
-            .slice(0, 51)
-            .map((thread, index) =>
-              index === 50
-                ? {
-                    ...thread,
-                    lineage: { ...thread.lineage, parentThreadId: snapshot.threads[0]!.id },
-                  }
-                : thread,
-            ),
+          threads: snapshot.threads.slice(0, 51).map((thread, index) =>
+            index === 50
+              ? {
+                  ...thread,
+                  lineage: { ...thread.lineage, parentThreadId: snapshot.threads[0]!.id },
+                }
+              : thread,
+          ),
         })),
       },
     };
