@@ -72,6 +72,7 @@ export type LiveVoicePhase =
   | "prepared"
   | "connecting"
   | "live"
+  | "reconnecting"
   | "playback-blocked"
   | "stopping"
   | "ended"
@@ -114,6 +115,7 @@ const IDLE_STATE: LiveVoiceState = {
 };
 const MAX_TRANSCRIPT_ENTRIES = 24;
 const DEFAULT_START_TIMEOUT_MS = 30_000;
+const DEFAULT_RECONNECT_TIMEOUT_MS = 15_000;
 const isLiveVoiceError = Schema.is(LiveVoiceError);
 function stopTracks(stream: LiveVoiceMediaStream | null): void {
   stream?.getTracks().forEach((track) => track.stop());
@@ -158,6 +160,7 @@ function safeErrorMessage(error: unknown): string {
     "The browser did not create a WebRTC offer.",
     "Live session did not become ready in time.",
     "WebRTC connection ended.",
+    "Live voice connection was lost. Start a new call to reconnect.",
     "Live data channel closed.",
     "Live session closed by the environment.",
   ]);
@@ -190,6 +193,7 @@ export class LiveVoiceController {
   private channelIsOpen = false;
   private peerIsConnected = false;
   private cancelStartTimer: (() => void) | null = null;
+  private cancelReconnectTimer: (() => void) | null = null;
   private answer: ((sdp: string) => void) | null = null;
   private rejectAnswer: ((error: Error) => void) | null = null;
   private resolvePrepared: ((session: LiveVoiceSession) => void) | null = null;
@@ -217,6 +221,8 @@ export class LiveVoiceController {
       this.state.phase === "prepared" ||
       this.state.phase === "connecting" ||
       this.state.phase === "live" ||
+      this.state.phase === "reconnecting" ||
+      this.state.phase === "stopping" ||
       this.state.phase === "playback-blocked"
     )
       return;
@@ -391,9 +397,31 @@ export class LiveVoiceController {
       audio.autoplay = true;
       audio.muted = this.state.outputMuted;
       peer.onconnectionstatechange = () => {
+        if (!this.isCurrentLease(operation, activeLease)) return;
         this.peerIsConnected = peer.connectionState === "connected";
         if (peer.connectionState === "failed" || peer.connectionState === "closed") {
           void this.failAndStop(operation, activeLease, new Error("WebRTC connection ended."));
+          return;
+        }
+        if (
+          peer.connectionState === "disconnected" &&
+          (this.state.phase === "live" || this.state.phase === "playback-blocked")
+        ) {
+          this.setState({ ...this.state, phase: "reconnecting", error: null });
+          // Give this peer time to recover without creating a second native session.
+          let pending = true;
+          const cancelTimeout = this.dependencies.scheduleTimeout(() => {
+            if (!pending || this.state.phase !== "reconnecting") return;
+            void this.failAndStop(
+              operation,
+              activeLease,
+              new Error("Live voice connection was lost. Start a new call to reconnect."),
+            );
+          }, DEFAULT_RECONNECT_TIMEOUT_MS);
+          this.cancelReconnectTimer = () => {
+            pending = false;
+            cancelTimeout();
+          };
         }
         this.resolveRtcReadyIfReady();
       };
@@ -467,13 +495,23 @@ export class LiveVoiceController {
   }
 
   setLocalMuted(muted: boolean): void {
-    if (this.state.phase !== "live" && this.state.phase !== "playback-blocked") return;
+    if (
+      this.state.phase !== "live" &&
+      this.state.phase !== "playback-blocked" &&
+      this.state.phase !== "reconnecting"
+    )
+      return;
     for (const track of this.stream?.getAudioTracks() ?? []) track.enabled = !muted;
     this.setState({ ...this.state, localMuted: muted });
   }
 
   async setOutputMuted(muted: boolean): Promise<void> {
-    if (this.state.phase !== "live" && this.state.phase !== "playback-blocked") return;
+    if (
+      this.state.phase !== "live" &&
+      this.state.phase !== "playback-blocked" &&
+      this.state.phase !== "reconnecting"
+    )
+      return;
     if (this.audio) this.audio.muted = muted;
     this.setState({ ...this.state, outputMuted: muted });
     if (!muted && this.state.phase === "playback-blocked" && this.identity) {
@@ -592,6 +630,8 @@ export class LiveVoiceController {
     )
       return;
     this.clearStartTimer();
+    this.cancelReconnectTimer?.();
+    this.cancelReconnectTimer = null;
     this.setState({
       ...this.state,
       phase: this.playbackBlocked ? "playback-blocked" : "live",
@@ -675,6 +715,8 @@ export class LiveVoiceController {
     microphoneOwnership: MicrophoneOwnership | null,
   ): Promise<void> {
     this.clearStartTimer();
+    this.cancelReconnectTimer?.();
+    this.cancelReconnectTimer = null;
     this.abortController?.abort();
     this.unsubscribe?.();
     this.unsubscribe = null;

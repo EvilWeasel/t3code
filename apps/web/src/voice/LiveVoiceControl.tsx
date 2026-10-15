@@ -220,7 +220,10 @@ export function LiveVoiceControl(props: {
     getUserMedia:
       typeof navigator === "undefined" ? undefined : navigator.mediaDevices?.getUserMedia,
   });
-  const active = state.phase === "live" || state.phase === "playback-blocked";
+  const active =
+    state.phase === "live" ||
+    state.phase === "playback-blocked" ||
+    state.phase === "reconnecting";
   const busy =
     state.phase === "preparing" ||
     state.phase === "prepared" ||
@@ -241,13 +244,15 @@ export function LiveVoiceControl(props: {
         ? "Connecting to Live…"
         : state.phase === "playback-blocked"
           ? "Live connected. Audio playback needs permission."
-          : state.phase === "live"
-            ? "Live connected"
-            : state.phase === "stopping"
-              ? "Ending Live…"
-              : state.phase === "error"
-                ? state.error
-                : null;
+          : state.phase === "reconnecting"
+            ? "Live connection interrupted. Reconnecting…"
+            : state.phase === "live"
+              ? "Live connected"
+              : state.phase === "stopping"
+                ? "Ending Live…"
+                : state.phase === "error"
+                  ? state.error
+                  : null;
 
   const toggleMicrophone = useCallback(
     () => void controller.setLocalMuted(!state.localMuted),

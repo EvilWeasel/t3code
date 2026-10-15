@@ -62,8 +62,13 @@ function createHarness(
 ) {
   const events = new Set<(event: LiveVoiceSignalEvent) => void>();
   const calls: string[] = [];
+  const subscribed = deferred<void>();
+  const signalingStarted = deferred<void>();
+  const remoteDescriptionSet = deferred<void>();
+  const stopRequested = deferred<void>();
   const preparedLease = options.preparedLease ?? lease;
   let startTimeout: (() => void) | null = null;
+  let timeoutDelayMs: number | null = null;
   let localTrackEnabled = true;
   let stoppedTracks = 0;
   const track = {
@@ -103,6 +108,7 @@ function createHarness(
       }),
       setRemoteDescription: vi.fn(async (description: RTCSessionDescriptionInit) => {
         calls.push(`remote:${description.sdp}`);
+        remoteDescriptionSet.resolve();
       }),
       addTrack: vi.fn(() => {
         calls.push("add-track");
@@ -138,6 +144,7 @@ function createHarness(
           }
         };
         events.add(subscribedListener);
+        subscribed.resolve();
         const unsubscribe = () => {
           events.delete(subscribedListener);
           calls.push("unsubscribe");
@@ -159,11 +166,13 @@ function createHarness(
     }),
     start: vi.fn(async () => {
       calls.push("signaling-start");
+      signalingStarted.resolve();
       return { ...preparedLease, status: "active" } as LiveVoiceLease;
     }),
     status: vi.fn(options.status ?? (async () => preparedLease)),
     stop: vi.fn(async () => {
       calls.push("signaling-stop");
+      stopRequested.resolve();
       return options.stop
         ? options.stop()
         : ({ ...preparedLease, status: "closed" } as LiveVoiceLease);
@@ -192,10 +201,12 @@ function createHarness(
       return () => `request-${++id}`;
     })(),
     ...(options.startTimeoutMs === undefined ? {} : { startTimeoutMs: options.startTimeoutMs }),
-    scheduleTimeout: (callback) => {
+    scheduleTimeout: (callback, delayMs) => {
       startTimeout = callback;
+      timeoutDelayMs = delayMs;
       return () => {
         startTimeout = null;
+        timeoutDelayMs = null;
       };
     },
     onStateChange: (state) => states.push(state.phase),
@@ -211,10 +222,20 @@ function createHarness(
     calls,
     states,
     stream,
+    subscribed: subscribed.promise,
+    signalingStarted: signalingStarted.promise,
+    remoteDescriptionSet: remoteDescriptionSet.promise,
+    stopRequested: stopRequested.promise,
     emit: (event: LiveVoiceSignalEvent) => events.forEach((listener) => listener(event)),
     fireStartTimeout: () => startTimeout?.(),
     get hasStartTimeout() {
       return startTimeout !== null;
+    },
+    get timeoutDelayMs() {
+      return timeoutDelayMs;
+    },
+    get timeoutCallback() {
+      return startTimeout;
     },
     get stoppedTracks() {
       return stoppedTracks;
@@ -223,6 +244,27 @@ function createHarness(
       return localTrackEnabled;
     },
   };
+}
+
+async function connectFirst(harness: ReturnType<typeof createHarness>, starting: Promise<void>) {
+  await harness.subscribed;
+  harness.emit(statusEvent(lease));
+  await harness.signalingStarted;
+  expect(harness.calls.indexOf("prepare")).toBeLessThan(harness.calls.indexOf("subscribe"));
+  expect(harness.calls.indexOf("subscribe")).toBeLessThan(harness.calls.indexOf("local-offer"));
+  harness.emit({ type: "answer", leaseId: "stale", generation: lease.generation, sdp: "wrong" });
+  harness.emit(answerEvent);
+  await harness.remoteDescriptionSet;
+  expect(harness.controller.currentState.phase).toBe("connecting");
+  harness.channel.readyState = "open";
+  harness.channel.onopen?.();
+  (harness.peer as { connectionState: RTCPeerConnectionState }).connectionState = "connected";
+  harness.peer.onconnectionstatechange?.();
+  harness.peer.ontrack?.({
+    streams: [],
+    track: {} as MediaStreamTrack,
+  } as unknown as RTCTrackEvent);
+  await starting;
 }
 
 async function connect(harness: ReturnType<typeof createHarness>, starting: Promise<void>) {
@@ -247,6 +289,99 @@ async function connect(harness: ReturnType<typeof createHarness>, starting: Prom
 }
 
 describe("LiveVoiceController", () => {
+  it.each([false, true])("recovers on the same lease with mute controls available (playback blocked: %s)", async (playbackBlocked) => {
+    const harness = createHarness();
+    if (playbackBlocked) {
+      vi.mocked(harness.audio.play).mockRejectedValue(new Error("autoplay blocked"));
+    }
+    await connectFirst(harness, harness.controller.start(target));
+    const connectionChanged = harness.peer.onconnectionstatechange!;
+    (harness.peer as { connectionState: RTCPeerConnectionState }).connectionState = "disconnected";
+    connectionChanged();
+
+    expect(harness.controller.currentState.phase).toBe("reconnecting");
+    expect(harness.timeoutDelayMs).toBe(15_000);
+    const deadline = harness.timeoutCallback;
+    connectionChanged();
+    expect(harness.timeoutCallback).toBe(deadline);
+    harness.controller.setLocalMuted(true);
+    await harness.controller.setOutputMuted(true);
+    await harness.controller.start(target);
+    expect(harness.localTrackEnabled).toBe(false);
+    expect(harness.audio.muted).toBe(true);
+    expect(harness.signaling.prepare).toHaveBeenCalledOnce();
+    expect(harness.signaling.start).toHaveBeenCalledOnce();
+    expect(harness.signaling.stop).not.toHaveBeenCalled();
+
+    (harness.peer as { connectionState: RTCPeerConnectionState }).connectionState = "connected";
+    connectionChanged();
+    expect(harness.controller.currentState).toMatchObject({
+      phase: playbackBlocked ? "playback-blocked" : "live",
+      localMuted: true,
+      outputMuted: true,
+      lease: { leaseId: lease.leaseId, generation: lease.generation },
+    });
+    expect(harness.hasStartTimeout).toBe(false);
+    expect(harness.stoppedTracks).toBe(0);
+    deadline?.();
+    expect(harness.controller.currentState.phase).toBe(playbackBlocked ? "playback-blocked" : "live");
+    expect(harness.signaling.stop).not.toHaveBeenCalled();
+    (harness.peer as { connectionState: RTCPeerConnectionState }).connectionState = "disconnected";
+    connectionChanged();
+    deadline?.();
+    expect(harness.controller.currentState.phase).toBe("reconnecting");
+    expect(harness.signaling.stop).not.toHaveBeenCalled();
+    await harness.controller.end();
+  });
+
+  it("releases local media at the reconnect deadline even when remote stop is still pending", async () => {
+    const remoteStop = deferred<LiveVoiceLease>();
+    const harness = createHarness({ stop: () => remoteStop.promise });
+    await connectFirst(harness, harness.controller.start(target));
+    const lateConnectionChanged = harness.peer.onconnectionstatechange!;
+    (harness.peer as { connectionState: RTCPeerConnectionState }).connectionState = "disconnected";
+    lateConnectionChanged();
+    harness.fireStartTimeout();
+
+    expect(harness.controller.currentState).toMatchObject({
+      phase: "error",
+      error: "Live voice connection was lost. Start a new call to reconnect.",
+    });
+    expect(harness.stoppedTracks).toBe(1);
+    expect(harness.peer.close).toHaveBeenCalledOnce();
+    expect(harness.channel.close).toHaveBeenCalledOnce();
+    expect(harness.audio.srcObject).toBeNull();
+    const releaseNextOwner = acquireMicrophoneOwnership();
+    expect(releaseNextOwner).not.toBeNull();
+    releaseNextOwner?.();
+    await harness.stopRequested;
+    expect(harness.signaling.stop).toHaveBeenCalledWith(
+      expect.objectContaining({ leaseId: lease.leaseId, generation: lease.generation }),
+    );
+    (harness.peer as { connectionState: RTCPeerConnectionState }).connectionState = "connected";
+    lateConnectionChanged();
+    expect(harness.controller.currentState.phase).toBe("error");
+    remoteStop.resolve({ ...lease, status: "closed" });
+    await harness.controller.end();
+  });
+
+  it("ends during reconnect and fences late connection events without starting another call", async () => {
+    const harness = createHarness();
+    await connectFirst(harness, harness.controller.start(target));
+    const lateConnectionChanged = harness.peer.onconnectionstatechange!;
+    (harness.peer as { connectionState: RTCPeerConnectionState }).connectionState = "disconnected";
+    lateConnectionChanged();
+    await harness.controller.end();
+    expect(harness.hasStartTimeout).toBe(false);
+    expect(harness.stoppedTracks).toBe(1);
+    (harness.peer as { connectionState: RTCPeerConnectionState }).connectionState = "connected";
+    lateConnectionChanged();
+    harness.fireStartTimeout();
+    expect(harness.controller.currentState.phase).toBe("ended");
+    expect(harness.signaling.prepare).toHaveBeenCalledOnce();
+    expect(harness.signaling.stop).toHaveBeenCalledOnce();
+  });
+
   it("does not start Live while dictation owns the renderer microphone", async () => {
     const releaseDictation = acquireMicrophoneOwnership();
     expect(releaseDictation).not.toBeNull();
