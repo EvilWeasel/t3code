@@ -191,12 +191,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       if ("error" in response) {
         const detail = response.error.data;
-        if (
-          detail !== null &&
-          typeof detail === "object" &&
-          !Array.isArray(detail) &&
-          detail.code === "outcome_unknown"
-        )
+        if (Schema.is(Schema.JsonObject)(detail) && detail.code === "outcome_unknown")
           return yield* unknownOutcome();
         return yield* failure("host_error", response.error.message);
       }
@@ -230,9 +225,7 @@ const make = Effect.gen(function* () {
       yield* recheck(scope, binding);
       const result = yield* resultFrom(response);
       if (
-        result !== null &&
-        typeof result === "object" &&
-        !Array.isArray(result) &&
+        Schema.is(Schema.JsonObject)(result) &&
         "engineSessionId" in result &&
         result.engineSessionId !== binding.engineSessionId
       )
@@ -316,9 +309,7 @@ const make = Effect.gen(function* () {
                 if ("id" in message) {
                   const snapshot = yield* resultFrom(message);
                   if (
-                    snapshot === null ||
-                    typeof snapshot !== "object" ||
-                    Array.isArray(snapshot) ||
+                    !Schema.is(Schema.JsonObject)(snapshot) ||
                     snapshot.schema !== "jarvis.v1" ||
                     snapshot.engineSessionId !== binding.engineSessionId
                   )

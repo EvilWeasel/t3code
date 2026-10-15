@@ -876,7 +876,6 @@ export const layerMcpTransport = McpServer.layerHttp({
 export const layer = Layer.mergeAll(
   layerPreviewToolkit,
   layerOrchestratorToolkit,
-  layerJarvisToolkit,
   layerThreadToolkit,
   layerAttachmentToolkit,
   layerProjectRegistration,

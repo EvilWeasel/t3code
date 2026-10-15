@@ -724,7 +724,8 @@ const layerMakeRoutes = Layer.mergeAll(
   // delegation targets through the same live adapter facade the V2
   // orchestrator uses, so MCP capability reporting can never drift from
   // what dispatch can actually serve.
-  McpHttpServer.layer.pipe(
+  McpHttpServer.layerJarvisToolkit.pipe(
+    Layer.provideMerge(McpHttpServer.layer),
     Layer.provide(JarvisClient.layer),
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),

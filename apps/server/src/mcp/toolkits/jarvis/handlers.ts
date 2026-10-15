@@ -61,6 +61,6 @@ const handlers = {
       );
     }),
   ),
-};
+} satisfies McpToolAccess.Handlers<typeof JarvisToolkit.tools>;
 
 export const layer = McpToolAccess.toLayer(JarvisToolkit, handlers);

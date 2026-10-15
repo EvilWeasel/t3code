@@ -364,7 +364,7 @@ describe("Jarvis bound capability service", () => {
         const f = yield* fixture();
         yield* Ref.update(f.childState, (child) => ({
           ...child,
-          thread: { ...child.thread, interactionMode: "plan" },
+          thread: { ...child.thread, interactionMode: "plan" as const },
         }));
         yield* Effect.gen(function* () {
           const service = yield* JarvisService.JarvisService;
