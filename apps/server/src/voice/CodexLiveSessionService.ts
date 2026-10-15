@@ -899,9 +899,8 @@ export const layer: Layer.Layer<
             ) {
               return sessionFromRow(row);
             }
-            if (row.status === "failed") return sessionFromRow(row);
             if (row.planner_native_thread_id === null || row.provider_session_id === null) {
-              if (row.status === "unknown") return sessionFromRow(row);
+              if (row.status === "unknown" || row.status === "failed") return sessionFromRow(row);
               return yield* liveError("invalid_state");
             }
             const next = yield* updateStatus(
@@ -1361,6 +1360,7 @@ export const layer: Layer.Layer<
             active.delete(leaseKey(leaseId, generation));
             return;
           case "transcript":
+            if (row.status !== "starting" && row.status !== "active") return;
             yield* eventHub.publish({
               type: "transcript",
               leaseId,

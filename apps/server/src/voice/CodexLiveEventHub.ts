@@ -32,6 +32,10 @@ export const make = Effect.gen(function* () {
   const publish = (event: LiveVoiceEvent) =>
     lock.withPermits(1)(
       Effect.gen(function* () {
+        if (event.type === "transcript") {
+          const session = (yield* Ref.get(sessions)).get(keyOf(event.leaseId, event.generation));
+          if (session?.status !== "starting" && session?.status !== "active") return;
+        }
         if (event.type === "status") {
           yield* Ref.update(sessions, (current) => {
             const next = new Map(current);

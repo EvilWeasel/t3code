@@ -2,6 +2,8 @@ import { assert, it } from "@effect/vitest";
 import {
   AuthOrchestrationOperateScope,
   AuthSessionId,
+  CommandId,
+  MessageId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
@@ -15,6 +17,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -87,6 +90,14 @@ it.effect.each([false, true])(
       >[0]["onWorkControl"];
       const workCompletion = yield* Deferred.make<void>();
       const workFinished = yield* Deferred.make<void>();
+      const heldWorkCompletion = yield* Deferred.make<void>();
+      const heldWorkFinished = yield* Deferred.make<void>();
+      const heldStopStarted = yield* Deferred.make<string>();
+      const heldStopFinished = yield* Deferred.make<void>();
+      let nativeStopGate: Deferred.Deferred<void> | undefined;
+      let finishHeldWork: Effect.Effect<void> = Effect.void;
+      let holdNextCanonicalWork = false;
+      let heldWorkCompletions = 0;
       let completedWork = 0;
       let steers = 0;
       let rejectSteerAtAdmission = false;
@@ -170,9 +181,13 @@ it.effect.each([false, true])(
               return { plannerNativeThreadId: `planner-native-${plannerCalls}` };
             }),
           start: () => Effect.void,
-          stop: () =>
-            Effect.sync(() => {
+          stop: (plannerNativeThreadId: string) =>
+            Effect.gen(function* () {
               stops += 1;
+              if (nativeStopGate) {
+                yield* Deferred.succeed(heldStopStarted, plannerNativeThreadId);
+                yield* Deferred.await(nativeStopGate);
+              }
             }),
           appendSpeech: (input: { plannerNativeThreadId: string; text: string }) =>
             Effect.gen(function* () {
@@ -307,6 +322,19 @@ it.effect.each([false, true])(
                   Effect.tap(() => Deferred.succeed(workFinished, undefined)),
                   Effect.forkChild,
                 );
+              if (holdNextCanonicalWork) {
+                holdNextCanonicalWork = false;
+                yield* Deferred.await(heldWorkCompletion).pipe(
+                  Effect.andThen(Effect.suspend(() => finishHeldWork)),
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      heldWorkCompletions += 1;
+                    }),
+                  ),
+                  Effect.tap(() => Deferred.succeed(heldWorkFinished, undefined)),
+                  Effect.forkChild,
+                );
+              }
               return { delivery: "queued", run: { id: `durable-run-${sends}` } };
             }),
           dispatch: (
@@ -378,6 +406,7 @@ it.effect.each([false, true])(
         assert.equal(plannerCalls, 1);
 
         const delivered = yield* Queue.unbounded<LiveVoiceEvent>();
+        const observedEvents: Array<LiveVoiceEvent> = [];
         const observedStatuses: string[] = [];
         yield* service
           .subscribe(session, {
@@ -387,6 +416,7 @@ it.effect.each([false, true])(
           .pipe(
             Stream.runForEach((event) =>
               Effect.sync(() => {
+                observedEvents.push(event);
                 if (event.type === "status") observedStatuses.push(event.session.status);
               }).pipe(Effect.andThen(Queue.offer(delivered, event))),
             ),
@@ -1115,7 +1145,11 @@ it.effect.each([false, true])(
             generation: secondPrepared.generation,
           })
           .pipe(
-            Stream.runForEach((event) => Queue.offer(delivered, event)),
+            Stream.runForEach((event) =>
+              Effect.sync(() => {
+                observedEvents.push(event);
+              }).pipe(Effect.andThen(Queue.offer(delivered, event))),
+            ),
             Effect.forkChild({ startImmediately: true }),
           );
         yield* waitForEvent(
@@ -1171,7 +1205,80 @@ it.effect.each([false, true])(
         );
         assert.equal(sends, 5);
         const raceRunId = `durable-run-${sends}`;
-        durableProjection = makeReadyProjection(raceRunId, 5);
+        const canonicalThreads = yield* ThreadManagementService.ThreadManagementService;
+        holdNextCanonicalWork = true;
+        const heldReceipt = yield* canonicalThreads.sendToThread({
+          projectId,
+          threadId,
+          commandId: CommandId.make("command-existing-background-work"),
+          messageId: MessageId.make("message-existing-background-work"),
+          text: "Keep implementing while this call ends.",
+          attachments: [],
+          mode: "queue",
+          createdBy: "user",
+          creationSource: "web",
+        });
+        assert.equal(sends, 6);
+        const heldRunId = "durable-run-6";
+        const raceProjection = makeReadyProjection(raceRunId, 5);
+        const heldRun = {
+          ...makeRunProjection(heldRunId, "completed").runs[0]!,
+          status: "running" as const,
+          completedAt: null,
+        };
+        durableProjection = {
+          ...raceProjection,
+          runs: [{ ...raceProjection.runs[0]!, status: "running", completedAt: null }, heldRun],
+          checkpoints: [],
+        };
+        finishHeldWork = Effect.gen(function* () {
+          durableProjection = makeReadyProjection(heldRunId, 6);
+          yield* Queue.offer(
+            t3EventQueues.get("run.updated")!,
+            eventFor({
+              type: "run.updated",
+              id: "event-held-work-finished",
+              threadId,
+              runId: heldRunId,
+              nodeId: `root-${heldRunId}`,
+              providerInstanceId,
+              occurredAt: "2026-10-14T00:00:05.000Z",
+              payload: durableProjection.runs[0] as never,
+            } as never),
+          );
+        });
+        yield* Queue.offer(secondNativeEvents, {
+          type: "transcript",
+          plannerNativeThreadId: "planner-native-2",
+          role: "user",
+          text: "Is my work still running?",
+        });
+        yield* waitForEvent(
+          (event) => event.type === "transcript" && event.text === "Is my work still running?",
+        );
+        yield* Queue.offer(secondNativeEvents, {
+          type: "transcript",
+          plannerNativeThreadId: "planner-native-2",
+          role: "assistant",
+          text: "Yes, we can keep talking while it runs.",
+        });
+        yield* waitForEvent(
+          (event) => event.type === "transcript" && event.text.includes("keep talking while"),
+        );
+        assert.isFalse(yield* Deferred.isDone(heldWorkCompletion));
+        const heldStatus = decodeWorkStatus(
+          yield* controlWork!({
+            plannerNativeThreadId: "planner-native-2",
+            plannerTurnId: "held-work-status",
+            callId: "held-work-status",
+            action: "status",
+            runId: heldRunId,
+          }),
+        );
+        assert.equal(heldStatus.leaseId, secondPrepared.leaseId);
+        assert.equal(heldStatus.tasks[0]!.status, "running");
+        assert.isFalse(heldStatus.tasks[0]!.resultReady);
+        durableProjection = { ...raceProjection, runs: [...raceProjection.runs, heldRun] };
         const principalGate = holdDispatchPrincipalLookup();
         const raceGateRead = waitForGateRead();
         yield* Queue.offer(
@@ -1208,7 +1315,7 @@ it.effect.each([false, true])(
           "planner-turn-native-error-race",
         );
         assert.equal(duplicateRaceReceipt, raceReceipt);
-        assert.equal(sends, 5);
+        assert.equal(sends, 6);
         assert.equal(
           appendAttempts,
           2,
@@ -1222,6 +1329,74 @@ it.effect.each([false, true])(
         `;
         assert.equal(readbackState(refusedReceipt[0]!.receipt_json), "refused");
         assert.isString(raceReceipt);
+        const afterFailure = observedEvents.length;
+        yield* Queue.offer(secondNativeEvents, {
+          type: "transcript",
+          plannerNativeThreadId: "planner-native-2",
+          role: "assistant",
+          text: "Stale transcript after failure",
+        });
+        nativeStopGate = yield* Deferred.make<void>();
+        const stopping = yield* service
+          .stop(session, {
+            leaseId: secondPrepared.leaseId,
+            generation: secondPrepared.generation,
+            clientRequestId: "stop-failed-call",
+          })
+          .pipe(
+            Effect.tap(() => Deferred.succeed(heldStopFinished, undefined)),
+            Effect.forkChild,
+          );
+        assert.equal(
+          yield* Effect.race(
+            Deferred.await(heldStopStarted).pipe(Effect.as("native-stop-started")),
+            Deferred.await(heldStopFinished).pipe(Effect.as("returned-before-native-stop")),
+          ),
+          "native-stop-started",
+        );
+        assert.equal(yield* Deferred.await(heldStopStarted), "planner-native-2");
+        assert.equal(stops, 2, "End must stop a failed but still bound native transport");
+        assert.isFalse(yield* Deferred.isDone(heldWorkCompletion));
+        yield* Queue.offer(secondNativeEvents, {
+          type: "transcript",
+          plannerNativeThreadId: "planner-native-2",
+          role: "assistant",
+          text: "Stale transcript while stopping",
+        });
+        yield* Deferred.succeed(nativeStopGate, undefined);
+        yield* Fiber.join(stopping);
+        yield* service.stop(session, {
+          leaseId: secondPrepared.leaseId,
+          generation: secondPrepared.generation,
+          clientRequestId: "stop-failed-call",
+        });
+        assert.equal(stops, 2, "duplicate End must not stop the native transport again");
+        yield* Queue.offer(secondNativeEvents, {
+          type: "closed",
+          plannerNativeThreadId: "planner-native-2",
+        });
+        yield* waitForEvent(
+          (event) =>
+            event.type === "status" &&
+            event.session.leaseId === secondPrepared.leaseId &&
+            event.session.status === "closed",
+        );
+        assert.deepEqual(
+          observedEvents.slice(afterFailure).filter((event) => event.type === "transcript"),
+          [],
+        );
+        assert.equal(sends, 6, "End must neither cancel nor enqueue canonical work");
+        yield* Deferred.succeed(heldWorkCompletion, undefined);
+        yield* Deferred.await(heldWorkFinished);
+        assert.equal(heldWorkCompletions, 1);
+        assert.equal(durableProjection.runs[0]!.id, heldRunId);
+        assert.equal(durableProjection.runs[0]!.status, "completed");
+        assert.equal(heldReceipt.run.id, heldRunId);
+        assert.equal(
+          appendAttempts,
+          2,
+          "finished work stays durable without reviving ended speech",
+        );
       });
       yield* program.pipe(
         Effect.provide(Layer.provideMerge(CodexLiveSessionService.layer, dependencies)),
