@@ -822,6 +822,11 @@ describe("orchestrator MCP toolkit", () => {
             let parentRootNodeId = parentRun.rootNodeId;
             const queueAutomaticCompletion = (suffix: string, taskText: string) =>
               Effect.gen(function* () {
+                const current = yield* orchestrator.getThreadProjection(parentThreadId);
+                const owner = current.runs.find((run) => run.id === parentRun.id);
+                if (owner?.rootNodeId === null || owner === undefined)
+                  return yield* Effect.die(new Error("Current parent root missing."));
+                parentRootNodeId = owner.rootNodeId;
                 const delegated = yield* orchestrator.dispatch({
                   type: "delegated_task.request",
                   createdBy: "agent",
