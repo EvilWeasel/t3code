@@ -27,7 +27,6 @@ const catalog = Tool.make("jarvis_catalog", {
   description:
     description +
     "Read the canonical capability catalog and availability. Discovery grants no execution authority.",
-  parameters: Schema.Struct({}),
   success: JarvisMcpResult,
   failure,
   failureMode: "return",

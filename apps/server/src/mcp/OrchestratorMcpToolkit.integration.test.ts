@@ -832,6 +832,67 @@ describe("orchestrator MCP toolkit", () => {
             expect((yield* orchestrator.getThreadProjection(task.childThreadId)).runs).toHaveLength(
               1,
             );
+            // Completed differs from interrupted: the UI's canonical late-steer
+            // fallback must not silently turn this targeted external operation
+            // into a fresh child run. Use real stored terminal state, no worker.
+            const completedCall = yield* invoke("external_delegate_task", {
+              ...request,
+              clientRequestId: "completed-steer-target",
+            });
+            const completedTask = yield* decodeDelegateTaskResult(completedCall.structuredContent);
+            const completedChild = yield* orchestrator.getThreadProjection(
+              completedTask.childThreadId,
+            );
+            const completedRun = completedChild.runs.find(
+              (candidate) => candidate.id === completedTask.childRunId,
+            );
+            if (completedRun === undefined)
+              return yield* Effect.die("Missing completed-target run");
+            const completedRoot = completedChild.nodes.find(
+              (node) => node.id === completedRun.rootNodeId,
+            );
+            if (completedRoot === undefined)
+              return yield* Effect.die("Missing completed-target root");
+            const finishedAt = yield* DateTime.now;
+            yield* (yield* EventSink.EventSinkV2).write({
+              commandId: CommandId.make("external:complete-steer-target"),
+              events: [
+                {
+                  id: EventId.make("external:complete-child-root"),
+                  type: "node.updated",
+                  threadId: completedTask.childThreadId,
+                  occurredAt: finishedAt,
+                  payload: { ...completedRoot, status: "completed", completedAt: finishedAt },
+                },
+                {
+                  id: EventId.make("external:complete-child-run"),
+                  type: "run.updated",
+                  threadId: completedTask.childThreadId,
+                  occurredAt: finishedAt,
+                  payload: {
+                    ...completedRun,
+                    status: "completed",
+                    startedAt: finishedAt,
+                    completedAt: finishedAt,
+                  },
+                },
+              ],
+            });
+            const completedSteer = yield* invoke("external_task_steer", {
+              ...binding,
+              taskId: completedTask.taskId,
+              childRunId: completedTask.childRunId,
+              clientRequestId: "completed-target-steer",
+              message: "Do not create another run",
+            });
+            expect(
+              (yield* orchestrator.getThreadProjection(completedTask.childThreadId)).runs,
+              "completed child targeted steering must not create another run",
+            ).toHaveLength(completedChild.runs.length);
+            expect(
+              completedSteer.isError,
+              "completed target must reject strict external steering",
+            ).toBe(true);
             // Stop, a replacement run, and a changed attempt root all happen after
             // the real service's preflight while its Git boundary is awaiting.
             for (const change of ["root", "run", "mode", "interaction", "stop"] as const) {
