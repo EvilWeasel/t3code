@@ -31,28 +31,48 @@ export function executionCode(item: OrchestrationV2TurnItem) {
     input === "" ||
     transportTruncated ||
     (record(input) && (input.truncated === true || input.redacted === true));
+  // Show an explicitly recorded script field as code, retaining all original
+  // structured arguments separately. Never read a filename to fill this in.
+  const inputField =
+    !unavailable && record(input)
+      ? ["code", "script", "command", "cmd"].find((key) => typeof input[key] === "string")
+      : undefined;
+  const fieldText = inputField && record(input) ? input[inputField] : undefined;
   const text = unavailable
     ? null
-    : typeof input === "string"
-      ? input
-      : JSON.stringify(input, null, 2);
+    : typeof fieldText === "string"
+      ? fieldText
+      : typeof input === "string"
+        ? input
+        : JSON.stringify(input, null, 2);
   const language =
-    item.type === "command_execution"
-      ? commandHighlightLanguage(item.input)
-      : typeof input !== "string"
-        ? "json"
-        : isJavaScriptReplTool(item.toolName)
+    item.type === "command_execution" || inputField === "command" || inputField === "cmd"
+      ? commandHighlightLanguage(typeof text === "string" ? text : "")
+      : record(input) && typeof input.language === "string"
+        ? input.language
+        : item.type === "dynamic_tool" && isJavaScriptReplTool(item.toolName)
           ? "typescript"
-          : "text";
+          : typeof input !== "string"
+            ? "json"
+            : isJavaScriptReplTool(item.toolName)
+              ? "typescript"
+              : "text";
   return {
     text: text ?? null,
+    inputField: inputField ?? null,
+    argumentsText: inputField ? JSON.stringify(input, null, 2) : null,
     language,
-    shell: item.type === "command_execution",
+    shell: language === "shellscript",
     title:
       item.type === "command_execution"
         ? "Recorded command"
         : (item.toolName ?? "Recorded tool input"),
-    cwd: record(input) && typeof input.cwd === "string" ? input.cwd : null,
+    cwd:
+      record(input) && typeof input.cwd === "string"
+        ? input.cwd
+        : record(input) && typeof input.workdir === "string"
+          ? input.workdir
+          : null,
     unavailable: transportTruncated
       ? "Complete recorded input is unavailable: the existing item read reached its transport limit."
       : unavailable

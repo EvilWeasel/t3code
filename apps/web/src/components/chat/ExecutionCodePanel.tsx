@@ -117,6 +117,11 @@ export function ExecutionCodeView(props: {
         Recorded provider input. A script filename does not include its historical file contents.
         Opening this view does not run code.
       </p>
+      {code?.inputField ? (
+        <p className="mb-2 text-xs text-muted-foreground">
+          Original input field: {code.inputField}
+        </p>
+      ) : null}
       {code?.text !== null && code?.text !== undefined ? (
         <>
           <div className="mb-2 flex flex-wrap items-center gap-2">
@@ -181,6 +186,18 @@ export function ExecutionCodeView(props: {
           {props.error ? " The authorized item read failed." : ""}
         </p>
       )}
+      {code?.argumentsText ? (
+        <details className="mt-4 text-xs">
+          <summary className="cursor-pointer">Complete structured input</summary>
+          <pre
+            aria-label="Complete structured input"
+            tabIndex={0}
+            className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap select-text"
+          >
+            {code.argumentsText}
+          </pre>
+        </details>
+      ) : null}
       <details className="mt-4 text-xs">
         <summary className="cursor-pointer">Output / errors (separate from input)</summary>
         <pre

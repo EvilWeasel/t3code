@@ -51,8 +51,9 @@ describe("recorded execution input", () => {
       extra: [1, 2],
     };
     const view = executionCode({ ...base, type: "dynamic_tool", toolName: "code", input })!;
-    expect(JSON.parse(view.text!)).toEqual(input);
-    expect(view.language).toBe("json");
+    expect(view.text).toBe(input.code);
+    expect(JSON.parse(view.argumentsText!)).toEqual(input);
+    expect(view.inputField).toBe("code");
     expect(view.cwd).toBe("/original/run");
   });
   it.each([{ summary: "not all code", truncated: true }, { redacted: true }, null, ""])(
