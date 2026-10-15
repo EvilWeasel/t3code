@@ -170,6 +170,34 @@ function diagnosticBridgeFixture() {
 }
 
 describe("explicit main renderer diagnostic requests", () => {
+  it("rejects raw request extras before pinning session or consuming sequence", () => {
+    const fixture = diagnosticBridgeFixture();
+    const producer = createLiveVoiceDiagnosticProducer(fixture.bridge, {
+      nowMs: () => 1_000,
+      scheduleExpiry: () => () => {},
+    })!;
+    producer.update(gateFor(localInput));
+    producer.start();
+    const valid = fixture.request("valid");
+    fixture.send({
+      ...valid,
+      mainSession: "foreign",
+      requestSequence: 100,
+      ...{ rawSettings: "forbidden" },
+    });
+    fixture.send({
+      ...valid,
+      requestSequence: 100,
+      target: { ...valid.target, ...{ rawSettings: "forbidden" } },
+    });
+    expect(fixture.bridge.respondMainRendererDiagnostics).not.toHaveBeenCalled();
+    expect(fixture.bridge.invalidateMainRendererDiagnostics).not.toHaveBeenCalled();
+    fixture.send(valid);
+    expect(fixture.bridge.respondMainRendererDiagnostics).toHaveBeenCalledOnce();
+    expect(fixture.bridge.respondMainRendererDiagnostics.mock.calls[0]![0].binding).toEqual(valid);
+    producer.dispose();
+  });
+
   it("pins only the first valid unexpired session and rejects foreign sessions without consuming their sequence", () => {
     const fixture = diagnosticBridgeFixture();
     const producer = createLiveVoiceDiagnosticProducer(fixture.bridge, {

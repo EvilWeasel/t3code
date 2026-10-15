@@ -2,6 +2,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import type * as SchemaAST from "effect/SchemaAST";
 import * as Scope from "effect/Scope";
 
 export interface DesktopIpcInvokeEvent {
@@ -176,6 +177,7 @@ export interface DesktopIpcMethodRegistration<
   ResultEncodingServices = never,
 > {
   readonly channel: string;
+  readonly payloadDecodeOptions?: SchemaAST.ParseOptions;
   readonly payload: Schema.Codec<
     Payload,
     EncodedPayload,
@@ -219,7 +221,7 @@ export const makeIpcMethod = <
   E | Schema.SchemaError,
   R | PayloadDecodingServices | ResultEncodingServices
 > => {
-  const decode = Schema.decodeUnknownEffect(method.payload);
+  const decode = Schema.decodeUnknownEffect(method.payload, method.payloadDecodeOptions);
   const encode = Schema.encodeUnknownEffect(method.result);
 
   return {

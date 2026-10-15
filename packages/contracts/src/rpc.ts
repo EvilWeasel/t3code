@@ -22,6 +22,8 @@ import {
   ChatGptHandoffState,
 } from "./providerSetup.ts";
 import * as Schema from "effect/Schema";
+import * as Effect from "effect/Effect";
+import * as SchemaGetter from "effect/SchemaGetter";
 import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
@@ -875,7 +877,16 @@ export const ServerTraceDiagnosticsInput = Schema.Struct({
   mainRendererSnapshot: Schema.optionalKey(MainRendererDiagnosticsReadInput),
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 const WsServerGetTraceDiagnosticsRpc = Rpc.make(WS_METHODS.serverGetTraceDiagnostics, {
-  payload: ServerTraceDiagnosticsInput,
+  payload: Schema.Unknown.pipe(
+    Schema.decodeTo(ServerTraceDiagnosticsInput, {
+      decode: SchemaGetter.transformEffect((raw: unknown) =>
+        Schema.decodeUnknownEffect(ServerTraceDiagnosticsInput, { onExcessProperty: "error" })(
+          raw,
+        ).pipe(Effect.mapError((error) => error.issue)),
+      ),
+      encode: SchemaGetter.transform((value) => value),
+    }),
+  ),
   success: Schema.Union([
     ServerTraceDiagnosticsResult,
     Schema.Struct({ mainRendererSnapshot: MainRendererDiagnosticsReadResult }),

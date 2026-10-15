@@ -46,6 +46,8 @@ import {
   DesktopBackendBootstrap,
   type DesktopBackendBootstrap as DesktopBackendBootstrapValue,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
+  DesktopMainRendererDiagnosticsPeer,
+  DesktopMainRendererDiagnosticsRequest,
   DesktopTelemetryControlMessage,
   type DesktopTelemetryControlMessage as DesktopTelemetryControlMessageValue,
 } from "@t3tools/contracts";
@@ -446,9 +448,41 @@ function drainBackendOutput(
 }
 
 const encodeBootstrapJson = Schema.encodeEffect(Schema.fromJsonString(DesktopBackendBootstrap));
-const decodeDesktopTelemetryControlLine = Schema.decodeUnknownEffect(
+const decodeLegacyDesktopTelemetryControlLine = Schema.decodeUnknownEffect(
   Schema.fromJsonString(DesktopTelemetryControlMessage),
 );
+const decodeRawDesktopTelemetryControlLine = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Unknown),
+);
+const decodeDiagnosticPeer = Schema.decodeUnknownEffect(DesktopMainRendererDiagnosticsPeer, {
+  onExcessProperty: "error",
+});
+const decodeDiagnosticRequest = Schema.decodeUnknownEffect(DesktopMainRendererDiagnosticsRequest, {
+  onExcessProperty: "error",
+});
+const decodeDesktopTelemetryControlLine = (line: string) =>
+  decodeRawDesktopTelemetryControlLine(line).pipe(
+    Effect.flatMap(
+      (
+        raw,
+      ): Effect.Effect<
+        DesktopTelemetryControlMessageValue,
+        Schema.SchemaError | "invalid diagnostic control message"
+      > => {
+        if (typeof raw === "object" && raw !== null && "type" in raw) {
+          if (raw.type === "mainRendererDiagnosticsPeer")
+            return decodeDiagnosticPeer(raw).pipe(
+              Effect.mapError(() => "invalid diagnostic control message" as const),
+            );
+          if (raw.type === "mainRendererDiagnosticsRequest")
+            return decodeDiagnosticRequest(raw).pipe(
+              Effect.mapError(() => "invalid diagnostic control message" as const),
+            );
+        }
+        return decodeLegacyDesktopTelemetryControlLine(line);
+      },
+    ),
+  );
 
 export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
   options: RunBackendProcessOptions,

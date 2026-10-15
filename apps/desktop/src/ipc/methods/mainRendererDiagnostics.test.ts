@@ -5,6 +5,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -23,7 +24,12 @@ import {
 import type * as Electron from "electron";
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
 import * as ElectronApp from "../../electron/ElectronApp.ts";
-import { make } from "./mainRendererDiagnostics.ts";
+import {
+  make,
+  MainRendererDiagnostics,
+  respond as respondMethod,
+  invalidate as invalidateMethod,
+} from "./mainRendererDiagnostics.ts";
 
 const target = {
   environmentId: "24efa85c-862c-4de4-9b5e-aaaa041e28a4",
@@ -284,7 +290,7 @@ describe("passive main renderer diagnostics", () => {
     );
   }
 
-  it("strict schemas reject foreign scope, raw fields, invalid enum, absent sequence and oversized nonce", () => {
+  it("explicit strict diagnostic decoder rejects foreign scope, raw fields, invalid enum, absent sequence and oversized nonce", () => {
     const binding = {
       version: 1,
       requestSequence: 1,
@@ -298,7 +304,9 @@ describe("passive main renderer diagnostics", () => {
       navigationGeneration: 0,
       expiresAtMs: 2_000,
     } as const;
-    const decode = Schema.decodeUnknownOption(MainRendererDiagnosticsRequest);
+    const decode = Schema.decodeUnknownOption(MainRendererDiagnosticsRequest, {
+      onExcessProperty: "error",
+    });
     assert.equal(Option.isSome(decode(binding)), true);
     assert.equal(Option.isNone(decode({ ...binding, requestSequence: 0 })), true);
     assert.equal(Option.isNone(decode({ ...binding, requestNonce: "a".repeat(129) })), true);
@@ -320,6 +328,68 @@ describe("passive main renderer diagnostics", () => {
       true,
     );
   });
+
+  it.effect(
+    "actual diagnostic IPC methods reject excess payloads before touching the bound request",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const read = yield* f.service.read("A", () => true, f.input).pipe(Effect.forkScoped);
+        const binding = yield* Queue.take(f.requests);
+        let respondCalls = 0;
+        let invalidateCalls = 0;
+        const service = MainRendererDiagnostics.of({
+          ...f.service,
+          respond: (input, event) =>
+            Effect.sync(() => {
+              respondCalls++;
+            }).pipe(Effect.andThen(f.service.respond(input, event))),
+          invalidate: (input, event) =>
+            Effect.sync(() => {
+              invalidateCalls++;
+            }).pipe(Effect.andThen(f.service.invalidate(input, event))),
+        });
+        const layer = Layer.succeed(MainRendererDiagnostics, service);
+        const ready = response(binding);
+        const invalidation = { binding, rendererEpoch: 1, revision: 1 };
+        const topReply = yield* respondMethod
+          .handler({ ...ready, rawSettings: "refused" }, sender)
+          .pipe(Effect.provide(layer), Effect.exit);
+        const nestedReply = yield* respondMethod
+          .handler(
+            { ...ready, binding: { ...binding, target: { ...target, rawSettings: "refused" } } },
+            sender,
+          )
+          .pipe(Effect.provide(layer), Effect.exit);
+        const topInvalidation = yield* invalidateMethod
+          .handler({ ...invalidation, rawSettings: "refused" }, sender)
+          .pipe(Effect.provide(layer), Effect.exit);
+        const nestedInvalidation = yield* invalidateMethod
+          .handler({ ...invalidation, binding: { ...binding, rawSettings: "refused" } }, sender)
+          .pipe(Effect.provide(layer), Effect.exit);
+        assert.isTrue(Exit.isFailure(topReply));
+        assert.isTrue(Exit.isFailure(nestedReply));
+        assert.isTrue(Exit.isFailure(topInvalidation));
+        assert.isTrue(Exit.isFailure(nestedInvalidation));
+        assert.equal(respondCalls, 0);
+        assert.equal(invalidateCalls, 0);
+        assert.equal(yield* respondMethod.handler(ready, sender).pipe(Effect.provide(layer)), true);
+        assert.equal(respondCalls, 1);
+        assert.equal((yield* Fiber.join(read)).status, "ready");
+        const second = yield* f.service
+          .read("A", () => true, { ...f.input, requestId: "read-2", requestNonce: "caller-2" })
+          .pipe(Effect.forkScoped);
+        const nextBinding = yield* Queue.take(f.requests);
+        assert.equal(
+          yield* invalidateMethod
+            .handler({ binding: nextBinding, rendererEpoch: 1, revision: 1 }, sender)
+            .pipe(Effect.provide(layer)),
+          true,
+        );
+        assert.equal(invalidateCalls, 1);
+        assert.equal((yield* Fiber.join(second)).status, "unavailable");
+      }).pipe(Effect.scoped),
+  );
 
   it("actual legacy hello decoder accepts the optional advertisement without diagnostic emission", () => {
     // Exact pre-feature hello schema, not the new union decoding itself.

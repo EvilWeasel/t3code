@@ -388,7 +388,9 @@ export function createLiveVoiceDiagnosticProducer(
     if (disposed || model === null) return;
     let decoded: MainRendererDiagnosticsRequest;
     try {
-      decoded = Schema.decodeUnknownSync(MainRendererDiagnosticsRequest)(raw);
+      decoded = Schema.decodeUnknownSync(MainRendererDiagnosticsRequest, {
+        onExcessProperty: "error",
+      })(raw);
     } catch {
       return;
     }

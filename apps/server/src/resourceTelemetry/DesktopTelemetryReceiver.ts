@@ -6,6 +6,7 @@ import type { Readable } from "node:stream";
 import * as NodeStream from "@effect/platform-node/NodeStream";
 import {
   DesktopHostTelemetryMessage,
+  DesktopMainRendererDiagnosticsReply,
   MainRendererDiagnosticsReadInput,
   type MainRendererDiagnosticsReadResult,
   type DesktopHostTelemetryMessage as DesktopHostTelemetryMessageValue,
@@ -208,7 +209,17 @@ export class DesktopTelemetryReceiver extends Context.Service<
   }
 >()("t3/resourceTelemetry/DesktopTelemetryReceiver") {}
 
-const decodeMessage = Schema.decodeUnknownEffect(DesktopHostTelemetryMessage);
+const decodeLegacyMessage = Schema.decodeUnknownEffect(DesktopHostTelemetryMessage);
+const decodeDiagnosticReply = Schema.decodeUnknownEffect(DesktopMainRendererDiagnosticsReply, {
+  onExcessProperty: "error",
+});
+const decodeMessage = (raw: unknown) =>
+  typeof raw === "object" &&
+  raw !== null &&
+  "type" in raw &&
+  raw.type === "mainRendererDiagnosticsReply"
+    ? decodeDiagnosticReply(raw)
+    : decodeLegacyMessage(raw);
 const encodeControlMessage = Schema.encodeEffect(
   Schema.fromJsonString(DesktopTelemetryControlMessage),
 );

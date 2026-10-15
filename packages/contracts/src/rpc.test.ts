@@ -68,3 +68,54 @@ describe("WebSocket RPC contracts", () => {
     ).toBe(true);
   });
 });
+
+describe("registered trace diagnostics serialization boundary", () => {
+  const rpc = WsRpcGroup.requests.get("server.getTraceDiagnostics");
+  if (rpc === undefined) throw new Error("trace diagnostics RPC is not registered");
+  const codec = Schema.toCodecJson(rpc.payloadSchema);
+  const decode = Schema.decodeUnknownExit(codec);
+  const input = {
+    mainRendererSnapshot: {
+      requestId: "read",
+      requestNonce: "nonce",
+      optIn: true,
+      expiresAtMs: 5_000,
+      target: {
+        environmentId: "24efa85c-862c-4de4-9b5e-aaaa041e28a4",
+        threadId: "7cd05d6b-5e09-4691-a664-0b56c6283f12",
+        providerInstanceId: "codex",
+      },
+    },
+  } as const;
+  it("preserves default trace and the typed explicit selector through the actual JSON codec", () => {
+    expect(Schema.decodeUnknownSync(codec)({})).toEqual({});
+    const decoded = Schema.decodeUnknownSync(codec)(input);
+    expect(decoded).toEqual(input);
+    expect(Schema.encodeSync(codec)(decoded)).toEqual(input);
+  });
+  it("rejects raw extras before destination struct stripping", () => {
+    expect(Exit.isFailure(decode({ rawSettings: "refused" }))).toBe(true);
+    expect(Exit.isFailure(decode({ ...input, rawSettings: "refused" }))).toBe(true);
+    expect(
+      Exit.isFailure(
+        decode({ mainRendererSnapshot: { ...input.mainRendererSnapshot, rawSettings: "refused" } }),
+      ),
+    ).toBe(true);
+    expect(
+      Exit.isFailure(
+        decode({
+          mainRendererSnapshot: {
+            ...input.mainRendererSnapshot,
+            target: { ...input.mainRendererSnapshot.target, rawSettings: "refused" },
+          },
+        }),
+      ),
+    ).toBe(true);
+  });
+  it("leaves another registered RPC's legacy decoding unchanged", () => {
+    const legacy = Schema.toCodecJson(WsSubscribeServerConfigRpc.payloadSchema);
+    expect(
+      Schema.decodeUnknownSync(legacy)({ environmentThemes: true, legacyExtra: "ignored" }),
+    ).toEqual({ environmentThemes: true });
+  });
+});

@@ -293,6 +293,7 @@ export const layer = Layer.effect(MainRendererDiagnostics, make());
 export const respond = DesktopIpc.makeIpcMethod({
   channel: Channels.MAIN_RENDERER_DIAGNOSTICS_RESPONSE_CHANNEL,
   payload: MainRendererDiagnosticsResponse,
+  payloadDecodeOptions: { onExcessProperty: "error" },
   result: Schema.Boolean,
   handler: (input, event) =>
     Effect.flatMap(MainRendererDiagnostics, (service) => service.respond(input, event)),
@@ -300,6 +301,7 @@ export const respond = DesktopIpc.makeIpcMethod({
 export const invalidate = DesktopIpc.makeIpcMethod({
   channel: Channels.MAIN_RENDERER_DIAGNOSTICS_INVALIDATE_CHANNEL,
   payload: MainRendererDiagnosticsInvalidation,
+  payloadDecodeOptions: { onExcessProperty: "error" },
   result: Schema.Boolean,
   handler: (input, event) =>
     Effect.flatMap(MainRendererDiagnostics, (service) => service.invalidate(input, event)),

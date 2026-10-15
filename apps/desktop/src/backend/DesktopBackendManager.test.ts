@@ -1685,13 +1685,23 @@ it.effect(
       let inputEnded = false;
       const layerSpawner = Layer.succeed(
         ChildProcessSpawner.ChildProcessSpawner,
-        ChildProcessSpawner.make(() =>
-          Effect.succeed(
-            makeProcess({
-              getOutputFd: () => Stream.fromEffect(Deferred.await(inputStarted)).pipe(Stream.drain),
+        ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            if (command._tag !== "StandardCommand")
+              return assert.fail("Expected owned standard command");
+            const input = command.options.additionalFds?.fd4;
+            if (input?.type !== "input" || input.stream === undefined)
+              return assert.fail("Expected actual telemetry input stream");
+            // The external spawner fixture must consume the stream production passed to fd4.
+            yield* input.stream.pipe(Stream.runDrain, Effect.forkScoped);
+            return makeProcess({
+              getOutputFd: (fd) =>
+                fd === 5
+                  ? Stream.fromEffect(Deferred.await(inputStarted)).pipe(Stream.drain)
+                  : Stream.empty,
               exitCode: Deferred.await(exit).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
-            }),
-          ),
+            });
+          }),
         ),
       );
       const running = yield* DesktopBackendManager.runBackendProcess({
@@ -1719,4 +1729,83 @@ it.effect(
       yield* Deferred.succeed(exit, undefined);
       assert.equal((yield* Fiber.join(running)).code.pipe(Option.getOrUndefined), 0);
     }).pipe(Effect.scoped),
+);
+
+it.effect("strictly decodes only new diagnostic control messages before delivery", () =>
+  Effect.gen(function* () {
+    const closed = yield* Deferred.make<void>();
+    const exit = yield* Deferred.make<void>();
+    const observed: DesktopTelemetryControlMessage[] = [];
+    const peer = {
+      version: 1,
+      type: "mainRendererDiagnosticsPeer",
+      desktopNonce: "desktop",
+      serverNonce: "server",
+    } as const;
+    const request = {
+      version: 1,
+      type: "mainRendererDiagnosticsRequest",
+      desktopNonce: "desktop",
+      serverNonce: "server",
+      input: {
+        requestId: "read",
+        requestNonce: "nonce",
+        optIn: true,
+        expiresAtMs: 5_000,
+        target: {
+          environmentId: "24efa85c-862c-4de4-9b5e-aaaa041e28a4",
+          threadId: "7cd05d6b-5e09-4691-a664-0b56c6283f12",
+          providerInstanceId: "codex",
+        },
+      },
+    } as const;
+    const encodeRaw = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+    const messages = [
+      { ...peer, rawSettings: "refused" },
+      peer,
+      { ...request, rawSettings: "refused" },
+      {
+        ...request,
+        input: { ...request.input, target: { ...request.input.target, rawSettings: "refused" } },
+      },
+      request,
+      { version: 1, type: "setDiagnosticsDemand", enabled: true, legacyExtra: "still accepted" },
+    ];
+    const spawner = Layer.succeed(
+      ChildProcessSpawner.ChildProcessSpawner,
+      ChildProcessSpawner.make(() =>
+        Effect.succeed(
+          makeProcess({
+            getOutputFd: (fd) =>
+              fd === 5
+                ? Stream.fromIterable(
+                    messages.map((message) => new TextEncoder().encode(encodeRaw(message) + "\n")),
+                  )
+                : Stream.empty,
+            exitCode: Deferred.await(exit).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+          }),
+        ),
+      ),
+    );
+    const running = yield* DesktopBackendManager.runBackendProcess({
+      ...baseConfig,
+      onDesktopTelemetryControl: (message) =>
+        Effect.sync(() => {
+          observed.push(message);
+        }),
+      onDesktopTelemetryControlClosed: Deferred.succeed(closed, undefined).pipe(Effect.asVoid),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.merge(spawner, layerHealthyHttpClient)),
+      Effect.forkScoped,
+    );
+    yield* Deferred.await(closed);
+    assert.deepEqual(observed, [
+      peer,
+      request,
+      { version: 1, type: "setDiagnosticsDemand", enabled: true },
+    ]);
+    yield* Deferred.succeed(exit, undefined);
+    yield* Fiber.join(running);
+  }).pipe(Effect.scoped),
 );
