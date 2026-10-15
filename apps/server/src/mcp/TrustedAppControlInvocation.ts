@@ -55,7 +55,10 @@ export interface AppControlOwnerIdentity {
 let issueOwner: (identity: AppControlOwnerIdentity) => TrustedAppControlOwner;
 /** Host capability only. No Schema/JSON constructor and no authority in copied fields. */
 export class TrustedAppControlOwner {
-  private constructor(private readonly data: Readonly<AppControlOwnerIdentity>) {}
+  private readonly data: Readonly<AppControlOwnerIdentity>;
+  private constructor(data: Readonly<AppControlOwnerIdentity>) {
+    this.data = data;
+  }
   get identity() {
     return this.data;
   }

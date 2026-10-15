@@ -532,7 +532,7 @@ export const makeObservatoryInvocationCallback = (
   captured: TrustedInvocation.CapturedAppControlExecution,
   trusted: TrustedInvocation.TrustedAppControlInvocation["Service"],
   observatory: Observatory.AgentObservatoryService["Service"],
-  crypto: Crypto.Crypto["Service"],
+  crypto: Crypto.Crypto,
 ): NonNullable<ProviderAdapter.ProviderAdapterV2TurnInput["onObservatoryInvocation"]> => {
   const execution = Object.freeze({ ...captured });
   return (native, intent) =>

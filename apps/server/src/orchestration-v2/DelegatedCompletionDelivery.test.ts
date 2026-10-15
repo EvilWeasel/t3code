@@ -1,8 +1,10 @@
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
+  EnvironmentId,
   CommandId,
   EventId,
   MessageId,
@@ -43,10 +45,17 @@ import * as ProviderTurnStartServiceTestkit from "./ProviderTurnStartService.tes
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 
-const layerPlatformTest = Layer.merge(
+const fixtureEnvironmentId = EnvironmentId.make(
+  "environment:observatory-fixture:DelegatedCompletionDelivery",
+);
+const layerPlatformTest = Layer.mergeAll(
   NodeServices.layer,
   Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
     resolveLink: () => Effect.die("unused title link"),
+  }),
+  Layer.succeed(ServerEnvironment.ServerEnvironment, {
+    getEnvironmentId: Effect.succeed(fixtureEnvironmentId),
+    getDescriptor: Effect.die("Server descriptor is unused in this destination-bound test fixture"),
   }),
 );
 

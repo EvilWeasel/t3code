@@ -125,10 +125,15 @@ const layerMcpRegistry = Layer.succeed(
   }),
 );
 
-const layerPlatformTest = Layer.merge(
+const fixtureEnvironmentId = EnvironmentId.make("00000000-0000-4000-8000-000000000001");
+const layerPlatformTest = Layer.mergeAll(
   NodeServices.layer,
   Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
     resolveLink: () => Effect.die("unused title link"),
+  }),
+  Layer.succeed(ServerEnvironment.ServerEnvironment, {
+    getEnvironmentId: Effect.succeed(fixtureEnvironmentId),
+    getDescriptor: Effect.die("Server descriptor is unused in this destination-bound test fixture"),
   }),
 );
 const layerServerConfig = ServerConfig.layerTest(`${ROOT}/work`, { prefix: "t3-opencode2-live-" });
@@ -199,9 +204,7 @@ const layerProviderInstanceRegistry = ProviderInstanceRegistryHydration.layer.pi
         managedDirectory: "unused-managed-installation",
       }),
       Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
-        getEnvironmentId: Effect.succeed(
-          EnvironmentId.make("00000000-0000-4000-8000-000000000001"),
-        ),
+        getEnvironmentId: Effect.succeed(fixtureEnvironmentId),
       }),
     ),
   ),

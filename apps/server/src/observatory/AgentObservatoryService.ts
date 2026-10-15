@@ -158,7 +158,11 @@ const make = Effect.gen(function* () {
           agents: [],
           nextCursor: null,
         });
-      const page = yield* projections.getCurrentNativeAgentRoster({ ...input, threadIds });
+      const page = yield* projections.getCurrentNativeAgentRoster({
+        threadIds,
+        limit: input.limit,
+        ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+      });
       return yield* Schema.decodeUnknownEffect(AgentObservatoryNativeRosterPage)({
         ...page,
         environmentId,

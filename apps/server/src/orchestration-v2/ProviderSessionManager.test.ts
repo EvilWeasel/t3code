@@ -4788,10 +4788,21 @@ it.effect.each([false, true])(
               threadId: input.threadId,
               providerSessionId:
                 input.providerSessionId ??
-                (yield* ids.allocate.providerSession({
-                  threadId: input.threadId,
-                  providerInstanceId: modelSelection.instanceId,
-                })),
+                (yield* ids.allocate
+                  .providerSession({
+                    threadId: input.threadId,
+                    providerInstanceId: modelSelection.instanceId,
+                  })
+                  .pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new ProviderAdapter.ProviderAdapterEnsureThreadError({
+                          driver: CODEX_DRIVER,
+                          threadId: input.threadId,
+                          cause,
+                        }),
+                    ),
+                  )),
               now: yield* DateTime.now,
             });
           }),
