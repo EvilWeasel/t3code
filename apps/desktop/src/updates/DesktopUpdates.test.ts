@@ -276,7 +276,9 @@ describe("DesktopUpdates", () => {
       ).pipe(Effect.forkScoped);
       yield* flushCallbacks;
       harness.emit("error", new Error("installer failed after accepting the handoff"));
-      assert.isTrue(Option.isSome(yield* Fiber.join(recovered)));
+      const recoveredState = yield* Fiber.join(recovered);
+      assert.equal(recoveredState.errorContext, "install");
+      assert.isUndefined(recoveredState.installLease);
       assert.isTrue(released);
       assert.equal(harness.stopCount(), 0);
       assert.deepEqual(harness.installSteps, ["quitAndInstall"]);
