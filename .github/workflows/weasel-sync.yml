@@ -63,7 +63,10 @@ jobs:
           [[ "$fork" =~ ^[0-9a-f]{40}$ && "$upstream" =~ ^[0-9a-f]{40}$ ]]
           git fetch origin "$fork"
           # The public fetch has no fork header, helper or ambient Git config.
-          env -i PATH="$PATH" HOME="$RUNNER_TEMP" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -c http.extraHeader= -c credential.helper= -c core.askPass= fetch https://github.com/pingdotgg/t3code.git "$upstream"
+          public_dir="$(mktemp -d "$RUNNER_TEMP/public-upstream.XXXXXX")"
+          env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -C "$public_dir" init --bare
+          env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -C "$public_dir" -c http.extraHeader= -c credential.helper= -c core.askPass= fetch https://github.com/pingdotgg/t3code.git "$upstream"
+          git fetch "$public_dir" "$upstream"
       - name: Reserve pair before any publication or qualification
         id: reserve
         run: |
@@ -279,7 +282,8 @@ jobs:
           test "$(git show -s --format=%P "$CANDIDATE")" = "$FORK $UPSTREAM"
           git -c credential.helper='!gh auth git-credential' fetch origin main
           test "$(git rev-parse FETCH_HEAD)" = "$FORK"
-          observed="$(env -i PATH="$PATH" HOME="$RUNNER_TEMP" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.extraHeader= ls-remote https://github.com/pingdotgg/t3code.git refs/heads/main | cut -f1)"
+          public_dir="$(mktemp -d "$RUNNER_TEMP/public-main-check.XXXXXX")"
+          observed="$(env -i PATH="$PATH" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 git -C "$public_dir" -c credential.helper= -c http.extraHeader= -c core.askPass= ls-remote https://github.com/pingdotgg/t3code.git refs/heads/main | cut -f1)"
           test "$observed" = "$UPSTREAM"
           git merge-base --is-ancestor "$FORK" "$CANDIDATE"
           git -c credential.helper='!gh auth git-credential' push origin "$CANDIDATE:refs/heads/main"
