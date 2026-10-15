@@ -945,7 +945,7 @@ export const make = Effect.gen(function* () {
     return { runIds: selected.map((item) => item.runId), effectIds };
   }).pipe(
     Effect.mapError((cause) =>
-      cause instanceof ProviderRuntimeRecoveryError
+      Schema.is(ProviderRuntimeRecoveryError)(cause)
         ? cause
         : new ProviderRuntimeRecoveryError({ operation: "reconcile", cause }),
     ),
@@ -963,7 +963,7 @@ export const make = Effect.gen(function* () {
     }
   }).pipe(
     Effect.mapError((cause) =>
-      cause instanceof ProviderRuntimeRecoveryError
+      Schema.is(ProviderRuntimeRecoveryError)(cause)
         ? cause
         : new ProviderRuntimeRecoveryError({ operation: "reconcile", cause }),
     ),

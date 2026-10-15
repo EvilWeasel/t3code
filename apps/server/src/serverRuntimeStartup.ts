@@ -153,14 +153,19 @@ export const makeCommandGate = Effect.gen(function* () {
 });
 
 /** Owns a single bootstrap-FD reservation; committed holds survive timeout/disconnect. */
-export const makeBackendUpdateCoordinator = (input: {
+export const makeBackendUpdateCoordinator = <
+  PrepareError,
+  ValidateError,
+  ClearError,
+  BusyError,
+>(input: {
   environmentId: string;
   bootId: string;
   gate: ProviderRuntimeRecovery.BackendUpdateGate;
-  prepare: Effect.Effect<ProviderRuntimeRecovery.BackendUpdatePreparedContinuations, unknown>;
-  validate: Effect.Effect<boolean, unknown>;
-  clear: Effect.Effect<void, unknown>;
-  busy: Effect.Effect<boolean, unknown>;
+  prepare: Effect.Effect<ProviderRuntimeRecovery.BackendUpdatePreparedContinuations, PrepareError>;
+  validate: Effect.Effect<boolean, ValidateError>;
+  clear: Effect.Effect<void, ClearError>;
+  busy: Effect.Effect<boolean, BusyError>;
   wake: Effect.Effect<void>;
   send: (response: DesktopBackendUpdateResponse) => Effect.Effect<void>;
   now: Effect.Effect<number>;
@@ -271,9 +276,9 @@ export const makeBackendUpdateCoordinator = (input: {
                     ? "stale"
                     : prepared.failure === "expired"
                       ? "expired"
-                      : prepared.failure instanceof
-                            ProviderRuntimeRecovery.ProviderRuntimeRecoveryError &&
-                          prepared.failure.cause === "optout"
+                      : Schema.is(ProviderRuntimeRecovery.ProviderRuntimeRecoveryError)(
+                            prepared.failure,
+                          ) && prepared.failure.cause === "optout"
                         ? "optout"
                         : "unsupported",
             );

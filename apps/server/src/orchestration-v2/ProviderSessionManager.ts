@@ -1723,7 +1723,7 @@ export const layerWithOptions = (
                   })
                 : Effect.failCause(signal.cause),
             ),
-            Stream.flattenArray,
+            Stream.flatMap(Stream.fromIterable),
             Stream.ensuring(close),
           );
           return { events, close } satisfies ProviderAdapter.ProviderAdapterV2EventSubscription;
