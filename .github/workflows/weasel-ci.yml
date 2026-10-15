@@ -18,6 +18,11 @@ on:
         required: false
         default: false
         type: boolean
+      qualifyFocusPrerequisite:
+        description: Qualify credential-free focus prerequisite only
+        required: false
+        default: false
+        type: boolean
   push:
     branches: [main, "weasel/**"]
   pull_request:
@@ -87,8 +92,17 @@ jobs:
           CANDIDATE_VERSION: ${{ inputs.candidateVersion }}
           SOURCE_SHA: ${{ github.sha }}
           SOURCE_REPOSITORY: ${{ github.repository }}
+          QUALIFY_FOCUS_PREREQUISITE: ${{ inputs.qualifyFocusPrerequisite || false }}
+          PROBE_PROTON_PASS: ${{ inputs.probeProtonPass || false }}
         run: |
           set -euo pipefail
+          if [[ "$QUALIFY_FOCUS_PREREQUISITE" == true ]]; then
+            test "$SOURCE_REPOSITORY" = morrowbyte/t3code
+            test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+            test "$PROBE_PROTON_PASS" = false
+            test "$BUILD_CANDIDATE_CLI" = false
+            test -z "$CANDIDATE_VERSION"
+          fi
           if [[ "$BUILD_CANDIDATE_CLI" != true ]]; then
             test -z "$CANDIDATE_VERSION"
             exit 0
@@ -104,6 +118,65 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsecret-1-dev pkg-config
           vp run build:desktop
+      - name: Qualify credential-free focus prerequisite scenarios
+        if: inputs.qualifyFocusPrerequisite
+        timeout-minutes: 7
+        env:
+          MORROWBYTE_FOCUS_PREREQUISITE: "1"
+          MORROWBYTE_RUNNER_PROFILE: blacksmith-8vcpu-ubuntu-2404
+          MORROWBYTE_FOCUS_BUNDLE_DIR: ${{ runner.temp }}/proton-pass-focus-build
+          FOCUS_SELECTED_RUNNER: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$FOCUS_SELECTED_RUNNER" = blacksmith-8vcpu-ubuntu-2404
+          test "$(id -u)" != 0
+          for required in /usr/bin/git /usr/bin/xvfb-run /usr/bin/Xvfb /usr/bin/xdotool; do
+            test -x "$required" || { echo "Missing existing focus prerequisite: $required" >&2; exit 1; }
+          done
+          test -s apps/desktop/dist-electron/preview-pick-preload.cjs
+          (cd apps/desktop/scripts/proton-pass-focus-prerequisite && vp pack)
+          test -s "$MORROWBYTE_FOCUS_BUNDLE_DIR/main.cjs"
+          focus_electron="$(node apps/desktop/scripts/ensure-electron-runtime.mjs)"
+          positive_status=0
+          negative_status=0
+          xvfb-run --auto-servernum node apps/desktop/scripts/proton-pass-focus-prerequisite/run.mjs \
+            --electron "$focus_electron" \
+            --entry "$MORROWBYTE_FOCUS_BUNDLE_DIR/main.cjs" \
+            --output "$RUNNER_TEMP/focus-positive/proton-pass-focus-prerequisite" \
+            --scenario single-focus || positive_status=$?
+          xvfb-run --auto-servernum node apps/desktop/scripts/proton-pass-focus-prerequisite/run.mjs \
+            --electron "$focus_electron" \
+            --entry "$MORROWBYTE_FOCUS_BUNDLE_DIR/main.cjs" \
+            --output "$RUNNER_TEMP/focus-negative/proton-pass-focus-prerequisite" \
+            --scenario second-focus-before-close || negative_status=$?
+          test "$positive_status" -eq 0
+          test "$negative_status" -eq 0
+      - name: Preserve positive focus prerequisite receipts
+        if: always() && inputs.qualifyFocusPrerequisite
+        uses: actions/upload-artifact@v4
+        with:
+          name: focus-prerequisite-positive-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/focus-positive/proton-pass-focus-prerequisite/fixture-receipt.json
+            ${{ runner.temp }}/focus-positive/proton-pass-focus-prerequisite/fixture-receipt.partial.json
+            ${{ runner.temp }}/focus-positive/proton-pass-focus-prerequisite/runner-receipt.json
+            ${{ runner.temp }}/focus-positive/proton-pass-focus-prerequisite/electron.log
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve negative focus prerequisite receipts
+        if: always() && inputs.qualifyFocusPrerequisite
+        uses: actions/upload-artifact@v4
+        with:
+          name: focus-prerequisite-negative-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/focus-negative/proton-pass-focus-prerequisite/fixture-receipt.json
+            ${{ runner.temp }}/focus-negative/proton-pass-focus-prerequisite/fixture-receipt.partial.json
+            ${{ runner.temp }}/focus-negative/proton-pass-focus-prerequisite/runner-receipt.json
+            ${{ runner.temp }}/focus-negative/proton-pass-focus-prerequisite/electron.log
+          if-no-files-found: error
+          retention-days: 7
       - name: Capture synthetic voice UI across sizes and themes
         run: node scripts/weasel/voice-ui-artifact.mjs
       - name: Preserve visual fixture evidence
