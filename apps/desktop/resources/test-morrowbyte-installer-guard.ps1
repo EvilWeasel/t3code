@@ -159,6 +159,51 @@ public static class MorrowbyteGuardFixture {
         if (value == 13) return "cr";
         return value < 128 ? "ascii-other" : "other";
     }
+    private static readonly byte[] StartupHeader = new byte[] { 239, 187, 191 };
+    private static readonly byte[] ReleaseToken = System.Text.Encoding.ASCII.GetBytes("MORROWBYTE_GUARD_FIXTURE_RELEASE\n");
+    private static bool ReadExact(System.IO.Stream input, byte[] expected, out int index, out int value) {
+        index = 0; value = -1;
+        for (; index < expected.Length; index++) {
+            value = input.ReadByte();
+            if (value != expected[index]) return false;
+        }
+        return true;
+    }
+    private static byte[] Join(byte[] left, byte[] right) {
+        var result = new byte[left.Length + right.Length];
+        Buffer.BlockCopy(left, 0, result, 0, left.Length);
+        Buffer.BlockCopy(right, 0, result, left.Length, right.Length);
+        return result;
+    }
+    private static bool MatchesFrame(byte[] bytes) {
+        using (var input = new System.IO.MemoryStream(bytes)) {
+            int index, value;
+            return ReadExact(input, StartupHeader, out index, out value)
+                && ReadExact(input, ReleaseToken, out index, out value);
+        }
+    }
+    private static bool ProtocolCasesPass() {
+        var valid = Join(StartupHeader, ReleaseToken);
+        var changedToken = (byte[])ReleaseToken.Clone(); changedToken[0] = 88;
+        var partialToken = new byte[ReleaseToken.Length - 1];
+        Buffer.BlockCopy(ReleaseToken, 0, partialToken, 0, partialToken.Length);
+        return MatchesFrame(valid)
+            && !MatchesFrame(ReleaseToken)
+            && !MatchesFrame(new byte[0])
+            && !MatchesFrame(new byte[] { 239 })
+            && !MatchesFrame(new byte[] { 239, 187 })
+            && !MatchesFrame(StartupHeader)
+            && !MatchesFrame(Join(new byte[] { 239, 187, 190 }, ReleaseToken))
+            && !MatchesFrame(Join(new byte[] { 255, 254 }, ReleaseToken))
+            && !MatchesFrame(Join(StartupHeader, valid))
+            && !MatchesFrame(Join(StartupHeader, partialToken))
+            && !MatchesFrame(Join(StartupHeader, changedToken));
+    }
+    private static int Refuse(int index, int value) {
+        if (value < 0) Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_EOF");
+        else Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_MISMATCH:{0}:{1}", index, ByteClass(value));
+        return 2;
+    }
     public static int Main() {
         if (ByteClass(239) != "prefix-ef" || ByteClass(255) != "prefix-ff" ||
             ByteClass(254) != "prefix-fe" || ByteClass(0) != "nul" ||
@@ -167,15 +212,17 @@ public static class MorrowbyteGuardFixture {
             Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_CLASSIFICATION_ERROR");
             return 2;
         }
+        if (!ProtocolCasesPass()) {
+            Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_CLASSIFICATION_ERROR");
+            return 2;
+        }
+        var input = Console.OpenStandardInput();
+        int mismatchIndex, received;
+        // Mandatory fixed startup frame, never an optional BOM-skipping decoder.
+        if (!ReadExact(input, StartupHeader, out mismatchIndex, out received)) return Refuse(mismatchIndex, received);
         Console.WriteLine("MORROWBYTE_GUARD_FIXTURE_READY");
         Console.Out.Flush();
-        var expected = System.Text.Encoding.ASCII.GetBytes("MORROWBYTE_GUARD_FIXTURE_RELEASE\n");
-        var input = Console.OpenStandardInput();
-        for (int i = 0; i < expected.Length; i++) {
-            int value = input.ReadByte();
-            if (value < 0) { Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_EOF"); return 2; }
-            if (value != expected[i]) { Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_MISMATCH:{0}:{1}", i, ByteClass(value)); return 2; }
-        }
+        if (!ReadExact(input, ReleaseToken, out mismatchIndex, out received)) return Refuse(mismatchIndex, received);
         Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_MATCHED");
         return 0;
     }
@@ -199,6 +246,10 @@ public static class MorrowbyteGuardFixture {
     $inputEncoding = [Console]::InputEncoding
     $fixtureInputCodePage = $inputEncoding.CodePage
     $fixtureInputPreamble = Get-FixturePreambleClass -Preamble $inputEncoding.GetPreamble()
+    # Require the exact reviewed UTF8 startup frame before any native spawn.
+    # Get-FixturePreambleClass returns utf8 only for exactly EF BB BF.
+    Assert-Equal 65001 $fixtureInputCodePage
+    Assert-Equal 'utf8' $fixtureInputPreamble
     $fixtureStarted = $fixtureProcess.Start()
     if (-not $fixtureStarted) { throw 'Owned fixture process did not start.' }
     $fixturePhase = 'readiness'
