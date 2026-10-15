@@ -400,7 +400,7 @@ describe("mounted observatory projection dashboard", () => {
     const read = (revision: number, title: string) => ({
       environmentId,
       threadId: shell.id,
-      status: "online",
+      status: "stale",
       throughSequence: 50,
       snapshot: {
         owner,
@@ -413,7 +413,7 @@ describe("mounted observatory projection dashboard", () => {
         state: {
           title,
           currentStepId: "inspect",
-          steps: [{ id: "inspect", label: "Inspect input", status: "active" }],
+          steps: [{ id: "inspect", label: `Inspect ${title}`, status: "active" }],
           todos: [],
           requestedCheckpoint: { id: "review", label: "Wait for review", when: "Before mutation" },
           layout: "split",
@@ -429,6 +429,13 @@ describe("mounted observatory projection dashboard", () => {
       }),
     );
     expect(container.textContent).toContain("Declared first plan");
+    expect(container.textContent).toContain(
+      "Recorded agent-authored state · revision 1 · service status: stale",
+    );
+    expect(container.textContent).toContain("Worker availability is observed separately");
+    expect(container.textContent).toContain("Observed status:");
+    expect(container.textContent).toContain("Inspect Declared first plan");
+    expect(registry.get(view.snapshotAtom).nodes[0]?.title).toBe("Declared first plan");
     expect(container.textContent).toContain("Requested · not proven reached");
     await act(async () =>
       registry.set(authored, {
@@ -446,6 +453,12 @@ describe("mounted observatory projection dashboard", () => {
     );
     expect(container.textContent).not.toContain("Declared first plan");
     expect(container.textContent).toContain("Declared new plan");
+    expect(container.textContent).toContain(
+      "Recorded agent-authored state · revision 2 · service status: stale",
+    );
+    expect(container.textContent).toContain("Inspect Declared new plan");
+    expect(registry.get(view.snapshotAtom).nodes[0]?.title).toBe("Declared new plan");
+    expect(registry.get(view.snapshotAtom).nodes[0]?.authoredRevision).toBe(2);
     expect(container.textContent).toContain("Reached · canonical event evidence");
     expect(container.textContent).toContain("does not grant approval or prove the runtime paused");
     expect(openThread).not.toHaveBeenCalled();

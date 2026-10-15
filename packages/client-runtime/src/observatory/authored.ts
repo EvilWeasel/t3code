@@ -18,8 +18,10 @@ export type ObservatoryAuthored =
   | { readonly status: "unsupported" | "unavailable" | "stale" }
   | {
       readonly status: "ready";
+      readonly recordStatus: "recorded";
+      readonly serviceStatus: "online" | "stale";
       readonly snapshot: AgentObservatorySnapshot;
-      readonly checkpointReached: boolean;
+      readonly checkpointReached: true | null;
     };
 
 /** Exact native correlation, not an owner claimed in agent-submitted layout data. */
@@ -59,6 +61,7 @@ export function observedObservatoryOwner(
 /** A scoped, monotonic client view of the SAME canonical service's read. No writer/authority here. */
 export function createObservatoryAuthoredProjector() {
   let latest: AgentObservatorySnapshot | null = null;
+  let latestFrontier = 0;
   return (
     owner: AgentObservatoryOwner | null,
     value: unknown,
@@ -76,7 +79,7 @@ export function createObservatoryAuthoredProjector() {
       if (
         read.environmentId !== owner.environmentId ||
         read.threadId !== owner.threadId ||
-        read.status !== "online" ||
+        (read.status !== "online" && read.status !== "stale") ||
         snapshot === null ||
         !sameOwner(owner, snapshot.owner) ||
         snapshot.sequence > read.throughSequence
@@ -86,13 +89,17 @@ export function createObservatoryAuthoredProjector() {
       if (
         latest !== null &&
         sameOwner(owner, latest.owner) &&
-        (snapshot.revision < latest.revision ||
+        (read.throughSequence < latestFrontier ||
+          snapshot.revision < latest.revision ||
+          (snapshot.revision > latest.revision &&
+            (snapshot.sequence <= latest.sequence || snapshot.eventId === latest.eventId)) ||
           snapshot.sequence < latest.sequence ||
           (snapshot.revision === latest.revision && !sameSnapshot(snapshot, latest)))
       )
         return { status: "stale" };
       latest = snapshot;
-      let checkpointReached = false;
+      latestFrontier = read.throughSequence;
+      let checkpointReached: true | null = null;
       if (reached !== null && snapshot.state.requestedCheckpoint !== null) {
         const proof = decodeReached(reached);
         checkpointReached =
@@ -100,9 +107,17 @@ export function createObservatoryAuthoredProjector() {
           proof.revision === snapshot.revision &&
           proof.requestedCheckpointId === snapshot.state.requestedCheckpoint.id &&
           proof.sequence >= snapshot.sequence &&
-          proof.sequence <= read.throughSequence;
+          proof.sequence <= read.throughSequence
+            ? true
+            : null;
       }
-      return { status: "ready", snapshot, checkpointReached };
+      return {
+        status: "ready",
+        recordStatus: "recorded",
+        serviceStatus: read.status,
+        snapshot,
+        checkpointReached,
+      };
     } catch {
       return { status: "unavailable" };
     }

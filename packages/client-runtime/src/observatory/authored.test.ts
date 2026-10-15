@@ -42,7 +42,7 @@ describe("canonical authored observatory reads", () => {
   it("applies live revisions while keeping requested checkpoint separate from exact reached proof", () => {
     const project = createObservatoryAuthoredProjector();
     const first = project(owner, read());
-    expect(first.status === "ready" && first.checkpointReached).toBe(false);
+    expect(first.status === "ready" && first.checkpointReached).toBeNull();
     const second = project(owner, read(2, "Updated plan"));
     expect(second.status === "ready" && second.snapshot.state.title).toBe("Updated plan");
     expect(project(owner, read()).status).toBe("stale");
@@ -57,8 +57,61 @@ describe("canonical authored observatory reads", () => {
     const reached = project(owner, read(2, "Updated plan"), proof);
     expect(reached.status === "ready" && reached.checkpointReached).toBe(true);
     const foreign = project(owner, read(2, "Updated plan"), { ...proof, revision: 1 });
-    expect(foreign.status === "ready" && foreign.checkpointReached).toBe(false);
+    expect(foreign.status === "ready" && foreign.checkpointReached).toBeNull();
     expect(project(owner, { ...read(2), throughSequence: 1 }).status).toBe("unavailable");
+  });
+  it("validates durable stale records independently of worker availability and advancing global frontier", () => {
+    const project = createObservatoryAuthoredProjector();
+    const bootstrap = { ...read(), status: "stale", throughSequence: 100 };
+    const first = project(owner, bootstrap);
+    expect(first).toMatchObject({
+      status: "ready",
+      recordStatus: "recorded",
+      serviceStatus: "stale",
+      checkpointReached: null,
+    });
+    // A global frontier can advance with no new authored event.
+    expect(project(owner, { ...bootstrap, throughSequence: 110 })).toMatchObject({
+      status: "ready",
+    });
+    expect(project(owner, { ...bootstrap, throughSequence: 109 }).status).toBe("stale");
+    const updated = { ...read(2, "Committed update"), status: "stale", throughSequence: 120 };
+    expect(project(owner, updated)).toMatchObject({
+      status: "ready",
+      recordStatus: "recorded",
+      serviceStatus: "stale",
+      snapshot: { revision: 2, sequence: 3, state: { title: "Committed update" } },
+    });
+    expect(project(owner, { ...updated, status: "online" })).toMatchObject({
+      status: "ready",
+      serviceStatus: "online",
+      recordStatus: "recorded",
+    });
+    expect(
+      project(owner, { ...updated, snapshot: { ...updated.snapshot, eventId: "different-event" } })
+        .status,
+    ).toBe("stale");
+    expect(
+      project(owner, { ...updated, snapshot: { ...updated.snapshot, sequence: 4 } }).status,
+    ).toBe("stale");
+    expect(
+      project(owner, { ...updated, snapshot: { ...updated.snapshot, revision: 3 } }).status,
+    ).toBe("stale");
+    expect(
+      project(owner, { ...updated, snapshot: { ...updated.snapshot, revision: 3, sequence: 4 } })
+        .status,
+    ).toBe("stale");
+    expect(project(owner, bootstrap).status).toBe("stale");
+    expect(project(owner, { ...updated, status: "offline" }).status).toBe("unavailable");
+    expect(project(owner, { ...updated, status: "unsupported", snapshot: null }).status).toBe(
+      "unsupported",
+    );
+    expect(
+      project(owner, {
+        ...updated,
+        snapshot: { ...updated.snapshot, owner: { ...owner, attemptId: "foreign" } },
+      }).status,
+    ).toBe("unavailable");
   });
   it("refuses unknown feed, wrong scope/attempt, conflicting revision, offline and executable layout", () => {
     const project = createObservatoryAuthoredProjector();

@@ -271,7 +271,7 @@ function Dashboard({
       <p className="text-sm">
         Declarative dashboard:{" "}
         {authored
-          ? `${authored.snapshot.provenance} · revision ${authored.snapshot.revision}`
+          ? `Recorded ${authored.snapshot.provenance} state · revision ${authored.snapshot.revision} · service status: ${authored.serviceStatus}. Worker availability is observed separately`
           : selection.visual.status}
         . Editing from an agent is unavailable until the canonical owner invocation is wired.
       </p>
