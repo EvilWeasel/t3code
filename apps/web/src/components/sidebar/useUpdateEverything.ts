@@ -1,9 +1,12 @@
 import { useAtomValue } from "@effect/atom-react";
 import { PROVIDER_DISPLAY_NAMES } from "@t3tools/contracts";
+import * as Crypto from "effect/Crypto";
+import * as Effect from "effect/Effect";
 import { Atom } from "effect/reactivity";
 import { useMemo } from "react";
 
 import { APP_VERSION } from "~/branding";
+import { runtime } from "~/lib/runtime";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
 import { isElectron } from "~/env";
@@ -118,7 +121,9 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
           candidate.instanceId, candidate.versionAdvisory.latestVersion,
         ] as const)),
       ] as const));
-      const outcomeId = crypto.randomUUID();
+      const outcomeId = await runtime.runPromise(
+        Crypto.Crypto.pipe(Effect.flatMap((crypto) => crypto.randomUUIDv4)),
+      );
       const localFailures: Array<string> = [];
       const reportLocalError: ReportLocalUpdateError = (title, description) => {
         localFailures.push(`${title}: ${description}`);
