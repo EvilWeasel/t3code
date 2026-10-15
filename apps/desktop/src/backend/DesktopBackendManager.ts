@@ -287,6 +287,9 @@ export interface DesktopBackendInstance {
 // open, global readiness flag) without coupling the factory to those
 // concerns; other instances pass them as undefined.
 export interface BackendInstanceSpec {
+  /** Pool-owned update admission. Covers private scheduled restarts as well
+   * as callers retaining the public start effect. */
+  readonly reserveStart?: (start: Effect.Effect<void>) => Effect.Effect<void>;
   readonly id: BackendInstanceId;
   readonly label: Effect.Effect<string>;
   // configResolve can now fail with PlatformError because the
@@ -1025,7 +1028,10 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
         }));
       }),
     ),
-  ).pipe(Effect.withSpan("desktop.backendInstance.start", { attributes: { id: spec.id } }));
+  ).pipe(
+    (operation) => spec.reserveStart?.(operation) ?? operation,
+    Effect.withSpan("desktop.backendInstance.start", { attributes: { id: spec.id } }),
+  );
 
   const scheduleRestart = Effect.fn("desktop.backendInstance.scheduleRestart")(function* (
     reason: string,

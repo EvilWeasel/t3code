@@ -157,6 +157,14 @@ export class DesktopUpdateUnexpectedActionError extends Schema.TaggedError<Deskt
 
 export type DesktopUpdateConfigureError = never;
 
+/** Production intentionally supplies no qualification: guest WebContents and
+ * native auxiliary-window creation still lack a complete held admission fence.
+ * Existing automatic downloads remain enabled independently of installation. */
+export class DesktopUpdateInstallQualification extends Context.Service<
+  DesktopUpdateInstallQualification,
+  { readonly completeRuntimeCreationFence: boolean }
+>()("@t3tools/desktop/updates/DesktopUpdateInstallQualification") {}
+
 export const DesktopUpdateSetChannelError = Schema.Union([
   DesktopUpdateActionInProgressError,
   DesktopUpdateChannelPersistenceError,
@@ -348,6 +356,7 @@ export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const fileSystem = yield* FileSystem.FileSystem;
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
+  const qualification = yield* Effect.serviceOption(DesktopUpdateInstallQualification);
 
   const appUpdateYmlConfigRef = yield* Ref.make<Option.Option<AppUpdateYmlConfig>>(Option.none());
   const activeUpdateActionRef = yield* Ref.make<Option.Option<UpdateAction>>(Option.none());
@@ -799,6 +808,7 @@ export const make = Effect.gen(function* () {
   });
 
   const attemptClientOnlyInstall = Effect.gen(function* () {
+    if (Option.isNone(qualification) || !qualification.value.completeRuntimeCreationFence) return;
     const state = yield* Ref.get(updateStateRef);
     const holdPool = pool.withUpdateInventory;
     const holdRenderers = electronWindow.withUpdateRenderers;

@@ -17,6 +17,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
@@ -119,6 +120,7 @@ function decodeBootstrap(raw: string) {
 }
 
 interface MakeInstanceInput {
+  readonly reserveStart?: DesktopBackendManager.BackendInstanceSpec["reserveStart"];
   readonly spawnerLayer: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>;
   readonly httpClientLayer?: Layer.Layer<HttpClient.HttpClient>;
   readonly backendOutputLog?: Partial<DesktopObservability.DesktopBackendOutputLogShape>;
@@ -181,6 +183,7 @@ function makeTestInstance(input: MakeInstanceInput) {
   );
 
   const instance = DesktopBackendManager.makeBackendInstance({
+    ...(input.reserveStart === undefined ? {} : { reserveStart: input.reserveStart }),
     id: DesktopBackendManager.PRIMARY_INSTANCE_ID,
     label: Effect.succeed("Windows"),
     configResolve: input.configResolve ?? Effect.succeed(input.config ?? baseConfig),
@@ -193,6 +196,62 @@ function makeTestInstance(input: MakeInstanceInput) {
 }
 
 describe("DesktopBackendManager", () => {
+  it.effect("holds a private restart after it cleared its fiber when stop and update admission win", () =>
+    Effect.scoped(Effect.gen(function* () {
+      const lane = yield* Semaphore.make(1);
+      const restartReached = yield* Deferred.make<void>();
+      const allowRestartToReserve = yield* Deferred.make<void>();
+      const inventoryHeld = yield* Deferred.make<void>();
+      const releaseInventory = yield* Deferred.make<void>();
+      const spawned = yield* Queue.unbounded<number>();
+      const failures = yield* Queue.unbounded<string>();
+      let reservations = 0;
+      let starts = 0;
+      const instance = yield* makeTestInstance({
+        reserveStart: (operation) => Effect.gen(function* () {
+          reservations += 1;
+          if (reservations === 2) {
+            yield* Deferred.succeed(restartReached, undefined);
+            yield* Deferred.await(allowRestartToReserve);
+          }
+          yield* lane.withPermits(1)(operation);
+        }),
+        spawnerLayer: Layer.succeed(ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.sync(() => {
+            starts += 1;
+            return makeProcess({ exitCode: Queue.offer(spawned, starts).pipe(
+              Effect.as(ChildProcessSpawner.ExitCode(1)),
+            ) });
+          })),
+        ),
+        httpClientLayer: layerHttpClient(() => Effect.never),
+        backendOutputLog: { persistFailure: ({ details }) => Queue.offer(failures, details).pipe(Effect.asVoid) },
+      });
+      yield* instance.start;
+      assert.equal(yield* Queue.take(spawned), 1);
+      yield* Queue.take(failures);
+      yield* TestClock.adjust(Duration.millis(500));
+      yield* Deferred.await(restartReached);
+      assert.isFalse((yield* instance.snapshot).restartScheduled);
+      yield* instance.stop();
+      const inventory = yield* lane.withPermits(1)(Effect.gen(function* () {
+        const snapshot = yield* instance.snapshot;
+        assert.isFalse(snapshot.desiredRunning);
+        assert.isTrue(Option.isNone(snapshot.activePid));
+        yield* Deferred.succeed(inventoryHeld, undefined);
+        yield* Deferred.await(releaseInventory);
+      })).pipe(Effect.forkScoped);
+      yield* Deferred.await(inventoryHeld);
+      yield* Deferred.succeed(allowRestartToReserve, undefined);
+      yield* Effect.yieldNow;
+      assert.equal(starts, 1);
+      assert.equal(yield* Queue.size(spawned), 0);
+      yield* Deferred.succeed(releaseInventory, undefined);
+      yield* Fiber.join(inventory);
+      assert.equal(yield* Queue.take(spawned), 2);
+    }).pipe(Effect.provide(TestClock.layer()))),
+  );
+
   it.effect("spawns the backend with fd3 bootstrap and fd4 telemetry", () =>
     Effect.scoped(
       Effect.gen(function* () {

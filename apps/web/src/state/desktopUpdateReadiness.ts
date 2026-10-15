@@ -50,6 +50,11 @@ export function createRendererUpdateReadiness(
         if (currentGeneration === lease.generation && timer !== undefined) clearTimeout(timer);
         return;
       }
+      if (Date.now() - lastInteraction < 60_000 || Date.now() >= lease.expiresAt) {
+        try { await bridge.acknowledgeUpdateReadiness({ lease, ready: false }); } catch { /* Defer. */ }
+        release();
+        return;
+      }
       if (currentGeneration !== lease.generation) {
         release();
         currentGeneration = lease.generation;

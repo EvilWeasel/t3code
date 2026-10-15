@@ -286,11 +286,9 @@ export const layer = Layer.effect(
     );
 
     const updateInventoryLane = yield* Semaphore.make(1);
-    const fenceInstanceStart = (instance: DesktopBackendInstance): DesktopBackendInstance => ({
-      ...instance,
-      start: updateInventoryLane.withPermits(1)(instance.start),
-    });
-    const primary = fenceInstanceStart(yield* DesktopBackendManager.makeBackendInstance({
+    const reserveStart = (operation: Effect.Effect<void>) => updateInventoryLane.withPermits(1)(operation);
+    const primary = yield* DesktopBackendManager.makeBackendInstance({
+      reserveStart,
       id: DesktopBackendManager.PRIMARY_INSTANCE_ID,
       // Keep this lazy. The pool layer is initialized before startup loads
       // persisted desktop settings, so resolving the primary label here would
@@ -314,7 +312,7 @@ export const layer = Layer.effect(
         ),
       onShutdown: () => desktopWindow.handleBackendNotReady,
       onPreflightFailed: handlePrimaryPreflightFailure,
-    }));
+    });
 
     const instancesRef = yield* SynchronizedRef.make<
       ReadonlyMap<BackendInstanceId, RegisteredInstance>
@@ -353,10 +351,10 @@ export const layer = Layer.effect(
               // Provide the captured factory services first, then the child scope
               // last so instance finalizers are owned by the unregisterable scope.
               const instanceScope = yield* Scope.fork(layerScope, "sequential");
-              const instance = fenceInstanceStart(yield* DesktopBackendManager.makeBackendInstance(spec).pipe(
+              const instance = yield* DesktopBackendManager.makeBackendInstance({ ...spec, reserveStart }).pipe(
                 Effect.provide(factoryContext),
                 Scope.provide(instanceScope),
-              ));
+              );
               const next = new Map(current);
               next.set(spec.id, {
                 _tag: "Active",

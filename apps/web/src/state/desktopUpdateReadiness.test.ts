@@ -27,6 +27,19 @@ describe("renderer update readiness", () => {
   });
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
+  it("leaves a recently active document usable without starting an unresolved runtime probe", async () => {
+    const acknowledge = vi.fn(async () => true);
+    const runtime = vi.fn(() => new Promise<"idle">(() => {}));
+    const persist = vi.fn(() => true);
+    const observer = createRendererUpdateReadiness({ acknowledgeUpdateReadiness: acknowledge }, runtime, persist);
+    await observer.observe(state());
+    expect(root.inert).toBe(false);
+    expect(runtime).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+    expect(acknowledge).toHaveBeenCalledWith(expect.objectContaining({ ready: false }));
+    observer.dispose();
+  });
+
   it.each(["busy", "unknown"] as const)("refuses %s runtime state without acknowledging persistence", async (runtimeState) => {
     const acknowledge = vi.fn(async () => true);
     const persist = vi.fn(() => true);
