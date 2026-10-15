@@ -1157,6 +1157,7 @@ const MainRendererDiagnosticsNonce = Schema.String.check(
 );
 export const MainRendererDiagnosticsRequest = Schema.Struct({
   version: Schema.Literal(1),
+  requestSequence: PositiveInt,
   requestId: MainRendererDiagnosticsNonce,
   requestNonce: MainRendererDiagnosticsNonce,
   target: MainRendererDiagnosticsTarget,
