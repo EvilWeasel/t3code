@@ -76,6 +76,25 @@ focused_tests=(
   apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
   apps/web/src/voice/voiceSettingsClient.test.ts
 )
+server_continuation_tests=(
+  apps/server/src/orchestration-v2/DelegatedCompletionDelivery.test.ts
+  apps/server/src/orchestration-v2/FoundationPersistence.test.ts
+  apps/server/src/orchestration-v2/ProjectionRecovery.test.ts
+  apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
+  apps/server/src/orchestration-v2/RestartContinuation.test.ts
+  apps/server/src/orchestration-v2/ThreadManagementService.test.ts
+  apps/server/src/orchestration-v2/runtimeLayer.test.ts
+  apps/server/src/process/agentScope.test.ts
+  apps/server/src/mcp/OrchestratorMcpService.activity.test.ts
+  apps/server/src/orchestration-v2/Toolkit.integration.test.ts
+)
+for server_continuation_test in "${server_continuation_tests[@]}"; do
+  if [[ ! -f "$server_continuation_test" ]]; then
+    echo "Required server continuation gate is missing: $server_continuation_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$server_continuation_test")
+done
 automatic_update_tests=(
   apps/desktop/src/backend/DesktopBackendManager.test.ts
   apps/desktop/src/backend/DesktopBackendPool.test.ts
