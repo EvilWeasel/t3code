@@ -24,6 +24,7 @@ export function AgentObservatoryPage() {
     <AgentObservatory
       view={view}
       onSelect={(ref) => registry.set(observatory.selectedAtom, ref)}
+      onQueryChange={(query) => registry.set(observatory.queryAtom, query)}
       onOpenThread={openThread}
       renderTool={(row, ref) => (
         <Suspense fallback={<p>Loading selected entry…</p>}>

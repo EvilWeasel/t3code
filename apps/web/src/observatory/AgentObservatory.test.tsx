@@ -31,7 +31,10 @@ vi.mock("@t3tools/client-runtime/observatory", async (importOriginal) => {
         return view.snapshotAtom;
       },
       get selectedAtom() {
-        return selected;
+        return view.selectedAtom;
+      },
+      get queryAtom() {
+        return view.queryAtom;
       },
     }),
   };
@@ -234,6 +237,62 @@ function button(label: string) {
   if (!target) throw new Error(`Missing test button: ${label}`);
   return target;
 }
+const remoteEnvironment = EnvironmentId.make("two");
+function largeSources(): readonly ObservatoryEnvironment[] {
+  return [
+    {
+      ...source,
+      shell: {
+        ...source.shell!,
+        snapshot: Option.some({
+          schemaVersion: 1,
+          snapshotSequence: 3,
+          projects: [],
+          archivedThreads: [],
+          threads: Array.from({ length: 500 }, (_, index) => {
+            const id = ThreadId.make(`shell-${String(index).padStart(4, "0")}`);
+            return {
+              ...shell,
+              id,
+              title: `Local ${index}`,
+              lineage: { ...shell.lineage, rootThreadId: id },
+            };
+          }),
+        }),
+      },
+    },
+    {
+      ...source,
+      environmentId: remoteEnvironment,
+      label: "Remote host",
+      shell: {
+        ...source.shell!,
+        snapshot: Option.some({
+          schemaVersion: 1,
+          snapshotSequence: 3,
+          projects: [],
+          archivedThreads: [],
+          threads: Array.from({ length: 39 }, (_, index) => {
+            const id = ThreadId.make(`shell-${String(index).padStart(4, "0")}`);
+            return {
+              ...shell,
+              id,
+              title: `Remote ${index}`,
+              lineage: { ...shell.lineage, rootThreadId: id },
+            };
+          }),
+        }),
+      },
+    },
+  ];
+}
+function searchThreads(text: string) {
+  const input = container.querySelector('input[aria-label="Search known threads"]');
+  if (!(input instanceof HTMLInputElement)) throw new Error("Missing search field");
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, text);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
 beforeEach(async () => {
   registry = AtomRegistry.make();
   container = document.createElement("div");
@@ -428,5 +487,119 @@ describe("mounted observatory projection dashboard", () => {
       "Actual child",
     );
     expect(container.textContent).toContain("Parent: Observe provider");
+  });
+  it("makes the 539th cross-host shell selectable through bounded shared graph/list pages", async () => {
+    await act(async () => registry.set(sources, largeSources()));
+    expect(container.textContent).toContain("Threads 1–50 of 539 matching");
+    expect(container.querySelectorAll("foreignObject")).toHaveLength(50);
+    expect(inspect).not.toHaveBeenCalled();
+    await act(async () => button("Next page").click());
+    expect(container.textContent).toContain("Threads 51–100 of 539 matching");
+    await act(async () => button("Show list").click());
+    expect(container.querySelectorAll('[role="listitem"]')).toHaveLength(50);
+    expect(container.textContent).toContain("Threads 51–100 of 539 matching");
+    await act(async () => button("Last page").click());
+    expect(container.textContent).toContain("Threads 501–539 of 539 matching");
+    expect(container.querySelectorAll('[role="listitem"]')).toHaveLength(39);
+    await act(async () => button("Show graph").click());
+    expect(container.querySelectorAll("foreignObject")).toHaveLength(39);
+    await act(async () => button("Remote 38").click());
+    expect(
+      container.querySelector('[aria-label="Selected agent dashboard"]')?.textContent,
+    ).toContain("Remote 38");
+    expect(container.querySelector('[aria-label="Thread filters and pages"]')).toBeNull();
+    await act(async () => button("Open canonical thread").click());
+    expect(openThread).toHaveBeenCalledWith({
+      to: "/$environmentId/$threadId",
+      params: { environmentId: remoteEnvironment, threadId: ThreadId.make("shell-0038") },
+    });
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  it("filters and searches shells without retargeting selected identity after reorder or grant loss", async () => {
+    const large = largeSources();
+    await act(async () => registry.set(sources, large));
+    const trigger = container.querySelector('button[aria-label="Filter environment"]');
+    if (!(trigger instanceof HTMLButtonElement)) throw new Error("Missing environment filter");
+    await act(async () => trigger.click());
+    const option = [...document.querySelectorAll('[role="option"]')].find((option) =>
+      option.textContent?.includes("Remote host"),
+    );
+    if (!(option instanceof HTMLElement)) throw new Error("Missing environment option");
+    await act(async () => option.click());
+    expect(container.textContent).toContain("of 39 matching");
+    await act(async () => searchThreads("Remote 38"));
+    expect(container.textContent).toContain("Threads 1–1 of 1 matching");
+    expect(container.querySelectorAll("foreignObject")).toHaveLength(1);
+    const reordered = [...large].reverse().map((source) => ({
+      ...source,
+      shell:
+        source.shell === null
+          ? null
+          : {
+              ...source.shell,
+              snapshot: Option.map(source.shell.snapshot, (snapshot) => ({
+                ...snapshot,
+                threads: [...snapshot.threads].reverse(),
+              })),
+            },
+    }));
+    await act(async () => registry.set(sources, reordered));
+    expect(container.querySelectorAll("foreignObject")).toHaveLength(1);
+    await act(async () => button("Remote 38").click());
+    expect(registry.get(view.selectedAtom)).toEqual({
+      environmentId: remoteEnvironment,
+      threadId: ThreadId.make("shell-0038"),
+    });
+    await act(async () => registry.set(sources, large));
+    expect(
+      container.querySelector('[aria-label="Selected agent dashboard"]')?.textContent,
+    ).toContain("Remote 38");
+    await act(async () =>
+      registry.set(
+        sources,
+        large.map((source) =>
+          source.environmentId === remoteEnvironment ? { ...source, status: "denied" } : source,
+        ),
+      ),
+    );
+    expect(container.querySelector('[aria-label="Selected agent dashboard"]')).toBeNull();
+    expect(registry.get(view.selectedAtom)).toBeNull();
+    await act(async () => registry.set(sources, large));
+    expect(container.querySelector('[aria-label="Selected agent dashboard"]')).toBeNull();
+    await act(async () => button("Clear filters").click());
+    expect(container.textContent).toContain("Threads 1–50 of 539 matching");
+    expect(inspect).not.toHaveBeenCalled();
+  });
+  it("labels a known parent on another page without drawing an invented on-page edge", async () => {
+    const seed = largeSources()[0]!;
+    const paged: ObservatoryEnvironment = {
+      ...seed,
+      shell: {
+        ...seed.shell!,
+        snapshot: Option.map(seed.shell!.snapshot, (snapshot) => ({
+          ...snapshot,
+          threads: snapshot.threads
+            .slice(0, 51)
+            .map((thread, index) =>
+              index === 50
+                ? {
+                    ...thread,
+                    lineage: { ...thread.lineage, parentThreadId: snapshot.threads[0]!.id },
+                  }
+                : thread,
+            ),
+        })),
+      },
+    };
+    await act(async () => registry.set(sources, [paged]));
+    await act(async () => button("Last page").click());
+    expect(container.textContent).toContain("Threads 51–51 of 51 matching");
+    expect(container.textContent).toContain("Parent outside this page");
+    expect(
+      container.querySelectorAll('path[aria-label="Observed parent-child relationship"]'),
+    ).toHaveLength(0);
+    await act(async () => button("Show list").click());
+    expect(container.textContent).toContain("Parent: outside this page");
   });
 });

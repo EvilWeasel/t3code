@@ -1,18 +1,32 @@
 import { useState, type ReactNode } from "react";
-import { nativeItemText, type ObservatoryView } from "@t3tools/client-runtime/observatory";
+import {
+  nativeItemText,
+  type ObservatoryView,
+  type ObservatoryQuery,
+} from "@t3tools/client-runtime/observatory";
 import type { OrchestrationV2ProjectedTurnItem, ScopedThreadRef } from "@t3tools/contracts";
 import { Button } from "../components/ui/button";
+import { Input } from "../components/ui/input";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectPopup,
+  SelectItem,
+} from "../components/ui/select";
 import { ObservatoryGraph } from "./ObservatoryGraph";
 
 export function AgentObservatory({
   view,
   onSelect,
   onOpenThread,
+  onQueryChange,
   renderTool,
 }: {
   readonly view: ObservatoryView;
   readonly onSelect: (ref: ScopedThreadRef | null) => void;
   readonly onOpenThread: (ref: ScopedThreadRef) => void;
+  readonly onQueryChange: (query: ObservatoryQuery) => void;
   readonly renderTool: (row: OrchestrationV2ProjectedTurnItem, ref: ScopedThreadRef) => ReactNode;
 }) {
   const [mode, setMode] = useState<"graph" | "list">("graph");
@@ -41,8 +55,11 @@ export function AgentObservatory({
         {!view.catalogReady && <p>Environment coverage unknown: catalog not ready.</p>}
         {view.sources.map((source) => (
           <p key={source.environmentId}>
-            {source.label}: {source.status} · {source.visibleThreads} visible threads
-            {source.omittedThreads > 0 && ` · ${source.omittedThreads} omitted (view limit)`}
+            {source.label}: {source.status} · {source.visibleThreads} on this page /{" "}
+            {source.totalThreads ?? "unknown"} known authorized live threads
+            {source.omittedThreads !== null &&
+              source.omittedThreads > 0 &&
+              ` · ${source.omittedThreads} outside page (${source.filteredThreads} filtered, ${source.offPageThreads} other pages)`}
           </p>
         ))}
         <p className="text-muted-foreground">
@@ -63,25 +80,19 @@ export function AgentObservatory({
             <h2 className="mb-3 font-medium">
               {mode === "graph" ? "Thread relationships" : "Threads"}
             </h2>
+            <ShellBrowserControls view={view} onQueryChange={onQueryChange} />
             {view.nodes.length === 0 && (
               <p className="text-sm text-muted-foreground">
-                No currently authorized live threads available. Offline and unknown coverage is
-                shown above.
+                {view.page.totalKnownThreads > 0
+                  ? "No threads match this environment and search. Clear filters to browse all known authorized live threads."
+                  : "No currently authorized live threads available. Offline and unknown coverage is shown above."}
               </p>
             )}
             {mode === "graph" ? (
               <ObservatoryGraph nodes={view.nodes} onSelect={onSelect} />
             ) : (
               <>
-                <div
-                  role="list"
-                  aria-label="Agent list"
-                  className={
-                    mode === "graph"
-                      ? "grid gap-3 sm:grid-cols-2 xl:grid-cols-3"
-                      : "flex flex-col gap-2"
-                  }
-                >
+                <div role="list" aria-label="Agent list" className="flex flex-col gap-2">
                   {view.nodes.map((node) => (
                     <div
                       role="listitem"
@@ -97,11 +108,12 @@ export function AgentObservatory({
                       </Button>
                       <p className="text-sm">
                         Observed: {node.nativeStatus} · {node.ref.environmentId}
+                        {node.shell.archivedAt !== null && " · archived"}
                       </p>
                       <p className="text-xs text-muted-foreground">
                         {node.parentKey === null
                           ? "Root thread"
-                          : `Parent: ${view.nodes.find((parent) => parent.key === node.parentKey)?.title ?? "outside loaded coverage"}`}
+                          : `Parent: ${view.nodes.find((parent) => parent.key === node.parentKey)?.title ?? (node.parentLocation === "outside-page" ? "outside this page" : "outside loaded coverage")}`}
                       </p>
                       {node.authoredRevision !== null && (
                         <p className="text-xs">Agent-authored revision {node.authoredRevision}</p>
@@ -115,6 +127,106 @@ export function AgentObservatory({
         )}
       </div>
     </main>
+  );
+}
+
+function ShellBrowserControls({
+  view,
+  onQueryChange,
+}: {
+  readonly view: ObservatoryView;
+  readonly onQueryChange: (query: ObservatoryQuery) => void;
+}) {
+  const { page } = view;
+  const filter = page.query;
+  const environment =
+    filter.environmentId === null
+      ? null
+      : view.sources.find((source) => source.environmentId === filter.environmentId);
+  const move = (anchorKey: string | null) => onQueryChange({ ...filter, anchorKey });
+  return (
+    <section aria-label="Thread filters and pages" className="mb-4 space-y-3">
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="w-full sm:w-56">
+          <span className="mb-1 block text-sm">Environment</span>
+          <Select
+            value={filter.environmentId === null ? "all" : `environment:${filter.environmentId}`}
+            onValueChange={(value) => {
+              if (value === "all")
+                onQueryChange({ ...filter, environmentId: null, anchorKey: null });
+              else {
+                const source = view.sources.find(
+                  (source) => value === `environment:${source.environmentId}`,
+                );
+                if (source)
+                  onQueryChange({
+                    ...filter,
+                    environmentId: source.environmentId,
+                    anchorKey: null,
+                  });
+              }
+            }}
+          >
+            <SelectTrigger aria-label="Filter environment">
+              <SelectValue>
+                {filter.environmentId === null
+                  ? "All environments"
+                  : (environment?.label ?? "Unavailable environment")}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectPopup>
+              <SelectItem value="all">All environments</SelectItem>
+              {view.sources.map((source) => (
+                <SelectItem
+                  key={source.environmentId}
+                  value={`environment:${source.environmentId}`}
+                >
+                  {source.label}
+                </SelectItem>
+              ))}
+            </SelectPopup>
+          </Select>
+        </div>
+        <div className="w-full sm:min-w-56 sm:flex-1">
+          <Input
+            aria-label="Search known threads"
+            type="search"
+            maxLength={200}
+            placeholder="Search thread title, identity or environment"
+            value={filter.search}
+            onValueChange={(search) => onQueryChange({ ...filter, search, anchorKey: null })}
+          />
+        </div>
+        <Button
+          variant="outline"
+          onClick={() => onQueryChange({ environmentId: null, search: "", anchorKey: null })}
+        >
+          Clear filters
+        </Button>
+      </div>
+      <nav aria-label="Thread pages" className="flex flex-wrap items-center gap-2">
+        <Button variant="outline" disabled={!page.hasPrevious} onClick={() => move(null)}>
+          First page
+        </Button>
+        <Button
+          variant="outline"
+          disabled={!page.hasPrevious}
+          onClick={() => move(page.previousKey)}
+        >
+          Previous page
+        </Button>
+        <span role="status" className="text-sm">
+          Threads {page.from}–{page.to} of {page.matchingThreads} matching ·{" "}
+          {page.totalKnownThreads} known · {page.size} per page
+        </span>
+        <Button variant="outline" disabled={!page.hasNext} onClick={() => move(page.nextKey)}>
+          Next page
+        </Button>
+        <Button variant="outline" disabled={!page.hasNext} onClick={() => move(page.lastKey)}>
+          Last page
+        </Button>
+      </nav>
+    </section>
   );
 }
 

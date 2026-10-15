@@ -39,9 +39,17 @@ export function projectObservatoryNative(environments: readonly ObservatoryEnvir
       Option.isNone(source.shell.error)
         ? Option.getOrNull(source.shell.snapshot)
         : null;
-    const threads = snapshot?.threads ?? [];
-    const remaining = Math.max(0, 500 - nodes.length);
-    for (const shell of threads.slice(0, remaining)) {
+    const threads =
+      snapshot === null
+        ? []
+        : [
+            ...new Map(
+              [...snapshot.archivedThreads, ...snapshot.threads].map(
+                (thread) => [thread.id, thread] as const,
+              ),
+            ).values(),
+          ].filter((thread) => thread.deletedAt === null);
+    for (const shell of threads) {
       const ref = { environmentId: source.environmentId, threadId: shell.id };
       nodes.push({
         key: observatoryKey(ref),
@@ -64,8 +72,7 @@ export function projectObservatoryNative(environments: readonly ObservatoryEnvir
       label: source.label,
       status:
         source.status === "live" && snapshot === null ? ("synchronizing" as const) : source.status,
-      visibleThreads: Math.min(remaining, threads.length),
-      omittedThreads: Math.max(0, threads.length - remaining),
+      totalThreads: snapshot === null ? null : threads.length,
     };
   });
   return {
@@ -73,6 +80,96 @@ export function projectObservatoryNative(environments: readonly ObservatoryEnvir
     sources,
     nativeAgentCoverage:
       "Selected-thread details only; other provider-native agents are not enumerated." as const,
+  };
+}
+
+export interface ObservatoryQuery {
+  readonly environmentId: EnvironmentId | null;
+  readonly search: string;
+  /** First visible identity, not an array offset: source reordering cannot retarget a page. */
+  readonly anchorKey: string | null;
+}
+export const OBSERVATORY_PAGE_SIZE = 50;
+export const EMPTY_OBSERVATORY_QUERY: ObservatoryQuery = {
+  environmentId: null,
+  search: "",
+  anchorKey: null,
+};
+
+/** Local shell-only pagination. Every authorized known shell remains reachable without detail reads. */
+export function projectObservatoryPage<Node extends ObservatoryNode>(
+  graph: Omit<ObservatoryNativeGraph, "nodes"> & { readonly nodes: readonly Node[] },
+  query: ObservatoryQuery,
+) {
+  const search = query.search.slice(0, 200).trim().toLowerCase();
+  const labels = new Map(graph.sources.map((source) => [source.environmentId, source.label]));
+  const matching = graph.nodes
+    .filter(
+      (node) =>
+        (query.environmentId === null || query.environmentId === node.ref.environmentId) &&
+        (search === "" ||
+          `${node.title} ${node.ref.threadId} ${node.ref.environmentId} ${labels.get(node.ref.environmentId) ?? ""} ${node.shell.archivedAt === null ? "" : "archived"}`
+            .toLowerCase()
+            .includes(search)),
+    )
+    .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const anchorIndex =
+    query.anchorKey === null
+      ? 0
+      : matching.findIndex((node) => node.key >= (query.anchorKey ?? ""));
+  const lastStart = Math.max(
+    0,
+    Math.floor((matching.length - 1) / OBSERVATORY_PAGE_SIZE) * OBSERVATORY_PAGE_SIZE,
+  );
+  const start = matching.length === 0 ? 0 : anchorIndex < 0 ? lastStart : anchorIndex;
+  const pageNodes = matching.slice(start, start + OBSERVATORY_PAGE_SIZE);
+  const allKeys = new Set(graph.nodes.map((node) => node.key));
+  const pageKeys = new Set(pageNodes.map((node) => node.key));
+  const counts = new Map<EnvironmentId, { matching: number; visible: number }>();
+  for (const node of matching) {
+    const count = counts.get(node.ref.environmentId) ?? { matching: 0, visible: 0 };
+    count.matching++;
+    if (pageKeys.has(node.key)) count.visible++;
+    counts.set(node.ref.environmentId, count);
+  }
+  return {
+    ...graph,
+    nodes: pageNodes.map((node) => ({
+      ...node,
+      parentLocation:
+        node.parentKey === null
+          ? ("root" as const)
+          : pageKeys.has(node.parentKey)
+            ? ("page" as const)
+            : allKeys.has(node.parentKey)
+              ? ("outside-page" as const)
+              : ("unknown" as const),
+    })),
+    sources: graph.sources.map((source) => {
+      const count = counts.get(source.environmentId) ?? { matching: 0, visible: 0 };
+      return {
+        ...source,
+        matchingThreads: count.matching,
+        visibleThreads: count.visible,
+        omittedThreads: source.totalThreads === null ? null : source.totalThreads - count.visible,
+        filteredThreads: source.totalThreads === null ? null : source.totalThreads - count.matching,
+        offPageThreads: count.matching - count.visible,
+      };
+    }),
+    page: {
+      query: { ...query, search: query.search.slice(0, 200) },
+      size: OBSERVATORY_PAGE_SIZE,
+      totalKnownThreads: graph.nodes.length,
+      matchingThreads: matching.length,
+      from: matching.length === 0 ? 0 : start + 1,
+      to: start + pageNodes.length,
+      previousKey:
+        start > 0 ? (matching[Math.max(0, start - OBSERVATORY_PAGE_SIZE)]?.key ?? null) : null,
+      nextKey: matching[start + OBSERVATORY_PAGE_SIZE]?.key ?? null,
+      lastKey: matching[lastStart]?.key ?? null,
+      hasPrevious: start > 0,
+      hasNext: start + pageNodes.length < matching.length,
+    },
   };
 }
 

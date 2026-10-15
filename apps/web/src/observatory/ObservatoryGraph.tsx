@@ -29,7 +29,7 @@ export function ObservatoryGraph({
     <section aria-label="Agent graph">
       <p className="mb-2 text-xs text-muted-foreground">
         {edges.length} observed parent-child edges. Pan horizontally on narrow screens. Parents
-        outside loaded coverage have no invented edge.
+        outside this page or loaded coverage have no invented edge.
       </p>
       <div className="overflow-auto rounded-lg border">
         <svg
@@ -63,14 +63,19 @@ export function ObservatoryGraph({
                   <Button variant="ghost" size="sm-multiline" onClick={() => onSelect(node.ref)}>
                     {node.title}
                   </Button>
-                  <p>Observed: {node.nativeStatus}</p>
+                  <p>
+                    Observed: {node.nativeStatus}
+                    {node.shell.archivedAt !== null && " · archived"}
+                  </p>
                   <p className="break-words text-xs text-muted-foreground">
                     {node.ref.environmentId} ·{" "}
                     {node.parentKey === null
                       ? "Root thread"
                       : positions.has(node.parentKey)
                         ? "Parent linked"
-                        : "Parent outside coverage"}
+                        : node.parentLocation === "outside-page"
+                          ? "Parent outside this page"
+                          : "Parent outside loaded coverage"}
                   </p>
                 </div>
               </foreignObject>

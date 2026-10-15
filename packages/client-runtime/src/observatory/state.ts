@@ -6,6 +6,9 @@ import {
   observatoryKey,
   projectObservatoryDetails,
   projectObservatoryNative,
+  projectObservatoryPage,
+  EMPTY_OBSERVATORY_QUERY,
+  type ObservatoryQuery,
   type ObservatoryEnvironment,
 } from "./native.ts";
 
@@ -22,6 +25,9 @@ export function createObservatoryViewAtoms(input: {
   readonly detailAtom: (ref: ScopedThreadRef) => Atom.Atom<EnvironmentThreadState | null>;
   readonly authoredAtom?: (ref: ScopedThreadRef) => Atom.Atom<ObservatoryAuthoredSource | null>;
 }) {
+  const queryAtom = Atom.make<ObservatoryQuery>(EMPTY_OBSERVATORY_QUERY);
+  // Retire the current selection intent when its authorized live shell disappears.
+  const invalidatedSelection = new WeakMap<AtomRegistry.AtomRegistry, ScopedThreadRef>();
   const authored = new WeakMap<
     AtomRegistry.AtomRegistry,
     {
@@ -32,6 +38,8 @@ export function createObservatoryViewAtoms(input: {
   >();
   const selectionAtom = Atom.make((get) => {
     const selected = get(input.selectedAtom);
+    if (selected === null) invalidatedSelection.delete(get.registry);
+    if (selected !== null && invalidatedSelection.get(get.registry) === selected) return null;
     const sources = get(input.sourcesAtom);
     const graph = projectObservatoryNative(sources);
     const node =
@@ -43,6 +51,7 @@ export function createObservatoryViewAtoms(input: {
         ? undefined
         : sources.find((source) => source.environmentId === node.ref.environmentId);
     if (!node || !source) {
+      if (selected !== null) invalidatedSelection.set(get.registry, selected);
       authored.delete(get.registry);
       return null;
     }
@@ -79,9 +88,19 @@ export function createObservatoryViewAtoms(input: {
           }
         : { ...node, authoredRevision: null },
     );
-    return { ...graph, nodes, catalogReady: get(input.catalogReadyAtom), selection };
+    return {
+      ...projectObservatoryPage({ ...graph, nodes }, get(queryAtom)),
+      catalogReady: get(input.catalogReadyAtom),
+      selection,
+    };
   });
-  return { snapshotAtom, selectedAtom: input.selectedAtom };
+  // Choosing even the same thread explicitly creates a fresh intent after grant loss.
+  const selectedAtom = Atom.writable(
+    (get) => get(selectionAtom)?.node.ref ?? null,
+    (context, ref: ScopedThreadRef | null) =>
+      context.set(input.selectedAtom, ref === null ? null : { ...ref }),
+  );
+  return { snapshotAtom, selectedAtom, queryAtom };
 }
 export type ObservatoryView = Atom.Type<
   ReturnType<typeof createObservatoryViewAtoms>["snapshotAtom"]
