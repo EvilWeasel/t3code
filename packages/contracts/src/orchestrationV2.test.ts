@@ -1618,7 +1618,11 @@ describe("agent observatory message metadata", () => {
     const message = decode({ ...raw, observatory: metadata });
     const encoded = Schema.encodeSync(OrchestrationV2ConversationMessageJson)(message);
     expect(encoded.observatory).toEqual(metadata);
-    expect(DateTime.isUtc(message.observatory?.recordedAt)).toBe(true);
+    const decodedMetadata = message.observatory;
+    if (decodedMetadata === undefined) {
+      throw new Error("Expected decoded observatory metadata");
+    }
+    expect(DateTime.isUtc(decodedMetadata.recordedAt)).toBe(true);
     const persisted = Schema.encodeSync(
       Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
     )(message);
