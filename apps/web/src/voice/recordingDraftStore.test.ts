@@ -81,20 +81,23 @@ describe("recording drafts across module resets with committed IndexedDB transac
     const store = await reloadStore();
     store.writeRecordingDraft("target", recording("committed", "Committed"));
     await commitQueuedWrites(store);
-    const aborted = Promise.withResolvers<void>();
+    let resolveAbort!: () => void;
+    const aborted = new Promise<void>((resolve) => {
+      resolveAbort = resolve;
+    });
     const put = EmulatorObjectStore.prototype.put;
     const intercepted = vi.spyOn(EmulatorObjectStore.prototype, "put").mockImplementation(function (
       this: IDBObjectStore,
       ...args
     ) {
       const request = put.apply(this, args);
-      this.transaction.addEventListener("abort", () => aborted.resolve(), { once: true });
+      this.transaction.addEventListener("abort", resolveAbort, { once: true });
       request.addEventListener("success", () => this.transaction.abort(), { once: true });
       return request;
     });
     const failed = { ...recording("uncommitted", "Keep for retry"), message: "Retry available" };
     store.writeRecordingDraft("target", failed);
-    await aborted.promise;
+    await aborted;
     await commitQueuedWrites(store);
     expect(await store.readRecordingDraft("target")).toBe(failed);
     intercepted.mockRestore();
