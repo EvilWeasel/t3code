@@ -69,6 +69,10 @@ export function receiptFailures(receipt) {
   if (!receipt.apiProfiles?.A || !receipt.apiProfiles?.B)
     failures.push("Missing API profile observations");
   if (receipt.fatalError) failures.push("Probe did not finish");
+  if (receipt.phase !== undefined && receipt.phase !== "final") failures.push("Receipt is partial");
+  if (receipt.cleanup?.status !== undefined && receipt.cleanup.status !== "complete")
+    failures.push("Cleanup did not complete");
+  if (receipt.persistenceErrors?.length) failures.push("Receipt persistence failed");
   return failures;
 }
 
@@ -88,6 +92,53 @@ const deadline = async (operation, label, milliseconds = 10000) => {
   }
 };
 
+/** Serialization is independently testable; it proves no Electron/API behavior. */
+export function serializeProbeReceipt(receipt, phase, cleanup, exitCode) {
+  const snapshot = { ...receipt, phase, cleanup, officialProtonSupport: "unknown" };
+  const failures = receiptFailures(snapshot);
+  return JSON.stringify(
+    {
+      ...snapshot,
+      failures,
+      harnessPassed: phase === "final" && exitCode === 0 && failures.length === 0,
+    },
+    null,
+    2,
+  );
+}
+
+/** Flush before returning so closing a last window cannot discard diagnostics. */
+export function persistProbeReceipt(output, serialized, preservePartial = false) {
+  NodeFS.mkdirSync(output, { recursive: true });
+  const writeFlushed = (file, flags) => {
+    const descriptor = NodeFS.openSync(file, flags, 0o600);
+    try {
+      NodeFS.writeFileSync(descriptor, serialized);
+      NodeFS.fsyncSync(descriptor);
+    } finally {
+      NodeFS.closeSync(descriptor);
+    }
+  };
+  // Exclusive creation keeps the first partial failure even if finalization fails.
+  if (preservePartial) writeFlushed(NodePath.join(output, "fixture-receipt.partial.json"), "wx");
+  const target = NodePath.join(output, "fixture-receipt.json");
+  const temporary = `${target}.${NodeCrypto.randomUUID()}.tmp`;
+  try {
+    writeFlushed(temporary, "wx");
+    NodeFS.renameSync(temporary, target);
+  } finally {
+    if (NodeFS.existsSync(temporary)) NodeFS.unlinkSync(temporary);
+  }
+  if (NodeOS.type() !== "Windows_NT") {
+    const directory = NodeFS.openSync(output, "r");
+    try {
+      NodeFS.fsyncSync(directory);
+    } finally {
+      NodeFS.closeSync(directory);
+    }
+  }
+}
+
 export async function runProbe() {
   // Starting this script on a workstation must fail before Electron app readiness.
   if (process.env.GITHUB_ACTIONS !== "true" || process.env.MORROWBYTE_NAMESPACE_PROBE !== "1")
@@ -103,6 +154,9 @@ export async function runProbe() {
   if (NodeFS.readFileSync(NodePath.join(temporary, ".owned-probe"), "utf8") !== "synthetic-only")
     throw new Error("Missing temporary root ownership marker");
   const { app, BrowserWindow, session, webContents } = await import("electron");
+  // Electron otherwise calls app.quit() when cleanup destroys the last window.
+  // Only this probe owns its lifecycle; explicit app.exit follows receipt flush.
+  app.on("window-all-closed", () => {});
   app.setPath("userData", NodePath.join(temporary, "user-data"));
   app.setPath("sessionData", NodePath.join(temporary, "session-data"));
   const receipt = {
@@ -171,48 +225,115 @@ export async function runProbe() {
   let origins = [];
   const assets = {};
   let exitCode = 1;
+  let finishPromise;
+  let requestedExitCode = 0;
+  const noteFatal = (error) => {
+    receipt.fatalError ??= errorText(error);
+    process.stderr.write(`Probe failure at ${receipt.stage ?? "unknown"}: ${errorText(error)}\n`);
+  };
   const watchdog = setTimeout(() => {
-    receipt.fatalError = "Overall 110s probe deadline exceeded";
+    noteFatal(new Error("Overall 110s probe deadline exceeded"));
     void finish(1);
   }, 110000);
-  let finishing = false;
-  async function finish(code) {
-    if (finishing) return;
-    finishing = true;
+  function finish(code) {
+    if (code !== 0) requestedExitCode = 1;
+    if (finishPromise) return finishPromise;
     clearTimeout(watchdog);
-    for (const window of windows) if (!window.isDestroyed()) window.destroy();
-    // All sessions and profiles were created below this run's owned temporary userData.
-    for (const browserSession of ownedSessions) {
-      try {
-        for (const extension of browserSession.extensions.getAllExtensions())
-          browserSession.extensions.removeExtension(extension.id);
-      } catch {}
-      try {
-        await browserSession.closeAllConnections();
-      } catch {}
-    }
-    await Promise.all(
-      servers.map(
-        (server) =>
-          new Promise((resolve) => {
-            server.closeAllConnections();
-            server.close(resolve);
-          }),
-      ),
-    );
-    receipt.observations = events;
-    receipt.failures = receiptFailures(receipt);
-    receipt.harnessPassed = code === 0 && receipt.failures.length === 0;
-    // A synthetic extension can never qualify the real Proton package.
-    receipt.officialProtonSupport = "unknown";
-    await NodeFSP.mkdir(output, { recursive: true });
-    await NodeFSP.writeFile(
-      NodePath.join(output, "fixture-receipt.json"),
-      JSON.stringify(receipt, null, 2),
-    );
-    // The parent Node runner removes this owned root after Electron has exited,
-    // including on Windows where Chromium can retain open storage handles.
-    app.exit(receipt.harnessPassed ? 0 : 1);
+    // Store the shared promise before cleanup can trigger lifecycle callbacks.
+    finishPromise = Promise.resolve()
+      .then(async () => {
+        const cleanup = { status: "pending", errors: [] };
+        const save = (phase, preservePartial = false) => {
+          receipt.observations = [...events];
+          try {
+            const serialized = serializeProbeReceipt(receipt, phase, cleanup, requestedExitCode);
+            persistProbeReceipt(output, serialized, preservePartial);
+            return JSON.parse(serialized);
+          } catch (error) {
+            requestedExitCode = 1;
+            (receipt.persistenceErrors ??= []).push(errorText(error));
+            process.stderr.write(`Receipt ${phase} persistence failed: ${errorText(error)}\n`);
+            return null;
+          }
+        };
+        // Flush both snapshots before ANY cleanup; a write failure forces a failed result.
+        save("partial", true);
+        if (receipt.fatalError)
+          process.stderr.write(`First probe failure: ${receipt.fatalError}\n`);
+        const cleanupOperation = async () => {
+          for (const window of windows) {
+            try {
+              if (!window.isDestroyed()) window.destroy();
+            } catch (error) {
+              cleanup.errors.push(errorText(error));
+            }
+          }
+          // These are exclusively this run's temporary sessions.
+          for (const browserSession of ownedSessions) {
+            try {
+              for (const extension of browserSession.extensions.getAllExtensions())
+                browserSession.extensions.removeExtension(extension.id);
+            } catch (error) {
+              cleanup.errors.push(errorText(error));
+            }
+            try {
+              await browserSession.closeAllConnections();
+            } catch (error) {
+              cleanup.errors.push(errorText(error));
+            }
+          }
+          await Promise.all(
+            servers.map(
+              (server) =>
+                new Promise((resolve) => {
+                  try {
+                    server.closeAllConnections();
+                    server.close((error) => {
+                      if (error) cleanup.errors.push(errorText(error));
+                      resolve();
+                    });
+                  } catch (error) {
+                    cleanup.errors.push(errorText(error));
+                    resolve();
+                  }
+                }),
+            ),
+          );
+        };
+        try {
+          await deadline(cleanupOperation(), "Probe cleanup", 8000);
+          cleanup.status = cleanup.errors.length ? "failed" : "complete";
+        } catch (error) {
+          cleanup.status = "timed-out";
+          cleanup.errors.push(errorText(error));
+        }
+        if (cleanup.status !== "complete") {
+          requestedExitCode = 1;
+          process.stderr.write(`Probe cleanup ${cleanup.status}: ${cleanup.errors.join("; ")}\n`);
+        }
+        const finalReceipt = save("final");
+        // Parent's 130s bound and owned-temp cleanup remain the final backstop.
+        app.exit(finalReceipt?.harnessPassed ? 0 : 1);
+      })
+      .catch((error) => {
+        // Unexpected finalizer errors cannot leave a live Electron process behind.
+        noteFatal(error);
+        try {
+          persistProbeReceipt(
+            output,
+            serializeProbeReceipt(
+              receipt,
+              "partial",
+              { status: "failed", errors: [errorText(error)] },
+              1,
+            ),
+          );
+        } catch (writeError) {
+          process.stderr.write(`Emergency receipt persistence failed: ${errorText(writeError)}\n`);
+        }
+        app.exit(1);
+      });
+    return finishPromise;
   }
   try {
     if (process.versions.electron !== expectedElectron)
@@ -305,6 +426,7 @@ export async function runProbe() {
     };
     const profiles = {};
     for (const name of ["A", "B"]) {
+      receipt.stage = `profile-${name}`;
       const partition = `persist:morrowbyte-proton-probe-${runToken}-${name}`;
       const browserSession = createSession(partition);
       const extension = await deadline(
@@ -373,6 +495,7 @@ export async function runProbe() {
       profiles.B.before.marker === null &&
       markerA.marker === "A" &&
       markerB.marker === "B";
+    receipt.stage = "incognito-boundary";
     const ephemeral = createSession(`morrowbyte-proton-probe-${runToken}-incognito`);
     try {
       await ephemeral.extensions.loadExtension(extensionPath);
@@ -382,6 +505,7 @@ export async function runProbe() {
       receipt.incognito = { status: "unsupported", error: errorText(error) };
       receipt.invariants.incognitoRejected = /persistent|in.memory/i.test(String(error));
     }
+    receipt.stage = "native-webview-host";
     const host = new BrowserWindow({
       show: true,
       width: 1000,
@@ -407,6 +531,7 @@ export async function runProbe() {
     });
     await host.loadURL("data:text/html,<title>Owned compatibility host</title><body></body>");
     const createGuest = async (name, profile) => {
+      receipt.stage = `guest-${name}`;
       const url = `${origins[0]}/login?guest=${name}`;
       const id = await deadline(
         host.webContents.executeJavaScript(`new Promise((resolve, reject) => {
@@ -438,6 +563,7 @@ export async function runProbe() {
         processId: frame.processId,
       }));
     const capture = async (entry, requestId) => {
+      receipt.stage = `capture-${requestId}`;
       const frames = nativeFrames(entry.guest);
       await Promise.all(
         entry.guest.mainFrame.framesInSubtree.map((frame) =>
@@ -526,7 +652,7 @@ export async function runProbe() {
     receipt.failures = receiptFailures(receipt);
     exitCode = receipt.failures.length === 0 ? 0 : 1;
   } catch (error) {
-    receipt.fatalError = errorText(error);
+    noteFatal(error);
   } finally {
     await finish(exitCode);
   }

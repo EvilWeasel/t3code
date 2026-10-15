@@ -11,6 +11,8 @@ import {
   classifyContentMapping,
   receiptFailures,
   expectedElectron,
+  serializeProbeReceipt,
+  persistProbeReceipt,
 } from "./proton-pass-compatibility.mjs";
 
 if (process.argv.includes("--electron")) {
@@ -107,6 +109,27 @@ if (process.argv.includes("--electron")) {
         },
       };
       NodeAssert.deepEqual(receiptFailures(receipt), []);
+      NodeAssert.equal(
+        JSON.parse(serializeProbeReceipt(receipt, "partial", { status: "pending", errors: [] }, 0))
+          .harnessPassed,
+        false,
+      );
+      NodeAssert.equal(
+        JSON.parse(serializeProbeReceipt(receipt, "final", { status: "complete", errors: [] }, 0))
+          .harnessPassed,
+        true,
+      );
+      NodeAssert.equal(
+        JSON.parse(
+          serializeProbeReceipt(
+            { ...receipt, persistenceErrors: ["write failed"] },
+            "final",
+            { status: "complete", errors: [] },
+            0,
+          ),
+        ).harnessPassed,
+        false,
+      );
       NodeAssert.ok(
         receiptFailures({
           ...receipt,
@@ -130,6 +153,66 @@ if (process.argv.includes("--electron")) {
           "Probe did not finish",
         ),
       );
+    },
+  );
+  NodeTest.test(
+    "flushes a first partial failure before final cleanup diagnostics without overwriting it",
+    async () => {
+      const output = await NodeFSP.mkdtemp(
+        NodePath.join(NodeOS.tmpdir(), "proton-receipt-assertion-"),
+      );
+      try {
+        const receipt = {
+          fatalError: "Original probe failure",
+          stage: "guest-alpha",
+          observations: [{ type: "worker-boot" }],
+        };
+        const partial = serializeProbeReceipt(
+          receipt,
+          "partial",
+          { status: "pending", errors: [] },
+          1,
+        );
+        persistProbeReceipt(output, partial, true);
+        // This is real file IO/serialization proof, not a simulated Electron runtime.
+        NodeAssert.equal(
+          await NodeFSP.readFile(NodePath.join(output, "fixture-receipt.json"), "utf8"),
+          partial,
+        );
+        NodeAssert.equal(JSON.parse(partial).harnessPassed, false);
+        NodeAssert.equal(JSON.parse(partial).cleanup.status, "pending");
+        const final = serializeProbeReceipt(
+          receipt,
+          "final",
+          { status: "timed-out", errors: ["Cleanup deadline exceeded"] },
+          1,
+        );
+        persistProbeReceipt(output, final);
+        NodeAssert.equal(
+          await NodeFSP.readFile(NodePath.join(output, "fixture-receipt.partial.json"), "utf8"),
+          partial,
+        );
+        const saved = JSON.parse(
+          await NodeFSP.readFile(NodePath.join(output, "fixture-receipt.json"), "utf8"),
+        );
+        NodeAssert.equal(saved.phase, "final");
+        NodeAssert.equal(saved.fatalError, "Original probe failure");
+        NodeAssert.equal(saved.cleanup.status, "timed-out");
+        NodeAssert.deepEqual(saved.cleanup.errors, ["Cleanup deadline exceeded"]);
+        NodeAssert.equal(saved.harnessPassed, false);
+        NodeAssert.ok(receiptFailures(saved).includes("Cleanup did not complete"));
+        NodeAssert.throws(() => persistProbeReceipt(output, "{}", true), { code: "EEXIST" });
+        NodeAssert.equal(
+          await NodeFSP.readFile(NodePath.join(output, "fixture-receipt.partial.json"), "utf8"),
+          partial,
+        );
+        NodeAssert.equal(
+          await NodeFSP.readFile(NodePath.join(output, "fixture-receipt.json"), "utf8"),
+          final,
+        );
+      } finally {
+        await NodeFSP.rm(output, { recursive: true, force: true });
+      }
     },
   );
 }
@@ -226,7 +309,7 @@ async function runNamespaceChild() {
       ),
     );
     if (receipt) {
-      receipt.cleanup = { ownedTemporaryRootRemoved: true };
+      receipt.cleanup = { ...receipt.cleanup, ownedTemporaryRootRemoved: true };
       receipt.runnerExecutableSha256 = executableSha256;
       await NodeFSP.writeFile(
         NodePath.join(output, "fixture-receipt.json"),
