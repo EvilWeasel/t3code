@@ -817,7 +817,7 @@ describe("orchestrator MCP toolkit", () => {
             const status = yield* invoke("external_task_status", selected);
             expect(status.structuredContent).toMatchObject({
               taskId: task.taskId,
-              status: "cancelled",
+              status: "interrupted",
             });
             expect(yield* Ref.get(capturedTurns)).toHaveLength(0);
             const staleSteer = yield* invoke("external_task_steer", {
@@ -912,7 +912,7 @@ describe("orchestrator MCP toolkit", () => {
               if (change === "root")
                 expect(
                   (yield* invoke("external_task_status", selected)).structuredContent,
-                ).toMatchObject({ taskId: task.taskId, status: "cancelled" });
+                ).toMatchObject({ taskId: task.taskId, status: "interrupted" });
             }
           }).pipe(Effect.provide(layer));
         }),
