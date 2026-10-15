@@ -39,7 +39,7 @@ case "$mode" in
   --rollback|--activate)
     version="${2:-}"
     [[ $# -eq 2 ]] && valid_version "$version" || die 'activation requires an installed version'
-    mkdir -p "$base_dir"
+    [[ -d "$base_dir" ]] || die 'activation requires an installed version'
     exec 9>"$base_dir/.update.lock"
     flock -n 9 || die 'another update is running'
     valid_install "$version" || die 'activation requires an installed version'
