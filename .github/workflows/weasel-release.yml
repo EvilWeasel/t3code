@@ -413,6 +413,13 @@ jobs:
           merge-multiple: true
           path: release-assets
 
+      - name: Setup checksum consumer runtime
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
       - name: Verify isolated release payload
         run: |
           set -euo pipefail
