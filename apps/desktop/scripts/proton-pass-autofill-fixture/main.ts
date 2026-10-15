@@ -16,6 +16,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
+import { DesktopBrowserEvent } from "@t3tools/contracts";
+import * as DesktopChannel from "../../../server/src/preview/DesktopBrowserChannel.ts";
+import * as ServerBrowser from "../../../server/src/preview/ServerBrowser.ts";
+import { SessionControl } from "../../../server/src/preview/SessionControl.ts";
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
 import * as EffectNodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -97,6 +102,8 @@ const required = [
   "recordingRefusal",
   "devtoolsRefusal",
   "agentOwnedPreEntry",
+  "viewerOwnedPreEntry",
+  "unsupportedAuthority",
 ] as const;
 type Check = (typeof required)[number];
 const checks: Record<string, "UNKNOWN_REQUIRED" | "PASS" | "FAIL"> = Object.fromEntries(
@@ -348,8 +355,21 @@ async function exercise(
   run: <A, E>(effect: Effect.Effect<A, E>) => Promise<A>,
   replies: Map<number, { privateEntry: boolean; success: boolean }>,
   cdpEvents: { count: number },
+  connection: DesktopBrowserHost.DesktopBrowserConnection,
+  nativeTabs: Map<string, { control: SessionControl; desktop: object | null; closing: boolean }>,
+  controlChanged: (key: { threadId: string; tabId: string }) => void,
+  refusals: Map<string, string>,
 ) {
-  const makeGuest = async (id: string, profile: string, persistent = true) => {
+  const makeGuest = async (
+    id: string,
+    profile: string,
+    persistent = true,
+    agentId: string | null = null,
+  ) => {
+    const key = { threadId: "fixture-thread", tabId: id };
+    const control = new SessionControl(agentId, () => controlChanged(key));
+    nativeTabs.set(id, { control, desktop: {}, closing: false });
+    const authorityAttached = event(`authority-attached-${id}`);
     const partition = await run(profiles.getPartition(profile, persistent, "profile"));
     await constrain(await run(profiles.getSession(profile, persistent, "profile")));
     const owner = new BrowserWindow({
@@ -382,13 +402,14 @@ async function exercise(
       { threadId: "fixture-thread", tabId: id },
       { webContents: wc, debugger: wc.debugger },
     );
+    await authorityAttached;
     receipt.ids.push({
       window: owner.id,
       webContents: wc.id,
       mainFrame: wc.mainFrame.routingId,
       subframes: wc.mainFrame.frames.map((frame) => frame.routingId),
     });
-    return { owner, wc, id, partition };
+    return { owner, wc, id, partition, control };
   };
   type Guest = Awaited<ReturnType<typeof makeGuest>>;
   const focus = async (guest: Guest, field = "u") => {
@@ -505,7 +526,7 @@ async function exercise(
   });
   const cdp = async (id: number, method: string, params: object = {}, browser = false) =>
     run(
-      host.handleCommandLine(
+      connection.handleCommandLine(
         JSON.stringify({
           type: "cdp",
           threadId: "fixture-thread",
@@ -848,9 +869,49 @@ async function exercise(
     return result;
   });
   await focus(A);
-  // No public production seam exposes completion/drain of a discarded relay's own promise.
-  // An unrelated later response is NOT a completion barrier. Leave required evidence UNKNOWN.
-  checks.lateReply = "UNKNOWN_REQUIRED";
+  if (connection.dispatchCommandLine)
+    await check("lateReply", async () => {
+      const started = event("late-command-started");
+      const pending = await run(
+        connection.dispatchCommandLine!(
+          JSON.stringify({
+            type: "cdp",
+            threadId: "fixture-thread",
+            tabId: A.id,
+            message: JSON.stringify({
+              id: 200,
+              method: "Runtime.evaluate",
+              sessionId: "t3-preview-page",
+              params: {
+                expression:
+                  "new Promise(resolve=>{globalThis.ownedLateResolve=()=>resolve(true);fetch('/event/late-command-started',{method:'POST'})})",
+                awaitPromise: true,
+                returnByValue: true,
+              },
+            }),
+          }),
+        ),
+      );
+      if (!pending) return false;
+      await started;
+      activeGuest = A;
+      await service.fill(await target(A), reference);
+      const privateBefore = host.isPrivateEntry(A.wc);
+      await freshClear(A);
+      await A.wc.executeJavaScript(
+        "globalThis.ownedLateResolve();delete globalThis.ownedLateResolve",
+      );
+      // This is the captured old command's actual reply/suppression boundary, not another command.
+      await pending.settled;
+      await cdp(201, "DOM.enable");
+      await waitReply(201);
+      return (
+        privateBefore &&
+        !host.isPrivateEntry(A.wc) &&
+        !replies.has(200) &&
+        replies.get(201)?.success === true
+      );
+    });
   await check("annotationCancellation", async () => {
     await focus(A);
     const current = await target(A);
@@ -927,6 +988,59 @@ async function exercise(
     }
     return result;
   });
+  await check("agentOwnedPreEntry", async () => {
+    const guest = await makeGuest("fixture-agent-owned", "A", true, "actual-fixture-agent");
+    activeGuest = guest;
+    await focus(guest);
+    const current = await target(guest);
+    if ((await service.linked(current)).length !== 1) return false;
+    const before = receipt.counts.credentialReads;
+    const refused = await rejected(service.fill(current, reference));
+    return (
+      guest.control.agentId === "actual-fixture-agent" &&
+      refused &&
+      refusals.get(guest.id) === "agent-owned" &&
+      receipt.counts.credentialReads === before &&
+      !host.isPrivateEntry(guest.wc) &&
+      (await observer(guest, true)) === true
+    );
+  });
+  await check("viewerOwnedPreEntry", async () => {
+    const guest = await makeGuest("fixture-viewer-owned", "A");
+    await guest.control.take("other-human-viewer");
+    activeGuest = guest;
+    await focus(guest);
+    const current = await target(guest);
+    if ((await service.linked(current)).length !== 1) return false;
+    const before = receipt.counts.credentialReads;
+    const refused = await rejected(service.fill(current, reference));
+    return (
+      guest.control.controller === "other-human-viewer" &&
+      refused &&
+      refusals.get(guest.id) === "viewer-owned" &&
+      receipt.counts.credentialReads === before &&
+      !host.isPrivateEntry(guest.wc)
+    );
+  });
+  await check("unsupportedAuthority", async () => {
+    const guest = await makeGuest("fixture-headless", "A");
+    const tab = nativeTabs.get(guest.id)!;
+    tab.desktop = null;
+    activeGuest = guest;
+    await focus(guest);
+    const current = await target(guest);
+    if ((await service.linked(current)).length !== 1) return false;
+    const before = receipt.counts.credentialReads;
+    const refused = await rejected(service.fill(current, reference));
+    return (
+      refused &&
+      refusals.get(guest.id) === "unavailable" &&
+      receipt.counts.credentialReads === before &&
+      !host.isPrivateEntry(guest.wc)
+    );
+  });
+  activeGuest = A;
+  await focus(A);
   await check("unlink", async () => {
     await focus(A);
     const current = await target(A);
@@ -953,7 +1067,6 @@ async function exercise(
       receipt.counts.credentialReads === before
     );
   });
-  // No public Manager operation creates controller='agent'. This MUST remain UNKNOWN_REQUIRED.
 }
 
 async function main() {
@@ -1009,10 +1122,47 @@ async function main() {
     const run = Effect.runPromiseWith(context);
     const replies = new Map<number, { privateEntry: boolean; success: boolean }>();
     const cdpEvents = { count: 0 };
-    yield* host.events.pipe(
+    const connection = host.createConnection();
+    const nativeTabs = new Map<
+      string,
+      { control: SessionControl; desktop: object | null; closing: boolean }
+    >();
+    const refusals = new Map<string, string>();
+    const router = yield* DesktopChannel.makePrivateEntryRouter((response) =>
+      Effect.gen(function* () {
+        if (response.type === "private-entry-refused")
+          refusals.set(response.tabId, response.reason);
+        yield* connection.handleCommandLine(JSON.stringify(response));
+        return true;
+      }),
+    );
+    const authority = yield* ServerBrowser.makeDesktopPrivateEntryAuthority(router, (key) =>
+      key.threadId === "fixture-thread" ? nativeTabs.get(key.tabId) : undefined,
+    );
+    yield* Effect.addFinalizer(() => connection.closed.pipe(Effect.andThen(router.close)));
+    yield* connection.events.pipe(
       Stream.runForEach((bytes) =>
-        Effect.sync(() => {
-          const item: unknown = JSON.parse(new TextDecoder().decode(bytes));
+        Effect.gen(function* () {
+          const item = Schema.decodeUnknownSync(Schema.fromJsonString(DesktopBrowserEvent))(
+            new TextDecoder().decode(bytes),
+          );
+          if (item.type === "attached") {
+            yield* router.attach(item, item.privateEntry);
+            events.get(`authority-attached-${item.tabId}`)?.resolve();
+            return;
+          }
+          if (item.type === "detached") {
+            yield* router.detach(item, item.privateEntry);
+            return;
+          }
+          if (
+            item.type === "private-entry-acquire" ||
+            item.type === "private-entry-release" ||
+            item.type === "private-entry-cancel"
+          ) {
+            yield* router.receive(item);
+            return;
+          }
           if (
             !item ||
             typeof item !== "object" ||
@@ -1047,9 +1197,23 @@ async function main() {
           }
         }),
       ),
+      Effect.ensuring(router.close),
       Effect.forkScoped,
     );
-    yield* Effect.promise(() => exercise(manager, host, profiles, run, replies, cdpEvents));
+    yield* Effect.promise(() =>
+      exercise(
+        manager,
+        host,
+        profiles,
+        run,
+        replies,
+        cdpEvents,
+        connection,
+        nativeTabs,
+        authority.controlChanged,
+        refusals,
+      ),
+    );
   }).pipe(Effect.provide(dependencies), Effect.scoped);
   await Effect.runPromise(program);
   await finish(false);
