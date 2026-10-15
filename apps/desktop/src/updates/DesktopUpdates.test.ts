@@ -21,6 +21,113 @@ import * as DesktopUpdates from "./DesktopUpdates.ts";
 import { flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
 
 describe("DesktopUpdates", () => {
+  it.effect("only enables the packaged fork feed and never polls upstream or custom hosts", () =>
+    Effect.gen(function* () {
+      for (const [feed, enabled] of [
+        ["provider: github\nowner: morrowbyte\nrepo: t3code\n", true],
+        ["provider: 'github'\nowner: 'morrowbyte'\nrepo: 't3code'\n", true],
+        ["provider: github\nowner: pingdotgg\nrepo: t3code\n", false],
+        ["provider: github\nowner: morrowbyte\nrepo: other\n", false],
+        ["provider: github\nowner: morrowbyte\nrepo: t3code\nhost: other.example\n", false],
+        ["provider: github\nowner: morrowbyte\nrepo: t3code\nprotocol: http\n", false],
+        ["provider: generic\nurl: https://example.com\n", false],
+      ] as const) {
+        const harness = makeHarness({
+          appUpdateYml: feed,
+          env: { T3CODE_DESKTOP_MOCK_UPDATES: "false" },
+        });
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const updates = yield* DesktopUpdates.DesktopUpdates;
+            yield* updates.configure;
+            assert.equal((yield* updates.getState).enabled, enabled);
+            if (!enabled) {
+              assert.equal((yield* updates.check("manual")).checked, false);
+              assert.equal(harness.checkCount(), 0);
+              assert.equal(harness.listenerCount(), 0);
+            }
+          }),
+        ).pipe(Effect.provide(harness.layer));
+      }
+    }),
+  );
+
+  it.effect("prepares a startup update automatically without stopping a backend or installing", () =>
+    Effect.gen(function* () {
+      const downloadStarted = yield* Deferred.make<void>();
+      const finishDownload = yield* Deferred.make<void>();
+      let publishAvailable: () => void = () => {
+        throw new Error("Update publisher has not been attached");
+      };
+      const harness = makeHarness({
+        checkForUpdates: Effect.sync(() => publishAvailable()).pipe(Effect.andThen(flushCallbacks)),
+        downloadUpdate: Deferred.succeed(downloadStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(finishDownload)),
+        ),
+      });
+      publishAvailable = () => harness.emit("update-available", { version: "1.2.4" });
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const updates = yield* DesktopUpdates.DesktopUpdates;
+          yield* updates.configure;
+          yield* TestClock.adjust(Duration.seconds(15));
+          yield* Deferred.await(downloadStarted);
+          assert.equal(harness.downloadCount(), 1);
+          assert.equal((yield* updates.getState).status, "downloading");
+          assert.equal((yield* updates.download).accepted, false);
+          assert.equal((yield* updates.check("manual")).checked, false);
+          harness.emit("update-downloaded", { version: "1.2.4" });
+          yield* Deferred.succeed(finishDownload, undefined);
+          yield* flushCallbacks;
+          assert.equal((yield* updates.getState).downloadedVersion, "1.2.4");
+          assert.equal(harness.quitAndInstalls(), 0);
+          assert.deepEqual(harness.installSteps, []);
+        }),
+      ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+    }),
+  );
+
+  it.effect("rejects previews and wrong-channel downloads before they become installable", () => {
+    const harness = makeHarness();
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        for (const version of [
+          "1.2.4-preview.20261015.1",
+          "1.2.4-pr.42",
+          "1.2.4-nightly.20261015.1",
+        ]) {
+          harness.emit("update-available", { version });
+          harness.emit("update-downloaded", { version });
+          yield* flushCallbacks;
+          assert.isNull((yield* updates.getState).downloadedVersion);
+          assert.equal((yield* updates.download).accepted, false);
+          assert.equal((yield* updates.install).accepted, false);
+        }
+        assert.equal(harness.downloadCount(), 0);
+        assert.equal(harness.quitAndInstalls(), 0);
+      }),
+    ).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("does not admit a downloaded artifact for a different release version", () => {
+    const harness = makeHarness();
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const updates = yield* DesktopUpdates.DesktopUpdates;
+        yield* updates.configure;
+        harness.emit("update-available", { version: "1.2.4" });
+        yield* flushCallbacks;
+        harness.emit("update-downloaded", { version: "1.2.5" });
+        yield* flushCallbacks;
+        assert.isNull((yield* updates.getState).downloadedVersion);
+        assert.equal((yield* updates.install).accepted, false);
+        assert.equal(harness.quitAndInstalls(), 0);
+      }),
+    ).pipe(Effect.provide(harness.layer));
+  });
+
   it("preserves complete causes for update poller and event failures", () => {
     const cause = Cause.combine(
       Cause.fail(new Error("updater failed")),

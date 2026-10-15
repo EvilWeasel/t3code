@@ -34,7 +34,7 @@ import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as IpcChannels from "../ipc/channels.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import { normalizeDesktopUpdateReleaseNotes } from "./releaseNotes.ts";
-import { resolveDefaultDesktopUpdateChannel } from "./updateChannels.ts";
+import { isReleasedDesktopVersionForChannel } from "./updateChannels.ts";
 import {
   createInitialDesktopUpdateState,
   reduceDesktopUpdateStateOnCheckFailure,
@@ -259,7 +259,7 @@ function parseAppUpdateYml(raw: string): Effect.Effect<Option.Option<AppUpdateYm
   for (const line of raw.split("\n")) {
     const match = line.match(/^(\w+):\s*(.+)$/);
     if (match?.[1] && match[2]) {
-      entries[match[1]] = match[2].trim();
+      entries[match[1]] = match[2].trim().replace(/^(["'])(.*)\1$/, "$2");
     }
   }
 
@@ -314,7 +314,7 @@ function getAutoUpdateDisabledReason(args: {
   hasUpdateFeedConfig: boolean;
 }): string | null {
   if (!args.hasUpdateFeedConfig) {
-    return "Automatic updates are not available because no update feed is configured.";
+    return "Automatic updates require the morrowbyte/t3code release feed or a managed Nix package.";
   }
   if (args.isDevelopment || !args.isPackaged) {
     return "Automatic updates are only available in packaged production builds.";
@@ -409,7 +409,16 @@ export const make = Effect.gen(function* () {
   const hasUpdateFeedConfig = Ref.get(appUpdateYmlConfigRef).pipe(
     Effect.map(
       (appUpdateYmlConfig) =>
-        Option.isSome(appUpdateYmlConfig) || config.mockUpdates || isNixPackage,
+        (Option.isSome(appUpdateYmlConfig) &&
+          appUpdateYmlConfig.value.provider === "github" &&
+          appUpdateYmlConfig.value.owner === "morrowbyte" &&
+          appUpdateYmlConfig.value.repo === "t3code" &&
+          (appUpdateYmlConfig.value.protocol === undefined ||
+            appUpdateYmlConfig.value.protocol === "https") &&
+          appUpdateYmlConfig.value.pathPrefix === undefined &&
+          (appUpdateYmlConfig.value.host === undefined ||
+            appUpdateYmlConfig.value.host === "github.com")) ||
+        config.mockUpdates || isNixPackage,
     ),
   );
 
@@ -773,8 +782,17 @@ export const make = Effect.gen(function* () {
   });
 
   const startUpdatePollers: Effect.Effect<void, never, Scope.Scope> = Effect.gen(function* () {
+    // Keep Electron's implicit download/install hooks disabled. The same action
+    // reservation and failure handling serve manual and background downloads;
+    // installation still requires a separately admitted safe restart window.
+    const checkAndPrepare = (reason: string) =>
+      checkForUpdates(reason).pipe(
+        Effect.flatMap((checked) =>
+          checked ? downloadAvailableUpdate.pipe(Effect.asVoid) : Effect.void,
+        ),
+      );
     yield* Effect.sleep(AUTO_UPDATE_STARTUP_DELAY).pipe(
-      Effect.andThen(checkForUpdates("startup")),
+      Effect.andThen(checkAndPrepare("startup")),
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
           return Effect.void;
@@ -789,7 +807,7 @@ export const make = Effect.gen(function* () {
       Effect.forkScoped,
     );
     yield* Effect.sleep(AUTO_UPDATE_POLL_INTERVAL).pipe(
-      Effect.andThen(checkForUpdates("poll")),
+      Effect.andThen(checkAndPrepare("poll")),
       Effect.forever,
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
@@ -813,7 +831,7 @@ export const make = Effect.gen(function* () {
       Effect.flatMap(
         Effect.fn("desktop.updates.applyUpdateAvailable")(function* (info) {
           const state = yield* Ref.get(updateStateRef);
-          if (resolveDefaultDesktopUpdateChannel(info.version) !== state.channel) {
+          if (!isReleasedDesktopVersionForChannel(info.version, state.channel)) {
             yield* logUpdaterInfo("ignoring update that does not match selected channel", {
               version: info.version,
               channel: state.channel,
@@ -950,6 +968,15 @@ export const make = Effect.gen(function* () {
       Effect.flatMap(
         Effect.fn("desktop.updates.applyUpdateDownloaded")(function* (info) {
           const state = yield* Ref.get(updateStateRef);
+          if (
+            !isReleasedDesktopVersionForChannel(info.version, state.channel) ||
+            (state.availableVersion !== null && state.availableVersion !== info.version)
+          ) {
+            yield* logUpdaterWarning("ignoring downloaded update outside the selected release train", {
+              channel: state.channel,
+            });
+            return;
+          }
           yield* setState(reduceDesktopUpdateStateOnDownloadComplete(state, info.version));
           yield* logUpdaterInfo("update downloaded", { version: info.version });
         }),
