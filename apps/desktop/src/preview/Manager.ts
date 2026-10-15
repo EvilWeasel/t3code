@@ -465,8 +465,10 @@ const POPUP_WINDOW_OPTIONS = {
  *
  * `"new-tab"` hands a `target="_blank"` link (a tab disposition) to the web
  * app, which opens it as another preview tab so the page that held the link
- * stays put. Schemes a popup cannot be hardened for keep loading in place, and
- * so does a form POST with a body, which a new tab could only reopen as a GET.
+ * stays put. A form POST uses the native popup path so Chromium preserves its
+ * body, content type, referrer and opener; loading just its URL here or in a
+ * new tab would turn it into a GET. Schemes a popup cannot be hardened for
+ * keep loading in place.
  *
  * `"deny"` is for a blank window (`""` or `about:blank`). It cannot get a real
  * window (see `POPUP_PROTOCOLS`), and loading it into the preview tab would
@@ -480,9 +482,8 @@ export const previewWindowOpenAction = (details: {
 }): "popup" | "new-tab" | "navigate" | "deny" => {
   if (details.url === "" || details.url === "about:blank") return "deny";
   if (!isPopupUrl(details.url)) return "navigate";
-  if (details.disposition === "new-window") return "popup";
-  return !details.postBody &&
-    (details.disposition === "foreground-tab" || details.disposition === "background-tab")
+  if (details.postBody || details.disposition === "new-window") return "popup";
+  return details.disposition === "foreground-tab" || details.disposition === "background-tab"
     ? "new-tab"
     : "navigate";
 };

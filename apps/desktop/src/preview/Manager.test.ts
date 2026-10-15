@@ -168,15 +168,14 @@ describe("previewWindowOpenAction", () => {
     );
   });
 
-  it("keeps a form POST with a body on the in-place path", () => {
-    // A new tab can only reopen the URL as a GET, which would drop the body.
+  it("keeps a form POST on the native popup path so Electron retains its body and opener", () => {
     const postBody = { data: [], contentType: "application/x-www-form-urlencoded" };
     expect(
       PreviewManager.previewWindowOpenAction({
         ...details({ disposition: "foreground-tab" }),
         postBody,
       }),
-    ).toBe("navigate");
+    ).toBe("popup");
   });
 
   it("does not hand a window to schemes that cannot be hardened", () => {
@@ -189,7 +188,14 @@ describe("previewWindowOpenAction", () => {
       "vscode://vscode-remote/ssh-remote+box/tmp",
       "not a url",
     ]) {
-      expect(PreviewManager.previewWindowOpenAction(details({ url }))).toBe("navigate");
+      for (const postBody of [
+        undefined,
+        { data: [], contentType: "application/x-www-form-urlencoded" },
+      ]) {
+        expect(PreviewManager.previewWindowOpenAction({ ...details({ url }), postBody })).toBe(
+          "navigate",
+        );
+      }
     }
   });
 
@@ -198,7 +204,14 @@ describe("previewWindowOpenAction", () => {
     // loading the blank page into the tab would destroy that fallback.
     for (const url of ["about:blank", ""]) {
       for (const disposition of ["new-window", "foreground-tab"] as const) {
-        expect(PreviewManager.previewWindowOpenAction(details({ url, disposition }))).toBe("deny");
+        for (const postBody of [
+          undefined,
+          { data: [], contentType: "application/x-www-form-urlencoded" },
+        ]) {
+          expect(
+            PreviewManager.previewWindowOpenAction({ ...details({ url, disposition }), postBody }),
+          ).toBe("deny");
+        }
       }
     }
   });
@@ -599,6 +612,64 @@ describe("PreviewManager", () => {
     createFromPath.mockClear();
     webviewSend.mockClear();
   });
+
+  effectIt.effect(
+    "preserves target=_blank form posts through hardened native popups without replaying a GET",
+    () =>
+      withManager((manager) =>
+        Effect.gen(function* () {
+          const preview = makeFaviconWebContents({ url: "https://example.test/signin" });
+          fromId.mockReturnValue(preview.webContents);
+          const opened: Array<{ tabId: string; url: string; background: boolean }> = [];
+          yield* manager.subscribeOpenLinks((event) => Effect.sync(() => void opened.push(event)));
+          yield* manager.createTab("tab_form_post");
+          yield* manager.registerWebview("tab_form_post", 42);
+          const installed = (preview.webContents as Electron.WebContents)
+            .setWindowOpenHandler as ReturnType<typeof vi.fn>;
+          const handler = installed.mock.lastCall![0] as (
+            details: Partial<Electron.HandlerDetails>,
+          ) => Electron.WindowOpenHandlerResponse;
+          for (const disposition of ["foreground-tab", "background-tab"] as const) {
+            for (const postBody of [
+              {
+                data: [{ type: "rawData" as const, bytes: Buffer.from("result=fixture") }],
+                contentType: "application/x-www-form-urlencoded",
+              },
+              {
+                data: [
+                  {
+                    type: "rawData" as const,
+                    bytes: Buffer.from("--fixture-boundary\r\nfixture\r\n--fixture-boundary--"),
+                  },
+                ],
+                contentType: "multipart/form-data",
+                boundary: "fixture-boundary",
+              },
+            ]) {
+              expect(
+                handler({
+                  url: "https://example.test/signin/return",
+                  disposition,
+                  postBody,
+                  referrer: {
+                    url: "https://example.test/signin",
+                    policy: "strict-origin-when-cross-origin",
+                  },
+                }),
+              ).toEqual({
+                action: "allow",
+                overrideBrowserWindowOptions: {
+                  webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+                },
+              });
+            }
+          }
+          expect(preview.loadURL).not.toHaveBeenCalled();
+          expect(opened).toEqual([]);
+          expect(preview.webContents.getURL()).toBe("https://example.test/signin");
+        }),
+      ),
+  );
 
   effectIt.effect("opens a target=_blank link as a new tab without navigating the opener", () =>
     withManager((manager) =>
