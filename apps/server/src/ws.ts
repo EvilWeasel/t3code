@@ -28,6 +28,7 @@ import {
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
   AuthOrchestrationOperateScope,
+  AuthOrchestrationReadScope,
   type AuthEnvironmentScope,
   type ScheduledTaskListResult,
   AuthSessionId,

@@ -45,7 +45,7 @@ export class MainRendererDiagnostics extends Context.Service<
       event?: DesktopIpc.DesktopIpcInvokeEvent,
     ) => Effect.Effect<boolean>;
   }
->()("@t3tools/desktop/MainRendererDiagnostics") {}
+>()("@t3tools/desktop/ipc/methods/mainRendererDiagnostics") {}
 
 type Pending = {
   readonly source: string;

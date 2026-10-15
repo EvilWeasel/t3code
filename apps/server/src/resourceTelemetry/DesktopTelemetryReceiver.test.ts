@@ -1,4 +1,5 @@
-import * as NodeStream from "node:stream";
+import * as NodeStream from "@effect/platform-node/NodeStream";
+import * as Queue from "effect/Queue";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   DesktopTelemetryControlMessage,
@@ -123,22 +124,25 @@ it.effect(
   "requires advertised paired support and exact request nonces on the actual NDJSON receiver",
   () =>
     Effect.gen(function* () {
-      const inputStream = new NodeStream.PassThrough();
+      const inputQueue = yield* Queue.unbounded<string>();
+      const inputStream = yield* NodeStream.toReadable(Stream.fromQueue(inputQueue));
       const requestSeen =
         yield* Deferred.make<
           Extract<DesktopTelemetryControlMessage, { type: "mainRendererDiagnosticsRequest" }>
         >();
       const commands: DesktopTelemetryControlMessage[] = [];
       const config = yield* ServerConfig.ServerConfig;
-      const decodeControl = Schema.decodeUnknownSync(
+      const decodeControl = Schema.decodeUnknownEffect(
         Schema.fromJsonString(DesktopTelemetryControlMessage),
       );
-      const encode = Schema.encodeSync(Schema.fromJsonString(DesktopHostTelemetryMessage));
+      const encode = Schema.encodeEffect(Schema.fromJsonString(DesktopHostTelemetryMessage));
       const receiver = yield* make({
         readable: inputStream,
         write: (_fd, bytes) =>
           Effect.gen(function* () {
-            const message = decodeControl(new TextDecoder().decode(bytes));
+            const message = yield* decodeControl(new TextDecoder().decode(bytes)).pipe(
+              Effect.orDie,
+            );
             commands.push(message);
             if (message.type === "mainRendererDiagnosticsRequest")
               yield* Deferred.succeed(requestSeen, message);
@@ -169,13 +173,14 @@ it.effect(
         commands.some((m) => m.type === "mainRendererDiagnosticsPeer"),
         false,
       );
-      inputStream.write(
-        encode({
+      yield* Queue.offer(
+        inputQueue,
+        (yield* encode({
           version: 1,
           type: "desktopTelemetryHello",
           electronPid: 1,
           mainRendererDiagnostics: { revision: 1, desktopNonce: "desktop" },
-        }) + "\n",
+        })) + "\n",
       );
       // This actual decoded hello updates health; subscribe-before-write provides the milestone.
       const read = yield* Effect.gen(function* () {
@@ -197,18 +202,19 @@ it.effect(
         requestNonce: request.requestNonce,
         result: { status: "unavailable", reason: "off" },
       } as const;
-      inputStream.write(
-        encode({
+      yield* Queue.offer(
+        inputQueue,
+        (yield* encode({
           ...reply,
           requestNonce: "wrong",
           result: { status: "unavailable", reason: "invalid-response" },
-        }) + "\n",
+        })) + "\n",
       );
-      inputStream.write(encode(reply) + "\n");
+      yield* Queue.offer(inputQueue, (yield* encode(reply)) + "\n");
       assert.deepEqual(yield* Fiber.join(read), { status: "unavailable", reason: "off" });
       assert.equal(commands.filter((m) => m.type === "mainRendererDiagnosticsPeer").length, 1);
       assert.equal(commands.filter((m) => m.type === "mainRendererDiagnosticsRequest").length, 1);
-      inputStream.end();
+      yield* Queue.end(inputQueue);
     }).pipe(
       Effect.scoped,
       Effect.provide(

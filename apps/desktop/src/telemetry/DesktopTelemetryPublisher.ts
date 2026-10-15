@@ -488,19 +488,19 @@ export const make = Effect.fn("desktop.telemetryPublisher.make")(function* () {
             yield* service
               .read(desktopNonce, () => alive && serverNonce === peer, message.input)
               .pipe(
-                Effect.flatMap((result) =>
-                  alive && serverNonce === peer
-                    ? PubSub.publish(replies, {
-                        version: 1,
-                        type: "mainRendererDiagnosticsReply",
-                        desktopNonce,
-                        serverNonce: message.serverNonce,
-                        requestId: message.input.requestId,
-                        requestNonce: message.input.requestNonce,
-                        result,
-                      }).pipe(Effect.asVoid)
-                    : Effect.void,
-                ),
+                Effect.flatMap((result) => {
+                  if (!alive || serverNonce !== peer) return Effect.void;
+                  const reply: DesktopMainRendererDiagnosticsReply = {
+                    version: 1,
+                    type: "mainRendererDiagnosticsReply",
+                    desktopNonce,
+                    serverNonce: message.serverNonce,
+                    requestId: message.input.requestId,
+                    requestNonce: message.input.requestNonce,
+                    result,
+                  };
+                  return PubSub.publish(replies, reply).pipe(Effect.asVoid);
+                }),
                 Effect.ensuring(
                   Effect.sync(() => {
                     busy = false;

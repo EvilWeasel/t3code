@@ -16,6 +16,7 @@ import * as Layer from "effect/Layer";
 import { Atom, AtomRegistry } from "effect/reactivity";
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import { RpcPermissionGuard } from "../rpc/client.ts";
+import type { ConnectionCatalogEntry } from "../connection/catalog.ts";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
@@ -32,6 +33,8 @@ import {
   AVAILABLE_CONNECTION_STATE,
   PrimaryConnectionTarget,
   type PreparedConnection,
+  type SupervisorConnectionState,
+  type NetworkStatus,
 } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as Persistence from "../platform/persistence.ts";
@@ -974,7 +977,7 @@ describe("legacy trace diagnostics query", () => {
                   : trace;
               }),
           } as unknown as WsRpcProtocolClient;
-          const state = yield* SubscriptionRef.make({
+          const state = yield* SubscriptionRef.make<SupervisorConnectionState>({
             ...AVAILABLE_CONNECTION_STATE,
             desired: true,
             network: "online" as const,
@@ -1001,6 +1004,10 @@ describe("legacy trace diagnostics query", () => {
           const runtime = Atom.runtime(
             Layer.mergeAll(
               Layer.mock(EnvironmentRegistry.EnvironmentRegistry)({
+                entries: yield* SubscriptionRef.make<
+                  ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>
+                >(new Map<EnvironmentId, ConnectionCatalogEntry>()),
+                networkStatus: yield* SubscriptionRef.make<NetworkStatus>("online"),
                 run,
                 followStream,
                 stateChanges: () => SubscriptionRef.changes(state),

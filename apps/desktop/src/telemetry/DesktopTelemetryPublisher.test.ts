@@ -833,8 +833,10 @@ it.effect(
       yield* Effect.gen(function* () {
         const service = yield* DesktopTelemetryPublisher.DesktopTelemetryPublisher;
         const old = Option.getOrThrow(yield* Stream.runHead(service.encoded));
-        const decode = Schema.decodeUnknownSync(Schema.fromJsonString(DesktopHostTelemetryMessage));
-        const oldHello = decode(new TextDecoder().decode(old));
+        const decode = Schema.decodeUnknownEffect(
+          Schema.fromJsonString(DesktopHostTelemetryMessage),
+        );
+        const oldHello = yield* decode(new TextDecoder().decode(old));
         assert.equal(oldHello.type, "desktopTelemetryHello");
         if (oldHello.type === "desktopTelemetryHello")
           assert.equal(oldHello.mainRendererDiagnostics, undefined);
@@ -842,7 +844,9 @@ it.effect(
         const received = yield* Queue.unbounded<DesktopHostTelemetryMessage>();
         yield* connection.encoded.pipe(
           Stream.runForEach((bytes) =>
-            Queue.offer(received, decode(new TextDecoder().decode(bytes))),
+            decode(new TextDecoder().decode(bytes)).pipe(
+              Effect.flatMap((message) => Queue.offer(received, message)),
+            ),
           ),
           Effect.forkScoped,
         );
@@ -888,7 +892,7 @@ it.effect(
         yield* Deferred.succeed(release, undefined);
         assert.equal(closed, 1);
         const replacement = yield* service.createDiagnosticsConnection!("same-backend");
-        const replacementHello = decode(
+        const replacementHello = yield* decode(
           new TextDecoder().decode(Option.getOrThrow(yield* Stream.runHead(replacement.encoded))),
         );
         assert.equal(replacementHello.type, "desktopTelemetryHello");
