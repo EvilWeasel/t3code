@@ -51,9 +51,32 @@ $fixtureTerminal = $null
 $fixtureReleaseAttempted = $false
 $fixtureCreation = $null
 $fixtureCapturedPid = $null
+$fixtureInputCodePage = 'unknown'
+$fixtureInputPreamble = 'unknown'
+# Closed metadata only; never format the preamble byte array or arbitrary pipe bytes.
+function Get-FixturePreambleClass([AllowEmptyCollection()][byte[]]$Preamble) {
+    if ($null -eq $Preamble) { return 'unavailable' }
+    if ($Preamble.Length -eq 0) { return 'none' }
+    if ($Preamble.Length -eq 3 -and $Preamble[0] -eq 239 -and $Preamble[1] -eq 187 -and $Preamble[2] -eq 191) { return 'utf8' }
+    if ($Preamble.Length -eq 2 -and $Preamble[0] -eq 255 -and $Preamble[1] -eq 254) { return 'utf16-le' }
+    if ($Preamble.Length -eq 2 -and $Preamble[0] -eq 254 -and $Preamble[1] -eq 255) { return 'utf16-be' }
+    if ($Preamble.Length -eq 4 -and $Preamble[0] -eq 255 -and $Preamble[1] -eq 254 -and $Preamble[2] -eq 0 -and $Preamble[3] -eq 0) { return 'utf32-le' }
+    if ($Preamble.Length -eq 4 -and $Preamble[0] -eq 0 -and $Preamble[1] -eq 0 -and $Preamble[2] -eq 254 -and $Preamble[3] -eq 255) { return 'utf32-be' }
+    return 'other'
+}
+# Fixed privacy-classifier cases only, no console mutation or native operation.
+Assert-Equal 'none' (Get-FixturePreambleClass -Preamble ([byte[]]@()))
+Assert-Equal 'utf8' (Get-FixturePreambleClass -Preamble ([byte[]]@(239,187,191)))
+Assert-Equal 'utf16-le' (Get-FixturePreambleClass -Preamble ([byte[]]@(255,254)))
+Assert-Equal 'utf16-be' (Get-FixturePreambleClass -Preamble ([byte[]]@(254,255)))
+Assert-Equal 'utf32-le' (Get-FixturePreambleClass -Preamble ([byte[]]@(255,254,0,0)))
+Assert-Equal 'utf32-be' (Get-FixturePreambleClass -Preamble ([byte[]]@(0,0,254,255)))
+Assert-Equal 'other' (Get-FixturePreambleClass -Preamble ([byte[]]@(239,187)))
+Assert-Equal 'other' (Get-FixturePreambleClass -Preamble ([byte[]]@(1,2,3)))
 # Static state only, captured before cleanup can release/dispose the owned child.
 function Write-FixtureBoundary([string]$Phase) {
     $alive = 'unknown'; $exitCode = 'unknown'; $moduleAvailable = 'unknown'; $terminal = 'pending'
+    $mismatchIndex = 'unknown'; $mismatchClass = 'unknown'
     if ($fixtureStarted -and $null -ne $fixtureProcess) {
         try {
             $fixtureProcess.Refresh()
@@ -64,15 +87,25 @@ function Write-FixtureBoundary([string]$Phase) {
     }
     if ($null -ne $fixtureTerminal -and $fixtureTerminal.IsCompleted) {
         try {
-            $terminal = switch ($fixtureTerminal.Result) {
-                'MORROWBYTE_GUARD_FIXTURE_EOF' { 'eof-before-release'; break }
-                'MORROWBYTE_GUARD_FIXTURE_MISMATCH' { 'nonmatching-release'; break }
-                'MORROWBYTE_GUARD_FIXTURE_MATCHED' { 'matched-release'; break }
+            $terminal = switch -Regex ($fixtureTerminal.Result) {
+                '^MORROWBYTE_GUARD_FIXTURE_EOF$' { 'eof-before-release'; break }
+                '^MORROWBYTE_GUARD_FIXTURE_MISMATCH:([0-9]{1,2}):(prefix-ef|prefix-ff|prefix-fe|nul|lf|cr|ascii-other|other)$' {
+                    $index = [int]$Matches[1]
+                    if ($index -lt $fixtureReleaseBytes.Length) {
+                        $mismatchIndex = $index
+                        $mismatchClass = $Matches[2]
+                        'nonmatching-release'
+                    } else { 'unclassified-terminal' }
+                    break
+                }
+                '^MORROWBYTE_GUARD_FIXTURE_MATCHED$' { 'matched-release'; break }
+                '^MORROWBYTE_GUARD_FIXTURE_CLASSIFICATION_ERROR$' { 'classification-error'; break }
                 default { 'unclassified-terminal'; break }
             }
         } catch { $terminal = 'unavailable' }
     }
     Write-Output ('Morrowbyte fixture boundary: phase={0}; alive={1}; exit={2}; module={3}; release_attempted={4}; terminal={5}; pid={6}' -f $Phase, $alive, $exitCode, $moduleAvailable, $fixtureReleaseAttempted, $terminal, $(if ($null -eq $fixtureCapturedPid) { 'unknown' } else { $fixtureCapturedPid }))
+    Write-Output ('Morrowbyte fixture input: code_page={0}; preamble_class={1}; mismatch_index={2}; byte_class={3}' -f $fixtureInputCodePage, $fixtureInputPreamble, $mismatchIndex, $mismatchClass)
 }
 function Assert-FixtureCimIdentity([string]$Phase) {
     # Resolve only the captured PID and the unique invocation-owned image name.
@@ -117,7 +150,23 @@ try {
     $fixtureSource = @'
 using System;
 public static class MorrowbyteGuardFixture {
+    private static string ByteClass(int value) {
+        if (value == 239) return "prefix-ef";
+        if (value == 255) return "prefix-ff";
+        if (value == 254) return "prefix-fe";
+        if (value == 0) return "nul";
+        if (value == 10) return "lf";
+        if (value == 13) return "cr";
+        return value < 128 ? "ascii-other" : "other";
+    }
     public static int Main() {
+        if (ByteClass(239) != "prefix-ef" || ByteClass(255) != "prefix-ff" ||
+            ByteClass(254) != "prefix-fe" || ByteClass(0) != "nul" ||
+            ByteClass(10) != "lf" || ByteClass(13) != "cr" ||
+            ByteClass(77) != "ascii-other" || ByteClass(128) != "other") {
+            Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_CLASSIFICATION_ERROR");
+            return 2;
+        }
         Console.WriteLine("MORROWBYTE_GUARD_FIXTURE_READY");
         Console.Out.Flush();
         var expected = System.Text.Encoding.ASCII.GetBytes("MORROWBYTE_GUARD_FIXTURE_RELEASE\n");
@@ -125,7 +174,7 @@ public static class MorrowbyteGuardFixture {
         for (int i = 0; i < expected.Length; i++) {
             int value = input.ReadByte();
             if (value < 0) { Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_EOF"); return 2; }
-            if (value != expected[i]) { Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_MISMATCH"); return 2; }
+            if (value != expected[i]) { Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_MISMATCH:{0}:{1}", i, ByteClass(value)); return 2; }
         }
         Console.Error.WriteLine("MORROWBYTE_GUARD_FIXTURE_MATCHED");
         return 0;
@@ -146,6 +195,10 @@ public static class MorrowbyteGuardFixture {
     $fixtureStart.RedirectStandardError = $true
     $fixtureProcess = [Diagnostics.Process]::new()
     $fixtureProcess.StartInfo = $fixtureStart
+    # Read only immediately before Start; do not change process/console encoding.
+    $inputEncoding = [Console]::InputEncoding
+    $fixtureInputCodePage = $inputEncoding.CodePage
+    $fixtureInputPreamble = Get-FixturePreambleClass -Preamble $inputEncoding.GetPreamble()
     $fixtureStarted = $fixtureProcess.Start()
     if (-not $fixtureStarted) { throw 'Owned fixture process did not start.' }
     $fixturePhase = 'readiness'
