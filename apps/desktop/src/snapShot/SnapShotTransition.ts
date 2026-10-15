@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import type * as Fiber from "effect/Fiber";
 
 import * as Electron from "electron";
+import type { ElectronWindow } from "../electron/ElectronWindow.ts";
 
 const MIN_DURATION_MS = 280;
 const MAX_DURATION_MS = 680;
@@ -56,6 +57,7 @@ type ActiveTransition = {
 };
 
 type SnapShotTransitionOptions = {
+  readonly tryReserveRendererCreation?: ElectronWindow["Service"]["tryReserveRendererCreation"];
   readonly showWindow?: ((window: Electron.BaseWindow) => void) | undefined;
   readonly boundOverlayToCaptureDisplays?: boolean | undefined;
   readonly waitForCompositorFrame?: boolean | undefined;
@@ -103,8 +105,13 @@ export function snapShotAnimationDisplayBounds(
 function createWindow(
   bounds: Electron.Rectangle,
   alwaysOnTopLevel: SnapShotTransitionOptions["alwaysOnTopLevel"],
+  tryReserveRendererCreation: SnapShotTransitionOptions["tryReserveRendererCreation"],
 ): Electron.BrowserWindow {
-  const window = new Electron.BrowserWindow({
+  const reservation = tryReserveRendererCreation?.({ kind: "snapshot-window", owner: null });
+  if (tryReserveRendererCreation !== undefined && reservation === undefined) throw new Error("Snapshot window creation refused during update admission");
+  let window: Electron.BrowserWindow;
+  try {
+    window = new Electron.BrowserWindow({
     ...bounds,
     alwaysOnTop: true,
     backgroundColor: "#00000000",
@@ -123,6 +130,15 @@ function createWindow(
       sandbox: true,
     },
   });
+  } catch (cause) {
+    reservation?.release();
+    throw cause;
+  }
+  if (reservation !== undefined) window.once("closed", reservation.release);
+  if (reservation !== undefined && !reservation.bind(window.webContents)) {
+    window.close();
+    throw new Error("Snapshot renderer creation could not be bound");
+  }
   if (alwaysOnTopLevel) window.setAlwaysOnTop(true, alwaysOnTopLevel);
   window.setIgnoreMouseEvents(true);
   return window;
@@ -206,11 +222,13 @@ export class SnapShotTransition {
   private readonly waitForCompositorFrame: boolean;
   private readonly alwaysOnTopLevel: SnapShotTransitionOptions["alwaysOnTopLevel"];
   private readonly showWindow: (window: Electron.BaseWindow) => void;
+  private readonly tryReserveRendererCreation: SnapShotTransitionOptions["tryReserveRendererCreation"];
 
   constructor(options: SnapShotTransitionOptions = {}) {
     this.boundOverlayToCaptureDisplays = options.boundOverlayToCaptureDisplays ?? false;
     this.waitForCompositorFrame = options.waitForCompositorFrame ?? false;
     this.alwaysOnTopLevel = options.alwaysOnTopLevel;
+    this.tryReserveRendererCreation = options.tryReserveRendererCreation;
     this.showWindow = options.showWindow ?? ((window) => window.showInactive());
   }
 
@@ -265,7 +283,7 @@ export class SnapShotTransition {
     const overlays: ActiveTransition["overlays"] = [];
     try {
       for (const bounds of requestedBounds) {
-        const window = createWindow(bounds, this.alwaysOnTopLevel);
+        const window = createWindow(bounds, this.alwaysOnTopLevel, this.tryReserveRendererCreation);
         const overlay = { window, requestedBounds: bounds, bounds: window.getBounds() };
         active.overlays.push(overlay);
         overlays.push(overlay);

@@ -2,6 +2,8 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Option from "effect/Option";
+import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as Electron from "electron";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import { MacPermissionHelper } from "./MacPermissionHelper.ts";
@@ -23,7 +25,8 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const environment = yield* DesktopEnvironment.DesktopEnvironment;
     const path = yield* Path.Path;
-    const helper = new MacPermissionHelper();
+    const window = yield* Effect.serviceOption(ElectronWindow.ElectronWindow);
+    const helper = new MacPermissionHelper(Option.isSome(window) ? window.value.tryReserveRendererCreation : undefined);
     yield* Effect.addFinalizer(() => Effect.sync(() => helper.close()));
     return MacPermissions.of({
       showHelper: Effect.fn("MacPermissions.showHelper")(function* (permission, owner, isGranted) {

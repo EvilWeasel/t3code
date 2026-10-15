@@ -48,7 +48,10 @@ vi.mock("./WindowsForegroundFocusThread.ts", () => ({
 vi.mock("electron", () => ({
   app: {
     focus: appFocusMock,
+    on: vi.fn(),
+    removeListener: vi.fn(),
   },
+  webContents: { getAllWebContents: () => [] },
   BrowserWindow: Object.assign(browserWindowMock, {
     getAllWindows: getAllWindowsMock,
     getFocusedWindow: getFocusedWindowMock,
@@ -107,6 +110,83 @@ describe("ElectronWindow", () => {
     windowsForegroundFocusMock.mockReset().mockResolvedValue(false);
     windowsForegroundPrepareMock.mockReset().mockResolvedValue(false);
     windowsForegroundCloseMock.mockReset();
+  });
+
+  it("holds native creation synchronously and revokes proof for unexpected WebContents allocation", () => {
+    let now = 100;
+    const contents: Electron.WebContents[] = [];
+    const gate = ElectronWindow.makeRendererCreationAdmission(() => now, () => contents);
+    const token = gate.acquire(200);
+    assert.isDefined(token);
+    assert.isFalse(gate.canCreateUncorrelatedRenderer());
+    assert.isUndefined(gate.tryReserveRendererCreation({ kind: "main-window", owner: null }));
+    const unexpected = { id: 9, isDestroyed: () => false } as Electron.WebContents;
+    contents.push(unexpected);
+    gate.observeCreated(unexpected);
+    assert.isFalse(token!.tryCommit());
+    token!.release();
+    assert.isTrue(gate.canCreateUncorrelatedRenderer());
+    assert.isUndefined(gate.acquire(200));
+    contents.splice(0);
+    gate.observeDestroyed(unexpected);
+    const fresh = gate.acquire(200);
+    assert.isDefined(fresh);
+    now = 200;
+    assert.isFalse(fresh!.isValid());
+    // Expiry invalidates proof, but never opens a held creation lane by timeout.
+    assert.isFalse(gate.canCreateUncorrelatedRenderer());
+    fresh!.release();
+  });
+
+  it("refuses pending or uncorrelated guests and binds only a new exact creator-owned contents", () => {
+    const contents: Electron.WebContents[] = [];
+    const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => contents);
+    const create = gate.tryReserveRendererCreation({ kind: "main-window", owner: null });
+    assert.isDefined(create);
+    assert.isUndefined(gate.acquire(200));
+    const first = { id: 7, isDestroyed: () => false } as Electron.WebContents;
+    contents.push(first);
+    gate.observeCreated(first);
+    assert.isTrue(create!.bind(first));
+    assert.isFalse(create!.bind(first));
+    const held = gate.acquire(200);
+    assert.isDefined(held);
+    gate.observeActivity();
+    assert.isFalse(held!.isValid());
+    held!.release();
+    const guest = { id: 8, isDestroyed: () => false } as Electron.WebContents;
+    contents.push(guest);
+    gate.observeCreated(guest);
+    const unrelated = gate.tryReserveRendererCreation({ kind: "preview-pip", owner: 7 });
+    assert.isFalse(unrelated!.bind(guest)); // Allocation preceded this exact reservation.
+    unrelated!.release();
+    assert.isUndefined(gate.acquire(200));
+    contents.splice(1);
+    gate.observeDestroyed(guest);
+    const afterGuest = gate.acquire(200);
+    assert.isDefined(afterGuest);
+    afterGuest!.release();
+    create!.release(); // Premature release leaves live first renderer unknown.
+    assert.isUndefined(gate.acquire(200));
+  });
+
+  it("holds native activity without inventing a WebContents for BaseWindow or capture", () => {
+    const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+    const capture = gate.tryReserveRuntimeActivity({ kind: "snapshot-capture" });
+    const flash = gate.tryReserveRuntimeActivity({ kind: "snapshot-flash" });
+    assert.isUndefined(gate.acquire(200));
+    capture!.release();
+    assert.isUndefined(gate.acquire(200));
+    flash!.release();
+    const held = gate.acquire(200);
+    assert.isDefined(held);
+    assert.isUndefined(gate.tryReserveRuntimeActivity({ kind: "snapshot-capture" }));
+    assert.isUndefined(gate.tryReserveRuntimeActivity({ kind: "snapshot-flash" }));
+    held!.release();
+    const newer = gate.acquire(200);
+    held!.release(); // An old identity cannot open the new reservation.
+    assert.isFalse(gate.canCreateUncorrelatedRenderer());
+    newer!.release();
   });
 
   it.effect("preserves schema-safe creation context and the Electron cause", () =>

@@ -1,5 +1,6 @@
 // @effect-diagnostics globalTimers:off -- Poll TCC only while the native permission helper is open.
 import * as Electron from "electron";
+import type { ElectronWindow } from "../electron/ElectronWindow.ts";
 import { MAC_PERMISSION_HELPER_CHANNEL } from "../ipc/channels.ts";
 
 import {
@@ -70,6 +71,8 @@ export class MacPermissionHelper {
   private generation = 0;
   private window: Electron.BrowserWindow | undefined;
 
+  constructor(private readonly tryReserveRendererCreation?: ElectronWindow["Service"]["tryReserveRendererCreation"]) {}
+
   close() {
     this.generation++;
     this.window?.destroy();
@@ -97,7 +100,11 @@ export class MacPermissionHelper {
       .find((image) => !image.isEmpty());
     if (!appIcon) throw new Error("The packaged T3 Code icon is missing.");
     const icon = appIcon.resize({ width: 64, height: 64 });
-    const window = new Electron.BrowserWindow({
+    const reservation = this.tryReserveRendererCreation?.({ kind: "permission-window", owner: owner?.webContents.id ?? null });
+    if (this.tryReserveRendererCreation !== undefined && reservation === undefined) return;
+    let window: Electron.BrowserWindow;
+    try {
+      window = new Electron.BrowserWindow({
       width: 560,
       height: 140,
       show: false,
@@ -115,6 +122,15 @@ export class MacPermissionHelper {
       title: `Set up ${MAC_PERMISSION_TITLES[permission]}`,
       webPreferences: { preload, sandbox: true, contextIsolation: true, nodeIntegration: false },
     });
+    } catch (cause) {
+      reservation?.release();
+      throw cause;
+    }
+    window.once("closed", () => reservation?.release());
+    if (reservation !== undefined && !reservation.bind(window.webContents)) {
+      window.close();
+      return;
+    }
     this.window = window;
     const finish = () => {
       window.close();

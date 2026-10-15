@@ -1,3 +1,4 @@
+import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as MacPermissions from "../permissions/MacPermissions.ts";
 import { assert, it } from "@effect/vitest";
 import {
@@ -290,6 +291,9 @@ vi.mock("node:child_process", () => ({
 vi.mock("electron", () => {
   class BaseWindow {
     protected readonly state: (typeof flashWindows)[number];
+    private readonly closed: Array<() => void> = [];
+    once(event: string, listener: () => void) { if (event === "closed") this.closed.push(listener); return this; }
+    close() { this.destroy(); }
 
     constructor(options: Electron.BrowserWindowConstructorOptions) {
       this.state = {
@@ -317,6 +321,7 @@ vi.mock("electron", () => {
 
     destroy() {
       this.state.destroyed = true;
+      for (const listener of this.closed.splice(0)) listener();
     }
 
     getBounds() {
@@ -3928,3 +3933,77 @@ it.effect("rejects macOS test capture on other platforms", () =>
     }),
   ).pipe(Effect.provide(layerTest("win32"))),
 );
+
+it("refuses native flash construction while installation holds runtime admission", async () => {
+  flashWindows.length = 0;
+  const flash = new DesktopSnapShot.SnapShotFlash(undefined, () => undefined);
+  await flash.showStatic({ x: 0, y: 0, width: 10, height: 10 });
+  assert.lengthOf(flashWindows, 0);
+  flash.dispose();
+});
+
+it("holds native BaseWindow activity until the actual closed lifecycle", async () => {
+  flashWindows.length = 0;
+  let releases = 0;
+  const flash = new DesktopSnapShot.SnapShotFlash(undefined, () => ({ release: () => { releases++; } }));
+  await flash.showStatic({ x: 0, y: 0, width: 10, height: 10 });
+  assert.lengthOf(flashWindows, 1);
+  assert.equal(releases, 0);
+  flash.dispose();
+  assert.isTrue(flashWindows[0]!.destroyed);
+  assert.equal(releases, 1);
+});
+
+it.effect("refuses capture before any capture native work while install admission is held", () =>
+  Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    const before = activeWindowMock.mock.calls.length;
+    const error = yield* service.capture.pipe(Effect.flip);
+    assert.equal(error.operation, "capture");
+    assert.equal(activeWindowMock.mock.calls.length, before);
+  })).pipe(
+    Effect.provide(layerTest("win32")),
+    Effect.provideService(ElectronWindow.ElectronWindow, {
+      tryReserveRuntimeActivity: () => undefined,
+    } as ElectronWindow.ElectronWindow["Service"]),
+  ),
+);
+
+it.effect("retains a pending native capture hold after Effect interruption until native completion", () => {
+  const nativeStarted = Promise.withResolvers<void>();
+  const finishNative = Promise.withResolvers<undefined>();
+  const nativeRetired = Promise.withResolvers<void>();
+  activeWindowMock.mockReset().mockImplementation(() => {
+    nativeStarted.resolve();
+    return finishNative.promise;
+  });
+  const gate = ElectronWindow.makeRendererCreationAdmission(() => 100, () => []);
+  let acquisitions = 0;
+  const reserve: NonNullable<ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"]> = (request) => {
+    const token = gate.tryReserveRuntimeActivity(request);
+    const native = ++acquisitions === 2;
+    return token === undefined ? undefined : { release: () => {
+      token.release();
+      if (native) nativeRetired.resolve();
+    } };
+  };
+  return Effect.scoped(Effect.gen(function* () {
+    const service = yield* DesktopSnapShot.make;
+    yield* service.configure(enabledSettings({ snapShotFlash: false, snapShotAnimations: false }));
+    const capturing = yield* service.capture.pipe(Effect.forkScoped);
+    yield* Effect.promise(() => nativeStarted.promise);
+    assert.isUndefined(gate.acquire(200));
+    yield* Fiber.interrupt(capturing);
+    // Interrupting the fiber does not mean the native async operation finished.
+    assert.isUndefined(gate.acquire(200));
+    finishNative.resolve(undefined);
+    yield* Effect.promise(() => nativeRetired.promise);
+    const held = gate.acquire(200);
+    assert.isDefined(held);
+    held!.release();
+  })).pipe(
+    Effect.provide(layerTest("win32", { makeDirectory: () => Effect.void })),
+    Effect.provideService(ElectronWindow.ElectronWindow, { tryReserveRuntimeActivity: reserve } as ElectronWindow.ElectronWindow["Service"]),
+    Effect.ensuring(Effect.sync(() => { finishNative.resolve(undefined); activeWindowMock.mockReset(); })),
+  );
+});

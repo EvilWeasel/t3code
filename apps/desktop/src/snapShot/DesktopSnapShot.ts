@@ -71,6 +71,7 @@ import {
   type RegionSnapShotPool,
   type RegionSnapShotSource,
 } from "./RegionSnapShot.ts";
+import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import { type SnapShotAnimationDestination, SnapShotTransition } from "./SnapShotTransition.ts";
 import {
   type AccessibilityProcessPool,
@@ -579,6 +580,7 @@ export class SnapShotFlash {
 
   constructor(
     showWindow: (window: Electron.BaseWindow) => void = (window) => window.showInactive(),
+    private readonly tryReserveRuntimeActivity?: ElectronWindow.ElectronWindow["Service"]["tryReserveRuntimeActivity"],
   ) {
     this.showWindow = showWindow;
   }
@@ -606,7 +608,12 @@ export class SnapShotFlash {
     durationMs: number,
   ): Promise<void> {
     this.dispose();
-    const window = createSnapShotFlashWindow(bounds);
+    const reservation = this.tryReserveRuntimeActivity?.({ kind: "snapshot-flash" });
+    if (this.tryReserveRuntimeActivity !== undefined && reservation === undefined) return;
+    let window: Electron.BaseWindow;
+    try { window = createSnapShotFlashWindow(bounds); }
+    catch (cause) { reservation?.release(); throw cause; }
+    if (reservation !== undefined) window.once("closed", reservation.release);
     this.flashWindow = window;
     if (window.isDestroyed()) return;
     this.showWindow(window);
@@ -779,8 +786,11 @@ export const make = Effect.gen(function* () {
   let stopShiftShortcut: (() => void) | undefined;
   const showCaptureWindow =
     environment.platform === "win32" ? showWindowsCaptureOverlay : undefined;
-  const flash = new SnapShotFlash(showCaptureWindow);
+  const updateWindow = yield* Effect.serviceOption(ElectronWindow.ElectronWindow);
+  const reserveActivity = Option.isSome(updateWindow) ? updateWindow.value.tryReserveRuntimeActivity : undefined;
+  const flash = new SnapShotFlash(showCaptureWindow, reserveActivity);
   const transition = new SnapShotTransition({
+    tryReserveRendererCreation: Option.isSome(updateWindow) ? updateWindow.value.tryReserveRendererCreation : undefined,
     showWindow: showCaptureWindow,
     waitForCompositorFrame: environment.platform === "win32",
     // Transparent Windows surfaces must not resize while their compositor animation is running.
@@ -874,8 +884,12 @@ export const make = Effect.gen(function* () {
       yield* fileSystem.makeDirectory(captureDirectory, { recursive: true });
       yield* emit({ type: "requested", id: id as DesktopSnapShotId });
       const snapshot = yield* Effect.tryPromise({
-        try: () =>
-          captureSource({
+        try: async () => {
+          const nativeActivity = reserveActivity?.({ kind: "snapshot-capture" });
+          if (reserveActivity !== undefined && nativeActivity === undefined) throw new Error("Capture refused during update admission");
+          let returned = false;
+          try {
+            const snapshot = await captureSource({
             mode,
             captureId: id,
             platform: environment.platform,
@@ -892,7 +906,15 @@ export const make = Effect.gen(function* () {
             onLinuxFeedback: (feedback) => {
               linuxFeedback = { id, feedback };
             },
-          }),
+          });
+            // Interruption of the Effect cannot cancel the underlying native
+            // promise. Keep its separate hold until real completion, including
+            // the accessibility read which otherwise outlives pixel capture.
+            void snapshot.contextPromise.then(() => nativeActivity?.release(), () => nativeActivity?.release());
+            returned = true;
+            return snapshot;
+          } finally { if (!returned) nativeActivity?.release(); }
+        },
         catch: (cause) => captureFailure(cause, id),
       });
       const capturedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
@@ -966,7 +988,12 @@ export const make = Effect.gen(function* () {
     }).pipe(Effect.mapError((cause) => captureFailure(cause, id)));
   });
 
-  const capture = Effect.gen(function* () {
+  const capture = Effect.scoped(Effect.gen(function* () {
+    const activity = yield* Effect.acquireRelease(
+      Effect.sync(() => reserveActivity?.({ kind: "snapshot-capture" })),
+      (token) => Effect.sync(() => token?.release()),
+    );
+    if (reserveActivity !== undefined && activity === undefined) return yield* new DesktopSnapShotError({ operation: "capture" });
     const settings = yield* Ref.get(settingsRef);
     if (!settings.snapShotEnabled) {
       return yield* new DesktopSnapShotError({ operation: "disabled" });
@@ -996,7 +1023,7 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-  }).pipe(Effect.withSpan("desktop.snapShot.capture"));
+  })).pipe(Effect.withSpan("desktop.snapShot.capture"));
 
   const captureFromShortcut = Effect.gen(function* () {
     if (shortcutSuppressed) return;

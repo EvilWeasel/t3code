@@ -5,6 +5,8 @@ import * as NodePath from "node:path";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import type * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
+import * as Scope from "effect/Scope";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -107,9 +109,113 @@ export class ElectronWindowOperationError extends Schema.TaggedError<ElectronWin
   }
 }
 
+export type RendererCreationKind = "preview-guest" | "preview-popup" | "preview-pip" |
+  "main-window" | "permission-window" | "snapshot-window";
+
+export interface RendererCreationReservation {
+  readonly bind: (contents: Electron.WebContents) => boolean;
+  readonly release: () => void;
+}
+
+export interface RuntimeActivityReservation {
+  readonly release: () => void;
+}
+
+export interface RendererInstallationReservation {
+  readonly isValid: () => boolean;
+  readonly tryCommit: () => boolean;
+}
+
+/** Synchronous native-callback boundary. Unknown allocations are never paired by
+ * order or owner: only the creator holding the exact returned object may bind. */
+export function makeRendererCreationAdmission(
+  now: () => number,
+  allContents: () => ReadonlyArray<Electron.WebContents>,
+) {
+  let epoch = 0;
+  const contents = new Map<Electron.WebContents, { epoch: number; bound: boolean }>();
+  const pending = new Set<RendererCreationReservation>();
+  const activities = new Set<RuntimeActivityReservation>();
+  let held: { epoch: number; expiresAt: number; revoked: boolean } | undefined;
+  const observeCreated = (created: Electron.WebContents) => {
+    if (contents.has(created)) return;
+    contents.set(created, { epoch: ++epoch, bound: false });
+    if (held !== undefined) held.revoked = true;
+  };
+  const observeActivity = () => {
+    epoch += 1;
+    if (held !== undefined) held.revoked = true;
+  };
+  const observeDestroyed = (destroyed: Electron.WebContents) => {
+    contents.delete(destroyed);
+    observeActivity();
+  };
+  const completeInventory = () => {
+    try {
+      return allContents().every((item) => item.isDestroyed() || contents.get(item)?.bound === true);
+    } catch { return false; }
+  };
+  const tryReserveRendererCreation = (request: { readonly kind: RendererCreationKind; readonly owner: number | null }) => {
+    if (held !== undefined) return undefined;
+    if (request.owner !== null && !allContents().some((item) => item.id === request.owner && !item.isDestroyed())) return undefined;
+    const reservedAt = epoch;
+    let bound: Electron.WebContents | undefined;
+    let released = false;
+    const reservation: RendererCreationReservation = Object.freeze({
+      bind: (item: Electron.WebContents) => {
+        const entry = contents.get(item);
+        if (released || bound !== undefined || held !== undefined || entry === undefined ||
+          entry.bound || entry.epoch <= reservedAt || item.isDestroyed()) return false;
+        if (request.owner !== null && !allContents().some((owner) => owner.id === request.owner && !owner.isDestroyed())) return false;
+        entry.bound = true;
+        bound = item;
+        pending.delete(reservation);
+        return true;
+      },
+      release: () => {
+        if (released) return;
+        released = true;
+        pending.delete(reservation);
+        // Early release cannot turn a live renderer into untracked safe state.
+        const entry = bound === undefined ? undefined : contents.get(bound);
+        if (entry !== undefined) { entry.bound = false; observeActivity(); }
+      },
+    });
+    pending.add(reservation);
+    return reservation;
+  };
+  const tryReserveRuntimeActivity = (_request: { readonly kind: "snapshot-capture" | "snapshot-flash" }) => {
+    if (held !== undefined) return undefined;
+    const token: RuntimeActivityReservation = Object.freeze({ release: () => {
+      if (activities.delete(token)) observeActivity();
+    } });
+    activities.add(token);
+    observeActivity();
+    return token;
+  };
+  const acquire = (expiresAt: number) => {
+    if (held !== undefined || activities.size !== 0 || pending.size !== 0 || expiresAt <= now() || !completeInventory()) return undefined;
+    const identity = { epoch, expiresAt, revoked: false };
+    held = identity;
+    const isValid = () => held === identity && !identity.revoked && epoch === identity.epoch &&
+      now() < identity.expiresAt && activities.size === 0 && pending.size === 0 && completeInventory();
+    return Object.freeze({
+      isValid,
+      tryCommit: isValid,
+      release: () => { if (held === identity) held = undefined; },
+    });
+  };
+  return { observeCreated, observeDestroyed, observeActivity, tryReserveRendererCreation, tryReserveRuntimeActivity,
+    canCreateUncorrelatedRenderer: () => held === undefined, acquire };
+}
+
 export class ElectronWindow extends Context.Service<
   ElectronWindow,
   {
+    readonly tryReserveRuntimeActivity?: (request: { readonly kind: "snapshot-capture" | "snapshot-flash" }) => RuntimeActivityReservation | undefined;
+    readonly tryReserveRendererCreation?: (request: { readonly kind: RendererCreationKind; readonly owner: number | null }) => RendererCreationReservation | undefined;
+    readonly canCreateUncorrelatedRenderer?: () => boolean;
+    readonly acquireUpdateRendererReservation?: (request: { readonly generation: string; readonly targetVersion: string; readonly expiresAt: number }) => Effect.Effect<Option.Option<RendererInstallationReservation>, never, Scope.Scope>;
     readonly updateInventory?: Effect.Effect<ReadonlyArray<{ readonly id: number; readonly generation: string; readonly audible: boolean }>>;
     readonly withUpdateRenderers?: <A, E, R>(use: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
     readonly create: (
@@ -134,6 +240,33 @@ export class ElectronWindow extends Context.Service<
 export const make = Effect.gen(function* () {
   const platform = yield* HostProcess.Platform;
   const updateCreationLane = yield* Semaphore.make(1);
+  const clock = yield* Clock.Clock;
+  const admission = makeRendererCreationAdmission(() => clock.currentTimeMillisUnsafe(), () => Electron.webContents.getAllWebContents());
+  const cleanups = new Set<() => void>();
+  const observeCreated = (_event: Electron.Event, contents: Electron.WebContents) => {
+    admission.observeCreated(contents);
+    const activity = () => admission.observeActivity();
+    const destroyed = () => {
+      admission.observeDestroyed(contents);
+      cleanup();
+    };
+    const cleanup = () => {
+      contents.removeListener("media-started-playing", activity);
+      contents.removeListener("did-start-loading", activity);
+      contents.removeListener("destroyed", destroyed);
+      cleanups.delete(cleanup);
+    };
+    contents.on("media-started-playing", activity);
+    contents.on("did-start-loading", activity);
+    contents.once("destroyed", destroyed);
+    cleanups.add(cleanup);
+  };
+  Electron.app.on("web-contents-created", observeCreated);
+  for (const contents of Electron.webContents.getAllWebContents()) observeCreated({} as Electron.Event, contents);
+  yield* Effect.addFinalizer(() => Effect.sync(() => {
+    Electron.app.removeListener("web-contents-created", observeCreated);
+    for (const cleanup of cleanups) cleanup();
+  }));
   // The focus worker loads a native accessibility module. Start it on the first
   // capture reveal so users who never capture pay nothing at launch.
   let windowsForegroundFocus: ReturnType<typeof startWindowsForegroundFocusThread> | undefined;
@@ -213,12 +346,19 @@ export const make = Effect.gen(function* () {
   });
 
   return ElectronWindow.of({
+    tryReserveRuntimeActivity: admission.tryReserveRuntimeActivity,
+    tryReserveRendererCreation: admission.tryReserveRendererCreation,
+    canCreateUncorrelatedRenderer: admission.canCreateUncorrelatedRenderer,
+    acquireUpdateRendererReservation: (request) => Effect.acquireRelease(
+      Effect.sync(() => Option.fromUndefinedOr(admission.acquire(request.expiresAt))),
+      (reservation) => Effect.sync(() => { if (Option.isSome(reservation)) reservation.value.release(); }),
+    ),
     withUpdateRenderers: (use) => updateCreationLane.withPermits(1)(use),
-    updateInventory: listWindows.pipe(Effect.map((windows) => windows.map((window) => ({
-      id: window.webContents.id,
-      generation: `${window.webContents.mainFrame.processId}:${window.webContents.mainFrame.routingId}`,
-      audible: window.webContents.isCurrentlyAudible(),
-    })))),
+    updateInventory: Effect.sync(() => Electron.webContents.getAllWebContents().map((contents) => ({
+      id: contents.id,
+      generation: `${contents.mainFrame.processId}:${contents.mainFrame.routingId}`,
+      audible: contents.isCurrentlyAudible(),
+    }))),
     create: (options) => {
       const webPreferences = options.webPreferences;
       const diagnosticOptions = {
@@ -243,10 +383,24 @@ export const make = Effect.gen(function* () {
         },
       } satisfies typeof ElectronWindowCreateOptions.Type;
 
-      return updateCreationLane.withPermits(1)(Effect.try({
-        try: () => new Electron.BrowserWindow(options),
-        catch: (cause) => new ElectronWindowCreateError({ options: diagnosticOptions, cause }),
-      }));
+      return Effect.suspend(() => {
+        const reservation = admission.tryReserveRendererCreation({ kind: "main-window", owner: null });
+        if (reservation === undefined) return Effect.fail(new ElectronWindowCreateError({
+          options: diagnosticOptions, cause: "Renderer creation refused while an update is admitted.",
+        }));
+        return updateCreationLane.withPermits(1)(Effect.try({
+          try: () => {
+            const window = new Electron.BrowserWindow(options);
+            window.once("closed", reservation.release);
+            if (!reservation.bind(window.webContents)) {
+              window.close();
+              throw new Error("New renderer could not be bound to its creation reservation.");
+            }
+            return window;
+          },
+          catch: (cause) => new ElectronWindowCreateError({ options: diagnosticOptions, cause }),
+        })).pipe(Effect.onError(() => Effect.sync(reservation.release)));
+      });
     },
     main: liveMain,
     currentMainOrFirst,

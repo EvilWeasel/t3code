@@ -312,3 +312,27 @@ it("does not reopen a superseded helper when its initial probe completes", async
   expect(windows).toHaveLength(1);
   expect(windows[0]!.destroyed).toBe(false);
 });
+
+it("refuses helper construction after the asynchronous permission probe when the update gate is held", async () => {
+  let resolve: (granted: boolean) => void = () => { throw new Error("probe not started"); };
+  helper = new MacPermissionHelper(() => undefined);
+  const opening = helper.show("accessibility", "/bundle/preload.cjs", null, iconPaths,
+    () => new Promise<boolean>((done) => { resolve = done; }));
+  expect(windows).toHaveLength(0);
+  resolve(false);
+  await opening;
+  expect(windows).toHaveLength(0);
+  expect(mocks.loadURL).not.toHaveBeenCalled();
+});
+
+it("binds a helper's exact new contents and retains the reservation until it actually closes", async () => {
+  const bind = vi.fn(() => true);
+  const release = vi.fn();
+  helper = new MacPermissionHelper(() => ({ bind, release }));
+  await open();
+  expect(windows).toHaveLength(1);
+  expect(bind).toHaveBeenCalledWith(windows[0]!.webContents);
+  expect(release).not.toHaveBeenCalled();
+  helper.close();
+  expect(release).toHaveBeenCalledTimes(1);
+});
