@@ -632,6 +632,91 @@ describe("DesktopBackendManager", () => {
     ),
   );
 
+  for (const termination of ["eof", "error", "interruption"] as const) {
+    it.effect(`revokes the bound browser connection on command reader ${termination}`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const inputStarted = yield* Deferred.make<void>();
+          const readerStarted = yield* Deferred.make<void>();
+          const finishReader = yield* Deferred.make<void>();
+          const closed = yield* Deferred.make<void>();
+          const inputAlive = yield* Ref.make(false);
+          const closeCount = yield* Ref.make(0);
+          const failure = PlatformError.systemError({
+            _tag: "Unknown",
+            module: "ChildProcessSpawner",
+            method: "getOutputFd",
+            description: "synthetic browser command read failure",
+          });
+          const layerSpawner = Layer.succeed(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make((command) =>
+              Effect.gen(function* () {
+                const input = command.options.additionalFds?.fd6;
+                if (input?.type !== "input" || input.stream === undefined)
+                  return yield* Effect.die("missing browser input stream");
+                yield* Stream.runDrain(input.stream).pipe(Effect.forkScoped);
+                return makeProcess({
+                  getOutputFd: () =>
+                    Stream.fromEffect(
+                      Deferred.succeed(readerStarted, void 0).pipe(
+                        Effect.andThen(Deferred.await(finishReader)),
+                      ),
+                    ).pipe(
+                      Stream.flatMap(() =>
+                        termination === "error" ? Stream.fail(failure) : Stream.empty,
+                      ),
+                    ),
+                  exitCode: Effect.never,
+                });
+              }),
+            ),
+          );
+          const run = yield* DesktopBackendManager.runBackendProcess({
+            ...baseConfig,
+            bootstrap: {
+              ...baseConfig.bootstrap,
+              desktopBrowserFd: 6,
+              desktopBrowserControlFd: 7,
+            },
+            desktopTelemetryStream: Stream.empty,
+            desktopBrowserStream: Stream.fromEffect(
+              Ref.set(inputAlive, true).pipe(
+                Effect.andThen(Deferred.succeed(inputStarted, void 0)),
+                Effect.andThen(Effect.never),
+                Effect.ensuring(Ref.set(inputAlive, false)),
+              ),
+            ),
+            onDesktopBrowserCommand: () => Effect.void,
+            onDesktopBrowserCommandClosed: Ref.update(closeCount, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(closed, void 0)),
+              Effect.asVoid,
+            ),
+          }).pipe(
+            Effect.provide(Layer.merge(layerSpawner, layerHealthyHttpClient)),
+            Effect.scoped,
+            Effect.forkChild,
+          );
+          yield* Deferred.await(inputStarted);
+          yield* Deferred.await(readerStarted);
+          if (termination === "interruption") {
+            yield* Fiber.interrupt(run);
+          } else {
+            yield* Deferred.succeed(finishReader, void 0);
+            yield* Deferred.await(closed);
+            // Command EOF/error revokes before the input consumer or backend exits.
+            assert.isTrue(yield* Ref.get(inputAlive));
+            assert.isUndefined(run.pollUnsafe());
+            yield* Fiber.interrupt(run);
+          }
+          yield* Deferred.await(closed);
+          assert.equal(yield* Ref.get(closeCount), 1);
+          assert.isFalse(yield* Ref.get(inputAlive));
+        }),
+      ),
+    );
+  }
+
   it.effect("continues routing desktop telemetry control messages after an invalid line", () =>
     Effect.scoped(
       Effect.gen(function* () {

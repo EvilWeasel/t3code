@@ -230,6 +230,8 @@ interface RunBackendProcessOptions extends DesktopBackendStartConfig {
   readonly desktopBrowserStream?: Stream.Stream<Uint8Array>;
   /** Each line the backend writes to `desktopBrowserControlFd`. */
   readonly onDesktopBrowserCommand?: (line: string) => Effect.Effect<void>;
+  /** Revokes this connection when its command fd closes, including a half-close. */
+  readonly onDesktopBrowserCommandClosed?: Effect.Effect<void>;
   readonly onDesktopTelemetryControl?: (
     message: DesktopTelemetryControlMessageValue,
   ) => Effect.Effect<void>;
@@ -583,6 +585,7 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
           cause: Cause.pretty(cause),
         }),
       ),
+      Effect.ensuring(options.onDesktopBrowserCommandClosed ?? Effect.void),
       Effect.forkScoped,
     );
   }
@@ -957,12 +960,18 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           );
         });
 
+        // WSL instances have no browser fds and must not replace the primary channel.
+        const browserConnection =
+          config.value.bootstrap.desktopBrowserControlFd === undefined
+            ? undefined
+            : desktopBrowserHost.createConnection();
         const program = runBackendProcess({
           ...config.value,
           desktopTelemetryStream: desktopTelemetryPublisher.encoded,
           // Only a bootstrap that names the browser fds (the local primary) gets them.
-          desktopBrowserStream: desktopBrowserHost.events,
-          onDesktopBrowserCommand: desktopBrowserHost.handleCommandLine,
+          desktopBrowserStream: browserConnection?.events,
+          onDesktopBrowserCommand: browserConnection?.handleCommandLine,
+          onDesktopBrowserCommandClosed: browserConnection?.closed,
           onDesktopTelemetryControl: (message) =>
             desktopTelemetryPublisher.handleControlForSource(spec.id, message),
           onStarted: Effect.fn("desktop.backendInstance.onStarted")(function* (pid) {
@@ -1025,6 +1034,8 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           Effect.provideService(HttpClient.HttpClient, httpClient),
           Scope.provide(runScope),
+          // Also release a connection if bootstrap encoding or spawn fails before a reader exists.
+          Effect.ensuring(browserConnection?.closed ?? Effect.void),
           Effect.matchEffect({
             onFailure: (error) => finalizeRun(error.message),
             onSuccess: (exit) => finalizeRun(exit.reason, Option.getOrUndefined(exit.code)),
