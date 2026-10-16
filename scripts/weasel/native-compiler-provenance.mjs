@@ -227,30 +227,68 @@ async function observe(output, rootPid) {
   catch { await jsonFile(join(output, "root-unknown.json"), { at, status: "UNKNOWN_INVOCATION_ROOT", rootPid }); return; }
   const records = new Map(); const images = new Map(); const attemptedImages = new Set(); let imageBytes = 0; let samples = 0;
   const apiPromise = collectApis(output).catch(() => { unknown("API_COLLECTION_UNKNOWN"); return null; });
+  const fileIdentity = (info) => ({ device: String(info.dev), inode: String(info.ino),
+    type: info.isFile() ? "regular" : "other", size: String(info.size), mtime: String(info.mtimeNs) });
+  const sameFile = (a, b) => a.device === b.device && a.inode === b.inode &&
+    a.type === b.type && a.size === b.size && a.mtime === b.mtime;
+  const changedImages = new Set();
+  const taintedImageIds = new Set();
+  async function executable(identity) {
+    if (!same(identity, await stat(identity.pid))) throw Error("IMAGE_CHANGED");
+    const path = safePath(await fs.readlink(`/proc/${identity.pid}/exe`));
+    const file = fileIdentity(await fs.stat(`/proc/${identity.pid}/exe`, { bigint: true }));
+    if (path !== await fs.readlink(`/proc/${identity.pid}/exe`) ||
+        !same(identity, await stat(identity.pid))) throw Error("IMAGE_CHANGED");
+    return { path, ...file };
+  }
+  const sameExecutable = (a, b) => a.path === b.path && sameFile(a, b);
   async function image(identity) {
     if (performance.now() - began >= LIMIT.milliseconds) { unknown("IMAGE_DEADLINE"); return null; }
+    const pidKey = `${identity.pid}:${identity.start}`;
+    if (changedImages.has(pidKey)) { unknown("IMAGE_CHANGED_NO_RETRY"); return null; }
+    let touchedImage = null;
     try {
-      const exe = safePath(await fs.readlink(`/proc/${identity.pid}/exe`));
-      if (!same(identity, await stat(identity.pid))) throw Error("PID_CHANGED");
+      const beforeExe = await executable(identity);
       const h = await fs.open(`/proc/${identity.pid}/exe`, "r");
       try {
-        const before = await h.stat();
-        const imageKey = `${exe}:${before.dev}:${before.ino}:${before.size}:${before.mtimeMs}`;
-        const prior = images.get(imageKey);
-        if (prior) { if (!same(identity, await stat(identity.pid))) throw Error("PID_CHANGED"); return prior.id; }
+        const before = fileIdentity(await h.stat({ bigint: true }));
+        if (!sameFile(beforeExe, before)) throw Error("IMAGE_CHANGED");
+        const imageKey = `${beforeExe.path}:${before.device}:${before.inode}:${before.size}:${before.mtime}`;
+        const prior = images.get(imageKey); touchedImage = prior?.id ?? null;
+        if (prior) {
+          const after = fileIdentity(await h.stat({ bigint: true }));
+          const afterExe = await executable(identity);
+          if (!sameFile(before, after) || !sameExecutable(beforeExe, afterExe) ||
+              !sameFile(afterExe, after)) throw Error("IMAGE_CHANGED");
+          return prior.id;
+        }
         if (attemptedImages.has(imageKey)) { unknown("IMAGE_PREVIOUSLY_UNAVAILABLE"); return null; }
         if (attemptedImages.size >= LIMIT.images) { unknown("IMAGE_COUNT_BOUND"); return null; }
         attemptedImages.add(imageKey);
-        if (!before.isFile() || before.size > LIMIT.imageBytes || imageBytes + before.size > LIMIT.imageTotal) throw Error("IMAGE_SIZE_BOUND");
-        imageBytes += before.size; // Failed/partial reads consume budget too; never retry this image.
+        const size = Number(before.size);
+        if (before.type !== "regular" || !Number.isSafeInteger(size) || size > LIMIT.imageBytes || imageBytes + size > LIMIT.imageTotal) throw Error("IMAGE_SIZE_BOUND");
+        imageBytes += size; // Failed/partial reads consume budget too; no reattempt.
         const hash = createHash("sha256"); let count = 0;
         for await (const bytes of h.createReadStream({ autoClose: false, highWaterMark: 1024 ** 2 })) {
-          count += bytes.length; if (count > before.size || performance.now() - began >= LIMIT.milliseconds) throw Error("IMAGE_READ_BOUND"); hash.update(bytes);
+          count += bytes.length; if (count > size || performance.now() - began >= LIMIT.milliseconds) throw Error("IMAGE_READ_BOUND"); hash.update(bytes);
         }
-        const after = await h.stat(); if (count !== before.size || before.ino !== after.ino || before.size !== after.size || !same(identity, await stat(identity.pid))) throw Error("IMAGE_IDENTITY_CHANGED");
-        const item = { id: images.size, path: exe, device: before.dev, inode: before.ino, bytes: count, sha256: hash.digest("hex") }; images.set(imageKey, item); return item.id;
+        const after = fileIdentity(await h.stat({ bigint: true }));
+        const afterExe = await executable(identity);
+        if (count !== size || !sameFile(before, after) || !sameExecutable(beforeExe, afterExe) ||
+            !sameFile(afterExe, after)) throw Error("IMAGE_CHANGED");
+        const item = { id: images.size, path: beforeExe.path, device: before.device,
+          inode: before.inode, type: before.type, mtime: before.mtime, bytes: count, sha256: hash.digest("hex") };
+        images.set(imageKey, item); return item.id;
       } finally { await h.close(); }
-    } catch { unknown("IMAGE_UNKNOWN"); return null; }
+    } catch (error) {
+      if (error?.message === "IMAGE_CHANGED") {
+        changedImages.add(pidKey);
+        if (touchedImage !== null) taintedImageIds.add(touchedImage);
+        for (const record of records.values()) if (record.pid === identity.pid && record.start === identity.start && record.image !== null) taintedImageIds.add(record.image);
+        unknown("IMAGE_CHANGED_UNKNOWN_NO_RETRY");
+      } else unknown("IMAGE_UNKNOWN");
+      return null;
+    }
   }
   try {
     while (samples < LIMIT.samples && performance.now() - began < LIMIT.milliseconds) {
@@ -289,7 +327,8 @@ async function observe(output, rootPid) {
   const canonicalCommandExit = await commandExit(output);
   const api = await apiPromise;
   const observed = [...images.values()];
-  const compilerImages = observed.filter((item) => /(?:^|\/)tsc-rs(?:\.exe)?$/.test(item.path) &&
+  const compilerImages = observed.filter((item) => !taintedImageIds.has(item.id) &&
+    [...records.values()].some((record) => record.image === item.id) && /(?:^|\/)tsc-rs(?:\.exe)?$/.test(item.path) &&
     api?.roots.some((pkg) => pkg.name.includes("tsc-rs") && inside(pkg.path, item.path)));
   const binding = {};
   for (const path of ["scripts/weasel/native-compiler-provenance.mjs", "scripts/weasel/check.sh", ".github/workflows/weasel-ci.yml", "pnpm-lock.yaml"]) {
