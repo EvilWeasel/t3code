@@ -346,5 +346,17 @@ for agent_session_test in "${agent_session_tests[@]}"; do
   fi
   focused_tests+=("$agent_session_test")
 done
+transcript_http_tests=(
+  apps/server/src/orchestration-v2/http.test.ts
+  apps/server/src/orchestration-v2/boundedSnapshotTransport.test.ts
+  apps/server/integration/transferBudgetV2.integration.test.ts
+)
+for transcript_http_test in "${transcript_http_tests[@]}"; do
+  if [[ ! -f "$transcript_http_test" ]]; then
+    echo "Required transcript HTTP gate is missing: $transcript_http_test" >&2
+    exit 1
+  fi
+  focused_tests+=("$transcript_http_test")
+done
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)
