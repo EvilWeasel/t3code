@@ -154,8 +154,12 @@ vi.mock("../state/threads.ts", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../state/threads.ts")>()),
   createEnvironmentThreadStateAtoms: streamDetailFactory,
 }));
+// The fixture owns this HTTP reply until registry disposal, even while reconnect
+// temporarily removes the view's auth dependency. No new HTTP producer runs here.
 const sessionResults = Atom.family((_id: EnvironmentId) =>
-  Atom.make<AsyncResult.AsyncResult<AuthSessionState, string>>(AsyncResult.initial()),
+  Atom.make<AsyncResult.AsyncResult<AuthSessionState, string>>(AsyncResult.initial()).pipe(
+    Atom.keepAlive,
+  ),
 );
 type FixtureScopeName = "first" | "grant-restored" | "auth-restored" | "reconnected";
 type StreamBoundary = "shell-release" | "shell-failure" | "detail-release" | "detail-failure";
