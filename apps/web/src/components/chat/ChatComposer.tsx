@@ -1529,6 +1529,67 @@ export interface ChatComposerHandle {
 // Props
 // --------------------------------------------------------------------------
 
+/** Shared by the full composer and its mounted mobile regression fixture. */
+export function ChatComposerFooter({
+  controls,
+  actions,
+  controlsRef,
+  actionsRef,
+  compact,
+  pendingInput,
+  mobilePendingActions,
+  resting,
+  inlineResting,
+  primaryActionsCompact,
+}: {
+  controls: ReactNode;
+  actions: ReactNode;
+  controlsRef?: ComponentProps<"div">["ref"];
+  actionsRef?: ComponentProps<"div">["ref"];
+  compact: boolean;
+  pendingInput: boolean;
+  mobilePendingActions: boolean;
+  resting: boolean;
+  inlineResting: boolean;
+  primaryActionsCompact: boolean;
+}) {
+  return (
+    <div
+      data-chat-composer-footer="true"
+      data-chat-composer-footer-compact={compact ? "true" : "false"}
+      className={cn(
+        "flex min-w-0 flex-wrap items-center justify-between gap-2 overflow-visible px-3 pb-3 sm:flex-nowrap sm:px-4 sm:pb-4",
+        pendingInput && "pt-2",
+        compact ? "gap-1.5" : "gap-2 sm:gap-0",
+        mobilePendingActions && "hidden sm:flex",
+        resting && "absolute right-px z-10 h-12 w-auto flex-nowrap gap-0 py-0 sm:gap-0 sm:py-0",
+        resting && (inlineResting ? "bottom-[calc(2rem+1px)]" : "bottom-px"),
+      )}
+    >
+      <div
+        ref={controlsRef}
+        data-chat-composer-controls="left"
+        data-chat-composer-footer-controls="true"
+        className={cn(
+          "relative -m-1 -ms-3.5 flex min-w-0 flex-1 basis-full items-center gap-1 overflow-x-auto p-1 ps-3.5 sm:basis-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+          resting && "hidden",
+        )}
+      >
+        {controls}
+      </div>
+      <div
+        ref={actionsRef}
+        data-chat-composer-actions="right"
+        data-chat-composer-transition-actions="true"
+        data-chat-composer-primary-actions-compact={primaryActionsCompact ? "true" : "false"}
+        className="flex min-w-0 max-w-full flex-1 flex-wrap items-center justify-end gap-2 sm:flex-none"
+      >
+        {actions}
+      </div>
+    </div>
+  );
+}
+
 export interface ChatComposerProps {
   composerDraftTarget: ScopedThreadRef | DraftId;
   environmentId: EnvironmentId;
@@ -6911,7 +6972,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (isInsideRestingComposerControlScope(event.target)) return;
         composerMentionDragHandlers.onDrop(event);
       }}
-      className="mx-auto w-full min-w-0 max-w-(--chat-content-max-width)"
+      className="mx-auto w-full min-w-0 max-w-(--chat-content-max-width) max-sm:pb-[env(safe-area-inset-bottom,0px)]"
       data-chat-composer-form="true"
       {...threadContextDropTargetProps()}
     >
@@ -6938,7 +6999,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             key={activeThreadId}
             className="relative z-0"
             items={bannerStackItems}
-            attachedAbove={props.queuedRunsControl}
+            attachedAbove={
+              props.queuedRunsControl ? (
+                <div
+                  data-chat-composer-queued-runs="true"
+                  className="w-full min-w-0 max-w-full max-sm:[&_[data-slot=scroll-area-viewport]]:max-h-[min(8rem,20dvh)]"
+                >
+                  {props.queuedRunsControl}
+                </div>
+              ) : undefined
+            }
           />
           {!activityStackItem && (shownSyncPhase || inlineTasksBadge) ? (
             <ComposerBanner.Attachment>
@@ -7690,8 +7760,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     buildContextClipboardFragment={buildContextClipboardFragment}
                     importContextFragment={importContextFragment}
                     skills={selectedProviderSkills}
-                    containerClassName={cn(isComposerResting && "min-w-0 flex-1")}
+                    containerClassName={cn("min-w-0", isComposerResting && "flex-1")}
                     className={cn(
+                      "max-sm:max-h-[min(13rem,24dvh)] max-sm:min-h-12",
                       showMobilePendingAnswerActions && "max-sm:pb-12",
                       isComposerResting &&
                         "my-0 max-h-8 min-h-8 overflow-hidden py-0 whitespace-pre! leading-8",
@@ -7775,153 +7846,132 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
             {/* Bottom toolbar */}
             {isComposerCollapsedMobile || isComposerApprovalState ? null : (
-              <div
-                data-chat-composer-footer="true"
-                data-chat-composer-footer-compact={isComposerFooterCompact ? "true" : "false"}
-                className={cn(
-                  "flex min-w-0 flex-nowrap items-center justify-between gap-2 overflow-visible px-3 pb-3 sm:px-4 sm:pb-4",
-                  pendingUserInputs.length > 0 && "pt-2",
-                  isComposerFooterCompact ? "gap-1.5" : "gap-2 sm:gap-0",
-                  showMobilePendingAnswerActions && "hidden sm:flex",
-                  isComposerResting &&
-                    "absolute right-px z-10 h-12 w-auto gap-0 py-0 sm:gap-0 sm:py-0",
-                  isComposerResting &&
-                    (showInlineRestingControls ? "bottom-[calc(2rem+1px)]" : "bottom-px"),
-                )}
-              >
-                <div
-                  ref={expandedControlsLayout.attachControls}
-                  data-chat-composer-controls="left"
-                  data-chat-composer-footer-controls="true"
-                  className={cn(
-                    "relative -m-1 -ms-3.5 flex min-w-0 flex-1 items-center gap-1 overflow-x-auto p-1 ps-3.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
-                    isComposerResting && "hidden",
-                  )}
-                >
-                  {composerControlsCollapsed ? null : composerControls}
-                </div>
-
-                {/* Right side: send / stop button */}
-                <div
-                  ref={setRestingActionsElement}
-                  data-chat-composer-actions="right"
-                  data-chat-composer-transition-actions="true"
-                  data-chat-composer-primary-actions-compact={
-                    isComposerPrimaryActionsCompact ? "true" : "false"
-                  }
-                  className="flex shrink-0 flex-nowrap items-center justify-end gap-2"
-                >
-                  {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
-                    <VoiceDictationControl
-                      environmentId={environmentId}
-                      targetKey={voiceDraftTargetKeyRef.current}
-                      currentTargetKey={() => voiceDraftTargetKeyRef.current}
-                      transcribe={transcribeVoiceRecording(environmentId)}
-                      onTranscript={insertVoiceTranscript}
-                      onSend={sendVoiceTranscript}
-                      hasTranscript={(text) => promptRef.current.includes(text)}
-                    />
-                  ) : null}
-                  <LiveVoiceControl
-                    environmentId={liveVoiceEnvironmentId}
-                    threadId={activeThreadId}
-                    providerInstanceId={selectedProviderEntry?.instanceId ?? null}
-                    eligible={liveVoiceProviderEligible && canOperateThread}
-                    availability={liveVoiceAvailability}
-                  />
-                  {showComposerAttachAction ? (
-                    <>
-                      <input
-                        ref={attachmentInputRef}
-                        type="file"
-                        multiple
-                        className="hidden"
-                        onChange={(event) => {
-                          const files = Array.from(event.currentTarget.files ?? []);
-                          event.currentTarget.value = "";
-                          // Inserting a chip refocuses the editor after the draft renders;
-                          // focusing synchronously here would report the editor's stale text
-                          // over the prompt that was just written.
-                          void addComposerAttachments(files).then((inserted) => {
-                            if (!inserted) focusComposer();
-                          });
-                        }}
+              <ChatComposerFooter
+                primaryActionsCompact={isComposerPrimaryActionsCompact}
+                compact={isComposerFooterCompact}
+                pendingInput={pendingUserInputs.length > 0}
+                mobilePendingActions={showMobilePendingAnswerActions}
+                resting={isComposerResting}
+                inlineResting={showInlineRestingControls}
+                controlsRef={expandedControlsLayout.attachControls}
+                actionsRef={setRestingActionsElement}
+                controls={composerControlsCollapsed ? null : composerControls}
+                actions={
+                  <>
+                    {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
+                      <VoiceDictationControl
+                        environmentId={environmentId}
+                        targetKey={voiceDraftTargetKeyRef.current}
+                        currentTargetKey={() => voiceDraftTargetKeyRef.current}
+                        transcribe={transcribeVoiceRecording(environmentId)}
+                        onTranscript={insertVoiceTranscript}
+                        onSend={sendVoiceTranscript}
+                        hasTranscript={(text) => promptRef.current.includes(text)}
                       />
-                      <Tooltip>
-                        <TooltipTrigger
-                          render={
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon-sm"
-                              onPointerDown={(event) => event.preventDefault()}
-                              onClick={() => attachmentInputRef.current?.click()}
-                              aria-label="Attach files"
-                            />
-                          }
-                        >
-                          <PaperclipIcon />
-                        </TooltipTrigger>
-                        <TooltipPopup>Attach files</TooltipPopup>
-                      </Tooltip>
-                    </>
-                  ) : null}
-                  <ComposerFooterPrimaryActions
-                    compact={isComposerResting || isComposerPrimaryActionsCompact}
-                    canOperateThread={canOperateThread}
-                    activeContextWindow={
-                      settings.contextWindowMeterEnabled ? activeContextWindow : null
-                    }
-                    reserveContextWindowMeter={reserveContextWindowMeter}
-                    activeThreadModelDisplayName={activeThreadModelDisplayName}
-                    pendingAction={pendingPrimaryAction}
-                    isRunning={phase === "running"}
-                    canInterrupt={canInterrupt}
-                    followUpBehavior={settings.followUpBehavior}
-                    alternateShortcutLabel={shortcutLabelForCommand(
-                      keybindings,
-                      "composer.sendAlternate",
-                      {
-                        context: {
-                          composerFocus: true,
-                          draftThreadRoute: routeKind === "draft",
-                          turnRunning: true,
+                    ) : null}
+                    <LiveVoiceControl
+                      environmentId={liveVoiceEnvironmentId}
+                      threadId={activeThreadId}
+                      providerInstanceId={selectedProviderEntry?.instanceId ?? null}
+                      eligible={liveVoiceProviderEligible && canOperateThread}
+                      availability={liveVoiceAvailability}
+                    />
+                    {showComposerAttachAction ? (
+                      <>
+                        <input
+                          ref={attachmentInputRef}
+                          type="file"
+                          multiple
+                          className="hidden"
+                          onChange={(event) => {
+                            const files = Array.from(event.currentTarget.files ?? []);
+                            event.currentTarget.value = "";
+                            // Inserting a chip refocuses the editor after the draft renders;
+                            // focusing synchronously here would report the editor's stale text
+                            // over the prompt that was just written.
+                            void addComposerAttachments(files).then((inserted) => {
+                              if (!inserted) focusComposer();
+                            });
+                          }}
+                        />
+                        <Tooltip>
+                          <TooltipTrigger
+                            render={
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-sm"
+                                onPointerDown={(event) => event.preventDefault()}
+                                onClick={() => attachmentInputRef.current?.click()}
+                                aria-label="Attach files"
+                              />
+                            }
+                          >
+                            <PaperclipIcon />
+                          </TooltipTrigger>
+                          <TooltipPopup>Attach files</TooltipPopup>
+                        </Tooltip>
+                      </>
+                    ) : null}
+                    <ComposerFooterPrimaryActions
+                      compact={isComposerResting || isComposerPrimaryActionsCompact}
+                      canOperateThread={canOperateThread}
+                      activeContextWindow={
+                        settings.contextWindowMeterEnabled ? activeContextWindow : null
+                      }
+                      reserveContextWindowMeter={reserveContextWindowMeter}
+                      activeThreadModelDisplayName={activeThreadModelDisplayName}
+                      pendingAction={pendingPrimaryAction}
+                      isRunning={phase === "running"}
+                      canInterrupt={canInterrupt}
+                      followUpBehavior={settings.followUpBehavior}
+                      alternateShortcutLabel={shortcutLabelForCommand(
+                        keybindings,
+                        "composer.sendAlternate",
+                        {
+                          context: {
+                            composerFocus: true,
+                            draftThreadRoute: routeKind === "draft",
+                            turnRunning: true,
+                          },
                         },
-                      },
-                    )}
-                    showPlanFollowUpPrompt={
-                      pendingUserInputs.length === 0 && showPlanFollowUpPrompt
-                    }
-                    promptHasText={prompt.trim().length > 0}
-                    isSendBusy={isSendBusy}
-                    sendDisabledReason={sendDisabledReason}
-                    isConnecting={isConnecting}
-                    isEnvironmentUnavailable={
-                      environmentUnavailable !== null ||
-                      noProviderAvailable ||
-                      projectSelectionRequired
-                    }
-                    isPreparingWorktree={isPreparingWorktree}
-                    hasSendableContent={composerSendState.hasSendableContent}
-                    canResume={showResumeAction}
-                    preserveComposerFocusOnPointerDown={isMobileViewport || isComposerResting}
-                    isEditingQueuedMessage={isEditingQueuedMessage}
-                    onSubmitMessage={handleSubmitMessage}
-                    onResume={onResume}
-                    onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
-                    onInterrupt={handleInterruptPrimaryAction}
-                    onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
-                    compactBeforeSendTokens={props.resumeCompactionTokens}
-                    keepFullHistory={props.keepFullHistory}
-                    onToggleKeepFullHistory={props.onToggleKeepFullHistory}
-                    compactDisabled={
-                      compactDisabled || noProviderAvailable || isSendBusy || isConnecting
-                    }
-                    compactDisabledReason={resolvedCompactDisabledReason}
-                    {...(compactCommandAvailable ? { onCompactContext: compactThreadContext } : {})}
-                  />
-                </div>
-              </div>
+                      )}
+                      showPlanFollowUpPrompt={
+                        pendingUserInputs.length === 0 && showPlanFollowUpPrompt
+                      }
+                      promptHasText={prompt.trim().length > 0}
+                      isSendBusy={isSendBusy}
+                      sendDisabledReason={sendDisabledReason}
+                      isConnecting={isConnecting}
+                      isEnvironmentUnavailable={
+                        environmentUnavailable !== null ||
+                        noProviderAvailable ||
+                        projectSelectionRequired
+                      }
+                      isPreparingWorktree={isPreparingWorktree}
+                      hasSendableContent={composerSendState.hasSendableContent}
+                      canResume={showResumeAction}
+                      preserveComposerFocusOnPointerDown={isMobileViewport || isComposerResting}
+                      isEditingQueuedMessage={isEditingQueuedMessage}
+                      onSubmitMessage={handleSubmitMessage}
+                      onResume={onResume}
+                      onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
+                      onInterrupt={handleInterruptPrimaryAction}
+                      onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
+                      compactBeforeSendTokens={props.resumeCompactionTokens}
+                      keepFullHistory={props.keepFullHistory}
+                      onToggleKeepFullHistory={props.onToggleKeepFullHistory}
+                      compactDisabled={
+                        compactDisabled || noProviderAvailable || isSendBusy || isConnecting
+                      }
+                      compactDisabledReason={resolvedCompactDisabledReason}
+                      {...(compactCommandAvailable
+                        ? { onCompactContext: compactThreadContext }
+                        : {})}
+                    />
+                  </>
+                }
+              />
             )}
             {showInlineRestingControls ? (
               <div className="h-8">

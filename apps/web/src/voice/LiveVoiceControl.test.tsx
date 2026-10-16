@@ -320,7 +320,7 @@ describe("explicit main renderer diagnostic requests", () => {
     expect(next.revision).toBeGreaterThan(response.revision);
     if (next.result.status !== "ready") throw new Error("Expected ready diagnostic");
     expect(next.result.gate.canStart).toBe(!startButton().disabled);
-    expect(next.result.gate.reason).toBe(container.querySelector('[role="status"]')?.textContent);
+    expect(next.result.gate.reason).toBe(await startHint());
     expectPassive();
   });
 
@@ -461,6 +461,18 @@ function startButton() {
   return button;
 }
 
+async function startHint() {
+  const trigger = startButton().closest<HTMLElement>('[data-slot="tooltip-trigger"]');
+  if (!trigger) throw new Error("Missing keyboard-accessible voice hint trigger");
+  await act(async () => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+    trigger.focus();
+  });
+  const tooltip = document.querySelector<HTMLElement>('[role="tooltip"]');
+  if (!tooltip) throw new Error("Voice hint did not open on deliberate focus");
+  return tooltip.textContent;
+}
+
 function expectPassive() {
   expect(commands.prepare).not.toHaveBeenCalled();
   expect(commands.start).not.toHaveBeenCalled();
@@ -522,7 +534,7 @@ describe("Live voice diagnostic producer model (transport absent)", () => {
     expect(next.revision).toBe(first.revision + 1);
     await render(denied);
     expect(next.gate.canStart).toBe(!startButton().disabled);
-    expect(container.querySelector('[role="status"]')?.textContent).toBe(next.gate.reason);
+    expect(await startHint()).toBe(next.gate.reason);
     expect(next.gate.facts?.canOperate).toBe(false);
     const busy = advanceLiveVoiceDiagnosticModel(first, gateFor(loaded, "preparing"));
     expect(busy.gate.canStart).toBe(false);
@@ -779,18 +791,19 @@ describe("LiveVoiceControl passive availability", () => {
     },
   );
 
-  it("keeps the disabled tooltip trigger keyboard reachable and the exact reason visible", async () => {
+  it("keeps the disabled reason out of the toolbar and opens it on deliberate keyboard focus", async () => {
     await render({ ...loaded, config: { setupMode: "existing" } });
-    const trigger = container.querySelector<HTMLElement>('[data-slot="tooltip-trigger"]')!;
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(container.textContent).not.toContain("existing installation");
+    const trigger = container.querySelector<HTMLElement>('[data-slot="tooltip-trigger"]');
+    if (!trigger) throw new Error("Missing voice hint trigger");
     expect(trigger.tabIndex).toBe(0);
     await act(async () => {
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
       trigger.focus();
     });
     expect(document.activeElement).toBe(trigger);
-    expect(container.querySelector('[role="status"]')?.textContent).toContain(
-      "existing installation",
-    );
+    expect(await startHint()).toContain("existing installation");
     expectPassive();
   });
   it("enables loaded managed setup without probing, and only prepares after a deliberate click", async () => {
@@ -877,7 +890,8 @@ describe("LiveVoiceControl passive availability", () => {
   }>)("explains $reason and blocks side effects", async ({ patch, reason }) => {
     await render({ ...loaded, ...patch });
     expect(startButton().disabled).toBe(true);
-    expect(container.querySelector('[role="status"]')?.textContent).toContain(reason);
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(await startHint()).toContain(reason);
     expect(container.textContent).not.toContain("private-invalid-value");
     expect(container.textContent).not.toContain(environmentA);
     expect(container.textContent).not.toContain(thread);

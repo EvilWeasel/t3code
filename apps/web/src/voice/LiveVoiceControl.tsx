@@ -763,7 +763,10 @@ export function LiveVoiceControl(props: {
   }, [canStart, controller, target]);
 
   return (
-    <div className="flex items-center gap-1" data-live-voice-phase={state.phase}>
+    <div
+      className="flex min-w-0 max-w-full flex-wrap items-center gap-1"
+      data-live-voice-phase={state.phase}
+    >
       {state.lease && state.phase !== "ended" ? (
         <LiveVoiceEventFeed
           environmentId={props.environmentId}
@@ -773,13 +776,11 @@ export function LiveVoiceControl(props: {
       ) : null}
       {!active && !busy ? (
         <>
-          {unavailableNotice ? (
-            <span role="status" className="max-w-64 text-xs text-muted-foreground">
-              {unavailableNotice}
-            </span>
-          ) : null}
           {state.phase === "error" ? (
-            <span role="status" className="text-xs text-destructive">
+            <span
+              role="status"
+              className="min-w-0 max-w-full wrap-break-word text-xs text-destructive"
+            >
               {statusText}
             </span>
           ) : null}
@@ -807,7 +808,10 @@ export function LiveVoiceControl(props: {
         </>
       ) : (
         <>
-          <span role="status" className="text-xs text-muted-foreground">
+          <span
+            role="status"
+            className="min-w-0 max-w-full wrap-break-word text-xs text-muted-foreground"
+          >
             {statusText}
           </span>
           {active ? (
