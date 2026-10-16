@@ -148,7 +148,17 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv, Path.Pat
           config,
         });
       const crypto = yield* Crypto.Crypto;
-      const configurationId = yield* crypto.randomUUIDv4;
+      const configurationId = yield* crypto.randomUUIDv4.pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderDriverError({
+              driver: DRIVER_KIND,
+              instanceId,
+              detail: "Failed to create native Live preparation identity.",
+              cause,
+            }),
+        ),
+      );
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const resetCreditCoordinator = yield* ResetCreditCoordinator.ResetCreditCoordinator;
       const fileSystem = yield* FileSystem.FileSystem;
