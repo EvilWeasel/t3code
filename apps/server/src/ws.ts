@@ -3240,6 +3240,7 @@ const makeWsRpcHandlers = (
 type WsBuiltHandlers = Effect.Success<ReturnType<typeof makeWsRpcHandlers>>;
 type WsRegisteredRpc = RpcGroup.Rpcs<typeof ServerWsRpcGroup>;
 export type WsRpcInferenceBoundary = {
+  readonly rpcs: WsRegisteredRpc;
   readonly builder: ReturnType<typeof makeWsRpcHandlers>;
   readonly handlers: WsBuiltHandlers;
   readonly mappedServices: RpcGroup.HandlersServices<WsRegisteredRpc, WsBuiltHandlers>;
