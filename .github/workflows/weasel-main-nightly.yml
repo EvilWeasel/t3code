@@ -31,6 +31,8 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
+          sparse-checkout: scripts/weasel/nightly-after-ci.cjs
+          sparse-checkout-cone-mode: false
       - name: Dispatch or reconcile the existing Nightly workflow
         uses: actions/github-script@v7
         with:
