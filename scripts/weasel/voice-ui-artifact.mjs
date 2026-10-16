@@ -159,7 +159,7 @@ async function captureComposerMobile() {
       [join(web,"src/state/session"), partial(join(web,"src/state/session.ts"), `${atoms} import {environmentSession as actual} from ${JSON.stringify(join(web,"src/state/session.ts")+"?fixture-real")}; const session=Atom.make(AsyncResult.success({}));export const environmentSession={...actual,sessionStateAtom:()=>session};export const useEnvironmentScope=()=>true;export const readEnvironmentScope=()=>true;export const readPreparedConnection=()=>null;export const usePreparedConnection=()=>({_tag:"None"});`)],
       [join(web,"src/state/environments"), partial(join(web,"src/state/environments.ts"), `export const usePrimaryEnvironmentId=()=>${JSON.stringify(env)};export const usePrimaryEnvironment=()=>({environmentId:${JSON.stringify(env)},label:"Synthetic fixture"});`)],
       [join(web,"src/state/entities"), partial(join(web,"src/state/entities.ts"), 'const shells=[];export const useThreadShells=()=>shells;export const readThreadShell=()=>null;export const useThreadProjection=()=>null;')],
-      [join(web,"src/state/use-atom-command"), 'export const useAtomCommand=()=>async()=>{window.composerFixture.forbiddenCommands++;throw Error("Fixture command forbidden");};'],
+      [join(web,"src/state/use-atom-command"), 'import {useCallback} from "react";export const useAtomCommand=(command)=>useCallback(async()=>{window.composerFixture.forbiddenCommands++;throw Error("Fixture command forbidden");},[command]);'],
       [join(web,"src/state/use-atom-query-runner"), 'export const useAtomQueryRunner=()=>async()=>{window.composerFixture.forbiddenCommands++;throw Error("Fixture query forbidden");};'],
       [join(web,"src/state/liveVoice"), `${atoms} export const liveVoiceEnvironment={prepare:{},start:{},stop:{},status:{},events:()=>empty};`],
       [join(web,"src/lib/composerPathSearchState"), 'const entries=[];export const useComposerPathSearch=()=>({entries,error:null,isPending:false});'],
@@ -224,7 +224,7 @@ async function captureComposerMobile() {
           await editor.focus();
           result.geometry=await page.evaluate(()=>{
             const box=element=>{const r=element.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,right:r.right,bottom:r.bottom};};
-            const controls=[...document.querySelectorAll('form button,[aria-label="Message"]')].filter(element=>element.getClientRects().length).map(element=>({label:element.getAttribute("aria-label")||element.textContent?.trim(),disabled:element.disabled===true,...box(element)}));
+            const controls=[...document.querySelectorAll('[data-chat-composer-footer="true"] button,[aria-label="Message"]')].filter(element=>element.getClientRects().length).map(element=>({label:element.getAttribute("aria-label")||element.textContent?.trim(),disabled:element.disabled===true,...box(element)}));
             const queue=document.querySelector('[data-chat-composer-queued-runs] [data-slot="scroll-area-viewport"]');
             if(queue)queue.scrollTop=queue.scrollHeight;
             return {pageWidth:document.documentElement.scrollWidth,viewportWidth:innerWidth,viewportHeight:innerHeight,controls,queue:queue?{...box(queue),scrollHeight:queue.scrollHeight,scrollTop:queue.scrollTop}:null,focused:document.activeElement?.getAttribute("aria-label"),reasonVisible:[...document.querySelectorAll('[role="status"]')].some(element=>element.textContent?.includes("has no saved settings"))};
@@ -240,7 +240,7 @@ async function captureComposerMobile() {
           const options=page.getByRole("button",{name:/options|runtime mode|GPT-6.1/i}).first();
           if(await options.count()) {await options.click();await page.keyboard.press("Escape");result.optionsOpened=true;} else throw Error("Actual options control not found");
           await editor.focus();
-          const send=page.getByRole("button",{name:/^(send|send message|queue message)$/i}).first();
+          const send=page.getByRole("button",{name:"Submit message",exact:true});
           await send.click();
           result.observation=await page.evaluate(()=>window.composerFixture);
           result.interactionPassed=result.micFocusable&&result.attachmentFocusable&&result.voiceDisabled&&result.observation.sends.length===1&&result.observation.sends[0]==="Synthetic mobile draft retained across queue and options";
