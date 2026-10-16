@@ -2,6 +2,8 @@ import { readMainRendererDiagnosticsForTarget } from "./ws.ts";
 import { assert, it } from "@effect/vitest";
 import {
   ORCHESTRATION_PROTOCOL_VERSION,
+  type MainRendererDiagnosticsReadResult,
+  type MainRendererDiagnosticsReadInput,
   WS_METHODS,
   WsRpcGroup,
   AuthOrchestrationReadScope,
@@ -559,4 +561,57 @@ it.effect(
           assert.isFalse(Object.hasOwn(failure, field));
       }
     }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "target guards preserve original unsupported attribution only after exact target admission",
+  () =>
+    Effect.gen(function* () {
+      const target: MainRendererDiagnosticsReadInput["target"] = {
+        environmentId: "24efa85c-862c-4de4-9b5e-aaaa041e28a4",
+        threadId: "7cd05d6b-5e09-4691-a664-0b56c6283f12",
+        providerInstanceId: "codex",
+      };
+      const request: MainRendererDiagnosticsReadInput = {
+        requestId: "request",
+        requestNonce: "nonce",
+        target,
+        optIn: true,
+        expiresAtMs: 5000,
+      };
+      let calls = 0;
+      const outcome: MainRendererDiagnosticsReadResult = {
+        status: "unavailable",
+        reason: "unsupported",
+        unsupportedDiagnostic: { site: "main-metadata" },
+      };
+      const read = Effect.sync(() => {
+        calls += 1;
+        return outcome;
+      });
+      assert.deepEqual(
+        yield* readMainRendererDiagnosticsForTarget(request, "foreign", Effect.succeed(true), read),
+        { status: "unavailable", reason: "target-mismatch" },
+      );
+      assert.deepEqual(
+        yield* readMainRendererDiagnosticsForTarget(
+          request,
+          target.environmentId,
+          Effect.succeed(false),
+          read,
+        ),
+        { status: "unavailable", reason: "target-mismatch" },
+      );
+      assert.equal(calls, 0);
+      assert.deepEqual(
+        yield* readMainRendererDiagnosticsForTarget(
+          request,
+          target.environmentId,
+          Effect.succeed(true),
+          read,
+        ),
+        outcome,
+      );
+      assert.equal(calls, 1);
+    }),
 );

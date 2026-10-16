@@ -2,6 +2,8 @@ import { describe, it, assert } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Events from "node:events";
 import * as DateTime from "effect/DateTime";
+import * as Crypto from "effect/Crypto";
+import * as PlatformError from "effect/PlatformError";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -412,3 +414,73 @@ describe("passive main renderer diagnostics", () => {
     assert.equal(Option.isSome(Schema.decodeUnknownOption(DesktopHostTelemetryHello)(hello)), true);
   });
 });
+
+const unsupportedMainCases: ReadonlyArray<"session" | "metadata" | "request"> = [
+  "session",
+  "metadata",
+  "request",
+];
+it.effect.each(unsupportedMainCases)(
+  "attributes original Main %s refusal before renderer send",
+  (failure) =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const crypto = yield* Crypto.Crypto;
+      let uuidCalls = 0;
+      let metadataCalls = 0;
+      const nonceError = PlatformError.badArgument({
+        module: "Crypto",
+        method: "randomUUIDv4",
+        description: "synthetic failure",
+      });
+      const service = yield* make().pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            Layer.succeed(Crypto.Crypto, {
+              ...crypto,
+              randomUUIDv4: Effect.suspend(() => {
+                uuidCalls += 1;
+                return (failure === "session" && uuidCalls === 1) ||
+                  (failure === "request" && uuidCalls === 2)
+                  ? Effect.fail(nonceError)
+                  : crypto.randomUUIDv4;
+              }),
+            }),
+            Layer.mock(ElectronWindow.ElectronWindow)({ main: Ref.get(f.current) }),
+            Layer.mock(ElectronApp.ElectronApp)({
+              metadata: Effect.suspend(() => {
+                metadataCalls += 1;
+                return failure === "metadata"
+                  ? Effect.fail(
+                      new ElectronApp.ElectronAppMetadataReadError({
+                        property: "app-version",
+                        cause: new Error("synthetic metadata failure"),
+                      }),
+                    )
+                  : Effect.succeed({
+                      appVersion: "fixture",
+                      appPath: "/fixture",
+                      isPackaged: true,
+                      resourcesPath: "/fixture",
+                      runningUnderArm64Translation: false,
+                    });
+              }),
+            }),
+          ),
+        ),
+      );
+      const expected =
+        failure === "session"
+          ? "main-session-nonce"
+          : failure === "metadata"
+            ? "main-metadata"
+            : "main-request-nonce";
+      assert.deepEqual(yield* service.read("source", () => true, f.input), {
+        status: "unavailable",
+        reason: "unsupported",
+        unsupportedDiagnostic: { site: expected },
+      });
+      assert.equal(yield* Queue.size(f.requests), 0);
+      assert.equal(metadataCalls, failure === "session" ? 0 : 1);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);

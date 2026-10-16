@@ -20,6 +20,7 @@ import {
   WsRpcGroup,
   WS_METHODS,
   type MainRendererDiagnosticsRequest,
+  type MainRendererDiagnosticsUnsupportedSite,
   type MainRendererDiagnosticsResponse,
 } from "@t3tools/contracts";
 import type * as Electron from "electron";
@@ -365,6 +366,64 @@ it.live(
         Layer.mergeAll(
           NodeServices.layer,
           ServerConfig.layerTest("/fixture", { prefix: "local-main-refusal" }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      ),
+    ),
+);
+
+const unsupportedPreflightCases: ReadonlyArray<{
+  platform: NodeJS.Platform;
+  userId: number | undefined;
+  fd: boolean;
+  site: MainRendererDiagnosticsUnsupportedSite;
+}> = [
+  { platform: "win32", userId: undefined, fd: true, site: "local-platform" },
+  { platform: "linux", userId: undefined, fd: true, site: "local-user-id" },
+  { platform: "linux", userId: 1000, fd: true, site: "local-fd-conflict" },
+];
+it.effect.each(unsupportedPreflightCases)(
+  "attributes the original local preflight guard $site before inspection",
+  (scenario) =>
+    Effect.gen(function* () {
+      let inspections = 0;
+      const config = yield* ServerConfig.ServerConfig;
+      const client = yield* make({
+        inspect: async () => {
+          inspections += 1;
+          throw new Error("Unexpected native inspection after preflight refusal");
+        },
+      }).pipe(
+        Effect.provideService(HostProcess.Platform, scenario.platform),
+        Effect.provideService(HostProcess.UserId, scenario.userId),
+        Effect.provideService(ServerConfig.ServerConfig, {
+          ...config,
+          desktopTelemetryFd: scenario.fd ? 7 : undefined,
+          desktopTelemetryControlFd: undefined,
+        }),
+      );
+      const result = yield* client.read(
+        {
+          requestId: "preflight",
+          requestNonce: "nonce",
+          target,
+          optIn: true,
+          expiresAtMs: DateTime.toEpochMillis(yield* DateTime.now) + 5000,
+        },
+        target.environmentId,
+      );
+      assert.deepEqual(result, {
+        status: "unavailable",
+        reason: "unsupported",
+        unsupportedDiagnostic: { site: scenario.site },
+      });
+      assert.equal(inspections, 0);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          ServerConfig.layerTest("/fixture", { prefix: "unsupported-preflight-" }).pipe(
             Layer.provide(NodeServices.layer),
           ),
         ),
