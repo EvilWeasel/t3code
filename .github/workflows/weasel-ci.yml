@@ -57,6 +57,7 @@ jobs:
           test "$GITHUB_REPOSITORY" = morrowbyte/t3code
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git fetch --no-tags --depth=1 origin b6525bb5fe4343ea5612ba5e9ec8e1a0b2482791
+          if [ "$GITHUB_REF_NAME" = feature/mobile-compact-config-candidate-20261016 ]; then git fetch --no-tags --depth=1 origin a86d942da9e89ed382d2bfd7295b1e90ab2bc429; fi
           node scripts/weasel/voice-ui-artifact.mjs "$RUNNER_TEMP/composer-mobile" --composer-mobile
       - name: Preserve emulated mobile composer development evidence
         if: always() && (github.ref_name == 'feature/mobile-composer-hotfix-candidate-20261016' || github.ref_name == 'feature/mobile-compact-config-candidate-20261016')
