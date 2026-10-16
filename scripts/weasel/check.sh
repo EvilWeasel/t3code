@@ -353,5 +353,12 @@ if [[ ! -f "$composer_thread_import_test" ]]; then
 fi
 focused_tests+=("$composer_thread_import_test")
 vp_cmd lint --report-unused-disable-directives apps/web/src/components/chat/composerThreadImport.ts apps/web/src/components/chat/composerThreadImport.test.ts
+thread_context_drop_test=apps/web/src/components/chat/threadContextDrag.test.tsx
+if [[ ! -f "$thread_context_drop_test" ]]; then
+  echo "Required thread context drop gate is missing: $thread_context_drop_test" >&2
+  exit 1
+fi
+focused_tests+=("$thread_context_drop_test")
+vp_cmd lint --report-unused-disable-directives apps/web/src/components/chat/threadContextDrag.ts apps/web/src/components/chat/threadContextDrag.test.tsx
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)
