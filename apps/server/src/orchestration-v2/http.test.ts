@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
+import { expectTypeOf } from "vitest";
 import {
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
@@ -255,3 +256,7 @@ it.effect.each([
     expect(body.length).toBeLessThan(1_024);
   }).pipe(Effect.scoped),
 );
+
+it("orchestration HTTP group retains concrete service requirements", () => {
+  expectTypeOf<Layer.Services<typeof OrchestrationHttp.layer>>().not.toBeAny();
+});

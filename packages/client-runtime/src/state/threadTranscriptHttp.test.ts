@@ -13,11 +13,13 @@ import * as Option from "effect/Option";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry } from "effect/reactivity";
 import * as Authorization from "../authorization/service.ts";
+import type { ConnectionCatalogEntry } from "../connection/catalog.ts";
 import {
   PrimaryConnectionTarget,
   RelayConnectionTarget,
   AVAILABLE_CONNECTION_STATE,
   type PreparedConnection,
+  type NetworkStatus,
 } from "../connection/model.ts";
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as Supervisor from "../connection/supervisor.ts";
@@ -66,6 +68,10 @@ const makeCommandHarness = (fetchFn: typeof fetch) =>
     });
     const destinations: EnvironmentId[] = [];
     const registryLayer = Layer.mock(EnvironmentRegistry.EnvironmentRegistry)({
+      entries: yield* SubscriptionRef.make<ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>>(
+        new Map(),
+      ),
+      networkStatus: yield* SubscriptionRef.make<NetworkStatus>("online"),
       run: (destination, effect) => {
         destinations.push(destination);
         return Effect.provideService(effect, Supervisor.EnvironmentSupervisor, supervisor);
