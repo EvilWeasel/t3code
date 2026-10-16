@@ -129,6 +129,13 @@ focused_tests=(
   apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
   apps/web/src/voice/voiceSettingsClient.test.ts
 )
+stable_callback_test=apps/web/src/hooks/useStableCallback.test.tsx
+if [[ ! -f "$stable_callback_test" ]]; then
+  echo "Required stable callback gate is missing: $stable_callback_test" >&2
+  exit 1
+fi
+vp lint --report-unused-disable-directives apps/web/src/hooks/useStableCallback.ts apps/web/src/hooks/useStableCallback.test.tsx
+focused_tests+=("$stable_callback_test")
 observatory_tests=(
   apps/web/src/observatory/AgentObservatory.test.tsx
   packages/client-runtime/src/observatory/authored.test.ts
