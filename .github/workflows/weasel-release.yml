@@ -124,6 +124,9 @@ jobs:
                       assert not p.is_absolute() and p.parts and all(x not in ('','.','..') for x in p.parts)
                       assert '\\' not in entry.filename and ':' not in entry.filename and mode in (0,stat.S_IFREG,stat.S_IFDIR)
                       key=entry.filename.casefold(); assert key not in seen; seen.add(key)
+                      # electron-builder's platform config dump is diagnostic, not a release asset.
+                      if name in ('weasel-release-linux','weasel-release-windows') and entry.filename=='builder-debug.yml':
+                          assert not entry.is_dir(); continue
                       out=dest.joinpath(*p.parts); assert out.resolve().is_relative_to(dest.resolve())
                       if entry.is_dir(): out.mkdir(parents=True,exist_ok=True); continue
                       if dest==release: assert len(p.parts)==1 and out.name not in ('SHA256SUMS','RELEASE-RECEIPT.txt')
