@@ -14,6 +14,7 @@ import {
   OrchestrationV2ThreadTranscript,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -78,6 +79,7 @@ const privateFailure = "SYNTHETIC_PRIVATE_STORAGE_DETAIL:/isolated/fixture-only"
 // or production environment is read. Only the downstream service is controlled.
 const makeHttpFixture = (failure: FixtureFailure = null) =>
   Effect.gen(function* () {
+    const requestClock = yield* Clock.Clock;
     const database = SqlitePersistence.layerMemory;
     const config = ServerConfig.layerTest(process.cwd(), { prefix: "t3-transcript-http-test-" });
     const identity = Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
@@ -153,6 +155,7 @@ const makeHttpFixture = (failure: FixtureFailure = null) =>
               },
             },
           ),
+          Context.make(Clock.Clock, requestClock),
         ),
       );
     return { auth: authService, calls, read };
