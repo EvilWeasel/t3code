@@ -197,7 +197,7 @@ export const routeCodexLiveVoiceTool = (
     const value = payload.arguments;
     if (
       !planner ||
-      payload.namespace !== "t3" ||
+      (payload.namespace != null && payload.namespace !== "t3") ||
       !payload.threadId.trim() ||
       !payload.turnId.trim() ||
       !payload.callId.trim() ||

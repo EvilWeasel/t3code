@@ -161,6 +161,45 @@ describe("restricted conversational LiveVoice tools", () => {
     }),
   );
 
+  it.effect("routes declared top-level voice tools with native optional namespaces", () =>
+    Effect.gen(function* () {
+      for (const namespace of [undefined, null, "t3"]) {
+        const submissions: Array<string> = [];
+        const controls: Array<string> = [];
+        const planner = {
+          onSubmitWork: (input: { message: string; plannerNativeThreadId: string }) =>
+            Effect.sync(() => {
+              submissions.push(input.plannerNativeThreadId + ":" + input.message);
+              return '{"accepted":true,"delivery":"queued","runId":"work-1"}';
+            }),
+          onWorkControl: (input: { action: string; plannerNativeThreadId: string }) =>
+            Effect.sync(() => {
+              controls.push(input.plannerNativeThreadId + ":" + input.action);
+              return '{"accepted":true,"runs":[]}';
+            }),
+        };
+        for (const [tool, argumentsValue] of [
+          ["t3_submit_voice_work", { message: "Check the requested data." }],
+          ["t3_voice_work_control", { action: "status" }],
+        ] as const) {
+          const payload = yield* Schema.decodeUnknownEffect(CodexSchema.DynamicToolCallParams)({
+            threadId: "bound-planner",
+            turnId: "spoken-turn",
+            callId: tool,
+            ...(namespace === undefined ? {} : { namespace }),
+            tool,
+            arguments: argumentsValue,
+          });
+          const reply = yield* CodexAdapterV2.routeCodexLiveVoiceTool(planner, payload);
+          assert.isTrue(reply.success);
+          assert.isFalse((yield* CodexAdapterV2.routeCodexLiveVoiceTool(undefined, payload)).success);
+        }
+        assert.deepEqual(submissions, ["bound-planner:Check the requested data."]);
+        assert.deepEqual(controls, ["bound-planner:status"]);
+      }
+    }),
+  );
+
   it.effect(
     "refuses unknown planners, malformed controls and cancellation without invoking work",
     () =>
