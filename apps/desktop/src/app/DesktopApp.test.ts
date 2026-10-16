@@ -1,3 +1,4 @@
+import * as NodePath from "@effect/platform-node/NodePath";
 import { assert, describe, it } from "@effect/vitest";
 import type { DesktopServerExposureState } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
@@ -17,6 +18,7 @@ import { bootstrap } from "./DesktopApp.ts";
 import * as DesktopAppActivation from "./DesktopAppActivation.ts";
 import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopConfig from "./DesktopConfig.ts";
 import * as DesktopLegacyLocalStorage from "./DesktopLegacyLocalStorage.ts";
 import * as DesktopState from "./DesktopState.ts";
 
@@ -84,12 +86,28 @@ const makeFixture = (input: {
     const services = Layer.mergeAll(
       Layer.succeed(DesktopState.DesktopState, state),
       DesktopAppSettings.layerTest(settings),
-      Layer.mock(DesktopEnvironment.DesktopEnvironment)({
-        isDevelopment: false,
-        configuredBackendPort: Option.some(3_773),
-        clientAssetsDir: "/fixture/client",
-        defaultDesktopSettings: DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
-      }),
+      DesktopEnvironment.layer({
+        dirname: "/fixture/apps/desktop/dist-electron",
+        homeDirectory: "/fixture/home",
+        platform: "linux",
+        processArch: "x64",
+        appVersion: "0.0.47-nightly.20261015.30",
+        appPath: "/fixture/app.asar",
+        isPackaged: true,
+        resourcesPath: "/fixture/resources",
+        runningUnderArm64Translation: false,
+      }).pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            NodePath.layerPosix,
+            DesktopConfig.layerTest({
+              T3CODE_PORT: "3773",
+              T3CODE_HOME: "/fixture/t3",
+              T3CODE_DESKTOP_PROFILE: "weasel",
+            }),
+          ),
+        ),
+      ),
       Layer.mock(ElectronProtocol.ElectronProtocol)({
         registerDesktopProtocol: () => record("protocol"),
       }),
