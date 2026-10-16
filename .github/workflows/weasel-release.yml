@@ -9,7 +9,7 @@ on:
         type: boolean
         default: true
       source_sha:
-        description: Fork main commit to build (set by the sync workflow)
+        description: Exact source commit (fork main for publishing, dispatched branch for artifacts only)
         required: true
         type: string
 
@@ -38,16 +38,14 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
 
-      - name: Verify source is on fork main
+      - name: Verify published or artifact-only source
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
+          PUBLISH_RELEASE: ${{ inputs.publish }}
+          DISPATCHED_REF: ${{ github.ref }}
+          DISPATCHED_SHA: ${{ github.sha }}
         run: |
-          set -euo pipefail
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          git fetch origin main
-          git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
-          test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
+          bash scripts/weasel/verify-desktop-source.sh "$SOURCE_SHA" "$PUBLISH_RELEASE" "$DISPATCHED_REF" "$DISPATCHED_SHA"
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1

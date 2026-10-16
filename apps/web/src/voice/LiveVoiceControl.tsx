@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
 import {
   LiveVoiceError,
+  defaultInstanceIdForDriver,
   MainRendererDiagnosticsGate,
   MainRendererDiagnosticsRequest,
   type MainRendererDiagnosticsResponse,
@@ -22,6 +23,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import type {
   EnvironmentId,
   ProjectId,
+  ProviderInstanceConfig,
   ServerProvider,
   ServerSettings,
   ThreadId,
@@ -50,6 +52,7 @@ import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
   sortProviderInstanceEntries,
+  type ProviderInstanceEntry,
 } from "../providerInstances";
 
 /** Classify only an observed typed prepare failure, never account entitlement. */
@@ -67,6 +70,31 @@ export function deriveLiveVoiceProviderEntries(
   return sortProviderInstanceEntries(
     applyProviderInstanceSettings(deriveProviderInstanceEntries(providers), settings, projectId),
   );
+}
+
+/** Persisted settings omit built-in defaults and may predate the optional Codex setup mode. */
+export function resolveLiveVoiceInstanceSettings(
+  provider: Pick<ProviderInstanceEntry, "instanceId" | "driverKind"> | null,
+  settings: Pick<ServerSettings, "providerInstances"> | undefined,
+) {
+  if (!provider || !settings) return;
+  const instance: ProviderInstanceConfig | undefined = Object.hasOwn(
+    settings.providerInstances,
+    provider.instanceId,
+  )
+    ? settings.providerInstances[provider.instanceId]
+    : provider.driverKind === "codex" &&
+        provider.instanceId === defaultInstanceIdForDriver(provider.driverKind)
+      ? { driver: provider.driverKind }
+      : undefined;
+  if (!instance || provider.driverKind !== "codex" || instance.driver !== "codex") return instance;
+  const config = instance.config;
+  if (config === undefined || config === null)
+    return { ...instance, config: { setupMode: "existing" } };
+  if (typeof config === "object" && !Array.isArray(config) && !Object.hasOwn(config, "setupMode")) {
+    return { ...instance, config: { ...config, setupMode: "existing" } };
+  }
+  return instance;
 }
 
 /** A cached successful config must not hide a current projection failure. */
@@ -113,6 +141,7 @@ export function resolveLiveVoiceAvailability(input: {
     readonly driverKind: string;
     readonly enabled: boolean;
     readonly isAvailable: boolean;
+    readonly snapshot?: Pick<ServerProvider, "auth"> | undefined;
   } | null;
   readonly instanceConfigured: boolean;
   readonly projectOverride?: boolean | undefined;
@@ -141,7 +170,7 @@ export function resolveLiveVoiceAvailability(input: {
   else if (!input.provider.isAvailable)
     reason = "The selected provider is unavailable. Check its setup in Settings.";
   else if (input.provider.driverKind !== "codex")
-    reason = "Select a managed Codex provider to use Live voice.";
+    reason = "Select a Codex provider signed in with ChatGPT to use Live voice.";
   else if (!input.selectionCurrent || !input.providerInstanceId)
     reason = "Waiting for this thread's provider selection to update.";
   else if (!input.instanceConfigured)
@@ -150,10 +179,13 @@ export function resolveLiveVoiceAvailability(input: {
     reason = "Codex setup mode is missing. Complete its setup in Settings.";
   else if (typeof input.config !== "object" || !("setupMode" in input.config))
     reason = "Codex setup mode is invalid or missing. Check its setup in Settings.";
-  else if (input.config.setupMode === "existing")
-    reason =
-      "This Codex provider uses an existing installation. Live voice requires managed setup.";
-  else if (input.config.setupMode !== "managed")
+  else if (input.config.setupMode === "existing") {
+    if (
+      input.provider.snapshot?.auth.status !== "authenticated" ||
+      input.provider.snapshot.auth.type !== "chatgpt"
+    )
+      reason = "Sign in to this Codex installation with ChatGPT to use Live voice.";
+  } else if (input.config.setupMode !== "managed")
     reason = "Codex setup mode is invalid. Check its setup in Settings.";
   const catalogMatches = input.catalogEnvironmentId === input.environmentId;
   const catalogReady = catalogMatches && input.configState === "ready";
@@ -226,7 +258,7 @@ export function resolveLiveVoiceControlGate(input: {
   );
   const supported = isLiveVoiceSupported({
     provider: "codex",
-    setupMode: "managed",
+    setupMode: input.availability.facts.setupMode,
     RTCPeerConnection: input.RTCPeerConnection,
     getUserMedia: input.getUserMedia,
   });

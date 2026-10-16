@@ -43,6 +43,7 @@ import {
   LiveVoiceControl,
   resolveLiveVoiceAvailability,
   resolveLiveVoiceConfigState,
+  resolveLiveVoiceInstanceSettings,
   resolveLiveVoiceControlGate,
   createLiveVoiceDiagnosticProducer,
 } from "./LiveVoiceControl";
@@ -78,6 +79,15 @@ const loaded: AvailabilityInput = {
   provider: { driverKind: "codex", enabled: true, isAvailable: true },
   instanceConfigured: true,
   config: { setupMode: "managed" },
+};
+
+const nativeLoaded: AvailabilityInput = {
+  ...loaded,
+  provider: {
+    ...loaded.provider!,
+    snapshot: { auth: { status: "authenticated", type: "chatgpt" } },
+  },
+  config: { setupMode: "existing" },
 };
 
 let root: Root;
@@ -620,6 +630,149 @@ describe("Live voice diagnostic producer model (transport absent)", () => {
   });
 });
 
+describe("LiveVoice instance defaults", () => {
+  const provider = {
+    instanceId: ProviderInstanceId.make("codex"),
+    driverKind: ProviderDriverKind.make("codex"),
+  };
+
+  function availabilityFor(
+    selected: typeof provider,
+    settings: Parameters<typeof resolveLiveVoiceInstanceSettings>[1],
+    patch: Partial<AvailabilityInput> = {},
+  ) {
+    const instance = resolveLiveVoiceInstanceSettings(selected, settings);
+    return {
+      ...nativeLoaded,
+      providerInstanceId: selected.instanceId,
+      instanceConfigured: instance !== undefined,
+      config: instance?.config,
+      ...patch,
+    };
+  }
+
+  it("uses the observed setup mode when checking browser support", () => {
+    const availability = resolveLiveVoiceAvailability(nativeLoaded);
+    for (const setupMode of ["missing", "invalid", "unknown"] as const) {
+      const gate = resolveLiveVoiceControlGate({
+        environmentId: environmentA,
+        threadId: thread,
+        providerInstanceId: "codex",
+        availability: { ...availability, facts: { ...availability.facts, setupMode } },
+        eligible: true,
+        phase: "idle",
+        RTCPeerConnection: peer,
+        getUserMedia,
+      });
+      expect(gate.canStart).toBe(false);
+    }
+    expectPassive();
+  });
+
+  it("admits the implicit built-in Codex default without saving settings or probing", async () => {
+    const settings = { providerInstances: {} };
+    const input = availabilityFor(provider, settings);
+    expect(gateFor(input).canStart).toBe(true);
+    expect(gateFor(input).facts?.setupMode).toBe("existing");
+    expect(settings.providerInstances).toEqual({});
+    await render(input);
+    expect(startButton().disabled).toBe(false);
+    expectPassive();
+    await act(async () => startButton().click());
+    expect(commands.prepare).toHaveBeenCalledOnce();
+    expect(commands.start).not.toHaveBeenCalled();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(peer).not.toHaveBeenCalled();
+  });
+
+  it.each(
+    [undefined, null, {}, { binaryPath: "custom-codex", homePath: "custom-home" }].map(
+      (config) => ({ config }),
+    ),
+  )(
+    "uses native defaults for omitted legacy config/mode while preserving fields: %j",
+    ({ config }) => {
+      const settings = {
+        providerInstances: { [provider.instanceId]: { driver: provider.driverKind, config } },
+      };
+      const before = structuredClone(settings);
+      const resolved = resolveLiveVoiceInstanceSettings(provider, settings);
+      expect(resolved?.config).toEqual({ ...(config ?? {}), setupMode: "existing" });
+      expect(settings).toEqual(before);
+      expect(gateFor(availabilityFor(provider, settings)).canStart).toBe(true);
+      expectPassive();
+    },
+  );
+
+  it("requires an own configured entry for custom Codex instances", () => {
+    const custom = { ...provider, instanceId: ProviderInstanceId.make("codex-personal") };
+    const missing = availabilityFor(custom, { providerInstances: {} });
+    expect(gateFor(missing).canStart).toBe(false);
+    expect(gateFor(missing).reason).toContain("no saved settings");
+    const configured = availabilityFor(custom, {
+      providerInstances: { [custom.instanceId]: { driver: provider.driverKind, config: {} } },
+    });
+    expect(gateFor(configured).canStart).toBe(true);
+    expect(
+      resolveLiveVoiceInstanceSettings(
+        { ...provider, driverKind: ProviderDriverKind.make("claudeAgent") },
+        { providerInstances: {} },
+      ),
+    ).toBeUndefined();
+    expect(resolveLiveVoiceInstanceSettings(provider, undefined)).toBeUndefined();
+    expectPassive();
+  });
+
+  it.each(
+    ["existing", [], { setupMode: null }, { setupMode: "invalid" }, { setupMode: undefined }].map(
+      (config) => ({ config }),
+    ),
+  )("preserves malformed explicit config for rejection: %j", ({ config }) => {
+    const settings = {
+      providerInstances: { [provider.instanceId]: { driver: provider.driverKind, config } },
+    };
+    expect(resolveLiveVoiceInstanceSettings(provider, settings)?.config).toBe(config);
+    expect(gateFor(availabilityFor(provider, settings)).canStart).toBe(false);
+    expectPassive();
+  });
+
+  it.each([
+    {
+      provider: {
+        ...nativeLoaded.provider!,
+        snapshot: { auth: { status: "authenticated", type: "apiKey" } },
+      },
+    },
+    {
+      provider: {
+        ...nativeLoaded.provider!,
+        snapshot: { auth: { status: "unauthenticated", type: "chatgpt" } },
+      },
+    },
+    { provider: { ...nativeLoaded.provider!, snapshot: { auth: { status: "authenticated" } } } },
+    { provider: { ...nativeLoaded.provider!, snapshot: undefined } },
+    { provider: { ...nativeLoaded.provider!, enabled: false } },
+    { provider: { ...nativeLoaded.provider!, isAvailable: false } },
+    { provider: { ...nativeLoaded.provider!, driverKind: "claudeAgent" } },
+    { catalogEnvironmentId: environmentB },
+    { settingsKnown: false },
+    { permissionState: "pending" },
+    { canOperate: false },
+    { selectionCurrent: false },
+    { configState: "failed" },
+  ] satisfies ReadonlyArray<Partial<AvailabilityInput>>)(
+    "keeps native defaults behind real auth, catalog and permission gates: %j",
+    async (patch) => {
+      const input = availabilityFor(provider, { providerInstances: {} }, patch);
+      expect(gateFor(input).canStart).toBe(false);
+      await render(input);
+      expect(startButton().disabled).toBe(true);
+      await act(async () => startButton().click());
+      expectPassive();
+    },
+  );
+});
+
 describe("LiveVoiceControl passive availability", () => {
   it.each([
     "unsupported_provider",
@@ -778,9 +931,7 @@ describe("LiveVoiceControl passive availability", () => {
         configState: resolveLiveVoiceConfigState(AsyncResult.initial()),
       });
       expect(startButton().disabled).toBe(true);
-      expect(await startHint()).toContain(
-        "Waiting for this environment's provider information",
-      );
+      expect(await startHint()).toContain("Waiting for this environment's provider information");
       await render({
         ...loaded,
         environmentId: environmentB,
@@ -797,7 +948,7 @@ describe("LiveVoiceControl passive availability", () => {
   it("keeps the disabled reason out of the toolbar and opens it on deliberate keyboard focus", async () => {
     await render({ ...loaded, config: { setupMode: "existing" } });
     expect(container.querySelector('[role="status"]')).toBeNull();
-    expect(container.textContent).not.toContain("existing installation");
+    expect(container.textContent).not.toContain("Sign in to this Codex installation");
     const trigger = container.querySelector<HTMLElement>('[data-slot="tooltip-trigger"]');
     if (!trigger) throw new Error("Missing voice hint trigger");
     expect(trigger.tabIndex).toBe(0);
@@ -806,24 +957,30 @@ describe("LiveVoiceControl passive availability", () => {
       trigger.focus();
     });
     expect(document.activeElement).toBe(trigger);
-    expect(await startHint()).toContain("existing installation");
+    expect(await startHint()).toContain("Sign in to this Codex installation");
     expectPassive();
   });
-  it("enables loaded managed setup without probing, and only prepares after a deliberate click", async () => {
-    await render(loaded);
-    expect(startButton().disabled).toBe(false);
-    expectPassive();
-    await act(async () => startButton().click());
-    expect(commands.prepare).toHaveBeenCalledOnce();
-    expect(commands.prepare.mock.calls[0]?.[0]).toMatchObject({
-      environmentId: environmentA,
-      input: { threadId: thread },
-    });
-    expect(commands.start).not.toHaveBeenCalled();
-    expect(getUserMedia).not.toHaveBeenCalled();
-    expect(peer).not.toHaveBeenCalled();
-    expect(container.textContent).toContain("ChatGPT");
-  });
+  it.each([
+    ["managed", loaded],
+    ["native ChatGPT", nativeLoaded],
+  ] as const)(
+    "enables %s setup passively and prepares only after a deliberate click",
+    async (_name, input) => {
+      await render(input);
+      expect(startButton().disabled).toBe(false);
+      expectPassive();
+      await act(async () => startButton().click());
+      expect(commands.prepare).toHaveBeenCalledOnce();
+      expect(commands.prepare.mock.calls[0]?.[0]).toMatchObject({
+        environmentId: environmentA,
+        input: { threadId: thread },
+      });
+      expect(commands.start).not.toHaveBeenCalled();
+      expect(getUserMedia).not.toHaveBeenCalled();
+      expect(peer).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("ChatGPT");
+    },
+  );
 
   it.each([
     {
@@ -836,7 +993,7 @@ describe("LiveVoiceControl passive availability", () => {
     },
     {
       patch: { config: { setupMode: "existing" } },
-      reason: "uses an existing installation",
+      reason: "Sign in to this Codex installation",
     },
     { patch: { instanceConfigured: false }, reason: "has no saved settings" },
     { patch: { config: null }, reason: "setup mode is missing" },
@@ -872,7 +1029,7 @@ describe("LiveVoiceControl passive availability", () => {
     },
     {
       patch: { provider: { ...loaded.provider!, driverKind: "claudeCode" } },
-      reason: "Select a managed Codex provider",
+      reason: "Select a Codex provider signed in with ChatGPT",
     },
     {
       patch: { canOperate: false },

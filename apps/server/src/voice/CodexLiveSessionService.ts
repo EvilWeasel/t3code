@@ -769,7 +769,11 @@ export const layer: Layer.Layer<
                     : liveError("planner_restriction_failed"),
                 ),
                 Effect.catch((error) =>
-                  markUnknown(leaseId, generation).pipe(Effect.andThen(Effect.fail(error))),
+                  Effect.gen(function* () {
+                    const failed = yield* getLease(leaseId, generation);
+                    if (failed !== undefined) yield* updateStatus(failed, "failed");
+                    return yield* Effect.fail(error);
+                  }),
                 ),
               );
             const row = yield* getLease(leaseId, generation);
@@ -901,7 +905,12 @@ export const layer: Layer.Layer<
             }
             if (row.status === "failed") return sessionFromRow(row);
             if (row.planner_native_thread_id === null || row.provider_session_id === null) {
-              if (row.status === "unknown") return sessionFromRow(row);
+              if (row.status === "unknown") {
+                if (row.planner_native_thread_id === null) {
+                  return (yield* updateStatus(row, "failed")).session;
+                }
+                return sessionFromRow(row);
+              }
               return yield* liveError("invalid_state");
             }
             const next = yield* updateStatus(

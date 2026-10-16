@@ -140,6 +140,8 @@ it.effect.each([false, true])(
         ["message.updated", yield* Queue.unbounded<OrchestrationV2StoredEvent>()],
       ]);
       let plannerCalls = 0;
+      let plannerAttempts = 0;
+      let plannerFailure: "managed_account_required" | "planner_restriction_failed" | undefined;
       const runtime = {
         instanceId: ProviderInstanceId.make("codex-test"),
         providerSessionId: ProviderSessionId.make("provider-session-test"),
@@ -157,17 +159,31 @@ it.effect.each([false, true])(
             }) => Effect.Effect<string>;
             onWorkControl: NonNullable<typeof controlWork>;
           }) =>
-            Effect.sync(() => {
-              plannerCalls += 1;
-              submitWork = input.onSubmitWork;
-              controlWork = input.onWorkControl;
-              plannerOptions = {
-                ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
-                ...(input.reasoningEffort === undefined
-                  ? {}
-                  : { reasoningEffort: input.reasoningEffort }),
-              };
-              return { plannerNativeThreadId: `planner-native-${plannerCalls}` };
+            Effect.suspend(() => {
+              plannerAttempts += 1;
+              if (plannerFailure !== undefined) {
+                return Effect.fail(
+                  new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: ProviderDriverKind.make("codex"),
+                    detail:
+                      plannerFailure === "managed_account_required"
+                        ? "Managed ChatGPT account is required for Codex Live."
+                        : "Codex Live planner settings were not confirmed.",
+                  }),
+                );
+              }
+              return Effect.sync(() => {
+                plannerCalls += 1;
+                submitWork = input.onSubmitWork;
+                controlWork = input.onWorkControl;
+                plannerOptions = {
+                  ...(input.serviceTier === undefined ? {} : { serviceTier: input.serviceTier }),
+                  ...(input.reasoningEffort === undefined
+                    ? {}
+                    : { reasoningEffort: input.reasoningEffort }),
+                };
+                return { plannerNativeThreadId: `planner-native-${plannerCalls}` };
+              });
             }),
           start: () => Effect.void,
           stop: () =>
@@ -1222,6 +1238,73 @@ it.effect.each([false, true])(
         `;
         assert.equal(readbackState(refusedReceipt[0]!.receipt_json), "refused");
         assert.isString(raceReceipt);
+
+        for (const code of ["managed_account_required", "planner_restriction_failed"] as const) {
+          plannerFailure = code;
+          const clientRequestId = `prepare-failure-${code}`;
+          const error = yield* Effect.flip(service.prepare(session, { threadId, clientRequestId }));
+          assert.equal(error.code, code);
+          const failed = yield* service.prepare(session, { threadId, clientRequestId });
+          assert.equal(failed.status, "failed");
+          assert.isNull(failed.plannerNativeThreadId);
+          const attempts = plannerAttempts;
+          assert.equal(
+            (yield* service.prepare(session, { threadId, clientRequestId })).leaseId,
+            failed.leaseId,
+          );
+          assert.equal(plannerAttempts, attempts, "a failed prepare request remains idempotent");
+        }
+
+        const historical = yield* service.prepare(session, {
+          threadId,
+          clientRequestId: "prepare-failure-planner_restriction_failed",
+        });
+        const lease = {
+          leaseId: historical.leaseId,
+          generation: historical.generation,
+          clientRequestId: "stop-historical",
+        };
+        yield* sql`UPDATE codex_live_voice_leases SET status = 'unknown' WHERE lease_id = ${lease.leaseId}`;
+        const status = () => service.status(session, lease).pipe(Effect.map((value) => value.status));
+        for (const invalidPrincipal of [
+          { ...session, scopes: [] },
+          { ...session, subject: "different-subject" },
+          { ...session, sessionId: AuthSessionId.make("different-session") },
+        ]) {
+          assert.isTrue(Exit.isFailure(yield* Effect.exit(service.stop(invalidPrincipal, lease))));
+          assert.equal(yield* status(), "unknown");
+        }
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(
+              service.stop(session, { ...lease, generation: lease.generation + 1 }),
+            ),
+          ),
+        );
+        yield* sql`UPDATE codex_live_voice_leases SET principal_session_id = 'different-owner' WHERE lease_id = ${lease.leaseId}`;
+        assert.isTrue(Exit.isFailure(yield* Effect.exit(service.stop(session, lease))));
+        yield* sql`UPDATE codex_live_voice_leases SET principal_session_id = ${sessionId},
+          planner_native_thread_id = 'unresolved-native-planner', provider_session_id = NULL
+          WHERE lease_id = ${lease.leaseId}`;
+        assert.equal(
+          (yield* service.stop(session, lease)).status,
+          "unknown",
+          "a lease that may own a native planner cannot be cleared locally",
+        );
+        yield* sql`UPDATE codex_live_voice_leases SET planner_native_thread_id = NULL WHERE lease_id = ${lease.leaseId}`;
+        const stopsBeforeHistorical = stops;
+        assert.equal((yield* service.stop(session, lease)).status, "failed");
+        assert.equal(stops, stopsBeforeHistorical, "no native session exists to stop");
+        plannerFailure = undefined;
+        const retry = yield* service.prepare(session, {
+          threadId,
+          clientRequestId: "prepare-after-failure",
+        });
+        assert.equal(
+          retry.status,
+          "prepared",
+          "failed preparation and historical empty leases do not block a new call",
+        );
       });
       yield* program.pipe(
         Effect.provide(Layer.provideMerge(CodexLiveSessionService.layer, dependencies)),

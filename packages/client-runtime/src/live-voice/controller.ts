@@ -230,7 +230,7 @@ export class LiveVoiceController {
       this.setState({
         ...IDLE_STATE,
         phase: "error",
-        error: "Live voice is only available for managed Codex threads.",
+        error: "Live voice is only available for Codex threads.",
       });
       return;
     }
@@ -795,7 +795,7 @@ export function isLiveVoiceSupported(scope: {
 }): boolean {
   return (
     scope.provider === "codex" &&
-    scope.setupMode === "managed" &&
+    (scope.setupMode === "managed" || scope.setupMode === "existing") &&
     typeof scope.RTCPeerConnection === "function" &&
     typeof scope.getUserMedia === "function"
   );

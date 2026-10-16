@@ -76,7 +76,7 @@ export type LiveVoiceErrorCode = typeof LiveVoiceErrorCode.Type;
 export const liveVoicePublicErrorMessage = (code: LiveVoiceErrorCode): string => {
   switch (code) {
     case "unsupported_provider":
-      return "Live voice is available only for a managed Codex thread.";
+      return "Live voice is available only for a Codex thread signed in with ChatGPT.";
     case "managed_account_required":
       return "Sign in to a supported ChatGPT account to use Live voice.";
     case "session_not_found":

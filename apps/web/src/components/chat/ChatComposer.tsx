@@ -293,12 +293,12 @@ import {
   LiveVoiceControl,
   resolveLiveVoiceAvailability,
   resolveLiveVoiceConfigState,
+  resolveLiveVoiceInstanceSettings,
 } from "../../voice/LiveVoiceControl";
 import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
 import * as Option from "effect/Option";
 import { transcribeVoiceRecording } from "../../voice/transcriptionClient";
-import { readCodexSetupMode } from "../settings/CodexSetupSection.logic";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
@@ -2285,9 +2285,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         entry.instanceId ===
         (liveVoiceInstanceId ?? liveVoiceSelection.unavailableProviderInstanceId),
     ) ?? null;
-  const liveVoiceInstanceSettings = liveVoiceProvider
-    ? liveVoiceConfig?.settings.providerInstances[liveVoiceProvider.instanceId]
-    : undefined;
+  const liveVoiceInstanceSettings = resolveLiveVoiceInstanceSettings(
+    liveVoiceProvider,
+    liveVoiceConfig?.settings,
+  );
   const liveVoiceAvailability = resolveLiveVoiceAvailability({
     environmentId: liveVoiceEnvironmentId,
     threadId: activeThreadId,
@@ -2315,10 +2316,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         : undefined,
     config: liveVoiceInstanceSettings?.config,
   });
-  const selectedCodexConfig = liveVoiceInstanceSettings?.config;
   const liveVoiceProviderEligible =
     selectedProviderEntry?.driverKind === "codex" &&
-    readCodexSetupMode(selectedCodexConfig) === "managed" &&
+    (liveVoiceAvailability.facts.setupMode === "managed" ||
+      liveVoiceAvailability.facts.setupMode === "existing") &&
     liveVoiceAvailability.reason === null;
   const supportedRuntimeModes = selectedProviderEntry?.snapshot.supportedRuntimeModes;
   const compatibleRuntimeModeOptions =

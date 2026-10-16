@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { DesktopEnvironmentBootstrapSchema } from "./ipc.ts";
+import { DesktopEnvironmentBootstrapSchema, MainRendererDiagnosticsReason } from "./ipc.ts";
 
 describe("DesktopEnvironmentBootstrapSchema", () => {
   const decode = Schema.decodeUnknownSync(DesktopEnvironmentBootstrapSchema);
@@ -34,5 +34,22 @@ describe("DesktopEnvironmentBootstrapSchema", () => {
         wsBaseUrl: null,
       }).runningDistro,
     ).toBeNull();
+  });
+});
+
+describe("MainRendererDiagnosticsReason", () => {
+  const decode = Schema.decodeUnknownSync(MainRendererDiagnosticsReason);
+
+  it.each([
+    "Select a Codex provider signed in with ChatGPT to use Live voice.",
+    "Sign in to this Codex installation with ChatGPT to use Live voice.",
+    "Select a managed Codex provider to use Live voice.",
+    "This Codex provider uses an existing installation. Live voice requires managed setup.",
+  ])("accepts current and older renderer qualification reasons: %s", (reason) => {
+    expect(decode(reason)).toBe(reason);
+  });
+
+  it("rejects arbitrary provider or credential details", () => {
+    expect(() => decode("private provider diagnostic")).toThrow();
   });
 });

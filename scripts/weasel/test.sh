@@ -3,6 +3,7 @@ set -euo pipefail
 
 bash -n scripts/weasel/*.sh
 bash scripts/weasel/sync-upstream-nightly.test.sh
+bash scripts/weasel/verify-desktop-source.test.sh
 actual="$(bash scripts/weasel/resolve-version.sh 0.0.46 20261013 1)"
 if [[ "$actual" != "version=0.0.47-nightly.20261013.1" ]]; then
   echo "Unexpected fork version: $actual" >&2

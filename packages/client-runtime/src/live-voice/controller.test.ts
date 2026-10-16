@@ -288,6 +288,29 @@ async function connect(harness: ReturnType<typeof createHarness>, starting: Prom
   await starting;
 }
 
+describe("isLiveVoiceSupported", () => {
+  const media = { RTCPeerConnection: () => undefined, getUserMedia: () => undefined };
+
+  it.each(["managed", "existing"])("supports Codex %s with both media APIs", (setupMode) => {
+    expect(isLiveVoiceSupported({ provider: "codex", setupMode, ...media })).toBe(true);
+    expect(isLiveVoiceSupported({ provider: "claude", setupMode, ...media })).toBe(false);
+    expect(
+      isLiveVoiceSupported({ provider: "codex", setupMode, getUserMedia: media.getUserMedia }),
+    ).toBe(false);
+    expect(
+      isLiveVoiceSupported({
+        provider: "codex",
+        setupMode,
+        RTCPeerConnection: media.RTCPeerConnection,
+      }),
+    ).toBe(false);
+  });
+
+  it.each(["", "invalid"])("rejects unknown setup mode %s", (setupMode) => {
+    expect(isLiveVoiceSupported({ provider: "codex", setupMode, ...media })).toBe(false);
+  });
+});
+
 describe("LiveVoiceController", () => {
   it.each([false, true])(
     "recovers on the same lease with mute controls available (playback blocked: %s)",

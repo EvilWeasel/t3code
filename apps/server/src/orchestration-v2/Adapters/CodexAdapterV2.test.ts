@@ -37,6 +37,7 @@ import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexError from "effect-codex-app-server/errors";
 import * as CodexReplay from "effect-codex-app-server/replay";
+import * as CodexSchema from "effect-codex-app-server/schema";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Crypto from "effect/Crypto";
@@ -2088,6 +2089,280 @@ describe("CodexAdapterV2 session initialize", () => {
         Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
     ),
+  );
+});
+
+describe("CodexAdapterV2 LiveVoice planner preparation", () => {
+  type Settings = CodexSchema.V2ThreadSettingsUpdatedNotification["threadSettings"];
+  const settings: Settings = {
+    model: CODEX_TEST_MODEL_SELECTION.model,
+    effort: "low",
+    serviceTier: "ultrafast",
+    modelProvider: "openai",
+    cwd: "/workspace",
+    approvalPolicy: "never",
+    approvalsReviewer: "user",
+    collaborationMode: { mode: "default", settings: { model: CODEX_TEST_MODEL_SELECTION.model } },
+    sandboxPolicy: { type: "readOnly", networkAccess: false },
+  };
+
+  const openPlanner = Effect.fnUntraced(function* (
+    options: {
+      readonly start?: Partial<CodexSchema.V2ThreadStartResponse>;
+      readonly update?: (
+        emit: (
+          settings: Settings,
+          threadId?: string,
+        ) => Effect.Effect<void, CodexError.CodexAppServerError>,
+      ) => Effect.Effect<unknown, CodexError.CodexAppServerError>;
+    } = {},
+  ) {
+    const preamble = codexReplayPreamble({
+      nativeThreadId: "new-live-planner",
+      nativeTurnId: "unused",
+      prompt: "unused",
+    });
+    const startEntry = preamble[4];
+    if (startEntry?.type !== "emit_inbound" || !Predicate.isObject(startEntry.frame)) {
+      return yield* Effect.die("Missing thread/start fixture.");
+    }
+    const started = yield* Schema.decodeUnknownEffect(CodexSchema.V2ThreadStartResponse)(
+      startEntry.frame.result,
+    );
+    const requests: Array<{ method: string; params: unknown }> = [];
+    let settingsHandler:
+      | ((
+          payload: CodexSchema.V2ThreadSettingsUpdatedNotification,
+        ) => Effect.Effect<void, CodexError.CodexAppServerError>)
+      | undefined;
+    const emit = (value: Settings, threadId = "new-live-planner") =>
+      settingsHandler?.({ threadId, threadSettings: value }) ??
+      Effect.die("Missing settings handler.");
+    const transcript = makeCodexReplayTranscript({
+      scenario: "live-planner",
+      entries: preamble.slice(0, 3),
+    });
+    const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
+      instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+      settings: DEFAULT_CODEX_SETTINGS,
+      environment: {},
+      clientFactory: {
+        open: (input) =>
+          Layer.build(CodexReplay.layerReplay(transcript)).pipe(
+            Effect.flatMap((context) =>
+              Effect.service(CodexClient.CodexAppServerClient).pipe(Effect.provide(context)),
+            ),
+            Effect.map(
+              (client) =>
+                ({
+                  ...client,
+                  raw: {
+                    ...client.raw,
+                    request: (method, params) =>
+                      Effect.gen(function* () {
+                        requests.push({ method, params });
+                        if (method === "account/read") return { account: { type: "chatgpt" } };
+                        if (method === "thread/start")
+                          return {
+                            ...started,
+                            approvalPolicy: "never",
+                            sandbox: { type: "readOnly", networkAccess: false },
+                            serviceTier: "ultrafast",
+                            reasoningEffort: "low",
+                            ...options.start,
+                          };
+                        if (method === "thread/settings/update")
+                          return yield* options.update?.(emit) ?? Effect.succeed({});
+                        if (method === "thread/archive") return {};
+                        return yield* CodexError.CodexAppServerRequestError.methodNotFound(method);
+                      }),
+                  },
+                  handleServerNotification: (method, handler) => {
+                    if (method === "thread/settings/updated") {
+                      settingsHandler = (payload) => handler(payload as never);
+                    }
+                    return client.handleServerNotification(method, handler);
+                  },
+                }) satisfies CodexClient.CodexAppServerClient["Service"],
+            ),
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterOpenSessionError({
+                  driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+                  providerSessionId: input.providerSessionId,
+                  cause,
+                }),
+            ),
+          ),
+      },
+      crypto: yield* Crypto.Crypto,
+      fileSystem: yield* FileSystem.FileSystem,
+      idAllocator: yield* IdAllocator.IdAllocatorV2,
+      serverConfig: yield* makeReplayServerConfig("live-planner").pipe(Effect.orDie),
+    });
+    const runtime = yield* adapter.openSession({
+      threadId: ThreadId.make("existing-work-thread"),
+      providerSessionId: ProviderSessionId.make("live-provider-session"),
+      modelSelection: CODEX_TEST_MODEL_SELECTION,
+      runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+    });
+    const liveVoice = runtime.liveVoice;
+    if (liveVoice === undefined) return yield* Effect.die("Missing LiveVoice runtime.");
+    return {
+      requests,
+      emit,
+      prepare: () =>
+        liveVoice.preparePlanner({
+          modelSelection: CODEX_TEST_MODEL_SELECTION,
+          serviceTier: "ultrafast",
+          reasoningEffort: "low",
+          onSubmitWork: () => Effect.succeed('{"accepted":false}'),
+        }),
+    };
+  });
+
+  const dependencies = Layer.mergeAll(
+    IdAllocator.layer,
+    McpProviderSessions.layer,
+    NodeServices.layer,
+  );
+
+  it.effect(
+    "accepts authoritative matching start settings without waiting for a deduplicated update",
+    () =>
+      Effect.gen(function* () {
+        const planner = yield* openPlanner();
+        assert.deepEqual(yield* planner.prepare(), { plannerNativeThreadId: "new-live-planner" });
+        assert.deepEqual(
+          planner.requests.map((request) => request.method),
+          ["account/read", "thread/start"],
+        );
+      }).pipe(Effect.scoped, Effect.provide(dependencies)),
+  );
+
+  it.effect.each([
+    { model: "other-model" },
+    { serviceTier: "other-tier" },
+    { reasoningEffort: "high" as const },
+  ])("requires a fresh matching update when start selection differs (%j)", (start) =>
+    Effect.gen(function* () {
+      const planner = yield* openPlanner({
+        start,
+        update: (emit) => emit(settings).pipe(Effect.as({})),
+      });
+      assert.deepEqual(yield* planner.prepare(), { plannerNativeThreadId: "new-live-planner" });
+      assert.equal(
+        planner.requests.filter((request) => request.method === "thread/settings/update").length,
+        1,
+      );
+      assert.notInclude(
+        planner.requests.map((request) => request.method),
+        "thread/archive",
+      );
+    }).pipe(Effect.scoped, Effect.provide(dependencies)),
+  );
+
+  it.effect.each([
+    { approvalPolicy: "on-request" as const },
+    { sandbox: { type: "readOnly" as const, networkAccess: true } },
+    { sandbox: { type: "dangerFullAccess" as const } },
+  ])("refuses unsafe start restrictions and archives only the new planner (%j)", (start) =>
+    Effect.gen(function* () {
+      const planner = yield* openPlanner({ start });
+      assert.equal((yield* Effect.exit(planner.prepare()))._tag, "Failure");
+      assert.deepEqual(
+        planner.requests.filter((request) => request.method === "thread/archive"),
+        [{ method: "thread/archive", params: { threadId: "new-live-planner" } }],
+      );
+      assert.notInclude(
+        planner.requests.map((request) => request.method),
+        "thread/settings/update",
+      );
+    }).pipe(Effect.scoped, Effect.provide(dependencies)),
+  );
+
+  it.effect.each([
+    { model: "other-model" },
+    { serviceTier: "other-tier" },
+    { effort: "high" as const },
+    { approvalPolicy: "on-request" as const },
+    { sandboxPolicy: { type: "readOnly" as const, networkAccess: true } },
+  ])("rejects a mismatching settings acknowledgement (%j)", (changed) =>
+    Effect.gen(function* () {
+      const planner = yield* openPlanner({
+        start: { reasoningEffort: "high" },
+        update: (emit) => emit({ ...settings, ...changed }).pipe(Effect.as({})),
+      });
+      assert.equal((yield* Effect.exit(planner.prepare()))._tag, "Failure");
+      assert.deepEqual(planner.requests.at(-1), {
+        method: "thread/archive",
+        params: { threadId: "new-live-planner" },
+      });
+    }).pipe(Effect.scoped, Effect.provide(dependencies)),
+  );
+
+  it.effect("does not reuse pre-registration settings or another thread's notification", () =>
+    Effect.gen(function* () {
+      const updateCalled = yield* Deferred.make<void>();
+      const planner = yield* openPlanner({
+        start: { reasoningEffort: "high" },
+        update: (emit) =>
+          emit(settings, "existing-work-thread").pipe(
+            Effect.andThen(Deferred.succeed(updateCalled, undefined)),
+            Effect.as({}),
+          ),
+      });
+      yield* planner.emit(settings);
+      const preparation = yield* planner
+        .prepare()
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(updateCalled);
+      yield* TestClock.adjust("5 seconds");
+      assert.equal((yield* Fiber.await(preparation))._tag, "Failure");
+      assert.deepEqual(planner.requests.at(-1), {
+        method: "thread/archive",
+        params: { threadId: "new-live-planner" },
+      });
+    }).pipe(Effect.scoped, Effect.provide(dependencies)),
+  );
+
+  it.effect(
+    "archives the new planner when the update request fails or preparation is interrupted",
+    () =>
+      Effect.gen(function* () {
+        const requestStarted = yield* Deferred.make<void>();
+        const planner = yield* openPlanner({
+          start: { reasoningEffort: "high" },
+          update: () =>
+            Deferred.succeed(requestStarted, undefined).pipe(Effect.andThen(Effect.never)),
+        });
+        const preparation = yield* planner
+          .prepare()
+          .pipe(Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(requestStarted);
+        yield* Fiber.interrupt(preparation);
+        yield* planner.emit(settings);
+        assert.deepEqual(planner.requests.at(-1), {
+          method: "thread/archive",
+          params: { threadId: "new-live-planner" },
+        });
+
+        const failed = yield* openPlanner({
+          start: { reasoningEffort: "high" },
+          update: () =>
+            Effect.fail(
+              new CodexError.CodexAppServerRequestError({
+                code: -32000,
+                errorMessage: "fixture update failure",
+              }),
+            ),
+        });
+        assert.equal((yield* Effect.exit(failed.prepare()))._tag, "Failure");
+        assert.deepEqual(failed.requests.at(-1), {
+          method: "thread/archive",
+          params: { threadId: "new-live-planner" },
+        });
+      }).pipe(Effect.scoped, Effect.provide(dependencies)),
   );
 });
 

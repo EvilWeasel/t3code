@@ -86,6 +86,7 @@ if [[ "$typecheck_failed" != 0 ]]; then
   exit 1
 fi
 focused_tests=(
+  packages/contracts/src/ipc.test.ts \
   packages/contracts/src/server.test.ts \
   packages/contracts/src/environmentHttp.test.ts \
   packages/client-runtime/src/state/serverConfigProjection.test.ts \

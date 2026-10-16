@@ -163,6 +163,22 @@ type CodexLiveVoiceWorkControl = NonNullable<
   >[0]["onWorkControl"]
 >;
 
+type CodexLivePlannerSettings = Pick<
+  CodexSchema.V2ThreadSettingsUpdatedNotification["threadSettings"],
+  "approvalPolicy" | "sandboxPolicy" | "model" | "serviceTier" | "effort"
+>;
+
+const codexLivePlannerSettingsMatch = (
+  settings: CodexLivePlannerSettings,
+  requested: Parameters<ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]>[0],
+) =>
+  settings.approvalPolicy === "never" &&
+  settings.sandboxPolicy.type === "readOnly" &&
+  settings.sandboxPolicy.networkAccess === false &&
+  settings.model === requested.modelSelection.model &&
+  (requested.serviceTier == null || settings.serviceTier === requested.serviceTier) &&
+  (requested.reasoningEffort == null || settings.effort === requested.reasoningEffort);
+
 /** Route only the restricted planner's declared tools, retaining native call correlation. */
 export const routeCodexLiveVoiceTool = (
   planner:
@@ -7546,6 +7562,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   started.sandbox.type !== "readOnly" ||
                   started.sandbox.networkAccess !== false
                 ) {
+                  yield* client.raw
+                    .request("thread/archive", { threadId: started.thread.id })
+                    .pipe(Effect.ignoreCause({ log: true }));
                   return yield* Effect.fail(
                     new ProviderAdapter.ProviderAdapterProtocolError({
                       driver: CODEX_PROVIDER,
@@ -7554,42 +7573,69 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   );
                 }
                 const plannerNativeThreadId = started.thread.id;
-                const ready =
-                  yield* Deferred.make<
-                    CodexSchema.V2ThreadSettingsUpdatedNotification["threadSettings"]
-                  >();
-                yield* Ref.update(liveVoiceSettingsWaiters, (current) =>
-                  new Map(current).set(plannerNativeThreadId, ready),
-                );
-                yield* client.raw.request("thread/settings/update", {
-                  threadId: plannerNativeThreadId,
-                  model: plannerInput.modelSelection.model,
-                  ...(plannerInput.serviceTier == null
-                    ? {}
-                    : { serviceTier: plannerInput.serviceTier }),
-                  ...(plannerInput.reasoningEffort == null
-                    ? {}
-                    : { effort: plannerInput.reasoningEffort }),
-                  approvalPolicy: "never",
-                  sandboxPolicy: { type: "readOnly", networkAccess: false },
-                });
-                const settings = yield* Deferred.await(ready).pipe(Effect.timeout("5 seconds"));
-                yield* Ref.update(liveVoiceSettingsWaiters, (current) => {
-                  const next = new Map(current);
-                  next.delete(plannerNativeThreadId);
-                  return next;
-                });
+                // Codex deduplicates unchanged settings updates, so an exact start response is
+                // authoritative; waiting for a redundant update notification would time out.
                 if (
-                  settings.approvalPolicy !== "never" ||
-                  settings.sandboxPolicy.type !== "readOnly" ||
-                  settings.sandboxPolicy.networkAccess !== false ||
-                  settings.model !== plannerInput.modelSelection.model
+                  !codexLivePlannerSettingsMatch(
+                    {
+                      approvalPolicy: started.approvalPolicy,
+                      sandboxPolicy: started.sandbox,
+                      model: started.model,
+                      ...(started.serviceTier === undefined
+                        ? {}
+                        : { serviceTier: started.serviceTier }),
+                      ...(started.reasoningEffort === undefined
+                        ? {}
+                        : { effort: started.reasoningEffort }),
+                    },
+                    plannerInput,
+                  )
                 ) {
-                  return yield* Effect.fail(
-                    new ProviderAdapter.ProviderAdapterProtocolError({
-                      driver: CODEX_PROVIDER,
-                      detail: "Codex Live planner settings were not confirmed.",
-                    }),
+                  yield* Effect.gen(function* () {
+                    const ready =
+                      yield* Deferred.make<
+                        CodexSchema.V2ThreadSettingsUpdatedNotification["threadSettings"]
+                      >();
+                    const settings = yield* Effect.gen(function* () {
+                      yield* Ref.update(liveVoiceSettingsWaiters, (current) =>
+                        new Map(current).set(plannerNativeThreadId, ready),
+                      );
+                      yield* client.raw.request("thread/settings/update", {
+                        threadId: plannerNativeThreadId,
+                        model: plannerInput.modelSelection.model,
+                        ...(plannerInput.serviceTier == null
+                          ? {}
+                          : { serviceTier: plannerInput.serviceTier }),
+                        ...(plannerInput.reasoningEffort == null
+                          ? {}
+                          : { effort: plannerInput.reasoningEffort }),
+                        approvalPolicy: "never",
+                        sandboxPolicy: { type: "readOnly", networkAccess: false },
+                      });
+                      return yield* Deferred.await(ready).pipe(Effect.timeout("5 seconds"));
+                    }).pipe(
+                      Effect.ensuring(
+                        Ref.update(liveVoiceSettingsWaiters, (current) => {
+                          const next = new Map(current);
+                          next.delete(plannerNativeThreadId);
+                          return next;
+                        }),
+                      ),
+                    );
+                    if (!codexLivePlannerSettingsMatch(settings, plannerInput)) {
+                      return yield* Effect.fail(
+                        new ProviderAdapter.ProviderAdapterProtocolError({
+                          driver: CODEX_PROVIDER,
+                          detail: "Codex Live planner settings were not confirmed.",
+                        }),
+                      );
+                    }
+                  }).pipe(
+                    Effect.onError(() =>
+                      client.raw
+                        .request("thread/archive", { threadId: plannerNativeThreadId })
+                        .pipe(Effect.ignoreCause({ log: true })),
+                    ),
                   );
                 }
                 yield* Ref.update(liveVoicePlanners, (current) =>
