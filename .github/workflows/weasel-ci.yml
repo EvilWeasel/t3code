@@ -46,6 +46,20 @@ jobs:
         run: vp install --frozen-lockfile
       - name: Prepare pinned Electron runtime before desktop imports
         run: node apps/desktop/scripts/ensure-electron-runtime.mjs
+      - name: Capture emulated mobile composer before source gates
+        if: github.ref_name == 'feature/mobile-composer-hotfix-candidate-20261016'
+        run: |
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          node scripts/weasel/voice-ui-artifact.mjs product-evidence/composer-mobile --composer-mobile
+      - name: Preserve emulated mobile composer development evidence
+        if: always() && github.ref_name == 'feature/mobile-composer-hotfix-candidate-20261016'
+        uses: actions/upload-artifact@v4
+        with:
+          name: composer-mobile-${{ github.sha }}-${{ github.run_attempt }}
+          path: product-evidence/composer-mobile
+          if-no-files-found: error
+          retention-days: 7
       - name: Run focused source gates
         env:
           EFFECTIVE_SOURCE_SHA: ${{ inputs.qualificationSourceSha || github.sha }}

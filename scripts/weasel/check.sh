@@ -346,5 +346,12 @@ for agent_session_test in "${agent_session_tests[@]}"; do
   fi
   focused_tests+=("$agent_session_test")
 done
+mobile_composer_test=apps/web/src/components/chat/ChatComposer.mobile.test.tsx
+if [[ ! -f "$mobile_composer_test" ]]; then
+  echo "Required mobile composer gate is missing: $mobile_composer_test" >&2
+  exit 1
+fi
+focused_tests+=("$mobile_composer_test")
+vp_cmd lint --report-unused-disable-directives "$mobile_composer_test"
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)
