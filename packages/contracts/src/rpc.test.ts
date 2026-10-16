@@ -407,6 +407,8 @@ describe("native preparation registered JSON codecs", () => {
         Schema.encodeSync(refreshCodec)(decodedRefresh),
         Schema.encodeSync(updateCodec)(decodedUpdate),
       ]) {
+        if (!Schema.is(refresh.successSchema)(encoded))
+          throw new Error("Encoded provider result does not match the registered contract");
         expect(encoded.providers).toHaveLength(1);
         expect(encoded.providers[0]?.nativeLiveVoicePreparation).toEqual(provenance);
       }
@@ -418,13 +420,14 @@ describe("native preparation registered JSON codecs", () => {
       });
       if (event.type !== "providerStatuses") throw new Error("Wrong config event");
       expect(event.payload.providers[0]?.nativeLiveVoicePreparation).toEqual(provenance);
+      const encodedProviders = Schema.encodeSync(refreshCodec)(decodedRefresh);
+      if (!Schema.is(refresh.successSchema)(encodedProviders))
+        throw new Error("Encoded providers do not match the registered contract");
       expect(Schema.encodeSync(streamCodec)(event)).toEqual({
         version: 1,
         type: "providerStatuses",
         payload: {
-          providers: Schema.encodeSync(refreshCodec)(
-            Schema.decodeUnknownSync(refreshCodec)({ providers: [provider] }),
-          ).providers,
+          providers: encodedProviders.providers,
         },
       });
     }
