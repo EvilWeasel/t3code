@@ -146,6 +146,7 @@ export function resolveLiveVoiceAvailability(input: {
   readonly instanceConfigured: boolean;
   readonly projectOverride?: boolean | undefined;
   readonly config: unknown;
+  readonly threadPreparationReason?: string | null | undefined;
 }): LiveVoiceAvailability {
   let reason: string | null = null;
   if (!input.threadId) reason = "Open an existing thread to start Live voice.";
@@ -161,6 +162,7 @@ export function resolveLiveVoiceAvailability(input: {
   else if (input.permissionState === "unavailable")
     reason = "Thread permissions could not be verified. Reconnect this environment.";
   else if (!input.canOperate) reason = "You need permission to operate this thread.";
+  else if (input.threadPreparationReason) reason = input.threadPreparationReason;
   else if (!input.provider)
     reason = input.instanceRequested
       ? "The selected provider instance is missing from this environment. Choose a configured provider."
@@ -606,6 +608,8 @@ export function LiveVoiceControl(props: {
   readonly providerInstanceId: string | null;
   readonly eligible: boolean;
   readonly availability: LiveVoiceAvailability;
+  readonly beforePrepare?: LiveVoiceControllerDependencies["beforePrepare"];
+  readonly onPhaseChange?: (phase: LiveVoiceState["phase"]) => void;
 }) {
   const hintId = useId();
   const prepare = useAtomCommand(liveVoiceEnvironment.prepare, {
@@ -719,9 +723,14 @@ export function LiveVoiceControl(props: {
     }),
     [bridge, prepare, props.environmentId, props.providerInstanceId, startRpc, statusRpc, stopRpc],
   );
+  const stateObserver = useMemo(
+    () => ({ active: true }),
+    [signaling, props.beforePrepare, props.onPhaseChange],
+  );
   const dependencies = useMemo<LiveVoiceControllerDependencies>(
     () => ({
       signaling,
+      ...(props.beforePrepare ? { beforePrepare: props.beforePrepare } : {}),
       getUserMedia: () => navigator.mediaDevices.getUserMedia({ audio: true }),
       createPeer: () => new RTCPeerConnection() as unknown as LiveVoicePeer,
       createRemoteStream: (track) => new MediaStream([track]),
@@ -735,9 +744,13 @@ export function LiveVoiceControl(props: {
         const handle = window.setTimeout(callback, delayMs);
         return () => window.clearTimeout(handle);
       },
-      onStateChange: setState,
+      onStateChange: (next) => {
+        if (!stateObserver.active) return;
+        setState(next);
+        props.onPhaseChange?.(next.phase);
+      },
     }),
-    [signaling],
+    [signaling, props.beforePrepare, props.onPhaseChange, stateObserver],
   );
   const controller = useMemo(() => new LiveVoiceController(dependencies), [dependencies]);
 
@@ -751,12 +764,16 @@ export function LiveVoiceControl(props: {
     ? state.transcript
     : [];
 
-  useEffect(
-    () => () => {
+  useLayoutEffect(() => {
+    stateObserver.active = true;
+    setState(controller.currentState);
+    props.onPhaseChange?.(controller.currentState.phase);
+    return () => {
+      // Cleanup must not report "stopping" to an owner that just collapsed this footer.
+      stateObserver.active = false;
       void controller.end();
-    },
-    [controller],
-  );
+    };
+  }, [controller, stateObserver, props.onPhaseChange]);
   useEffect(() => {
     setPrepareFailure(null);
     void controller.contextChanged(target);

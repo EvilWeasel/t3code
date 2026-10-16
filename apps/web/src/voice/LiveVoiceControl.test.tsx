@@ -449,7 +449,11 @@ describe("explicit main renderer diagnostic requests", () => {
   });
 });
 
-async function render(input: AvailabilityInput, targetEnvironment = input.environmentId) {
+async function render(
+  input: AvailabilityInput,
+  targetEnvironment = input.environmentId,
+  callbacks: Pick<Parameters<typeof LiveVoiceControl>[0], "beforePrepare" | "onPhaseChange"> = {},
+) {
   await act(async () =>
     root.render(
       <TooltipProvider delay={0}>
@@ -459,12 +463,12 @@ async function render(input: AvailabilityInput, targetEnvironment = input.enviro
           providerInstanceId={input.providerInstanceId}
           eligible={true}
           availability={resolveLiveVoiceAvailability(input)}
+          {...callbacks}
         />
       </TooltipProvider>,
     ),
   );
 }
-
 function startButton() {
   const button = container.querySelector<HTMLButtonElement>('[aria-label="Start voice call"]');
   if (!button) throw new Error("Missing Start voice call button");
@@ -774,6 +778,34 @@ describe("LiveVoice instance defaults", () => {
 });
 
 describe("LiveVoiceControl passive availability", () => {
+  it("uses the replacement controller's actual state after changing thread during a draft save", async () => {
+    let finishSaving!: () => void;
+    const saving = new Promise<void>((resolve) => {
+      finishSaving = resolve;
+    });
+    const beforePrepare = vi.fn(() => saving);
+    const firstPhase = vi.fn();
+    const nextPhase = vi.fn();
+    await render(loaded, environmentA, { beforePrepare, onPhaseChange: firstPhase });
+    await act(async () => startButton().click());
+    expect(container.querySelector('[data-live-voice-phase="preparing"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="End Live voice"]')).not.toBeNull();
+    await render({ ...loaded, threadId: ThreadId.make("replacement-thread") }, environmentA, {
+      beforePrepare,
+      onPhaseChange: nextPhase,
+    });
+    expect(container.querySelector('[data-live-voice-phase="idle"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="End Live voice"]')).toBeNull();
+    expect(startButton().disabled).toBe(false);
+    expect(nextPhase).toHaveBeenLastCalledWith("idle");
+    expect(firstPhase).toHaveBeenLastCalledWith("preparing");
+    await act(async () => {
+      finishSaving();
+      await saving;
+    });
+    expect(startButton().disabled).toBe(false);
+    expectPassive();
+  });
   it.each([
     "unsupported_provider",
     "managed_account_required",
@@ -996,6 +1028,10 @@ describe("LiveVoiceControl passive availability", () => {
       reason: "Sign in to this Codex installation",
     },
     { patch: { instanceConfigured: false }, reason: "has no saved settings" },
+    {
+      patch: { threadPreparationReason: "Prepare this thread's worktree before starting Live voice." },
+      reason: "Prepare this thread's worktree",
+    },
     { patch: { config: null }, reason: "setup mode is missing" },
     { patch: { config: {} }, reason: "setup mode is invalid or missing" },
     { patch: { config: "private-invalid-value" }, reason: "setup mode is invalid or missing" },

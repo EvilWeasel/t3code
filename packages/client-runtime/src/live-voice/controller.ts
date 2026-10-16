@@ -89,6 +89,7 @@ export type LiveVoiceState = {
 
 export type LiveVoiceControllerDependencies = {
   readonly signaling: LiveVoiceSignalingAdapter;
+  readonly beforePrepare?: (target: LiveVoiceTarget, signal: AbortSignal) => Promise<void>;
   readonly getUserMedia: () => Promise<LiveVoiceMediaStream>;
   readonly createPeer: () => LiveVoicePeer;
   readonly createRemoteStream: (track: MediaStreamTrack) => MediaStream;
@@ -163,6 +164,8 @@ function safeErrorMessage(error: unknown): string {
     "Live voice connection was lost. Start a new call to reconnect.",
     "Live data channel closed.",
     "Live session closed by the environment.",
+    "The selected voice thread changed. Start again.",
+    "The voice thread could not be saved. Reconnect and try again.",
   ]);
   if (error instanceof Error && localMessages.has(error.message)) return error.message;
   if (
@@ -286,6 +289,10 @@ export class LiveVoiceController {
     let lease: LiveVoiceLease | null = null;
 
     try {
+      if (this.dependencies.beforePrepare) {
+        await this.dependencies.beforePrepare(target, signal);
+        if (!this.isCurrentTarget(operation, target)) return;
+      }
       // The server authenticates and binds the selected T3 destination before WebRTC exists.
       lease = await this.dependencies.signaling.prepare(
         {

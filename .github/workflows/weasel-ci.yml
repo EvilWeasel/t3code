@@ -88,9 +88,15 @@ jobs:
       - name: Lint conversational work-control slice
         run: >-
           vp lint --report-unused-disable-directives
+          apps/web/src/components/ChatView.tsx
           apps/web/src/components/chat/ChatComposer.tsx
+          apps/web/src/components/chat/ChatComposer.mobile.test.tsx
           apps/web/src/voice/LiveVoiceControl.tsx
           apps/web/src/voice/LiveVoiceControl.test.tsx
+          apps/web/src/voice/LiveVoiceDraftThread.ts
+          apps/web/src/voice/LiveVoiceDraftThread.test.ts
+          packages/client-runtime/src/live-voice/controller.ts
+          packages/client-runtime/src/live-voice/controller.test.ts
           apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
           apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
           apps/server/src/voice/CodexLiveSessionService.test.ts

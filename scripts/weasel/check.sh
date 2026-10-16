@@ -126,6 +126,7 @@ focused_tests=(
   apps/server/src/voice/VoiceSettings.test.ts
   apps/web/src/voice/VoiceDictationControl.test.tsx
   apps/web/src/voice/LiveVoiceControl.test.tsx
+  apps/web/src/voice/LiveVoiceDraftThread.test.ts
   apps/web/src/voice/LiveVoiceCommands.test.ts
   apps/web/src/components/settings/VoiceTranscriptionSettings.test.tsx
   apps/web/src/voice/voiceSettingsClient.test.ts

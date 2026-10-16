@@ -25,6 +25,13 @@ import {
 import { useLoadBalancedEnvironment } from "../hooks/useLoadBalancedEnvironment";
 import { useScratchProject } from "../hooks/useScratchProject";
 import { useStableCallback } from "../hooks/useStableCallback";
+import {
+  createLiveVoiceThreadPreparer,
+  liveVoiceDraftStartReason,
+  LIVE_VOICE_THREAD_CREATE_FAILED,
+  type LiveVoiceThreadContext,
+} from "../voice/LiveVoiceDraftThread";
+import type { CreateThreadInput } from "@t3tools/client-runtime/operations";
 import { isScratchProject } from "@t3tools/client-runtime/state/projects";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import {
@@ -62,7 +69,7 @@ import {
   isProviderNativeSubagentThread,
   type ChatAttachment as ContractChatAttachment,
   EnvironmentAuthorizationError,
-  type EnvironmentId,
+  EnvironmentId,
   type MessageId,
   type ModelSelection,
   type ProjectScript,
@@ -6653,6 +6660,75 @@ export default function ChatView(props: ChatViewProps) {
     requestedEnvMode: envMode,
     isGitRepo,
   });
+  const liveVoiceThreadPreparationReason = liveVoiceDraftStartReason({
+    isDraft: isLocalDraftThread,
+    projectAvailable: activeProject !== null,
+    environmentChanging: isEnvironmentChanging || needsLoadBalancing,
+    envMode: sendEnvMode,
+    worktreePath: activeWorktreePath,
+  });
+  const readLiveVoiceThreadContext = useStableCallback((): LiveVoiceThreadContext | null => {
+    if (
+      !activeThread ||
+      !activeProject ||
+      currentRouteThreadKeyRef.current !== routeThreadKey ||
+      !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope) ||
+      activeEnvironmentUnavailable ||
+      isConnecting ||
+      isRevertingCheckpoint ||
+      !clientSettingsHydrated ||
+      environmentChangeRef.current !== null
+    )
+      return null;
+    const context = composerRef.current?.getSendContext();
+    if (!context?.providerAvailable || context.selectedProvider !== "codex") return null;
+    return {
+      target: {
+        environmentId,
+        threadId: activeThread.id,
+        provider: context.selectedProvider,
+        providerInstanceId: context.selectedModelSelection.instanceId,
+      },
+      persisted: isServerThread,
+      thread: {
+        // A lost acknowledgement or a remount must retry the same ordinary command.
+        commandId: CommandId.make(`live-voice-thread-create:${draftId ?? activeThread.id}`),
+        threadId: activeThread.id,
+        projectId: activeProject.id,
+        title: activeThread.title,
+        modelSelection: context.selectedModelSelection,
+        runtimeMode,
+        interactionMode: context.interactionMode,
+        branch: activeThreadBranch,
+        worktreePath: activeThread.worktreePath,
+      },
+      unavailableReason: liveVoiceThreadPreparationReason,
+    };
+  });
+  const createLiveVoiceThread = useStableCallback(async (input: CreateThreadInput) => {
+    if (sendInFlightRef.current || isSendBusy) throw new Error(LIVE_VOICE_THREAD_CREATE_FAILED);
+    sendInFlightRef.current = true;
+    try {
+      const result = await createThread({ environmentId, input });
+      if (result._tag === "Failure") throw new Error(LIVE_VOICE_THREAD_CREATE_FAILED);
+    } finally {
+      sendInFlightRef.current = false;
+    }
+  });
+  const markLiveVoiceThreadCreated = useStableCallback((context: LiveVoiceThreadContext) => {
+    markPromotedDraftThreadByRef(
+      scopeThreadRef(EnvironmentId.make(context.target.environmentId), context.thread.threadId),
+    );
+  });
+  const prepareLiveVoiceThread = useMemo(
+    () =>
+      createLiveVoiceThreadPreparer({
+        readContext: readLiveVoiceThreadContext,
+        createThread: createLiveVoiceThread,
+        onCreated: markLiveVoiceThreadCreated,
+      }),
+    [readLiveVoiceThreadContext, createLiveVoiceThread, markLiveVoiceThreadCreated],
+  );
   const localCheckoutBranchMismatch = useMemo(
     () =>
       isServerThread
@@ -11313,6 +11389,8 @@ export default function ChatView(props: ChatViewProps) {
                               onPageScrollRelease={onComposerPageScrollReleaseStable}
                               onCompactContext={onComposerCompactContextStable}
                               onSend={onComposerSendStable}
+                              onPrepareLiveVoice={prepareLiveVoiceThread}
+                              liveVoiceThreadPreparationReason={liveVoiceThreadPreparationReason}
                               onResume={onComposerResumeStable}
                               onInterrupt={onInterruptStable}
                               onImplementPlanInNewThread={onImplementPlanInNewThreadStable}

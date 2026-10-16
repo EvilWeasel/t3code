@@ -58,6 +58,7 @@ function createHarness(
     readonly prepare?: () => Promise<LiveVoiceLease>;
     readonly stop?: () => Promise<LiveVoiceLease>;
     readonly subscribeUntilStatus?: boolean;
+    readonly beforePrepare?: LiveVoiceControllerDependencies["beforePrepare"];
   } = {},
 ) {
   const events = new Set<(event: LiveVoiceSignalEvent) => void>();
@@ -189,6 +190,7 @@ function createHarness(
   const remoteStream = { getTracks: () => [] } as unknown as MediaStream;
   const dependencies: LiveVoiceControllerDependencies = {
     signaling,
+    ...(options.beforePrepare ? { beforePrepare: options.beforePrepare } : {}),
     getUserMedia: async () => {
       calls.push("media-request");
       return options.media ? options.media() : stream;
@@ -312,6 +314,70 @@ describe("isLiveVoiceSupported", () => {
 });
 
 describe("LiveVoiceController", () => {
+  it("saves a draft before lease preparation and deduplicates repeated starts while saving", async () => {
+    const saved = deferred<void>();
+    const beforePrepare = vi.fn((_target: LiveVoiceTarget, _signal: AbortSignal) => saved.promise);
+    const harness = createHarness({ beforePrepare });
+    const starting = harness.controller.start(target);
+    await harness.controller.start(target);
+    expect(harness.controller.currentState.phase).toBe("preparing");
+    expect(beforePrepare).toHaveBeenCalledOnce();
+    expect(beforePrepare.mock.calls[0]?.[0]).toEqual(target);
+    expect(harness.signaling.prepare).not.toHaveBeenCalled();
+    expect(harness.calls).not.toContain("media-request");
+    expect(harness.peer.createOffer).not.toHaveBeenCalled();
+    saved.resolve();
+    await connectFirst(harness, starting);
+    expect(harness.signaling.prepare).toHaveBeenCalledOnce();
+    await harness.controller.end();
+  });
+
+  it("reports a failed draft save without a lease, microphone request or peer", async () => {
+    const harness = createHarness({
+      beforePrepare: async () => {
+        throw new Error("The voice thread could not be saved. Reconnect and try again.");
+      },
+    });
+    await harness.controller.start(target);
+    expect(harness.controller.currentState).toMatchObject({
+      phase: "error",
+      error: "The voice thread could not be saved. Reconnect and try again.",
+      lease: null,
+    });
+    expect(harness.signaling.prepare).not.toHaveBeenCalled();
+    expect(harness.signaling.stop).not.toHaveBeenCalled();
+    expect(harness.calls).not.toContain("media-request");
+    expect(harness.peer.createOffer).not.toHaveBeenCalled();
+    const release = acquireMicrophoneOwnership();
+    expect(release).not.toBeNull();
+    release?.();
+  });
+
+  it.each(["context", "timeout"] as const)(
+    "does not prepare a late saved draft after %s cancellation",
+    async (cancel) => {
+      const saved = deferred<void>();
+      const signals: AbortSignal[] = [];
+      const harness = createHarness({
+        beforePrepare: (_target, signal) => {
+          signals.push(signal);
+          return saved.promise;
+        },
+      });
+      const starting = harness.controller.start(target);
+      if (cancel === "context")
+        await harness.controller.contextChanged({ ...target, threadId: "another-thread" });
+      else harness.fireStartTimeout();
+      expect(signals[0]?.aborted).toBe(true);
+      saved.resolve();
+      await starting;
+      expect(harness.signaling.prepare).not.toHaveBeenCalled();
+      expect(harness.signaling.stop).not.toHaveBeenCalled();
+      expect(harness.calls).not.toContain("media-request");
+      expect(harness.peer.createOffer).not.toHaveBeenCalled();
+      expect(harness.controller.currentState.phase).toBe(cancel === "context" ? "ended" : "error");
+    },
+  );
   it.each([false, true])(
     "recovers on the same lease with mute controls available (playback blocked: %s)",
     async (playbackBlocked) => {

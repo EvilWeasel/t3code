@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, createRef, useState } from "react";
+import { act, createRef, useCallback, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import {
   EnvironmentId,
@@ -29,7 +29,11 @@ vi.mock("../../state/use-atom-command", () => ({
   useAtomCommand: (name: keyof typeof commands) => commands[name],
 }));
 
-import { ChatComposerFooter, ComposerFooterModeControls } from "./ChatComposer";
+import {
+  ChatComposerFooter,
+  ComposerFooterModeControls,
+  useLiveVoiceComposerState,
+} from "./ChatComposer";
 import { LiveVoiceControl, resolveLiveVoiceAvailability } from "../../voice/LiveVoiceControl";
 import { Button } from "../ui/button";
 import { TooltipProvider } from "../ui/tooltip";
@@ -76,6 +80,84 @@ function expectPassive() {
 }
 
 describe("production composer mobile footer", () => {
+  it("keeps unfocused voice controls mounted through draft hydration until deliberate End", async () => {
+    let finishSaving!: () => void;
+    const saving = new Promise<void>((resolve) => {
+      finishSaving = resolve;
+    });
+    const availability = resolveLiveVoiceAvailability({
+      environmentId,
+      threadId,
+      providerInstanceId: "codex",
+      catalogEnvironmentId: environmentId,
+      configState: "ready",
+      settingsKnown: true,
+      canOperate: true,
+      permissionState: "known",
+      selectionCurrent: true,
+      instanceRequested: true,
+      provider: { driverKind: "codex", enabled: true, isAvailable: true },
+      instanceConfigured: true,
+      config: { setupMode: "managed" },
+    });
+    function Fixture() {
+      const [heroExpanded, setHeroExpanded] = useState(true);
+      const voice = useLiveVoiceComposerState("same-scoped-draft-thread");
+      const beforePrepare = useCallback(async () => {
+        setHeroExpanded(false);
+        await saving;
+      }, [saving]);
+      return (
+        <TooltipProvider delay={0}>
+          <textarea aria-label="Unfocused message" defaultValue="Keep this draft" />
+          <ChatComposerFooter
+            hidden={!heroExpanded}
+            keepVisibleForLiveVoice={voice.keepVisible}
+            compact={false}
+            pendingInput={false}
+            mobilePendingActions={!heroExpanded}
+            resting={false}
+            inlineResting={false}
+            primaryActionsCompact={false}
+            controls={null}
+            actions={
+              <LiveVoiceControl
+                environmentId={environmentId}
+                threadId={threadId}
+                providerInstanceId="codex"
+                eligible
+                availability={availability}
+                beforePrepare={beforePrepare}
+                onPhaseChange={voice.onPhaseChange}
+              />
+            }
+          />
+        </TooltipProvider>
+      );
+    }
+    await act(async () => root.render(<Fixture />));
+    const editor = container.querySelector<HTMLTextAreaElement>('[aria-label="Unfocused message"]');
+    expect(document.activeElement).not.toBe(editor);
+    await act(async () => control("Start voice call").click());
+    const end = control("End Live voice");
+    const footer = container.querySelector<HTMLElement>('[data-chat-composer-footer="true"]');
+    expect(footer).not.toBeNull();
+    expect(footer?.classList.contains("hidden")).toBe(false);
+    expect(container.querySelector('[data-live-voice-phase="preparing"]')).not.toBeNull();
+    expect(editor?.value).toBe("Keep this draft");
+    expect(document.activeElement).not.toBe(editor);
+    expectPassive();
+    await act(async () => end.click());
+    expect(container.querySelector('[data-chat-composer-footer="true"]')).toBeNull();
+    await act(async () => {
+      finishSaving();
+      await saving;
+    });
+    expect(container.querySelector('[data-chat-composer-footer="true"]')).toBeNull();
+    expectPassive();
+    expect(commands.stop).not.toHaveBeenCalled();
+  });
+
   it("keeps real disabled Live control compact while preserving child focus, actions and form submission", async () => {
     const send = vi.fn();
     const attach = vi.fn();

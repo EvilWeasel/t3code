@@ -295,6 +295,10 @@ import {
   resolveLiveVoiceConfigState,
   resolveLiveVoiceInstanceSettings,
 } from "../../voice/LiveVoiceControl";
+import type {
+  LiveVoiceControllerDependencies,
+  LiveVoiceState,
+} from "@t3tools/client-runtime/live-voice";
 import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
 import * as Option from "effect/Option";
@@ -1500,6 +1504,31 @@ export interface ChatComposerHandle {
   setMultipleModelSelections: (selections: ReadonlyArray<ModelSelection>) => void;
 }
 
+export function useLiveVoiceComposerState(targetKey: string) {
+  const [current, setCurrent] = useState<{
+    targetKey: string;
+    phase: LiveVoiceState["phase"];
+  }>({
+    targetKey,
+    phase: "idle",
+  });
+  const onPhaseChange = useCallback(
+    (phase: LiveVoiceState["phase"]) =>
+      setCurrent((previous) =>
+        previous.targetKey === targetKey && previous.phase === phase
+          ? previous
+          : { targetKey, phase },
+      ),
+    [targetKey],
+  );
+  return {
+    // Saving a draft can remove the hero expansion while its call still owns this footer.
+    keepVisible:
+      current.targetKey === targetKey && current.phase !== "idle" && current.phase !== "ended",
+    onPhaseChange,
+  };
+}
+
 /** Shared by the full composer and its mounted mobile regression fixture. */
 export function ChatComposerFooter({
   controls,
@@ -1513,6 +1542,8 @@ export function ChatComposerFooter({
   inlineResting,
   primaryActionsCompact,
   mobileConfiguration,
+  hidden = false,
+  keepVisibleForLiveVoice = false,
 }: {
   controls: ReactNode;
   actions: ReactNode;
@@ -1524,12 +1555,15 @@ export function ChatComposerFooter({
   resting: boolean;
   inlineResting: boolean;
   primaryActionsCompact: boolean;
+  hidden?: boolean;
+  keepVisibleForLiveVoice?: boolean;
   mobileConfiguration?: {
     label: string;
     open: boolean;
     onOpenChange: (open: boolean) => void;
   };
 }) {
+  if (hidden && !keepVisibleForLiveVoice) return null;
   return (
     <div
       data-chat-composer-footer="true"
@@ -1539,7 +1573,7 @@ export function ChatComposerFooter({
         mobileConfiguration && "max-sm:justify-start",
         pendingInput && "pt-2",
         compact ? "gap-1.5" : "gap-2 sm:gap-0",
-        mobilePendingActions && "hidden sm:flex",
+        mobilePendingActions && !keepVisibleForLiveVoice && "hidden sm:flex",
         resting && "absolute right-px z-10 h-12 w-auto flex-nowrap gap-0 py-0 sm:gap-0 sm:py-0",
         resting && (inlineResting ? "bottom-[calc(2rem+1px)]" : "bottom-px"),
       )}
@@ -1738,6 +1772,8 @@ export interface ChatComposerProps {
   onRemoveEditingQueuedAttachment: (attachmentId: string) => void;
 
   onCompactContext: () => void;
+  onPrepareLiveVoice?: LiveVoiceControllerDependencies["beforePrepare"];
+  liveVoiceThreadPreparationReason?: string | null | undefined;
   onSend: (
     e?: { preventDefault: () => void },
     dispatchMode?: ComposerDispatchMode,
@@ -2315,6 +2351,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           ]?.enabled
         : undefined,
     config: liveVoiceInstanceSettings?.config,
+    threadPreparationReason: props.liveVoiceThreadPreparationReason,
   });
   const liveVoiceProviderEligible =
     selectedProviderEntry?.driverKind === "codex" &&
@@ -2566,6 +2603,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [isComposerPrimaryActionsCompact, setIsComposerPrimaryActionsCompact] = useState(false);
   const [isComposerModelPickerOpen, setIsComposerModelPickerOpen] = useState(false);
   const [isMobileConfigurationOpen, setIsMobileConfigurationOpen] = useState(false);
+  const liveVoiceComposer = useLiveVoiceComposerState(
+    JSON.stringify([liveVoiceEnvironmentId, activeThreadId, liveVoiceInstanceId]),
+  );
   const isMobileViewport = useMediaQuery("max-sm");
   useEffect(() => {
     if (isMobileViewport && isComposerModelPickerOpen) setIsMobileConfigurationOpen(true);
@@ -2596,7 +2636,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     active: false,
   });
   const isComposerCollapsedMobile =
-    isMobileViewport && !forceExpandedOnMobile && !isComposerFocused && !hasMultilinePrompt;
+    isMobileViewport &&
+    !forceExpandedOnMobile &&
+    !liveVoiceComposer.keepVisible &&
+    !isComposerFocused &&
+    !hasMultilinePrompt;
 
   const composerEditorRef = useRef<ComposerPromptEditorHandle>(null);
   const pasteAsTextShortcutUntilRef = useRef(0);
@@ -5100,6 +5144,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     environmentUnavailable !== null ||
     composerSubmissionError !== null ||
     providerInputSubmissionError !== null ||
+    liveVoiceComposer.keepVisible ||
     hasImageAttachmentAttention;
   const isComposerResting = shouldUseRestingComposerLayout({
     isExistingThread: routeKind === "server" && activeThreadId !== null,
@@ -7494,150 +7539,152 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               message={providerInputSubmissionError ?? composerSubmissionError}
             />
 
-            {isComposerCollapsedMobile || isComposerApprovalState ? null : (
-              <ChatComposerFooter
-                primaryActionsCompact={isComposerPrimaryActionsCompact}
-                compact={isComposerFooterCompact}
-                pendingInput={pendingUserInputs.length > 0}
-                mobilePendingActions={showMobilePendingAnswerActions}
-                resting={isComposerResting}
-                inlineResting={showInlineRestingControls}
-                controlsRef={expandedControlsLayout.attachControls}
-                actionsRef={setRestingActionsElement}
-                controls={composerControlsCollapsed ? null : composerControls}
-                {...(mobileConfigurationVisible
-                  ? {
-                      mobileConfiguration: {
-                        label:
-                          resolveContextWindowModelDisplayName(
-                            selectedModelSelection,
-                            modelOptionsByInstance,
-                          ) ?? selectedModelForPickerWithCustomFallback,
-                        open: isMobileConfigurationOpen,
-                        onOpenChange: (open: boolean) => {
-                          setIsMobileConfigurationOpen(open);
-                          if (!open) setIsComposerModelPickerOpen(false);
+            <ChatComposerFooter
+              hidden={isComposerCollapsedMobile || isComposerApprovalState}
+              keepVisibleForLiveVoice={liveVoiceComposer.keepVisible}
+              primaryActionsCompact={isComposerPrimaryActionsCompact}
+              compact={isComposerFooterCompact}
+              pendingInput={pendingUserInputs.length > 0}
+              mobilePendingActions={showMobilePendingAnswerActions}
+              resting={isComposerResting}
+              inlineResting={showInlineRestingControls}
+              controlsRef={expandedControlsLayout.attachControls}
+              actionsRef={setRestingActionsElement}
+              controls={composerControlsCollapsed ? null : composerControls}
+              {...(mobileConfigurationVisible
+                ? {
+                    mobileConfiguration: {
+                      label:
+                        resolveContextWindowModelDisplayName(
+                          selectedModelSelection,
+                          modelOptionsByInstance,
+                        ) ?? selectedModelForPickerWithCustomFallback,
+                      open: isMobileConfigurationOpen,
+                      onOpenChange: (open: boolean) => {
+                        setIsMobileConfigurationOpen(open);
+                        if (!open) setIsComposerModelPickerOpen(false);
+                      },
+                    },
+                  }
+                : {})}
+              actions={
+                <>
+                  {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
+                    <VoiceDictationControl
+                      environmentId={environmentId}
+                      targetKey={voiceDraftTargetKeyRef.current}
+                      currentTargetKey={() => voiceDraftTargetKeyRef.current}
+                      transcribe={transcribeVoiceRecording(environmentId)}
+                      onTranscript={insertVoiceTranscript}
+                      onSend={sendVoiceTranscript}
+                      hasTranscript={(text) => promptRef.current.includes(text)}
+                    />
+                  ) : null}
+                  <LiveVoiceControl
+                    environmentId={liveVoiceEnvironmentId}
+                    threadId={activeThreadId}
+                    providerInstanceId={selectedProviderEntry?.instanceId ?? null}
+                    eligible={liveVoiceProviderEligible && canOperateThread}
+                    availability={liveVoiceAvailability}
+                    beforePrepare={props.onPrepareLiveVoice}
+                    onPhaseChange={liveVoiceComposer.onPhaseChange}
+                  />
+                  {showComposerAttachAction ? (
+                    <>
+                      <input
+                        ref={attachmentInputRef}
+                        type="file"
+                        multiple
+                        className="hidden"
+                        onChange={(event) => {
+                          const files = Array.from(event.currentTarget.files ?? []);
+                          event.currentTarget.value = "";
+                          // Inserting a chip refocuses the editor after the draft renders;
+                          // focusing synchronously here would report the editor's stale text
+                          // over the prompt that was just written.
+                          void addComposerAttachments(files).then((inserted) => {
+                            if (!inserted) focusComposer();
+                          });
+                        }}
+                      />
+                      <Tooltip>
+                        <TooltipTrigger
+                          render={
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-sm"
+                              onPointerDown={(event) => event.preventDefault()}
+                              onClick={() => attachmentInputRef.current?.click()}
+                              aria-label="Attach files"
+                            />
+                          }
+                        >
+                          <PaperclipIcon />
+                        </TooltipTrigger>
+                        <TooltipPopup>Attach files</TooltipPopup>
+                      </Tooltip>
+                    </>
+                  ) : null}
+                  <ComposerFooterPrimaryActions
+                    compact={isComposerResting || isComposerPrimaryActionsCompact}
+                    canOperateThread={canOperateThread}
+                    activeContextWindow={
+                      settings.contextWindowMeterEnabled ? activeContextWindow : null
+                    }
+                    reserveContextWindowMeter={reserveContextWindowMeter}
+                    activeThreadModelDisplayName={activeThreadModelDisplayName}
+                    pendingAction={pendingPrimaryAction}
+                    isRunning={phase === "running"}
+                    canInterrupt={canInterrupt}
+                    followUpBehavior={settings.followUpBehavior}
+                    alternateShortcutLabel={shortcutLabelForCommand(
+                      keybindings,
+                      "composer.sendAlternate",
+                      {
+                        context: {
+                          composerFocus: true,
+                          draftThreadRoute: routeKind === "draft",
+                          turnRunning: true,
                         },
                       },
+                    )}
+                    showPlanFollowUpPrompt={
+                      pendingUserInputs.length === 0 && showPlanFollowUpPrompt
                     }
-                  : {})}
-                actions={
-                  <>
-                    {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
-                      <VoiceDictationControl
-                        environmentId={environmentId}
-                        targetKey={voiceDraftTargetKeyRef.current}
-                        currentTargetKey={() => voiceDraftTargetKeyRef.current}
-                        transcribe={transcribeVoiceRecording(environmentId)}
-                        onTranscript={insertVoiceTranscript}
-                        onSend={sendVoiceTranscript}
-                        hasTranscript={(text) => promptRef.current.includes(text)}
-                      />
-                    ) : null}
-                    <LiveVoiceControl
-                      environmentId={liveVoiceEnvironmentId}
-                      threadId={activeThreadId}
-                      providerInstanceId={selectedProviderEntry?.instanceId ?? null}
-                      eligible={liveVoiceProviderEligible && canOperateThread}
-                      availability={liveVoiceAvailability}
-                    />
-                    {showComposerAttachAction ? (
-                      <>
-                        <input
-                          ref={attachmentInputRef}
-                          type="file"
-                          multiple
-                          className="hidden"
-                          onChange={(event) => {
-                            const files = Array.from(event.currentTarget.files ?? []);
-                            event.currentTarget.value = "";
-                            // Inserting a chip refocuses the editor after the draft renders;
-                            // focusing synchronously here would report the editor's stale text
-                            // over the prompt that was just written.
-                            void addComposerAttachments(files).then((inserted) => {
-                              if (!inserted) focusComposer();
-                            });
-                          }}
-                        />
-                        <Tooltip>
-                          <TooltipTrigger
-                            render={
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-sm"
-                                onPointerDown={(event) => event.preventDefault()}
-                                onClick={() => attachmentInputRef.current?.click()}
-                                aria-label="Attach files"
-                              />
-                            }
-                          >
-                            <PaperclipIcon />
-                          </TooltipTrigger>
-                          <TooltipPopup>Attach files</TooltipPopup>
-                        </Tooltip>
-                      </>
-                    ) : null}
-                    <ComposerFooterPrimaryActions
-                      compact={isComposerResting || isComposerPrimaryActionsCompact}
-                      canOperateThread={canOperateThread}
-                      activeContextWindow={
-                        settings.contextWindowMeterEnabled ? activeContextWindow : null
-                      }
-                      reserveContextWindowMeter={reserveContextWindowMeter}
-                      activeThreadModelDisplayName={activeThreadModelDisplayName}
-                      pendingAction={pendingPrimaryAction}
-                      isRunning={phase === "running"}
-                      canInterrupt={canInterrupt}
-                      followUpBehavior={settings.followUpBehavior}
-                      alternateShortcutLabel={shortcutLabelForCommand(
-                        keybindings,
-                        "composer.sendAlternate",
-                        {
-                          context: {
-                            composerFocus: true,
-                            draftThreadRoute: routeKind === "draft",
-                            turnRunning: true,
-                          },
-                        },
-                      )}
-                      showPlanFollowUpPrompt={
-                        pendingUserInputs.length === 0 && showPlanFollowUpPrompt
-                      }
-                      promptHasText={prompt.trim().length > 0}
-                      isSendBusy={isSendBusy}
-                      sendDisabledReason={sendDisabledReason}
-                      isConnecting={isConnecting}
-                      isEnvironmentUnavailable={
-                        environmentUnavailable !== null ||
-                        noProviderAvailable ||
-                        projectSelectionRequired
-                      }
-                      isPreparingWorktree={isPreparingWorktree}
-                      hasSendableContent={composerSendState.hasSendableContent}
-                      canResume={showResumeAction}
-                      preserveComposerFocusOnPointerDown={isMobileViewport || isComposerResting}
-                      isEditingQueuedMessage={isEditingQueuedMessage}
-                      onSubmitMessage={handleSubmitMessage}
-                      onResume={onResume}
-                      onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
-                      onInterrupt={handleInterruptPrimaryAction}
-                      onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
-                      compactBeforeSendTokens={props.resumeCompactionTokens}
-                      keepFullHistory={props.keepFullHistory}
-                      onToggleKeepFullHistory={props.onToggleKeepFullHistory}
-                      compactDisabled={
-                        compactDisabled || noProviderAvailable || isSendBusy || isConnecting
-                      }
-                      compactDisabledReason={resolvedCompactDisabledReason}
-                      {...(compactCommandAvailable
-                        ? { onCompactContext: compactThreadContext }
-                        : {})}
-                    />
-                  </>
-                }
-              />
-            )}
+                    promptHasText={prompt.trim().length > 0}
+                    isSendBusy={isSendBusy}
+                    sendDisabledReason={sendDisabledReason}
+                    isConnecting={isConnecting}
+                    isEnvironmentUnavailable={
+                      environmentUnavailable !== null ||
+                      noProviderAvailable ||
+                      projectSelectionRequired
+                    }
+                    isPreparingWorktree={isPreparingWorktree}
+                    hasSendableContent={composerSendState.hasSendableContent}
+                    canResume={showResumeAction}
+                    preserveComposerFocusOnPointerDown={isMobileViewport || isComposerResting}
+                    isEditingQueuedMessage={isEditingQueuedMessage}
+                    onSubmitMessage={handleSubmitMessage}
+                    onResume={onResume}
+                    onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
+                    onInterrupt={handleInterruptPrimaryAction}
+                    onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
+                    compactBeforeSendTokens={props.resumeCompactionTokens}
+                    keepFullHistory={props.keepFullHistory}
+                    onToggleKeepFullHistory={props.onToggleKeepFullHistory}
+                    compactDisabled={
+                      compactDisabled || noProviderAvailable || isSendBusy || isConnecting
+                    }
+                    compactDisabledReason={resolvedCompactDisabledReason}
+                    {...(compactCommandAvailable
+                      ? { onCompactContext: compactThreadContext }
+                      : {})}
+                  />
+                </>
+              }
+            />
             {showInlineRestingControls ? (
               <div className="h-8">
                 <div
