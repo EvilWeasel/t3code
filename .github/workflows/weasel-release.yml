@@ -1,532 +1,147 @@
-name: Weasel desktop nightly
-run-name: Weasel desktop release ${{ inputs.source_sha }}
-
+name: Promote verified Weasel candidate without rebuilding
+run-name: Promote verified 0.1.2-nightly.20261016.36 from candidate 38943743329
 on:
   workflow_dispatch:
     inputs:
-      publish:
-        description: Publish the built prerelease (false keeps artifacts only)
-        type: boolean
-        default: true
       source_sha:
-        description: Exact source commit (fork main for publishing, dispatched branch for artifacts only)
-        required: true
         type: string
-
+        required: true
+        default: 7135fab0a9b001751943684e055b953c125d4c55
+      candidate_run:
+        type: string
+        required: true
+        default: "38943743329"
+      version:
+        type: string
+        required: true
+        default: 0.1.2-nightly.20261016.36
+      candidate_receipt:
+        type: string
+        required: true
+        description: Exact approved synthetic E2E receipt JSON; SHA256 is pinned in this workflow
 concurrency:
   group: weasel-desktop-nightly
   cancel-in-progress: false
-
 permissions:
-  actions: read
   contents: read
-
+  actions: read
 jobs:
-  preflight:
-    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
-    timeout-minutes: 15
-    outputs:
-      source_sha: ${{ steps.release.outputs.source_sha }}
-      version: ${{ steps.release.outputs.version }}
-      tag: ${{ steps.release.outputs.tag }}
-      observatory_route_sha256: ${{ steps.route.outputs.observatory_route_sha256 }}
-    steps:
-      - name: Checkout promoted source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.source_sha }}
-          fetch-depth: 0
-
-      - name: Verify published or artifact-only source
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          PUBLISH_RELEASE: ${{ inputs.publish }}
-          DISPATCHED_REF: ${{ github.ref }}
-          DISPATCHED_SHA: ${{ github.sha }}
-        run: |
-          bash scripts/weasel/verify-desktop-source.sh "$SOURCE_SHA" "$PUBLISH_RELEASE" "$DISPATCHED_REF" "$DISPATCHED_SHA"
-
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
-        with:
-          node-version-file: package.json
-          cache: true
-          run-install: false
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Prepare pinned Electron runtime before desktop imports
-        run: node apps/desktop/scripts/ensure-electron-runtime.mjs
-
-      - name: Check source before release
-        env:
-          EFFECTIVE_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          set -euo pipefail
-          [[ "$EFFECTIVE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$EFFECTIVE_SOURCE_SHA"
-          bash scripts/weasel/check.sh
-
-      - id: route
-        name: Verify reviewed Observatory preflight route
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          set -euo pipefail
-          if [[ ! -f apps/web/src/routes/observatory.tsx ]]; then
-            exit 0
-          fi
-          python3 - <<'PYROUTE'
-          import hashlib, json, os, pathlib, subprocess
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'observatory-route-generation'
-          receipt = json.loads((root / 'receipt.json').read_bytes())
-          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
-          expected = '4a398647bcd2507fd8aabab1ea0119b5bb635ccb880f4c73f0570f533650480e'
-          source = os.environ['SOURCE_SHA']
-          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == source
-          assert receipt['status'] == 'generated-unreviewed'
-          assert receipt['source'] == receipt['effectiveSourceSha'] == source
-          assert receipt['run'] == os.environ['GITHUB_RUN_ID'] and receipt['attempt'] == os.environ['GITHUB_RUN_ATTEMPT']
-          assert receipt['trustedContextSha'] == os.environ['GITHUB_SHA']
-          assert receipt['trustedWorkflowSha'] == os.environ['GITHUB_WORKFLOW_SHA']
-          assert receipt['trustedWorkflowRef'] == os.environ['GITHUB_WORKFLOW_REF']
-          assert receipt['lockSha256'] == digest(pathlib.Path('pnpm-lock.yaml'))
-          assert receipt['checkScriptSha256'] == digest(pathlib.Path('scripts/weasel/check.sh'))
-          before = subprocess.check_output(['git', 'show', source + ':apps/web/src/routeTree.gen.ts'])
-          assert receipt['beforeSha256'] == hashlib.sha256(before).hexdigest()
-          assert receipt['generatorVersion'] == '1.167.12' and receipt['config'] == {'autoCodeSplitting': True}
-          assert receipt['afterSha256'] == digest(root / 'routeTree.gen.ts') == expected
-          assert digest(pathlib.Path('apps/web/src/routeTree.gen.ts')) == expected
-          assert (root / 'routeTree.diff').is_file()
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('observatory_route_sha256=' + expected + '\n')
-          PYROUTE
-
-      - name: Preserve release Observatory preflight route evidence
-        if: always() && hashFiles('apps/web/src/routes/observatory.tsx') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: weasel-observatory-preflight-${{ inputs.source_sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/observatory-route-generation/receipt.json
-            ${{ runner.temp }}/observatory-route-generation/routeTree.gen.ts
-            ${{ runner.temp }}/observatory-route-generation/routeTree.diff
-          if-no-files-found: error
-          retention-days: 7
-
-      - id: release
-        name: Resolve distinct fork version
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-          RELEASE_RUN: ${{ github.run_number }}
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
-        run: |
-          set -euo pipefail
-          upstream_metadata="$RUNNER_TEMP/upstream-nightly.txt"
-          run_created_at="$(gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID" --jq .created_at)"
-          release_date="$(bash scripts/weasel/resolve-run-date.sh "$run_created_at")"
-          node scripts/resolve-nightly-release.ts \
-            --date "$release_date" \
-            --run-number "$RELEASE_RUN" \
-            --sha "$SOURCE_SHA" > "$upstream_metadata"
-          source_nightly_base="$(sed -n 's/^base_version=//p' "$upstream_metadata")"
-          fork_version="$(bash scripts/weasel/resolve-version.sh \
-            "$source_nightly_base" \
-            "$release_date" \
-            "$RELEASE_RUN" | sed -n 's/^version=//p')"
-          if [[ -z "$fork_version" ]]; then
-            echo "Could not resolve a fork release version." >&2
-            exit 1
-          fi
-          {
-            echo "source_sha=$SOURCE_SHA"
-            echo "version=$fork_version"
-            echo "tag=v$fork_version"
-          } >> "$GITHUB_OUTPUT"
-
-  build_bundle:
-    needs: [preflight]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
-    timeout-minutes: 30
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.preflight.outputs.source_sha }}
-          fetch-depth: 1
-
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
-        with:
-          node-version-file: package.json
-          cache: true
-          run-install: false
-
-      - name: Install bundle dependencies
-        run: vp install --frozen-lockfile --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
-
-      - name: Align package versions and build shared assets
-        run: |
-          set -euo pipefail
-          node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
-          sudo apt-get update
-          sudo apt-get install -y libsecret-1-dev pkg-config
-          vp run build:desktop
-
-      - name: Download reviewed preflight route evidence
-        if: needs.preflight.outputs.observatory_route_sha256 != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: weasel-observatory-preflight-${{ needs.preflight.outputs.source_sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/observatory-release-preflight
-
-      - name: Bind independently built Observatory route
-        env:
-          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
-          PREFLIGHT_ROUTE_SHA: ${{ needs.preflight.outputs.observatory_route_sha256 }}
-        run: |
-          set -euo pipefail
-          if [[ ! -f apps/web/src/routes/observatory.tsx ]]; then
-            test -z "$PREFLIGHT_ROUTE_SHA"
-            exit 0
-          fi
-          python3 - <<'PYROUTE'
-          import hashlib, json, os, pathlib, subprocess
-          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
-          expected = '4a398647bcd2507fd8aabab1ea0119b5bb635ccb880f4c73f0570f533650480e'
-          source = os.environ['SOURCE_SHA']
-          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == source
-          assert os.environ['PREFLIGHT_ROUTE_SHA'] == expected
-          preflight = pathlib.Path(os.environ['RUNNER_TEMP']) / 'observatory-release-preflight'
-          before = json.loads((preflight / 'receipt.json').read_bytes())
-          assert before['source'] == before['effectiveSourceSha'] == source
-          assert before['run'] == os.environ['GITHUB_RUN_ID'] and before['attempt'] == os.environ['GITHUB_RUN_ATTEMPT']
-          assert before['lockSha256'] == digest(pathlib.Path('pnpm-lock.yaml'))
-          assert before['afterSha256'] == digest(preflight / 'routeTree.gen.ts') == expected
-          actual = pathlib.Path('apps/web/src/routeTree.gen.ts')
-          assert digest(actual) == expected
-          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'observatory-release-build'
-          output.mkdir(mode=0o700)
-          (output / 'routeTree.gen.ts').write_bytes(actual.read_bytes())
-          receipt = {'source': source, 'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
-                     'lockSha256': before['lockSha256'], 'generatedRouteSha256': expected,
-                     'preflightReceiptSha256': digest(preflight / 'receipt.json'),
-                     'trustedContextSha': os.environ['GITHUB_SHA'], 'trustedWorkflowSha': os.environ['GITHUB_WORKFLOW_SHA'],
-                     'trustedWorkflowRef': os.environ['GITHUB_WORKFLOW_REF']}
-          (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
-          PYROUTE
-
-      - name: Preserve independently built Observatory route evidence
-        if: always() && hashFiles('apps/web/src/routes/observatory.tsx') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: weasel-observatory-build-${{ needs.preflight.outputs.source_sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/observatory-release-build/receipt.json
-            ${{ runner.temp }}/observatory-release-build/routeTree.gen.ts
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload shared assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: weasel-js-bundle
-          path: |
-            apps/server/dist
-            apps/desktop/dist-electron
-          if-no-files-found: error
-          retention-days: 1
-
-  build_linux:
-    needs: [preflight, build_bundle]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
-    timeout-minutes: 80
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.preflight.outputs.source_sha }}
-          fetch-depth: 1
-
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
-        with:
-          node-version-file: package.json
-          cache: true
-          run-install: false
-
-      - name: Install Linux build dependencies
-        run: |
-          set -euo pipefail
-          vp install --frozen-lockfile --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
-          sudo apt-get update
-          sudo apt-get install -y libsecret-1-dev pkg-config imagemagick
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
-
-      - name: Download shared assets
-        uses: actions/download-artifact@v4
-        with:
-          name: weasel-js-bundle
-          path: apps
-
-      - name: Align package versions
-        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
-
-      - name: Build Linux CLI executable
-        env:
-          VP_NODE_VERSION: "26.8.2"
-        run: node apps/server/scripts/cli.ts build-exe --verbose
-
-      - name: Build Linux AppImage and updater metadata
-        env:
-          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
-          T3CODE_DESKTOP_APP_ID: com.evilweasel.t3code
-          T3CODE_DESKTOP_PRODUCT_NAME: T3 Code (Weasel Nightly)
-          T3CODE_DESKTOP_PROFILE: weasel
-          T3CODE_DESKTOP_REUSE_RESOURCE_MONITOR: "false"
-          T3CODE_DESKTOP_REUSE_LINUX_CAPTURE_HELPERS: "false"
-        run: |
-          set -euo pipefail
-          node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --output-dir release-linux
-          test -s release-linux/nightly-linux.yml
-          shopt -s nullglob
-          stage_roots=(/tmp/t3code-desktop-linux-stage-* "$RUNNER_TEMP"/t3code-desktop-linux-stage-*)
-          test "${#stage_roots[@]}" -gt 0
-          update_config="$(find "${stage_roots[@]}" -path '*/resources/app-update.yml' -print -quit)"
-          test -n "$update_config"
-          IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
-          grep -Fq "owner: $expected_owner" "$update_config"
-          grep -Fq "repo: $expected_repo" "$update_config"
-
-      - name: Prepare NixOS download bundle
-        run: |
-          set -euo pipefail
-          sed "s|EvilWeasel/t3code|${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}|g" \
-            scripts/weasel/install-linux.sh > release-linux/install-linux.sh
-          appimage="$(find release-linux -maxdepth 1 -name '*.AppImage' -print -quit)"
-          test -n "$appimage"
-          test "$(basename "$appimage")" = "T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage"
-          tar -czf release-linux/weasel-linux-x64.tar.gz -C release-linux \
-            "$(basename "$appimage")" nightly-linux.yml install-linux.sh
-
-      - name: Package and smoke-test Linux CLI archive
-        run: |
-          set -euo pipefail
-          monitor_dir="$RUNNER_TEMP/cli-resource-monitor/linux-x64"
-          mkdir -p "$monitor_dir"
-          cp native/resource-monitor/target/x86_64-unknown-linux-gnu/release/t3-resource-monitor "$monitor_dir/"
-          node scripts/build-cli-archive.ts --platform linux --arch x64 --version "${{ needs.preflight.outputs.version }}" --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" --output-dir release-cli
-          node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ needs.preflight.outputs.version }}"
-
-      - name: Upload Linux release assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: weasel-release-linux
-          path: release-linux/*
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload Linux CLI archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: weasel-release-cli-linux
-          path: release-cli/*
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Preserve built Linux files after a later failure
-        if: ${{ failure() && hashFiles('release-linux/*.AppImage') != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: weasel-linux-built-diagnostic
-          path: release-linux/*
-          if-no-files-found: error
-          retention-days: 1
-
-  build_nixos:
-    needs: [preflight, build_linux]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.preflight.outputs.source_sha }}
-      - uses: cachix/install-nix-action@3c6342b75005b9cc7c7d4069c3e9179247c89012 # v31
-      - name: Install closure packaging tools
-        run: sudo apt-get update && sudo apt-get install -y zstd
-      - name: Verify updater against a real Nix Store fixture
-        run: python3 packaging/nixos/test-updater.py
-      - uses: actions/download-artifact@v4
-        with:
-          name: weasel-release-linux
-          path: release-linux
-      - name: Build immutable NixOS closure on Blacksmith
-        env:
-          T3_WEASEL_REPOSITORY: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
-        run: bash scripts/weasel/build-nixos-closure.sh "${{ needs.preflight.outputs.version }}" "release-linux/T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage" release-nixos
-      - uses: actions/upload-artifact@v4
-        with:
-          name: weasel-release-nixos
-          path: release-nixos/*
-          if-no-files-found: error
-          retention-days: 1
-
-  build_windows:
-    needs: [preflight, build_bundle, build_linux]
-    runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'blacksmith-8vcpu-windows-2025' }}
-    timeout-minutes: 50
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.preflight.outputs.source_sha }}
-          fetch-depth: 1
-
-      - name: Setup Vite+
-        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
-        with:
-          node-version-file: package.json
-          cache: false
-          run-install: false
-
-      - name: Install Windows build dependencies
-        run: vp install --frozen-lockfile --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
-
-      - name: Install Spectre-mitigated MSVC runtime libraries
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $installPath = & $vswhere -products * -latest -property installationPath
-          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
-          $proc = Start-Process -FilePath $setupExe `
-            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
-            "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", "--quiet", "--norestart" `
-            -Wait -PassThru -NoNewWindow
-          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
-            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
-            Write-Error "Visual Studio Installer failed with exit code $code"
-            exit $code
-          }
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Download shared assets
-        uses: actions/download-artifact@v4
-        with:
-          name: weasel-js-bundle
-          path: apps
-
-      - name: Align package versions
-        run: node scripts/update-release-package-versions.ts "${{ needs.preflight.outputs.version }}"
-
-      - name: Download same-build Linux CLI runtime for WSL
-        uses: actions/download-artifact@v4
-        with:
-          name: weasel-release-cli-linux
-          path: wsl-runtime
-
-      - name: Build Windows CLI executable
-        env:
-          VP_NODE_VERSION: "26.8.2"
-        shell: bash
-        run: node apps/server/scripts/cli.ts build-exe --verbose
-
-      - name: Build Windows x64 installer and updater metadata
-        env:
-          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
-          T3CODE_DESKTOP_APP_ID: com.evilweasel.t3code
-          T3CODE_DESKTOP_PRODUCT_NAME: T3 Code (Weasel Nightly)
-          T3CODE_DESKTOP_PROFILE: weasel
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/build-desktop-artifact.ts --platform win --target nsis --arch x64 --build-version "${{ needs.preflight.outputs.version }}" --skip-build --keep-stage --wsl-runtime "$GITHUB_WORKSPACE"/wsl-runtime/t3-*-linux-x64.tar.gz --output-dir release-windows
-          test -s release-windows/nightly.yml
-          tmp_roots=("$RUNNER_TEMP")
-          [[ -n "${TEMP:-}" ]] && tmp_roots+=("$TEMP")
-          [[ -n "${TMP:-}" ]] && tmp_roots+=("$TMP")
-          update_config="$(find "${tmp_roots[@]}" -path '*/resources/app-update.yml' -print -quit 2>/dev/null || true)"
-          test -n "$update_config"
-          IFS=/ read -r expected_owner expected_repo <<<"${T3CODE_DESKTOP_UPDATE_REPOSITORY}"
-          grep -Fq "owner: $expected_owner" "$update_config"
-          grep -Fq "repo: $expected_repo" "$update_config"
-
-      - name: Package and smoke-test Windows CLI archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          monitor_dir="$RUNNER_TEMP/cli-resource-monitor/win32-x64"
-          mkdir -p "$monitor_dir"
-          cp native/resource-monitor/target/x86_64-pc-windows-msvc/release/t3-resource-monitor.exe "$monitor_dir/"
-          node scripts/build-cli-archive.ts --platform win --arch x64 --version "${{ needs.preflight.outputs.version }}" --resource-monitor-dir "$RUNNER_TEMP/cli-resource-monitor" --output-dir release-cli
-          node scripts/smoke-cli-archive.ts --archive release-cli/* --expect-version "${{ needs.preflight.outputs.version }}"
-
-      - name: Upload Windows release assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: weasel-release-windows
-          path: release-windows/*
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload Windows CLI archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: weasel-release-cli-windows
-          path: release-cli/*
-          if-no-files-found: error
-          retention-days: 1
-
   publish:
-    if: inputs.publish
-    needs: [preflight, build_linux, build_nixos, build_windows]
-    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
-    timeout-minutes: 15
+    if: github.repository == 'morrowbyte/t3code' && github.ref == 'refs/heads/ops/promote-verified-voice-36-20261016'
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 25
     permissions:
       contents: write
+      actions: read
     steps:
-      - name: Checkout promoted source for receipt metadata
+      - name: Checkout verified product source
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.preflight.outputs.source_sha }}
-          fetch-depth: 1
-
-      - name: Download dedicated release assets
-        uses: actions/download-artifact@v4
+          ref: 7135fab0a9b001751943684e055b953c125d4c55
+          fetch-depth: 0
+      - name: Set up checksum runtime only; no install or build
+        uses: actions/setup-node@v4
         with:
-          pattern: weasel-release-*
-          merge-multiple: true
-          path: release-assets
-
-      - name: Download Observatory preflight proof for publication
-        if: needs.preflight.outputs.observatory_route_sha256 != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: weasel-observatory-preflight-${{ needs.preflight.outputs.source_sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/observatory-publish-preflight
-
-      - name: Download Observatory build proof for publication
-        if: needs.preflight.outputs.observatory_route_sha256 != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: weasel-observatory-build-${{ needs.preflight.outputs.source_sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/observatory-publish-build
-
+          node-version: "24"
+      - name: Verify candidate provenance and download exact artifact ZIPs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: 7135fab0a9b001751943684e055b953c125d4c55
+          CANDIDATE_RUN_ID: "38943743329"
+          VERSION: 0.1.2-nightly.20261016.36
+          CANDIDATE_PROOF_SHA256: 01cf3cdc91c0b7364bcf8ec78243d08afc43c4df539e2097557a32f69abb2222
+          INPUT_SOURCE: ${{ inputs.source_sha }}
+          INPUT_RUN: ${{ inputs.candidate_run }}
+          INPUT_VERSION: ${{ inputs.version }}
+          CANDIDATE_PROOF: ${{ inputs.candidate_receipt }}
+        run: |-
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = morrowbyte/t3code
+          test "$GITHUB_REF" = refs/heads/ops/promote-verified-voice-36-20261016
+          test "$INPUT_SOURCE" = "$SOURCE_SHA"
+          test "$INPUT_RUN" = "$CANDIDATE_RUN_ID"
+          test "$INPUT_VERSION" = "$VERSION"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          bash scripts/weasel/verify-desktop-source.sh "$SOURCE_SHA" true "$GITHUB_REF" "$GITHUB_SHA"
+          git fetch --no-tags origin "$GITHUB_SHA"
+          test "$(git diff --name-only "$SOURCE_SHA" "$GITHUB_SHA")" = .github/workflows/weasel-release.yml
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,subprocess,zipfile,stat,shutil
+          repo='morrowbyte/t3code'; source=os.environ['SOURCE_SHA']; candidate=int(os.environ['CANDIDATE_RUN_ID'])
+          temporary=pathlib.Path(os.environ['RUNNER_TEMP'])/'verified-candidate-promotion'; temporary.mkdir()
+          def api(suffix):
+              return json.loads(subprocess.check_output(['gh','api','repos/'+repo+'/'+suffix],timeout=30))
+          def sha(p):
+              h=hashlib.sha256()
+              with p.open('rb') as f:
+                  for b in iter(lambda:f.read(1024*1024),b''): h.update(b)
+              return h.hexdigest()
+          proof_bytes=os.environ['CANDIDATE_PROOF'].encode()
+          assert hashlib.sha256(proof_bytes).hexdigest()==os.environ['CANDIDATE_PROOF_SHA256']
+          proof=json.loads(proof_bytes)
+          assert proof['sourceSha']==source and proof['version']==os.environ['VERSION']
+          assert proof['overall']=='PASS_ISOLATED_NATIVE_DRAFT_SYNTHETIC_E2E_AWAIT_ROOT_MAIN_PUBLICATION'
+          assert proof['nativeBuild']['run']['id']==candidate and proof['nativeBuild']['publish'] is False
+          assert proof['physicalCaptureGuardCalls']==0 and proof['attempts'][-1]['result']=='PASS'
+          r=api('actions/runs/'+str(candidate))
+          assert r['repository']['full_name']==repo and r['head_repository']['full_name']==repo
+          assert r['head_sha']==source and r['head_branch']=='fix/native-chatgpt-livevoice-20261016'
+          assert r['event']=='workflow_dispatch' and r['path']=='.github/workflows/weasel-release.yml'
+          assert r['status']=='completed' and r['conclusion']=='success' and r['run_attempt']==1 and r['run_number']==36
+          assert r['created_at'][:10].replace('-','')=='20261016'
+          j=api('actions/runs/'+str(candidate)+'/attempts/1/jobs?per_page=100')
+          assert len(j['jobs'])==j['total_count'] and j['total_count']<=100
+          for name in ['preflight','build_bundle','build_linux','build_nixos','build_windows']:
+              rows=[x for x in j['jobs'] if x['name']==name]
+              assert len(rows)==1 and rows[0]['run_id']==candidate and rows[0]['status']=='completed' and rows[0]['conclusion']=='success'
+              expected='blacksmith-8vcpu-windows-2025' if name=='build_windows' else 'blacksmith-8vcpu-ubuntu-2404'
+              assert expected in rows[0]['labels']
+          published=[x for x in j['jobs'] if x['name']=='publish']
+          assert len(published)==1 and published[0]['conclusion']=='skipped'
+          a=api('actions/runs/'+str(candidate)+'/artifacts?per_page=100')
+          assert len(a['artifacts'])==a['total_count'] and a['total_count']<=100
+          names=['weasel-release-linux','weasel-release-cli-linux','weasel-release-windows','weasel-release-cli-windows','weasel-release-nixos',
+                 'weasel-observatory-preflight-'+source+'-1','weasel-observatory-build-'+source+'-1']
+          release=pathlib.Path('release-assets'); release.mkdir()
+          manifest=[]
+          for name in names:
+              rows=[x for x in a['artifacts'] if x['name']==name]
+              assert len(rows)==1
+              item=rows[0]; assert item['expired'] is False and item['workflow_run']['id']==candidate and item['workflow_run']['head_sha']==source
+              assert item['digest'].startswith('sha256:') and len(item['digest'])==71
+              if name=='weasel-release-nixos':
+                  assert item['id']==proof['artifact']['artifactId'] and item['digest']=='sha256:'+proof['artifact']['artifactZipSha256']
+              archive=temporary/(name+'.zip')
+              with archive.open('xb') as output:
+                  subprocess.run(['gh','api','repos/'+repo+'/actions/artifacts/'+str(item['id'])+'/zip'],stdout=output,check=True,timeout=600)
+              assert 'sha256:'+sha(archive)==item['digest']
+              dest=release if name.startswith('weasel-release-') else pathlib.Path(os.environ['RUNNER_TEMP'])/('observatory-publish-preflight' if 'preflight' in name else 'observatory-publish-build')
+              if dest!=release: dest.mkdir()
+              seen=set()
+              with zipfile.ZipFile(archive) as z:
+                  for entry in z.infolist():
+                      p=pathlib.PurePosixPath(entry.filename); mode=(entry.external_attr>>16)&0o170000
+                      assert not p.is_absolute() and p.parts and all(x not in ('','.','..') for x in p.parts)
+                      assert '\\' not in entry.filename and ':' not in entry.filename and mode in (0,stat.S_IFREG,stat.S_IFDIR)
+                      key=entry.filename.casefold(); assert key not in seen; seen.add(key)
+                      out=dest.joinpath(*p.parts); assert out.resolve().is_relative_to(dest.resolve())
+                      if entry.is_dir(): out.mkdir(parents=True,exist_ok=True); continue
+                      if dest==release: assert len(p.parts)==1 and out.name not in ('SHA256SUMS','RELEASE-RECEIPT.txt')
+                      out.parent.mkdir(parents=True,exist_ok=True)
+                      with z.open(entry) as src,out.open('xb') as dst: shutil.copyfileobj(src,dst)
+              manifest.append({k:item[k] for k in ('id','name','size_in_bytes','digest')})
+          (temporary/'candidate-run.json').write_text(json.dumps(r,indent=2)+'\n')
+          (temporary/'candidate-jobs.json').write_text(json.dumps(j,indent=2)+'\n')
+          (temporary/'artifact-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+          (temporary/'candidate-proof-sha256.txt').write_text(os.environ['CANDIDATE_PROOF_SHA256']+'\n')
+          PY
       - name: Require matching Observatory route proofs before publication
         env:
-          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
-          PREFLIGHT_ROUTE_SHA: ${{ needs.preflight.outputs.observatory_route_sha256 }}
+          SOURCE_SHA: 7135fab0a9b001751943684e055b953c125d4c55
+          PREFLIGHT_ROUTE_SHA: 4a398647bcd2507fd8aabab1ea0119b5bb635ccb880f4c73f0570f533650480e
+          CANDIDATE_RUN_ID: "38943743329"
+          CANDIDATE_RUN_ATTEMPT: "1"
+          CANDIDATE_WORKFLOW_REF: morrowbyte/t3code/.github/workflows/weasel-release.yml@refs/heads/fix/native-chatgpt-livevoice-20261016
         run: |
           set -euo pipefail
           if [[ ! -f apps/web/src/routes/observatory.tsx ]]; then
@@ -547,11 +162,11 @@ jobs:
           built = json.loads((build / 'receipt.json').read_bytes())
           for receipt in [pre, built]:
               assert receipt['source'] == source
-              assert receipt['run'] == os.environ['GITHUB_RUN_ID'] and receipt['attempt'] == os.environ['GITHUB_RUN_ATTEMPT']
+              assert receipt['run'] == os.environ['CANDIDATE_RUN_ID'] and receipt['attempt'] == os.environ['CANDIDATE_RUN_ATTEMPT']
               assert receipt['lockSha256'] == digest(pathlib.Path('pnpm-lock.yaml'))
-              assert receipt['trustedContextSha'] == os.environ['GITHUB_SHA']
-              assert receipt['trustedWorkflowSha'] == os.environ['GITHUB_WORKFLOW_SHA']
-              assert receipt['trustedWorkflowRef'] == os.environ['GITHUB_WORKFLOW_REF']
+              assert receipt['trustedContextSha'] == os.environ['SOURCE_SHA']
+              assert receipt['trustedWorkflowSha'] == os.environ['SOURCE_SHA']
+              assert receipt['trustedWorkflowRef'] == os.environ['CANDIDATE_WORKFLOW_REF']
           assert pre['effectiveSourceSha'] == source and pre['status'] == 'generated-unreviewed'
           assert pre['afterSha256'] == built['generatedRouteSha256'] == expected
           assert digest(preflight / 'routeTree.gen.ts') == digest(build / 'routeTree.gen.ts') == expected
@@ -559,40 +174,34 @@ jobs:
           assert pre['generatorVersion'] == '1.167.12' and pre['config'] == {'autoCodeSplitting': True}
           assert (preflight / 'routeTree.diff').is_file()
           PYROUTE
-
-      - name: Setup checksum consumer runtime
-        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
-        with:
-          node-version-file: package.json
-          cache: false
-          run-install: false
-
       - name: Verify isolated release payload
         run: |
           set -euo pipefail
           test -s release-assets/nightly-linux.yml
           test -s release-assets/nightly.yml
           test -s release-assets/weasel-linux-x64.tar.gz
-          test -s "release-assets/T3-Code-${{ needs.preflight.outputs.version }}-x86_64.AppImage"
+          test -s "release-assets/T3-Code-0.1.2-nightly.20261016.36-x86_64.AppImage"
           test -s release-assets/install-linux.sh
-          test -s "release-assets/T3-Code-${{ needs.preflight.outputs.version }}-x86_64-linux-nix-closure.nar.zst"
-          test -s "release-assets/T3-Code-${{ needs.preflight.outputs.version }}-x86_64-linux-nix-closure.json"
-          bash scripts/weasel/verify-nixos-closure.sh "${{ needs.preflight.outputs.version }}" release-assets
+          test -s "release-assets/T3-Code-0.1.2-nightly.20261016.36-x86_64-linux-nix-closure.nar.zst"
+          test -s "release-assets/T3-Code-0.1.2-nightly.20261016.36-x86_64-linux-nix-closure.json"
+          bash scripts/weasel/verify-nixos-closure.sh "0.1.2-nightly.20261016.36" release-assets
           test -n "$(find release-assets -maxdepth 1 -name 't3-*-linux-x64.tar.gz' -print -quit)"
           test -n "$(find release-assets -maxdepth 1 -name 't3-*-win32-x64.zip' -print -quit)"
           ! find release-assets -maxdepth 1 -type f \( -name '*apk' -o -name '*aab' -o -name '*ipa' \) | grep -q .
-          bash scripts/weasel/verify-published-release.sh --write-checksums "${{ needs.preflight.outputs.version }}" release-assets
-
+          bash scripts/weasel/verify-published-release.sh --write-checksums "0.1.2-nightly.20261016.36" release-assets
       - name: Create fork-only prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
-          OBSERVATORY_ROUTE_SHA: ${{ needs.preflight.outputs.observatory_route_sha256 }}
+          GH_REPO: morrowbyte/t3code
+          OBSERVATORY_ROUTE_SHA: 4a398647bcd2507fd8aabab1ea0119b5bb635ccb880f4c73f0570f533650480e
+          CANDIDATE_RUN_ID: "38943743329"
+          CANDIDATE_RUN_ATTEMPT: "1"
+          CANDIDATE_PROOF_SHA256: 01cf3cdc91c0b7364bcf8ec78243d08afc43c4df539e2097557a32f69abb2222
         run: |
           set -euo pipefail
-          tag="${{ needs.preflight.outputs.tag }}"
-          source_sha="${{ needs.preflight.outputs.source_sha }}"
-          version="${{ needs.preflight.outputs.version }}"
+          tag="v0.1.2-nightly.20261016.36"
+          source_sha="7135fab0a9b001751943684e055b953c125d4c55"
+          version="0.1.2-nightly.20261016.36"
           assert_draft_release() {
             local release_state is_draft target_commitish
             release_state="$(gh release view "$tag" --json isDraft,targetCommitish)"
@@ -618,7 +227,7 @@ jobs:
           else
             gh release create "$tag" \
               --target "$source_sha" \
-              --title "Weasel Nightly ${{ needs.preflight.outputs.version }}" \
+              --title "Weasel Nightly 0.1.2-nightly.20261016.36" \
               --prerelease \
               --draft \
               --notes "Fork channel build from $source_sha. Linux AppImage installs include a user-local installer. NixOS installs use the dedicated package and updater launcher when available at https://github.com/$GH_REPO/tree/main/packaging/nixos. Linux auto-updates stay disabled for Nix store installs. This build has no configured T3 Connect relay backend."
@@ -639,8 +248,10 @@ jobs:
             if [[ -f apps/web/src/routes/observatory.tsx ]]; then
               test "$OBSERVATORY_ROUTE_SHA" = 4a398647bcd2507fd8aabab1ea0119b5bb635ccb880f4c73f0570f533650480e
               printf 'generated_route_sha256=%s\ngenerated_route_source_sha=%s\ngenerated_route_run_id=%s\ngenerated_route_run_attempt=%s\n' \
-                "$OBSERVATORY_ROUTE_SHA" "$source_sha" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+                "$OBSERVATORY_ROUTE_SHA" "$source_sha" "$CANDIDATE_RUN_ID" "$CANDIDATE_RUN_ATTEMPT"
             fi
+            printf 'candidate_run_id=%s\ncandidate_run_attempt=%s\ncandidate_proof_sha256=%s\npromotion_run_id=%s\npromotion_run_attempt=%s\npromotion_workflow_sha=%s\n' \
+              "$CANDIDATE_RUN_ID" "$CANDIDATE_RUN_ATTEMPT" "$CANDIDATE_PROOF_SHA256" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_WORKFLOW_SHA"
             printf 'github_asset_digests=%s\n' "$(jq -c '[.[] | {name, digest}]' <<<"$assets_json")"
             printf 'artifact_sha256:\n'
             cat release-assets/SHA256SUMS
@@ -648,3 +259,13 @@ jobs:
           assert_draft_release
           gh release upload "$tag" release-assets/RELEASE-RECEIPT.txt --clobber
           gh release edit "$tag" --draft=false
+      - name: Retain promotion metadata only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-promotion-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |-
+            ${{ runner.temp }}/verified-candidate-promotion/*.json
+            ${{ runner.temp }}/verified-candidate-promotion/*.txt
+          if-no-files-found: warn
+          retention-days: 7
