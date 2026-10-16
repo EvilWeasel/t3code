@@ -353,5 +353,12 @@ if [[ ! -f "$composer_context_id_test" ]]; then
 fi
 focused_tests+=("$composer_context_id_test")
 vp_cmd lint --report-unused-disable-directives packages/shared/src/composerContextReferences.ts packages/shared/src/composerContextReferences.test.ts
+mobile_context_id_test=apps/mobile/src/lib/composerContext.test.ts
+if [[ ! -f "$mobile_context_id_test" ]]; then
+  echo "Required mobile context ID gate is missing: $mobile_context_id_test" >&2
+  exit 1
+fi
+focused_tests+=("$mobile_context_id_test")
+vp_cmd lint --report-unused-disable-directives apps/mobile/src/lib/composerContext.ts apps/mobile/src/lib/composerContext.test.ts
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)
