@@ -1,3 +1,4 @@
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { assert, describe, it } from "@effect/vitest";
 import {
   AuthOrchestrationReadScope,
@@ -5,6 +6,7 @@ import {
   EnvironmentAuthenticatedAuth,
   EnvironmentAuthenticatedPrincipal,
   EnvironmentHttpApi,
+  EnvironmentId,
   EventId,
   MessageId,
   NodeId,
@@ -226,6 +228,9 @@ const seed = Effect.gen(function* () {
 // thread routes never touch projects.
 const TestLayer = Layer.mergeAll(
   management,
+  Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
+    getEnvironmentId: Effect.succeed(EnvironmentId.make("compact-transport")),
+  }),
   Layer.effectDiscard(seed),
   Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({}),
   Layer.mock(ProjectStore.ProjectStoreV2)({}),
