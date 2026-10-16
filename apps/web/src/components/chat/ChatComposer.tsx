@@ -606,7 +606,8 @@ function useComposerRestingTransition(
       const nextActionTop = action?.getBoundingClientRect().top ?? null;
       const nextControlsRect = controls?.getBoundingClientRect() ?? null;
       const nextControlsTop = nextControlsRect?.top ?? null;
-      const footerBottom = footer ? nextRect.bottom - footer.getBoundingClientRect().bottom : 1;
+      const footerRect = footer?.getBoundingClientRect();
+      const footerBottom = footerRect ? nextRect.bottom - footerRect.bottom : 1;
       const previousHeight = interruptedHeight ?? previousHeightRef.current;
       const targetChanged =
         interruptedTargetHeight === null || Math.abs(interruptedTargetHeight - nextHeight) >= 0.5;
@@ -657,11 +658,11 @@ function useComposerRestingTransition(
         // height changes. Its resting absolute layout otherwise spans the old
         // height on collapse, while its expanded flow layout falls below the
         // clipped surface on expansion.
-        if (footer) {
+        if (footer && footerRect) {
           footer.style.position = "absolute";
           footer.style.top = "auto";
           footer.style.bottom = `${String(footerBottom)}px`;
-          footer.style.height = "3rem";
+          footer.style.height = `${String(footerRect.height)}px`;
           if (nextIsCollapsed) {
             footer.style.left = "auto";
             footer.style.right = "1px";
@@ -1582,7 +1583,7 @@ export function ChatComposerFooter({
         data-chat-composer-actions="right"
         data-chat-composer-transition-actions="true"
         data-chat-composer-primary-actions-compact={primaryActionsCompact ? "true" : "false"}
-        className="flex min-w-0 max-w-full flex-1 flex-wrap items-center justify-end gap-2 sm:flex-none"
+        className="flex min-w-0 max-w-full flex-1 basis-full flex-wrap items-center justify-end gap-2 sm:basis-auto sm:flex-none"
       >
         {actions}
       </div>
