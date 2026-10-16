@@ -175,6 +175,10 @@ async function captureComposerMobile() {
         let key = request.startsWith(".") && importer ? resolve(dirname(importer.split("?")[0]),request) : request.startsWith("~/") ? join(web,"src",request.slice(2)) : request;
         key=key.replace(/\.(tsx?|jsx?)$/,"");
         if(boundaries.has(key)) return "\0composer-boundary:"+key;
+        // The fixture lives in scripts; resolve its declared browser dependencies from web.
+        if ((importer === join(repo,"scripts/weasel/composer-mobile-fixture.tsx") || importer?.startsWith("\0composer-boundary:")) && !request.startsWith(".") && !request.startsWith("/") && !request.startsWith("\0")) {
+          return this.resolve(request, join(web,"src/main.tsx"), {skipSelf:true});
+        }
       },
       load(id) {
         if(id.startsWith("\0composer-boundary:")) return boundaries.get(id.slice("\0composer-boundary:".length));
