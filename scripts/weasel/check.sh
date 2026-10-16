@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+node --test scripts/weasel/nightly-after-ci.test.cjs
+
 bash scripts/weasel/test.sh
 python3 packaging/nixos/test-updater.py
 

@@ -1,0 +1,39 @@
+name: Weasel main Nightly
+on:
+  workflow_run:
+    workflows: [Weasel CI]
+    types: [completed]
+    branches: [main]
+
+# One writer for the durable per-source dispatch intent. Never cancel an owner
+# between intent persistence and reconciliation of its dispatch acknowledgement.
+concurrency:
+  group: weasel-main-nightly-dispatch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+  statuses: write
+
+jobs:
+  dispatch:
+    if: >-
+      github.repository == 'morrowbyte/t3code' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - name: Dispatch or reconcile the existing Nightly workflow
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const dispatch = require('./scripts/weasel/nightly-after-ci.cjs');
+            await dispatch({github, context, core});
