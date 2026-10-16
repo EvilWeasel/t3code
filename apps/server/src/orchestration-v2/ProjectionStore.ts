@@ -137,7 +137,17 @@ export class ProjectionStoreReadError extends Schema.TaggedError<ProjectionStore
   }
 }
 
+export class ProjectionStoreNativeRosterError extends Schema.TaggedError<ProjectionStoreNativeRosterError>()(
+  "ProjectionStoreNativeRosterError",
+  { cause: Schema.optional(Schema.Defect()) },
+) {
+  override get message() {
+    return "Could not read the bounded native agent roster.";
+  }
+}
+
 export const ProjectionStoreV2Error = Schema.Union([
+  ProjectionStoreNativeRosterError,
   ProjectionStoreSetupError,
   ProjectionStoreApplyEventError,
   ProjectionStoreThreadNotFoundError,
@@ -293,6 +303,46 @@ export interface ProjectionRuntimeResponseContext {
   readonly session: OrchestrationV2ThreadProjection["providerSessions"][number] | undefined;
 }
 
+const NativeAgentRosterEntryJson = OrchestrationV2SubagentJsonSchema.mapFields((fields) => ({
+  id: fields.id,
+  threadId: fields.threadId,
+  runId: fields.runId,
+  parentNodeId: fields.parentNodeId,
+  origin: fields.origin,
+  driver: fields.driver,
+  providerInstanceId: fields.providerInstanceId,
+  providerThreadId: fields.providerThreadId,
+  childThreadId: fields.childThreadId,
+  status: fields.status,
+  title: fields.title,
+  updatedAt: fields.updatedAt,
+  titleTruncated: Schema.Boolean,
+}));
+export type NativeAgentRosterEntry = typeof NativeAgentRosterEntryJson.Type;
+const decodeNativeRosterEntry = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(NativeAgentRosterEntryJson),
+);
+
+export interface NativeAgentRosterCursor {
+  readonly throughSequence: number;
+  readonly threadIds: ReadonlyArray<ThreadId>;
+  readonly afterId: string;
+}
+export interface NativeAgentRosterQuery {
+  /** Already-authorized selection, max 128 threads. Not discovered by opening histories. */
+  readonly threadIds: ReadonlyArray<ThreadId>;
+  readonly limit: number;
+  readonly cursor?: NativeAgentRosterCursor;
+}
+export interface NativeAgentRosterPage {
+  readonly source: "canonical-subagent-index";
+  readonly coverage: "recorded-current-only";
+  readonly throughSequence: number;
+  readonly status: "complete" | "partial" | "stale";
+  readonly agents: ReadonlyArray<NativeAgentRosterEntry>;
+  readonly nextCursor: NativeAgentRosterCursor | null;
+}
+
 export interface ProjectionRecordFilter {
   readonly messageRoles?: ReadonlyArray<OrchestrationV2ConversationMessage["role"]>;
   readonly turnItemRunId?: RunId;
@@ -367,6 +417,9 @@ export interface ProjectionStoreV2Shape {
     readonly threadId: ThreadId;
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2TurnItem | null, ProjectionStoreV2Error>;
+  readonly getCurrentNativeAgentRoster: (
+    input: NativeAgentRosterQuery,
+  ) => Effect.Effect<NativeAgentRosterPage, ProjectionStoreV2Error>;
   readonly getThreadRecords: <K extends ProjectionRecordField>(
     threadId: ThreadId,
     fields: ReadonlyArray<K>,
@@ -4783,6 +4836,75 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause })),
       );
 
+    const getCurrentNativeAgentRoster: ProjectionStoreV2Shape["getCurrentNativeAgentRoster"] = (
+      input,
+    ) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const threadIds = [...new Set(input.threadIds)].sort();
+            if (
+              threadIds.length > 128 ||
+              !Number.isSafeInteger(input.limit) ||
+              input.limit < 1 ||
+              input.limit > 200
+            )
+              return yield* new ProjectionStoreNativeRosterError({
+                cause: "Invalid bounded roster selection.",
+              });
+            const frontier = yield* sql<{
+              readonly sequence: number;
+            }>`SELECT COALESCE(MAX(sequence), 0) AS sequence FROM orchestration_events`;
+            const throughSequence = frontier[0]?.sequence ?? 0;
+            const base = {
+              source: "canonical-subagent-index" as const,
+              coverage: "recorded-current-only" as const,
+              throughSequence,
+            };
+            if (
+              input.cursor &&
+              (input.cursor.throughSequence !== throughSequence ||
+                input.cursor.threadIds.length !== threadIds.length ||
+                input.cursor.threadIds.some((id, index) => id !== threadIds[index]))
+            )
+              return { ...base, status: "stale" as const, agents: [], nextCursor: null };
+            if (threadIds.length === 0)
+              return { ...base, status: "complete" as const, agents: [], nextCursor: null };
+            // Select bounded IDs before fetching bodies; no transcript/detail materialization.
+            const ids = yield* sql<{ readonly subagent_id: string }>`
+          SELECT subagent_id FROM orchestration_v2_projection_subagents INDEXED BY orchestration_v2_projection_subagents_thread_idx
+          WHERE thread_id IN ${sql.in(threadIds)} AND origin = 'provider_native'
+            AND status IN ('pending', 'running', 'waiting') AND subagent_id > ${input.cursor?.afterId ?? ""}
+          ORDER BY subagent_id ASC LIMIT ${input.limit + 1}`;
+            const selected = ids.slice(0, input.limit);
+            const rows =
+              selected.length === 0
+                ? []
+                : yield* sql<PayloadRow>`
+          SELECT json_object(
+            'id', subagent_id, 'threadId', thread_id, 'runId', run_id, 'parentNodeId', parent_node_id,
+            'origin', origin, 'driver', driver, 'providerInstanceId', provider_instance_id,
+            'providerThreadId', provider_thread_id, 'childThreadId', child_thread_id, 'status', status,
+            'title', substr(json_extract(payload_json, '$.title'), 1, 320), 'updatedAt', updated_at,
+            'titleTruncated', json(CASE WHEN length(json_extract(payload_json, '$.title')) > 320 THEN 'true' ELSE 'false' END)
+          ) AS payload_json FROM orchestration_v2_projection_subagents WHERE subagent_id IN ${sql.in(selected.map((row) => row.subagent_id))}
+          ORDER BY subagent_id ASC`;
+            const agents = yield* Effect.forEach(rows, (row) =>
+              decodeNativeRosterEntry(row.payload_json),
+            );
+            const more = ids.length > input.limit;
+            return {
+              ...base,
+              status: more ? ("partial" as const) : ("complete" as const),
+              agents,
+              nextCursor: more
+                ? { throughSequence, threadIds, afterId: selected.at(-1)?.subagent_id ?? "" }
+                : null,
+            };
+          }),
+        )
+        .pipe(Effect.mapError((cause) => new ProjectionStoreNativeRosterError({ cause })));
+
     const getThreadRecords: ProjectionStoreV2Shape["getThreadRecords"] = (
       threadId,
       fields,
@@ -5961,6 +6083,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         .pipe(Effect.mapError((cause) => new ProjectionStoreReadError({ threadId, cause })));
 
     return {
+      getCurrentNativeAgentRoster,
       apply,
       getShellSnapshot,
       readShellSnapshot,
@@ -6009,6 +6132,66 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
     const sequence = yield* Ref.make(0);
 
     const service: ProjectionStoreV2Shape = {
+      getCurrentNativeAgentRoster: (input) =>
+        Effect.gen(function* () {
+          const threadIds = [...new Set(input.threadIds)].sort();
+          if (
+            threadIds.length > 128 ||
+            !Number.isSafeInteger(input.limit) ||
+            input.limit < 1 ||
+            input.limit > 200
+          )
+            return yield* new ProjectionStoreNativeRosterError({
+              cause: "Invalid bounded roster selection.",
+            });
+          const throughSequence = yield* Ref.get(sequence);
+          const base = {
+            source: "canonical-subagent-index" as const,
+            coverage: "recorded-current-only" as const,
+            throughSequence,
+          };
+          if (
+            input.cursor &&
+            (input.cursor.throughSequence !== throughSequence ||
+              input.cursor.threadIds.length !== threadIds.length ||
+              input.cursor.threadIds.some((id, index) => id !== threadIds[index]))
+          )
+            return { ...base, status: "stale" as const, agents: [], nextCursor: null };
+          const existing = (yield* Ref.get(replayState)).projections;
+          const all = threadIds
+            .flatMap((id) => existing.get(id)?.subagents ?? [])
+            .filter(
+              (agent) =>
+                agent.origin === "provider_native" &&
+                ["pending", "running", "waiting"].includes(agent.status) &&
+                agent.id > (input.cursor?.afterId ?? ""),
+            )
+            .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+          const agents = all.slice(0, input.limit).map((agent) => ({
+            id: agent.id,
+            threadId: agent.threadId,
+            runId: agent.runId,
+            parentNodeId: agent.parentNodeId,
+            origin: agent.origin,
+            driver: agent.driver,
+            providerInstanceId: agent.providerInstanceId,
+            providerThreadId: agent.providerThreadId,
+            childThreadId: agent.childThreadId,
+            status: agent.status,
+            title: agent.title?.slice(0, 320) ?? null,
+            titleTruncated: (agent.title?.length ?? 0) > 320,
+            updatedAt: agent.updatedAt,
+          }));
+          const more = all.length > input.limit;
+          return {
+            ...base,
+            status: more ? ("partial" as const) : ("complete" as const),
+            agents,
+            nextCursor: more
+              ? { throughSequence, threadIds, afterId: agents.at(-1)?.id ?? "" }
+              : null,
+          };
+        }),
       apply: (event) =>
         Effect.gen(function* () {
           const result = yield* Ref.modify(replayState, (existing) => {

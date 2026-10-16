@@ -1,7 +1,8 @@
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { assert, it } from "@effect/vitest";
-import { ProjectId } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -118,10 +119,19 @@ const unusedEnrichment = {
 
 /** The production V2 runtime and project service against one file-backed database. */
 const layerRuntime = (dbPath: string) => {
-  const layerPlatform = Layer.merge(
+  const fixtureEnvironmentId = EnvironmentId.make(
+    "environment:observatory-fixture:ProjectSettingsUpgrade",
+  );
+  const layerPlatform = Layer.mergeAll(
     NodeServices.layer,
     Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
       resolveLink: () => Effect.die("unused"),
+    }),
+    Layer.succeed(ServerEnvironment.ServerEnvironment, {
+      getEnvironmentId: Effect.succeed(fixtureEnvironmentId),
+      getDescriptor: Effect.die(
+        "Server descriptor is unused in this destination-bound test fixture",
+      ),
     }),
   );
   const layerServerConfig = ServerConfig.layerTest(process.cwd(), {

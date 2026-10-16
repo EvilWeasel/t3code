@@ -1,3 +1,5 @@
+import * as AgentObservatory from "../observatory/AgentObservatoryService.ts";
+import * as TrustedInvocation from "../mcp/TrustedAppControlInvocation.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
@@ -124,10 +126,17 @@ const layerProviderSwitchServiceProvided = ProviderSwitchService.layer.pipe(
   Layer.provide(layerProviderAdapterRegistryProvided),
 );
 
+const layerAgentObservatoryProvided = AgentObservatory.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(ProjectionStore.layer, layerEventStoreProvided, layerEventSinkProvided),
+  ),
+);
+
 const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerProviderAdapterRegistryProvided,
+      layerAgentObservatoryProvided,
       layerEventSinkProvided,
       IdAllocator.layer,
       layerProviderEventIngestorProvided,
@@ -140,10 +149,22 @@ const layerProviderAuthServiceProvided = ProviderAuthService.layer.pipe(
   Layer.provide(Layer.merge(ProjectionStore.layer, layerProviderSessionManagerProvided)),
 );
 
+const layerTrustedObservatoryProvided = TrustedInvocation.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      ProjectionStore.layer,
+      layerProviderSessionManagerProvided,
+      ThreadCommandExecutor.layer,
+    ),
+  ),
+);
+
 const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       McpAppModelContext.layer,
+      layerAgentObservatoryProvided,
+      layerTrustedObservatoryProvided,
       layerCheckpointServiceProvided,
       layerEventSinkProvided,
       IdAllocator.layer,
@@ -337,6 +358,8 @@ const layerMcpAppRequestsProvided = McpAppRequests.layer.pipe(
 );
 
 export const layer = Layer.mergeAll(
+  layerAgentObservatoryProvided,
+  layerTrustedObservatoryProvided,
   layerOrchestratorProvided,
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,

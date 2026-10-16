@@ -1,3 +1,4 @@
+import { AgentObservatoryMetadata } from "./agentObservatory.ts";
 import { OrchestrationMessageContext } from "./composerContext.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -1203,6 +1204,7 @@ export const OrchestrationV2Notification = Schema.Struct({
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 
 export const OrchestrationV2ConversationMessage = Schema.Struct({
+  observatory: Schema.optional(AgentObservatoryMetadata),
   notification: Schema.optional(OrchestrationV2Notification),
   ...OrchestrationV2CreationFields,
   scheduledTaskId: Schema.optional(ScheduledTaskId),
@@ -2214,6 +2216,12 @@ export type OrchestrationV2RuntimeRequestJson = typeof OrchestrationV2RuntimeReq
 export const OrchestrationV2ConversationMessageJson = OrchestrationV2ConversationMessage.mapFields(
   (fields) => ({
     ...fields,
+    observatory: Schema.optional(
+      AgentObservatoryMetadata.mapFields((metadata) => ({
+        ...metadata,
+        recordedAt: Schema.DateTimeUtcFromString,
+      })),
+    ),
     createdAt: Schema.DateTimeUtcFromString,
     updatedAt: Schema.DateTimeUtcFromString,
   }),

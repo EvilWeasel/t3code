@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Exit from "effect/Exit";
+import * as DateTime from "effect/DateTime";
+import { AgentObservatoryNativeRosterPage } from "./agentObservatory.ts";
 import * as Schema from "effect/Schema";
 
 import { ORCHESTRATION_V2_WS_METHODS } from "./orchestrationV2.ts";
-import { WsRpcGroup, WsSubscribeServerConfigRpc } from "./rpc.ts";
+import {
+  WsRpcGroup,
+  WsSubscribeServerConfigRpc,
+  WS_METHODS,
+  AgentObservatoryReadError,
+} from "./rpc.ts";
 
 /**
  * The client always sends `environmentThemes`, including to servers built
@@ -117,5 +124,172 @@ describe("registered trace diagnostics serialization boundary", () => {
     expect(
       Schema.decodeUnknownSync(legacy)({ environmentThemes: true, legacyExtra: "ignored" }),
     ).toEqual({ environmentThemes: true });
+  });
+});
+
+describe("registered observatory read JSON codecs", () => {
+  const methods = [
+    WS_METHODS.agentObservatorySubscribe,
+    WS_METHODS.agentObservatoryReadNativeRoster,
+    WS_METHODS.agentObservatorySubscribeNativeRoster,
+  ] as const;
+  const registered = (method: (typeof methods)[number]) => {
+    const rpc = WsRpcGroup.requests.get(method);
+    if (!rpc) throw new Error("Observatory read RPC missing");
+    return rpc;
+  };
+  const roster = { threadIds: ["thread:b", "thread:a"], limit: 200 };
+  const cursor = {
+    environmentId: "destination",
+    threadIds: ["thread:a", "thread:b"],
+    throughSequence: 8,
+    afterId: "child:a",
+  };
+
+  it("retains explicit selectors and the unary cursor through registered JSON payload codecs", () => {
+    for (const method of methods) {
+      const codec = Schema.toCodecJson(registered(method).payloadSchema);
+      const input =
+        method === WS_METHODS.agentObservatorySubscribe
+          ? { threadId: "thread:a" }
+          : method === WS_METHODS.agentObservatoryReadNativeRoster
+            ? { ...roster, cursor }
+            : roster;
+      expect(Schema.encodeSync(codec)(Schema.decodeUnknownSync(codec)(input))).toEqual(input);
+    }
+    expect(
+      [...WsRpcGroup.requests.keys()].filter((tag) => tag.startsWith("agentObservatory.")),
+    ).toEqual(methods);
+  });
+
+  it("strictly rejects destination/owner/write extras and a cursor on the first-page subscription", () => {
+    for (const method of methods) {
+      const decode = Schema.decodeUnknownExit(Schema.toCodecJson(registered(method).payloadSchema));
+      const input =
+        method === WS_METHODS.agentObservatorySubscribe ? { threadId: "thread:a" } : roster;
+      for (const extra of [
+        { environmentId: "spoof" },
+        { owner: {} },
+        { publish: true },
+        { authorized: true },
+      ])
+        expect(Exit.isFailure(decode({ ...input, ...extra }))).toBe(true);
+    }
+    const decode = Schema.decodeUnknownExit(
+      Schema.toCodecJson(
+        registered(WS_METHODS.agentObservatorySubscribeNativeRoster).payloadSchema,
+      ),
+    );
+    expect(Exit.isFailure(decode({ ...roster, cursor }))).toBe(true);
+  });
+
+  it("enforces unique bounded thread selectors and integer limits on both roster registrations", () => {
+    for (const method of [
+      WS_METHODS.agentObservatoryReadNativeRoster,
+      WS_METHODS.agentObservatorySubscribeNativeRoster,
+    ] as const) {
+      const decode = Schema.decodeUnknownExit(Schema.toCodecJson(registered(method).payloadSchema));
+      for (const limit of [0, -1, 201, 1.5])
+        expect(Exit.isFailure(decode({ ...roster, limit }))).toBe(true);
+      for (const limit of [1, 200]) expect(Exit.isSuccess(decode({ ...roster, limit }))).toBe(true);
+      expect(Exit.isFailure(decode({ ...roster, threadIds: ["same", "same"] }))).toBe(true);
+      expect(
+        Exit.isFailure(
+          decode({ ...roster, threadIds: Array.from({ length: 129 }, (_, n) => `thread:${n}`) }),
+        ),
+      ).toBe(true);
+      expect(Exit.isSuccess(decode({ threadIds: [], limit: 1 }))).toBe(true);
+    }
+  });
+
+  it("roundtrips roster UTC timestamps and the fixed refusal through actual unary and stream element codecs", () => {
+    const encoded = {
+      environmentId: "destination",
+      threadIds: ["thread:a"],
+      throughSequence: 9,
+      source: "canonical-subagent-index",
+      coverage: "recorded-current-only",
+      status: "complete",
+      agents: [
+        {
+          id: "child:a",
+          threadId: "thread:a",
+          runId: "run:a",
+          parentNodeId: "root:a",
+          origin: "provider_native",
+          driver: "codex",
+          providerInstanceId: "codex",
+          providerThreadId: "native:a",
+          childThreadId: null,
+          status: "running",
+          title: "Bounded title",
+          titleTruncated: false,
+          updatedAt: "2026-10-16T00:00:00.000Z",
+        },
+      ],
+      nextCursor: null,
+    };
+    const unary = registered(WS_METHODS.agentObservatoryReadNativeRoster);
+    if (unary._tag !== WS_METHODS.agentObservatoryReadNativeRoster)
+      throw new Error("Unexpected observatory roster registration");
+    const rosterStream = registered(WS_METHODS.agentObservatorySubscribeNativeRoster);
+    if (rosterStream._tag !== WS_METHODS.agentObservatorySubscribeNativeRoster)
+      throw new Error("Unexpected observatory roster subscription registration");
+    const overviewStream = registered(WS_METHODS.agentObservatorySubscribe);
+    if (overviewStream._tag !== WS_METHODS.agentObservatorySubscribe)
+      throw new Error("Unexpected observatory subscription registration");
+    for (const codec of [
+      Schema.toCodecJson(unary.successSchema),
+      Schema.toCodecJson(rosterStream.successSchema.success),
+    ]) {
+      const decoded = Schema.decodeUnknownSync(codec)(encoded);
+      const typed = Schema.decodeUnknownSync(AgentObservatoryNativeRosterPage)(decoded);
+      expect(DateTime.formatIso(typed.agents[0]!.updatedAt)).toBe(encoded.agents[0]!.updatedAt);
+      expect(Schema.encodeSync(codec)(decoded)).toEqual(encoded);
+      const withPrivateExtras = {
+        ...encoded,
+        agents: [
+          {
+            ...encoded.agents[0]!,
+            prompt: "synthetic-private-prompt",
+            result: "synthetic-private-result",
+            progress: "synthetic-private-progress",
+          },
+        ],
+      };
+      expect(Schema.encodeSync(codec)(Schema.decodeUnknownSync(codec)(withPrivateExtras))).toEqual(
+        encoded,
+      );
+    }
+    for (const errorCodec of [
+      Schema.toCodecJson(unary.errorSchema),
+      Schema.toCodecJson(rosterStream.successSchema.error),
+      Schema.toCodecJson(overviewStream.successSchema.error),
+    ]) {
+      const refusal = new AgentObservatoryReadError({
+        message: "Agent observatory data is unavailable.",
+      });
+      expect(Schema.encodeSync(errorCodec)(refusal)).toEqual({
+        _tag: "AgentObservatoryReadError",
+        message: "Agent observatory data is unavailable.",
+      });
+      expect(
+        Exit.isFailure(
+          Schema.decodeUnknownExit(errorCodec)({
+            _tag: "AgentObservatoryReadError",
+            message: "private cause",
+          }),
+        ),
+      ).toBe(true);
+    }
+    const codec = Schema.toCodecJson(overviewStream.successSchema.success);
+    const offline = {
+      environmentId: "destination",
+      threadId: "thread:a",
+      status: "offline",
+      throughSequence: 0,
+      snapshot: null,
+    };
+    expect(Schema.encodeSync(codec)(Schema.decodeUnknownSync(codec)(offline))).toEqual(offline);
   });
 });

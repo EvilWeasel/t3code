@@ -1,3 +1,4 @@
+import type { AgentObservatoryIntent, AgentObservatoryInvocationResult } from "@t3tools/contracts";
 import type { OrchestrationV2HistoricalMessage } from "@t3tools/contracts";
 import {
   ChatAttachment,
@@ -393,6 +394,8 @@ export interface ProviderAdapterV2OpenSessionInput {
 }
 
 export interface ProviderAdapterV2EnsureThreadInput {
+  /** Host service presence only; never caller identity or permission. */
+  readonly observatoryAvailable?: boolean;
   readonly threadId: ThreadId;
   /** The app thread's title, for providers that name their native sessions. */
   readonly title?: string;
@@ -402,7 +405,20 @@ export interface ProviderAdapterV2EnsureThreadInput {
   readonly existingProviderThread?: OrchestrationV2ProviderThread;
 }
 
+/** Native protocol envelope, never model ownership fields. */
+export interface ProviderAdapterV2NativeInvocation {
+  readonly nativeThreadId: string;
+  readonly nativeTurnId: string;
+  readonly callId: string;
+  readonly providerTurnId: ProviderTurnId;
+}
+
 export interface ProviderAdapterV2TurnInput {
+  readonly onObservatoryInvocation?: (
+    native: ProviderAdapterV2NativeInvocation,
+    intent: AgentObservatoryIntent,
+  ) => Effect.Effect<AgentObservatoryInvocationResult, ProviderAdapterV2Error>;
+
   readonly appThread: OrchestrationV2AppThread;
   readonly threadId: ThreadId;
   readonly runId: RunId;

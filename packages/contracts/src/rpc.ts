@@ -381,6 +381,14 @@ import {
   LiveVoiceSubscribeInput,
 } from "./liveVoice.ts";
 
+import {
+  AgentObservatorySubscribeInput,
+  AgentObservatoryRead,
+  AgentObservatoryReadNativeRosterInput,
+  AgentObservatorySubscribeNativeRosterInput,
+  AgentObservatoryNativeRosterPage,
+} from "./agentObservatory.ts";
+
 export const WS_METHODS = {
   // Project registry methods
   projectsList: "projects.list",
@@ -431,6 +439,11 @@ export const WS_METHODS = {
   providerInstallCancel: "provider.install.cancel",
   providerInstallSubscribe: "provider.install.subscribe",
   providerInstallRemove: "provider.install.remove",
+
+  // Scoped read-only agent observatory.
+  agentObservatorySubscribe: "agentObservatory.subscribe",
+  agentObservatoryReadNativeRoster: "agentObservatory.readNativeRoster",
+  agentObservatorySubscribeNativeRoster: "agentObservatory.subscribeNativeRoster",
 
   // Subscription-backed Codex Live voice.
   liveVoicePrepare: "liveVoice.prepare",
@@ -1899,6 +1912,67 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
   stream: true,
 });
 
+/** A private service refusal never carries its cause or owner into the public read transport. */
+export class AgentObservatoryReadError extends Schema.TaggedError<AgentObservatoryReadError>()(
+  "AgentObservatoryReadError",
+  { message: Schema.Literal("Agent observatory data is unavailable.") },
+) {}
+
+const observatoryReadRpcError = Schema.Union([
+  AgentObservatoryReadError,
+  EnvironmentAuthorizationError,
+]);
+const WsAgentObservatorySubscribeRpc = Rpc.make(WS_METHODS.agentObservatorySubscribe, {
+  payload: Schema.Unknown.pipe(
+    Schema.decodeTo(AgentObservatorySubscribeInput, {
+      decode: SchemaGetter.transformEffect((raw: unknown) =>
+        Schema.decodeUnknownEffect(AgentObservatorySubscribeInput, { onExcessProperty: "error" })(
+          raw,
+        ).pipe(Effect.mapError((error) => error.issue)),
+      ),
+      encode: SchemaGetter.transform((value) => value),
+    }),
+  ),
+  success: AgentObservatoryRead,
+  error: observatoryReadRpcError,
+  stream: true,
+});
+const WsAgentObservatoryReadNativeRosterRpc = Rpc.make(
+  WS_METHODS.agentObservatoryReadNativeRoster,
+  {
+    payload: Schema.Unknown.pipe(
+      Schema.decodeTo(AgentObservatoryReadNativeRosterInput, {
+        decode: SchemaGetter.transformEffect((raw: unknown) =>
+          Schema.decodeUnknownEffect(AgentObservatoryReadNativeRosterInput, {
+            onExcessProperty: "error",
+          })(raw).pipe(Effect.mapError((error) => error.issue)),
+        ),
+        encode: SchemaGetter.transform((value) => value),
+      }),
+    ),
+    success: AgentObservatoryNativeRosterPage,
+    error: observatoryReadRpcError,
+  },
+);
+const WsAgentObservatorySubscribeNativeRosterRpc = Rpc.make(
+  WS_METHODS.agentObservatorySubscribeNativeRoster,
+  {
+    payload: Schema.Unknown.pipe(
+      Schema.decodeTo(AgentObservatorySubscribeNativeRosterInput, {
+        decode: SchemaGetter.transformEffect((raw: unknown) =>
+          Schema.decodeUnknownEffect(AgentObservatorySubscribeNativeRosterInput, {
+            onExcessProperty: "error",
+          })(raw).pipe(Effect.mapError((error) => error.issue)),
+        ),
+        encode: SchemaGetter.transform((value) => value),
+      }),
+    ),
+    success: AgentObservatoryNativeRosterPage,
+    error: observatoryReadRpcError,
+    stream: true,
+  },
+);
+
 const liveVoiceRpcError = Schema.Union([LiveVoiceError, EnvironmentAuthorizationError]);
 const WsLiveVoicePrepareRpc = Rpc.make(WS_METHODS.liveVoicePrepare, {
   payload: LiveVoicePrepareInput,
@@ -1938,6 +2012,9 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 ) {}
 
 export const WsRpcGroup = RpcGroup.make(
+  WsAgentObservatorySubscribeRpc,
+  WsAgentObservatoryReadNativeRosterRpc,
+  WsAgentObservatorySubscribeNativeRosterRpc,
   WsLiveVoicePrepareRpc,
   WsLiveVoiceStartRpc,
   WsLiveVoiceStopRpc,

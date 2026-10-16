@@ -1,9 +1,14 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ServerSettings from "../serverSettings.ts";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointId,
   CheckpointRef,
   CheckpointScopeId,
+  AgentObservatoryOwner,
+  AgentObservatoryVisualState,
+  EnvironmentId,
+  ProviderTurnId,
   CommandId,
   ContextTransferId,
   EventId,
@@ -3561,4 +3566,450 @@ it.effect("publishes live events in commit order across concurrent writers", () 
       );
     }).pipe(Effect.provide(layerEventSink));
   }).pipe(Effect.provide(layerDatabase)),
+);
+
+const seedObservatoryOwner = (suffix: string) =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make(`thread:observatory:${suffix}`);
+    const owner: AgentObservatoryOwner = {
+      environmentId: EnvironmentId.make("env:observatory"),
+      threadId,
+      runId: RunId.make(`run:observatory:${suffix}`),
+      attemptId: RunAttemptId.make(`attempt:observatory:${suffix}`),
+      rootNodeId: NodeId.make(`node:observatory:${suffix}`),
+      providerInstanceId,
+      providerThreadId: ProviderThreadId.make(`provider-thread:observatory:${suffix}`),
+      providerTurnId: ProviderTurnId.make(`provider-turn:observatory:${suffix}`),
+    };
+    const principal = {
+      providerSessionId: ProviderSessionId.make(`session:observatory:${suffix}`),
+      nativeThreadId: `native-thread:${suffix}`,
+      nativeTurnId: `native-turn:${suffix}`,
+      runtimeIncarnation: `runtime:${suffix}`,
+    };
+    const thread = makeThread(threadId, now);
+    const run: OrchestrationV2Run = {
+      id: owner.runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId,
+      modelSelection,
+      providerThreadId: owner.providerThreadId,
+      userMessageId: MessageId.make(`input:${suffix}`),
+      rootNodeId: owner.rootNodeId,
+      activeAttemptId: owner.attemptId,
+      status: "running",
+      requestedAt: now,
+      startedAt: now,
+      completedAt: null,
+      checkpointId: null,
+      contextHandoffId: null,
+    };
+    const events: ReadonlyArray<OrchestrationV2DomainEvent> = [
+      threadCreatedEvent({ id: `event:obs:${suffix}:thread`, thread, now }),
+      {
+        id: EventId.make(`event:obs:${suffix}:run`),
+        type: "run.created",
+        threadId,
+        occurredAt: now,
+        payload: run,
+      },
+      {
+        id: EventId.make(`event:obs:${suffix}:attempt`),
+        type: "run-attempt.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: owner.attemptId,
+          runId: owner.runId,
+          attemptOrdinal: 1,
+          rootNodeId: owner.rootNodeId,
+          providerInstanceId,
+          providerThreadId: owner.providerThreadId,
+          providerTurnId: owner.providerTurnId,
+          reason: "initial",
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        },
+      },
+      {
+        id: EventId.make(`event:obs:${suffix}:provider-thread`),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: owner.providerThreadId,
+          driver: providerDriver,
+          providerInstanceId,
+          providerSessionId: principal.providerSessionId,
+          appThreadId: threadId,
+          ownerNodeId: null,
+          nativeThreadRef: {
+            driver: providerDriver,
+            nativeId: principal.nativeThreadId,
+            strength: "strong",
+          },
+          nativeConversationHeadRef: null,
+          status: "active",
+          firstRunOrdinal: 1,
+          lastRunOrdinal: 1,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+      {
+        id: EventId.make(`event:obs:${suffix}:turn`),
+        type: "provider-turn.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: owner.providerTurnId,
+          providerThreadId: owner.providerThreadId,
+          nodeId: owner.rootNodeId,
+          runAttemptId: owner.attemptId,
+          nativeTurnRef: {
+            driver: providerDriver,
+            nativeId: principal.nativeTurnId,
+            strength: "strong",
+          },
+          ordinal: 1,
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        },
+      },
+    ];
+    yield* sink.write({ events });
+    const state: AgentObservatoryVisualState = {
+      title: "Inspect actual routing",
+      steps: [{ id: "inspect", label: "Inspect", status: "active" }],
+      todos: [],
+      currentStepId: "inspect",
+      requestedCheckpoint: {
+        id: "review",
+        label: "Review before write",
+        when: "Cause established",
+      },
+      layout: "single",
+      panels: [{ kind: "plan", collapsed: false }],
+    };
+    const input = {
+      owner,
+      principal,
+      update: { requestId: CommandId.make(`command:obs:${suffix}`), expectedRevision: 0, state },
+    };
+    return { input, run, thread, now };
+  });
+
+it.layer(Layer.mergeAll(layerTest, NodeServices.layer))(
+  "Observatory canonical transactions",
+  (it) => {
+    it.effect(
+      "replays the original revision and refuses changed body/owner/principal even after advancement",
+      () =>
+        Effect.gen(function* () {
+          const sink = yield* EventSink.EventSinkV2;
+          const store = yield* EventStore.EventStoreV2;
+          const { input } = yield* seedObservatoryOwner("replay");
+          const first = yield* sink.commitObservatoryUpdate(input);
+          assert.equal(first.snapshot.revision, 1);
+          const next = yield* sink.commitObservatoryUpdate({
+            ...input,
+            update: {
+              ...input.update,
+              requestId: CommandId.make("command:obs:replay:second"),
+              expectedRevision: 1,
+              state: { ...input.update.state, title: "Next" },
+            },
+          });
+          assert.equal(next.snapshot.revision, 2);
+          const replay = yield* sink.commitObservatoryUpdate(input);
+          assert.isTrue(replay.replayed);
+          assert.deepEqual(replay.snapshot, first.snapshot);
+          for (const changed of [
+            {
+              ...input,
+              update: { ...input.update, state: { ...input.update.state, title: "Changed" } },
+            },
+            {
+              ...input,
+              owner: { ...input.owner, attemptId: RunAttemptId.make("foreign-attempt") },
+            },
+            { ...input, principal: { ...input.principal, runtimeIncarnation: "foreign-runtime" } },
+          ]) {
+            const result = yield* sink.commitObservatoryUpdate(changed).pipe(Effect.result);
+            assert.equal(result._tag, "Failure");
+            if (result._tag === "Failure")
+              assert.propertyVal(result.failure, "reason", "request_conflict");
+          }
+          const committed = yield* store
+            .readByCommandId({ commandId: input.update.requestId })
+            .pipe(Stream.runCollect);
+          assert.equal(committed.length, 1);
+          assert.equal(committed[0]?.sequence, first.snapshot.sequence);
+        }),
+    );
+
+    it.effect(
+      "refuses mismatched canonical principal/native/root identities without visual events",
+      () =>
+        Effect.gen(function* () {
+          const sink = yield* EventSink.EventSinkV2;
+          const store = yield* EventStore.EventStoreV2;
+          const { input } = yield* seedObservatoryOwner("identity");
+          const variants = [
+            {
+              ...input,
+              principal: {
+                ...input.principal,
+                providerSessionId: ProviderSessionId.make("foreign-session"),
+              },
+            },
+            { ...input, principal: { ...input.principal, nativeTurnId: "foreign-native-turn" } },
+            {
+              ...input,
+              principal: { ...input.principal, nativeThreadId: "foreign-native-thread" },
+            },
+            { ...input, owner: { ...input.owner, rootNodeId: NodeId.make("foreign-root") } },
+            {
+              ...input,
+              owner: { ...input.owner, providerInstanceId: ProviderInstanceId.make("foreign") },
+            },
+          ];
+          for (const [index, changed] of variants.entries()) {
+            const update = {
+              ...changed.update,
+              requestId: CommandId.make(`command:obs:identity:${index}`),
+            };
+            const result = yield* sink
+              .commitObservatoryUpdate({ ...changed, update })
+              .pipe(Effect.result);
+            assert.equal(result._tag, "Failure");
+            if (result._tag === "Failure")
+              assert.propertyVal(result.failure, "reason", "stale_owner");
+            assert.equal(
+              (yield* store
+                .readByCommandId({ commandId: update.requestId })
+                .pipe(Stream.runCollect)).length,
+              0,
+            );
+          }
+        }),
+    );
+
+    it.effect(
+      "serializes competing revisions and durably replays refusal without incrementing twice",
+      () =>
+        Effect.gen(function* () {
+          const sink = yield* EventSink.EventSinkV2;
+          const { input } = yield* seedObservatoryOwner("competing");
+          const ready = yield* Deferred.make<void>();
+          const left = yield* Deferred.await(ready).pipe(
+            Effect.andThen(sink.commitObservatoryUpdate(input)),
+            Effect.result,
+            Effect.forkScoped,
+          );
+          const other = {
+            ...input,
+            update: { ...input.update, requestId: CommandId.make("command:obs:competing:right") },
+          };
+          const right = yield* Deferred.await(ready).pipe(
+            Effect.andThen(sink.commitObservatoryUpdate(other)),
+            Effect.result,
+            Effect.forkScoped,
+          );
+          yield* Deferred.succeed(ready, undefined);
+          const results = [yield* Fiber.join(left), yield* Fiber.join(right)];
+          assert.equal(results.filter((result) => result._tag === "Success").length, 1);
+          const rejectedInput = results[0]?._tag === "Failure" ? input : other;
+          const failed = yield* sink.commitObservatoryUpdate(rejectedInput).pipe(Effect.result);
+          assert.equal(failed._tag, "Failure");
+          if (failed._tag === "Failure")
+            assert.propertyVal(failed.failure, "reason", "revision_conflict");
+        }).pipe(Effect.scoped),
+    );
+
+    it.effect("rechecks owner after deferred preparation and never restores completed work", () =>
+      Effect.gen(function* () {
+        const sink = yield* EventSink.EventSinkV2;
+        const store = yield* EventStore.EventStoreV2;
+        const { input, run, now } = yield* seedObservatoryOwner("rollover");
+        const prepared = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const work = yield* Deferred.succeed(prepared, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.andThen(sink.commitObservatoryUpdate(input)),
+          Effect.result,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(prepared);
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("event:obs:rollover:complete"),
+              type: "run.updated",
+              threadId: input.owner.threadId,
+              occurredAt: now,
+              payload: { ...run, status: "completed", completedAt: now },
+            },
+          ],
+        });
+        yield* Deferred.succeed(release, undefined);
+        const result = yield* Fiber.join(work);
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.propertyVal(result.failure, "reason", "stale_owner");
+        const events = yield* store
+          .readByCommandId({ commandId: input.update.requestId })
+          .pipe(Stream.runCollect);
+        assert.equal(events.length, 0);
+        assert.equal(
+          (yield* (yield* ProjectionStore.ProjectionStoreV2).getThreadProjection(
+            input.owner.threadId,
+          )).runs[0]?.status,
+          "completed",
+        );
+      }).pipe(Effect.scoped),
+    );
+  },
+);
+
+it.effect("observatory rollback leaves no receipt, event or message projection", () =>
+  Effect.gen(function* () {
+    let failedProjectionCalls = 0;
+    const layerFailingProjection = Layer.effect(
+      ProjectionStore.ProjectionStoreV2,
+      Effect.gen(function* () {
+        const delegate = yield* ProjectionStore.ProjectionStoreV2;
+        return ProjectionStore.ProjectionStoreV2.of({
+          ...delegate,
+          apply: (event) =>
+            event.type === "message.updated" && event.payload.observatory
+              ? Effect.sync(() => {
+                  failedProjectionCalls += 1;
+                }).pipe(
+                  Effect.andThen(
+                    Effect.fail(
+                      new ProjectionStore.ProjectionStoreApplyEventError({ eventType: event.type }),
+                    ),
+                  ),
+                )
+              : delegate.apply(event),
+        });
+      }),
+    ).pipe(Layer.provide(layerProjectionStoreProvided));
+    const failingSink = Layer.fresh(EventSink.layer).pipe(
+      Layer.provide(Layer.mergeAll(layerDatabase, layerEventStoreProvided, layerFailingProjection)),
+    );
+    yield* Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const { input } = yield* seedObservatoryOwner("rollback");
+      const result = yield* sink.commitObservatoryUpdate(input).pipe(Effect.result);
+      assert.equal(failedProjectionCalls, 1);
+      assert.equal(result._tag, "Failure");
+      const store = yield* EventStore.EventStoreV2;
+      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+      const projection = yield* ProjectionStore.ProjectionStoreV2;
+      assert.equal(
+        (yield* store
+          .readByCommandId({ commandId: input.update.requestId })
+          .pipe(Stream.runCollect)).length,
+        0,
+      );
+      assert.isTrue(Option.isNone(yield* receipts.getByCommandId(input.update.requestId)));
+      assert.equal(
+        (yield* projection.getThreadRecords(input.owner.threadId, ["messages"])).messages.length,
+        0,
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layerStoresProvided,
+          layerCommandReceiptStoreProvided,
+          failingSink,
+          NodeServices.layer,
+        ),
+      ),
+    );
+  }),
+);
+
+it.effect("observatory and ordinary writers publish in the shared canonical commit order", () =>
+  Effect.gen(function* () {
+    const paused = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const ordinaryEntered = yield* Deferred.make<void>();
+    const published: number[] = [];
+    const wrappedStore = Layer.effect(
+      EventStore.EventStoreV2,
+      Effect.gen(function* () {
+        const delegate = yield* EventStore.EventStoreV2;
+        return EventStore.EventStoreV2.of({
+          ...delegate,
+          append: (input) =>
+            (input.events.some((event) => event.id === "event:obs:publish:ordinary")
+              ? Deferred.succeed(ordinaryEntered, undefined)
+              : Effect.void
+            ).pipe(Effect.andThen(delegate.append(input))),
+          publishCommitted: (events) =>
+            (events.some(
+              (stored) =>
+                "event" in stored &&
+                stored.event.type === "message.updated" &&
+                stored.event.payload.observatory,
+            )
+              ? Deferred.succeed(paused, undefined).pipe(Effect.andThen(Deferred.await(release)))
+              : Effect.void
+            ).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  published.push(...events.map((event) => event.sequence));
+                }),
+              ),
+              Effect.andThen(delegate.publishCommitted(events)),
+            ),
+        });
+      }),
+    ).pipe(Layer.provide(layerEventStoreProvided));
+    const sinkLayer = Layer.fresh(EventSink.layer).pipe(
+      Layer.provide(Layer.mergeAll(layerDatabase, layerProjectionStoreProvided, wrappedStore)),
+    );
+    yield* Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const { input, thread, now } = yield* seedObservatoryOwner("publish");
+      published.length = 0;
+      const first = yield* sink.commitObservatoryUpdate(input).pipe(Effect.forkScoped);
+      yield* Deferred.await(paused);
+      const second = yield* sink
+        .write({
+          events: [
+            {
+              id: EventId.make("event:obs:publish:ordinary"),
+              type: "thread.metadata-updated",
+              threadId: thread.id,
+              occurredAt: now,
+              payload: { ...thread, title: "Ordinary later update" },
+            },
+          ],
+        })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(ordinaryEntered);
+      assert.deepEqual(published, []);
+      yield* Deferred.succeed(release, undefined);
+      const firstResult = yield* Fiber.join(first);
+      const secondResult = yield* Fiber.join(second);
+      assert.deepEqual(published, [firstResult.snapshot.sequence, secondResult[0]?.sequence]);
+      assert.isBelow(firstResult.snapshot.sequence, secondResult[0]?.sequence ?? 0);
+      // Duplicate receipt replay must not call publish again.
+      yield* sink.commitObservatoryUpdate(input);
+      assert.equal(published.length, 2);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.mergeAll(layerStoresProvided, sinkLayer, NodeServices.layer)),
+    );
+  }),
 );

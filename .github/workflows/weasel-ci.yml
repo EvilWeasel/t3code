@@ -47,7 +47,23 @@ jobs:
       - name: Prepare pinned Electron runtime before desktop imports
         run: node apps/desktop/scripts/ensure-electron-runtime.mjs
       - name: Run focused source gates
-        run: bash scripts/weasel/check.sh
+        env:
+          EFFECTIVE_SOURCE_SHA: ${{ inputs.qualificationSourceSha || github.sha }}
+        run: |
+          [[ "$EFFECTIVE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$EFFECTIVE_SOURCE_SHA"
+          bash scripts/weasel/check.sh
+      - name: Preserve unreviewed Observatory route generation
+        if: always() && github.ref_name == 'feature/agent-observatory-candidate-20261016'
+        uses: actions/upload-artifact@v4
+        with:
+          name: observatory-routes-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/observatory-route-generation/receipt.json
+            ${{ runner.temp }}/observatory-route-generation/routeTree.gen.ts
+            ${{ runner.temp }}/observatory-route-generation/routeTree.diff
+          if-no-files-found: error
+          retention-days: 7
       - name: Lint conversational work-control slice
         run: >-
           vp lint --report-unused-disable-directives
@@ -178,6 +194,11 @@ jobs:
           mkdir -p product-evidence
           printf 'source_sha=%s\nrun_id=%s\nrun_attempt=%s\n' "$SOURCE_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" > product-evidence/BUILD-RECEIPT.txt
           sha256sum pnpm-lock.yaml >> product-evidence/BUILD-RECEIPT.txt
+          if [[ -f apps/web/src/routes/observatory.tsx ]]; then
+            test -s apps/web/src/routeTree.gen.ts
+            grep -q '/observatory' apps/web/src/routeTree.gen.ts
+            printf 'generated_route_sha256=%s\n' "$(sha256sum apps/web/src/routeTree.gen.ts | cut -d' ' -f1)" >> product-evidence/BUILD-RECEIPT.txt
+          fi
           find apps/server/dist apps/desktop/dist-electron -type f -print0 | sort -z | xargs -0 sha256sum > product-evidence/SHA256SUMS
           test -s product-evidence/SHA256SUMS
       - name: Upload reviewable product bundle

@@ -3,9 +3,16 @@ import type {
   MainRendererDiagnosticsReadResult,
 } from "@t3tools/contracts";
 import * as MainRendererDiagnosticsLocalClient from "./diagnostics/MainRendererDiagnosticsLocalClient.ts";
-import { OrchestrationDispatchCommandError } from "@t3tools/contracts";
+import {
+  OrchestrationDispatchCommandError,
+  AgentObservatoryReadError,
+  type AgentObservatorySubscribeInput,
+  type AgentObservatoryReadNativeRosterInput,
+  type AgentObservatorySubscribeNativeRosterInput,
+} from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Orchestrator from "./orchestration-v2/Orchestrator.ts";
+import * as AgentObservatory from "./observatory/AgentObservatoryService.ts";
 
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -551,6 +558,26 @@ function projectFileFailureContext(
     default:
       return unexpectedCompatibilityError(error);
   }
+}
+
+/** The connection's existing captured read-scope middleware authorizes before delegation. */
+export function agentObservatoryReadHandlers(
+  service: Pick<
+    AgentObservatory.AgentObservatoryService["Service"],
+    "subscribe" | "readNativeRoster" | "subscribeNativeRoster"
+  >,
+) {
+  const unavailable = () =>
+    new AgentObservatoryReadError({ message: "Agent observatory data is unavailable." });
+  return {
+    [WS_METHODS.agentObservatorySubscribe]: (input: AgentObservatorySubscribeInput) =>
+      service.subscribe(input).pipe(Stream.mapError(unavailable)),
+    [WS_METHODS.agentObservatoryReadNativeRoster]: (input: AgentObservatoryReadNativeRosterInput) =>
+      service.readNativeRoster(input).pipe(Effect.mapError(unavailable)),
+    [WS_METHODS.agentObservatorySubscribeNativeRoster]: (
+      input: AgentObservatorySubscribeNativeRosterInput,
+    ) => service.subscribeNativeRoster(input).pipe(Stream.mapError(unavailable)),
+  };
 }
 
 const PROVIDER_STATUS_DEBOUNCE_MS = 200;
@@ -1228,6 +1255,7 @@ const layerWsRpc = (
       const projectStore = yield* ProjectStore.ProjectStoreV2;
       const projectService = yield* ProjectService.ProjectService;
       const liveVoiceService = yield* CodexLiveSessionService.CodexLiveSessionService;
+      const observatoryService = yield* AgentObservatory.AgentObservatoryService;
       const managedFolders = yield* ManagedProjectFolders.ManagedProjectFolders;
       const threadSearch = yield* ThreadSearch.ThreadSearch;
 
@@ -1846,6 +1874,7 @@ const layerWsRpc = (
       });
 
       const handlers = ServerWsRpcGroup.of({
+        ...agentObservatoryReadHandlers(observatoryService),
         [WS_METHODS.liveVoicePrepare]: (input) => liveVoiceService.prepare(currentSession, input),
         [WS_METHODS.liveVoiceStart]: (input) => liveVoiceService.start(currentSession, input),
         [WS_METHODS.liveVoiceStop]: (input) => liveVoiceService.stop(currentSession, input),

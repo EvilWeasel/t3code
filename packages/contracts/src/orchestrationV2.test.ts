@@ -24,6 +24,7 @@ import {
 } from "./index.ts";
 import {
   latestProviderTurnForAttempt,
+  OrchestrationV2ConversationMessageJson,
   OrchestrationV2Checkpoint,
   OrchestrationV2CheckpointScope,
   OrchestrationV2Command,
@@ -1566,5 +1567,74 @@ describe("latestProviderTurnForAttempt", () => {
     ];
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
+  });
+});
+
+describe("agent observatory message metadata", () => {
+  it("round trips optional declarative metadata through the existing message JSON codec", () => {
+    const decode = Schema.decodeUnknownSync(OrchestrationV2ConversationMessageJson);
+    const raw = {
+      createdBy: "agent",
+      creationSource: "provider",
+      id: "message:obs",
+      threadId: "thread:obs",
+      runId: "run:obs",
+      nodeId: "node:obs",
+      role: "system",
+      text: "",
+      attachments: [],
+      streaming: false,
+      createdAt: DateTime.formatIso(now),
+      updatedAt: DateTime.formatIso(now),
+    };
+    expect(decode(raw).observatory).toBeUndefined();
+    const metadata = {
+      owner: {
+        environmentId: "env:obs",
+        threadId: "thread:obs",
+        runId: "run:obs",
+        attemptId: "attempt:obs",
+        rootNodeId: "node:obs",
+        providerInstanceId: "codex",
+        providerThreadId: "provider-thread:obs",
+        providerTurnId: "provider-turn:obs",
+      },
+      requestId: "command:obs",
+      revision: 1,
+      provenance: "agent-authored",
+      eventId: "event:obs",
+      recordedAt: DateTime.formatIso(now),
+      nativeFrontier: { source: "observed-native", sequence: 12, rawEventId: null },
+      state: {
+        title: "Inspect",
+        steps: [],
+        todos: [],
+        currentStepId: null,
+        requestedCheckpoint: { id: "review", label: "Review", when: "Before mutation" },
+        layout: "single",
+        panels: [{ kind: "checkpoint", collapsed: false }],
+      },
+    };
+    const message = decode({ ...raw, observatory: metadata });
+    const encoded = Schema.encodeSync(OrchestrationV2ConversationMessageJson)(message);
+    expect(encoded.observatory).toEqual(metadata);
+    const decodedMetadata = message.observatory;
+    if (decodedMetadata === undefined) {
+      throw new Error("Expected decoded observatory metadata");
+    }
+    expect(DateTime.isUtc(decodedMetadata.recordedAt)).toBe(true);
+    const persisted = Schema.encodeSync(
+      Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
+    )(message);
+    const replayed = Schema.decodeUnknownSync(
+      Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
+    )(persisted);
+    expect(replayed).toEqual(message);
+    expect(replayed.observatory && DateTime.formatIso(replayed.observatory.recordedAt)).toBe(
+      metadata.recordedAt,
+    );
+    expect(decode(encoded).observatory?.owner.attemptId).toBe("attempt:obs");
+    expect(message.observatory).not.toHaveProperty("sequence");
+    expect(message.observatory?.state).not.toHaveProperty("paused");
   });
 });

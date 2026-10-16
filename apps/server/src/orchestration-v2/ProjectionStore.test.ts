@@ -35,6 +35,7 @@ import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as EventStore from "./EventStore.ts";
 import {
   buildBoundedThreadProjection,
   decodeThreadHistoryCursor,
@@ -5486,5 +5487,132 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         [runId, newerRunId],
       );
     }),
+  );
+});
+
+it.layer(
+  Layer.mergeAll(layerTest, EventStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory))),
+)("Bounded current native roster", (it) => {
+  it.effect(
+    "pages the indexed authorized selection and marks changed frontier/scope stale without loading histories",
+    () =>
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const events = yield* EventStore.EventStoreV2;
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = yield* addRolledBackRecoveryCandidate("roster-selected");
+        const foreign = yield* addRolledBackRecoveryCandidate("roster-foreign");
+        const now = yield* DateTime.now;
+        for (const [id, target, origin, status] of [
+          ["a", threadId, "provider_native", "running"],
+          ["b", threadId, "provider_native", "waiting"],
+          ["c", threadId, "provider_native", "completed"],
+          ["d", threadId, "app_owned", "running"],
+          ["e", foreign, "provider_native", "running"],
+        ] as const) {
+          const event = {
+            id: EventId.make(`event:roster:${id}`),
+            type: "subagent.updated",
+            threadId: target,
+            occurredAt: now,
+            payload: {
+              id: NodeId.make(`node:roster:${id}`),
+              threadId: target,
+              runId: null,
+              parentNodeId: NodeId.make("node:roster:parent"),
+              origin,
+              createdBy: "agent",
+              driver,
+              providerInstanceId,
+              providerThreadId: null,
+              childThreadId: null,
+              nativeTaskRef: { driver, nativeId: `native:${id}`, strength: "strong" },
+              prompt: "",
+              title: id === "a" ? "A".repeat(400) : `Agent ${id}`,
+              model: null,
+              status,
+              result: null,
+              startedAt: now,
+              completedAt: status === "completed" ? now : null,
+              updatedAt: now,
+            },
+          } as const;
+          yield* sql.withTransaction(
+            events.append({ events: [event] }).pipe(Effect.andThen(store.apply(event))),
+          );
+        }
+        const trace = traceSqlStatements();
+        const first = yield* store
+          .getCurrentNativeAgentRoster({ threadIds: [threadId], limit: 1 })
+          .pipe(Effect.withTracer(trace.tracer));
+        assert.equal(first.coverage, "recorded-current-only");
+        assert.equal(first.status, "partial");
+        assert.deepEqual(
+          first.agents.map((agent) => agent.id),
+          ["node:roster:a"],
+        );
+        assert.equal(first.agents[0]?.title?.length, 320);
+        assert.isTrue(first.agents[0]?.titleTruncated);
+        assert.notProperty(first.agents[0], "prompt");
+        assert.notProperty(first.agents[0], "result");
+        assert.isNotNull(first.nextCursor);
+        if (!first.nextCursor) return yield* Effect.die("Expected bounded cursor.");
+        const second = yield* store.getCurrentNativeAgentRoster({
+          threadIds: [threadId],
+          limit: 1,
+          cursor: first.nextCursor,
+        });
+        assert.equal(second.status, "complete");
+        assert.deepEqual(
+          second.agents.map((agent) => agent.id),
+          ["node:roster:b"],
+        );
+        assert.equal(second.nextCursor, null);
+        const wrongScope = yield* store.getCurrentNativeAgentRoster({
+          threadIds: [foreign],
+          limit: 1,
+          cursor: first.nextCursor,
+        });
+        assert.equal(wrongScope.status, "stale");
+        assert.deepEqual(wrongScope.agents, []);
+        yield* events.append({
+          events: [
+            {
+              id: EventId.make("event:roster:advance"),
+              type: "thread.metadata-updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...(yield* store.getThread(threadId)), title: "Advanced" },
+            },
+          ],
+        });
+        const changed = yield* store.getCurrentNativeAgentRoster({
+          threadIds: [threadId],
+          limit: 1,
+          cursor: first.nextCursor,
+        });
+        assert.equal(changed.status, "stale");
+        assert.deepEqual(changed.agents, []);
+        assert.isFalse(
+          trace.statements.some((query) =>
+            /projection_messages|projection_turn_items|projection_runs/.test(query),
+          ),
+        );
+        assert.isTrue(
+          trace.statements.some((query) =>
+            query.includes("INDEXED BY orchestration_v2_projection_subagents_thread_idx"),
+          ),
+        );
+        assert.equal(
+          (yield* store.getCurrentNativeAgentRoster({ threadIds: [], limit: 10 })).status,
+          "complete",
+        );
+        assert.equal(
+          (yield* store
+            .getCurrentNativeAgentRoster({ threadIds: [threadId], limit: 201 })
+            .pipe(Effect.result))._tag,
+          "Failure",
+        );
+      }),
   );
 });

@@ -22,6 +22,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
 import * as Layer from "effect/Layer";
 import * as RpcTest from "effect/rpc/RpcTest";
 
@@ -522,5 +523,69 @@ it.effect(
           expect(handled).toBe(1);
         }
       }
+    }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "requires the destination read grant before any observatory read service delegation",
+  () =>
+    Effect.gen(function* () {
+      type ObservatoryTag =
+        | typeof WS_METHODS.agentObservatorySubscribe
+        | typeof WS_METHODS.agentObservatoryReadNativeRoster
+        | typeof WS_METHODS.agentObservatorySubscribeNativeRoster;
+      const methods = [
+        WS_METHODS.agentObservatorySubscribe,
+        WS_METHODS.agentObservatoryReadNativeRoster,
+        WS_METHODS.agentObservatorySubscribeNativeRoster,
+      ];
+      const group = WsRpcGroup.omit(
+        ...[...WsRpcGroup.requests.keys()].filter(
+          (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, ObservatoryTag> =>
+            !methods.some((method) => method === tag),
+        ),
+      );
+      for (const scopes of [[], [AuthOrchestrationOperateScope]]) {
+        let calls = 0;
+        const invoked = Effect.sync(() => {
+          calls++;
+          return undefined;
+        });
+        const client = yield* RpcTest.makeClient(group).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              group.toLayerHandler(WS_METHODS.agentObservatorySubscribe, () =>
+                Stream.fromEffect(invoked).pipe(Stream.drain),
+              ),
+              group.toLayerHandler(WS_METHODS.agentObservatoryReadNativeRoster, () =>
+                invoked.pipe(Effect.andThen(Effect.never)),
+              ),
+              group.toLayerHandler(WS_METHODS.agentObservatorySubscribeNativeRoster, () =>
+                Stream.fromEffect(invoked).pipe(Stream.drain),
+              ),
+              RpcAuthorization.layer(scopes),
+            ),
+          ),
+        );
+        const selector = { threadIds: [ThreadId.make("thread:a")], limit: 1 };
+        const errors = [
+          yield* client[WS_METHODS.agentObservatorySubscribe]({
+            threadId: ThreadId.make("thread:a"),
+          }).pipe(Stream.runCollect, Effect.flip),
+          yield* client[WS_METHODS.agentObservatoryReadNativeRoster](selector).pipe(Effect.flip),
+          yield* client[WS_METHODS.agentObservatorySubscribeNativeRoster](selector).pipe(
+            Stream.runCollect,
+            Effect.flip,
+          ),
+        ];
+        for (const error of errors)
+          expect(error).toMatchObject({
+            _tag: "EnvironmentAuthorizationError",
+            requiredPermission: AuthOrchestrationReadScope,
+          });
+        expect(calls).toBe(0);
+      }
+      for (const method of methods)
+        expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
     }).pipe(Effect.scoped),
 );

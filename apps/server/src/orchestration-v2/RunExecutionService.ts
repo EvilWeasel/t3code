@@ -1,6 +1,15 @@
+import * as TrustedInvocation from "../mcp/TrustedAppControlInvocation.ts";
+import * as Observatory from "../observatory/AgentObservatoryService.ts";
+import {
+  AgentObservatoryInvocation,
+  AgentObservatoryRefusal,
+} from "../observatory/AgentObservatoryPorts.ts";
+import * as Crypto from "effect/Crypto";
+import * as Option from "effect/Option";
 import { makeAssistantStreamingFilter } from "./assistantStreaming.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
+  type AgentObservatoryInvocationResult,
   isOrchestrationV2WorkActive,
   CommandId,
   type EventId,
@@ -519,6 +528,77 @@ export type RunExecutionServiceV2Error = typeof RunExecutionServiceV2Error.Type;
 /**
  * SERVICE DEFINITION
  */
+export const makeObservatoryInvocationCallback = (
+  captured: TrustedInvocation.CapturedAppControlExecution,
+  trusted: TrustedInvocation.TrustedAppControlInvocation["Service"],
+  observatory: Observatory.AgentObservatoryService["Service"],
+  crypto: Crypto.Crypto,
+): NonNullable<ProviderAdapter.ProviderAdapterV2TurnInput["onObservatoryInvocation"]> => {
+  const execution = Object.freeze({ ...captured });
+  return (native, intent) =>
+    trusted.capture(execution, native).pipe(
+      Effect.flatMap(
+        (
+          owner,
+        ): Effect.Effect<
+          AgentObservatoryInvocationResult,
+          AgentObservatoryRefusal | TrustedInvocation.TrustedAppControlInvocationError
+        > => {
+          if (intent.action === "read")
+            return trusted.withValidatedOwner(owner, (identity) =>
+              observatory
+                .read(identity.threadId)
+                .pipe(Effect.map((snapshot) => ({ action: "read" as const, snapshot }))),
+            );
+          const invocation = AgentObservatoryInvocation.of({
+            withOwner: (use) =>
+              trusted
+                .withValidatedOwner(owner, (identity) =>
+                  use(
+                    {
+                      environmentId: identity.environmentId,
+                      threadId: identity.threadId,
+                      runId: identity.runId,
+                      attemptId: identity.attemptId,
+                      rootNodeId: identity.rootNodeId,
+                      providerInstanceId: identity.providerInstanceId,
+                      providerThreadId: identity.providerThreadId,
+                      providerTurnId: identity.authorTurnId,
+                    },
+                    {
+                      providerSessionId: identity.providerSessionId,
+                      nativeThreadId: native.nativeThreadId,
+                      nativeTurnId: identity.nativeTurnId,
+                      runtimeIncarnation: identity.runtimeIncarnation,
+                    },
+                  ),
+                )
+                .pipe(
+                  Effect.mapError((cause) =>
+                    Schema.is(TrustedInvocation.TrustedAppControlInvocationError)(cause)
+                      ? new AgentObservatoryRefusal({ reason: "stale_owner" })
+                      : cause,
+                  ),
+                ),
+          });
+          return observatory.update(intent).pipe(
+            Effect.provideService(AgentObservatoryInvocation, invocation),
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.map((result) => ({ action: "publish" as const, ...result })),
+          );
+        },
+      ),
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapter.ProviderAdapterProtocolError({
+            driver: execution.runtime.driver,
+            detail: "Agent observatory invocation refused.",
+            cause,
+          }),
+      ),
+    );
+};
+
 export interface RunExecutionServiceV2StartRootRunInput {
   readonly commandId: CommandId;
   readonly appThread: OrchestrationV2AppThread;
@@ -579,6 +659,11 @@ export const layer: Layer.Layer<
     const serverSettings = yield* ServerSettings.ServerSettingsService;
     const mcpAppModelContext = yield* McpAppModelContext.McpAppModelContext;
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
+    const trustedObservatory = yield* Effect.serviceOption(
+      TrustedInvocation.TrustedAppControlInvocation,
+    );
+    const observatory = yield* Effect.serviceOption(Observatory.AgentObservatoryService);
+    const observatoryCrypto = yield* Effect.serviceOption(Crypto.Crypto);
 
     const writeFinalRunEvents = (input: {
       readonly run: OrchestrationV2Run;
@@ -1416,7 +1501,30 @@ export const layer: Layer.Layer<
             key: `mcp_app_${entry.itemId.replace(/[^\w.-]/g, "_")}`,
             text: entry.text,
           }));
+          const observatoryCallback =
+            input.session.driver === "codex" &&
+            Option.isSome(trustedObservatory) &&
+            Option.isSome(observatory) &&
+            Option.isSome(observatoryCrypto)
+              ? makeObservatoryInvocationCallback(
+                  {
+                    threadId: input.run.threadId,
+                    runId: input.run.id,
+                    attemptId: input.attemptId,
+                    rootNodeId: input.rootNode.id,
+                    providerInstanceId: input.run.providerInstanceId,
+                    providerThreadId: input.providerThread.id,
+                    runtime: input.session,
+                  },
+                  trustedObservatory.value,
+                  observatory.value,
+                  observatoryCrypto.value,
+                )
+              : undefined;
           const turnInput = {
+            ...(observatoryCallback === undefined
+              ? {}
+              : { onObservatoryInvocation: observatoryCallback }),
             appThread: input.appThread,
             threadId: input.run.threadId,
             runId: input.run.id,

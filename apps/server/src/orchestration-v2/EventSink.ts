@@ -1,4 +1,18 @@
+import type {
+  AgentObservatoryCommit,
+  AgentObservatoryCommitResult,
+} from "../observatory/AgentObservatoryPorts.ts";
 import {
+  AgentObservatoryPrincipal,
+  AgentObservatoryRefusal,
+} from "../observatory/AgentObservatoryPorts.ts";
+import {
+  AgentObservatoryOwner,
+  AgentObservatoryUpdate,
+  AgentObservatorySnapshot,
+  AgentObservatoryMetadata,
+  EventId,
+  MessageId,
   CommandId,
   type OrchestrationV2Run,
   OrchestrationV2DomainEvent,
@@ -12,6 +26,7 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -71,6 +86,14 @@ export type EventSinkV2Error = typeof EventSinkV2Error.Type;
  * SERVICE DEFINITION
  */
 export interface EventSinkV2Shape {
+  /** Internal host-attested call only; no RPC/tool decoder may provide principal. */
+  readonly commitObservatoryUpdate: (
+    input: AgentObservatoryCommit,
+  ) => Effect.Effect<
+    AgentObservatoryCommitResult,
+    EventSinkV2Error | AgentObservatoryRefusal,
+    Crypto.Crypto
+  >;
   readonly write: (input: {
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
@@ -509,6 +532,226 @@ const layerBase: Layer.Layer<
       );
     });
 
+    const commitObservatoryUpdate = (submitted: AgentObservatoryCommit) =>
+      Effect.gen(function* () {
+        const crypto = yield* Crypto.Crypto;
+        const codec = Schema.fromJsonString(
+          Schema.Struct({
+            owner: AgentObservatoryOwner,
+            principal: AgentObservatoryPrincipal,
+            update: AgentObservatoryUpdate,
+          }),
+        );
+        const canonical = yield* Schema.encodeEffect(codec)(submitted);
+        const input = yield* Schema.decodeUnknownEffect(codec)(canonical);
+        const bytes = yield* crypto.digest("SHA-256", new TextEncoder().encode(canonical));
+        const identity = `observatory.update:${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+        const result = yield* commitThenPublish(
+          Effect.gen(function* () {
+            const existing = yield* commandReceipts.getByCommandId(input.update.requestId);
+            if (Option.isSome(existing)) {
+              if (
+                existing.value.threadId !== input.owner.threadId ||
+                existing.value.commandType !== identity
+              )
+                return {
+                  status: "refused" as const,
+                  reason: "request_conflict" as const,
+                  events: [],
+                };
+              if (existing.value.status === "rejected") {
+                const reason = existing.value.error;
+                return {
+                  status: "refused" as const,
+                  reason:
+                    reason === "stale_owner" || reason === "revision_conflict"
+                      ? reason
+                      : ("request_conflict" as const),
+                  events: [],
+                };
+              }
+              const events = yield* eventStore
+                .readByCommandId({ commandId: input.update.requestId })
+                .pipe(Stream.runCollect);
+              const stored = events.find(
+                (stored) =>
+                  stored.event.type === "message.updated" &&
+                  stored.event.payload.observatory !== undefined,
+              );
+              if (stored?.event.type !== "message.updated" || !stored.event.payload.observatory)
+                return { status: "refused" as const, reason: "unavailable" as const, events: [] };
+              return {
+                status: "accepted" as const,
+                snapshot: { ...stored.event.payload.observatory, sequence: stored.sequence },
+                replayed: true,
+                events: [],
+              };
+            }
+            const now = yield* DateTime.now;
+            const refuse = (reason: "stale_owner" | "revision_conflict") =>
+              Effect.gen(function* () {
+                const inserted = yield* commandReceipts.insertIfAbsent({
+                  commandId: input.update.requestId,
+                  threadId: input.owner.threadId,
+                  commandType: identity,
+                  acceptedAt: now,
+                  resultSequence: yield* eventStore.latestSequence({
+                    threadId: input.owner.threadId,
+                  }),
+                  status: "rejected",
+                  error: reason,
+                });
+                return {
+                  status: "refused" as const,
+                  reason: inserted ? reason : ("request_conflict" as const),
+                  events: [],
+                };
+              });
+            const thread = yield* projectionStore.getThread(input.owner.threadId);
+            const current = yield* projectionStore.getRunningTurnContext(input.owner.threadId);
+            const owner = input.owner;
+            const run = current.run;
+            const control = yield* projectionStore.getProviderControlContext(owner.threadId, {
+              providerThreadId: owner.providerThreadId,
+              providerTurnId: owner.providerTurnId,
+              attemptId: owner.attemptId,
+            });
+            const attempt = control.attempt;
+            const providerThread = control.providerThread;
+            const turn = control.providerTurn;
+            const newer = run
+              ? yield* sql<{
+                  readonly present: number;
+                }>`SELECT 1 AS present FROM orchestration_v2_projection_runs
+              WHERE thread_id = ${owner.threadId} AND ordinal > ${run.ordinal} AND status <> 'queued' LIMIT 1`
+              : [];
+            if (
+              newer.length > 0 ||
+              thread.archivedAt !== null ||
+              thread.deletedAt !== null ||
+              thread.providerInstanceId !== owner.providerInstanceId ||
+              !run ||
+              run.id !== owner.runId ||
+              run.activeAttemptId !== owner.attemptId ||
+              run.rootNodeId !== owner.rootNodeId ||
+              run.providerInstanceId !== owner.providerInstanceId ||
+              run.providerThreadId !== owner.providerThreadId ||
+              !attempt ||
+              attempt.runId !== run.id ||
+              attempt.status !== "running" ||
+              attempt.rootNodeId !== owner.rootNodeId ||
+              attempt.providerInstanceId !== owner.providerInstanceId ||
+              attempt.providerThreadId !== owner.providerThreadId ||
+              attempt.providerTurnId !== owner.providerTurnId ||
+              !providerThread ||
+              providerThread.appThreadId !== owner.threadId ||
+              providerThread.providerInstanceId !== owner.providerInstanceId ||
+              providerThread.ownerNodeId !== null ||
+              providerThread.status !== "active" ||
+              providerThread.providerSessionId !== input.principal.providerSessionId ||
+              providerThread.nativeThreadRef?.strength !== "strong" ||
+              providerThread.nativeThreadRef.driver !== providerThread.driver ||
+              providerThread.nativeThreadRef.nativeId !== input.principal.nativeThreadId ||
+              !turn ||
+              turn.status !== "running" ||
+              turn.runAttemptId !== owner.attemptId ||
+              turn.nodeId !== owner.rootNodeId ||
+              turn.providerThreadId !== owner.providerThreadId ||
+              turn.nativeTurnRef?.strength !== "strong" ||
+              turn.nativeTurnRef.driver !== providerThread.driver ||
+              turn.nativeTurnRef.nativeId !== input.principal.nativeTurnId
+            )
+              return yield* refuse("stale_owner");
+            const messageId = MessageId.make(`message:observatory:${owner.threadId}`);
+            const records = yield* projectionStore.getThreadRecords(owner.threadId, ["messages"], {
+              messageIds: [messageId],
+            });
+            const previous = records.messages[0];
+            if (
+              (previous && !previous.observatory) ||
+              (previous?.observatory?.revision ?? 0) !== input.update.expectedRevision
+            )
+              return yield* refuse("revision_conflict");
+            const metadata: AgentObservatoryMetadata = {
+              owner,
+              requestId: input.update.requestId,
+              revision: input.update.expectedRevision + 1,
+              provenance: "agent-authored",
+              eventId: EventId.make(`event:observatory:${input.update.requestId}`),
+              recordedAt: now,
+              nativeFrontier: {
+                source: "observed-native",
+                sequence: yield* eventStore.latestSequence({ threadId: owner.threadId }),
+                rawEventId: null,
+              },
+              state: input.update.state,
+            };
+            const event: OrchestrationV2DomainEvent = {
+              id: metadata.eventId,
+              type: "message.updated",
+              threadId: owner.threadId,
+              occurredAt: now,
+              payload: {
+                createdBy: "agent",
+                creationSource: "provider",
+                id: messageId,
+                threadId: owner.threadId,
+                runId: owner.runId,
+                nodeId: owner.rootNodeId,
+                role: "system",
+                text: "",
+                attachments: [],
+                streaming: false,
+                createdAt: previous?.createdAt ?? now,
+                updatedAt: now,
+                observatory: metadata,
+              },
+            };
+            const events = yield* eventStore.append({
+              commandId: input.update.requestId,
+              events: [event],
+            });
+            const stored = events[0];
+            if (!stored) return yield* Effect.die("Observatory append produced no event.");
+            yield* applyStoredEvents(events);
+            const inserted = yield* commandReceipts.insertIfAbsent({
+              commandId: input.update.requestId,
+              threadId: owner.threadId,
+              commandType: identity,
+              acceptedAt: now,
+              resultSequence: stored.sequence,
+              status: "accepted",
+              error: null,
+            });
+            if (!inserted)
+              return yield* new AgentObservatoryRefusal({ reason: "request_conflict" });
+            return {
+              status: "accepted" as const,
+              snapshot: { ...metadata, sequence: stored.sequence },
+              replayed: false,
+              events,
+            };
+          }),
+          (result) => publishStoredEvents(result.events),
+        );
+        if (result.status === "refused")
+          return yield* new AgentObservatoryRefusal({ reason: result.reason });
+        return {
+          replayed: result.replayed,
+          snapshot: yield* Schema.decodeUnknownEffect(AgentObservatorySnapshot)(result.snapshot),
+        };
+      }).pipe(
+        Effect.mapError((cause) =>
+          Schema.is(AgentObservatoryRefusal)(cause)
+            ? cause
+            : new EventSinkWriteError({
+                eventCount: 1,
+                commandId: submitted.update.requestId,
+                cause,
+              }),
+        ),
+      );
+
     const existingCommandResult = (commandId: CommandId) =>
       Effect.gen(function* () {
         const existing = yield* commandReceipts.getByCommandId(commandId);
@@ -760,6 +1003,7 @@ const layerBase: Layer.Layer<
     };
 
     return EventSinkV2.of({
+      commitObservatoryUpdate,
       write: (input) =>
         writeEffect({ ...input, effects: [] }).pipe(
           Effect.mapError(
