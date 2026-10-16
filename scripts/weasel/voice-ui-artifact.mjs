@@ -307,7 +307,16 @@ async function captureComposerMobile() {
             result.optionsOpened=true;
           } else {
             const options=page.getByRole("combobox",{name:"Runtime mode",exact:true});
-            await options.click();await page.keyboard.press("Escape");result.optionsOpened=true;
+            if(await options.isVisible()) {
+              await options.click();
+              await page.getByRole("option").filter({hasText:"Full access"}).waitFor();
+              result.baselineOptionsRoute="inline-runtime";
+            } else {
+              await page.getByRole("button",{name:"More composer controls",exact:true}).click();
+              await page.getByRole("menuitemradio",{name:"Full access",exact:true}).waitFor();
+              result.baselineOptionsRoute="actual-overflow-menu";
+            }
+            await page.keyboard.press("Escape");result.optionsOpened=true;
           }
           await editor.focus();
           const send=page.getByRole("button",{name:"Submit message",exact:true});
