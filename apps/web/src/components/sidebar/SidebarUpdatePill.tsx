@@ -409,13 +409,21 @@ function SidebarUpdateControl() {
           {...(run.localVersion === null && action === "install" && window.desktopBridge
             ? {
                 onRestart: async () => {
-                  saveUpdateEverythingResult({
+                  const saved = saveUpdateEverythingResult({
                     localVersion: localUpdateVersion,
                     updatedServers: 0,
                     updatedProviders: 0,
                     failures: [],
                     restarting: [],
                   });
+                  if (!saved) {
+                    toastManager.add({
+                      type: "error",
+                      title: "Update postponed",
+                      description: "Could not save the cross-machine update result.",
+                    });
+                    return;
+                  }
                   if (!(await installLocalUpdate(window.desktopBridge!))) {
                     clearSavedUpdateEverythingResult();
                   }

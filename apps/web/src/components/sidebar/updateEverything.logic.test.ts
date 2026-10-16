@@ -9,6 +9,7 @@ import {
   describeUpdateCapsule,
   describeUpdateEverything,
   getUpdateEverythingToastView,
+  installAfterUpdateEverything,
   resolveUpdateRunMachineStatus,
   runUpdateEverything,
   type UpdateEverythingMachine,
@@ -452,4 +453,28 @@ describe("fork update outcomes after upstream handoff integration", () => {
       description: expect.stringContaining("remote · Codex"),
     });
   });
+});
+
+it("refuses local install when the cross-machine result cannot be saved", async () => {
+  let installs = 0;
+  const result = {
+    localVersion: "0.1.0",
+    updatedServers: 0,
+    updatedProviders: 0,
+    failures: [],
+    restarting: [],
+  };
+  expect(
+    await installAfterUpdateEverything({
+      result,
+      localReady: true,
+      save: () => false,
+      install: async () => {
+        installs += 1;
+        return true;
+      },
+      clear: () => {},
+    }),
+  ).toBe("storage-failed");
+  expect(installs).toBe(0);
 });

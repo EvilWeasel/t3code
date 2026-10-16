@@ -300,6 +300,25 @@ export interface UpdateEverythingResult {
   readonly skipped?: ReadonlyArray<string>;
 }
 
+/** The local handoff runs after every remote result has settled. */
+export async function installAfterUpdateEverything(input: {
+  readonly result: UpdateEverythingResult;
+  readonly localReady: boolean;
+  readonly install: () => Promise<boolean>;
+  readonly save: (result: UpdateEverythingResult) => boolean;
+  readonly clear: () => void;
+}): Promise<"relaunching" | "not-installed" | "storage-failed"> {
+  if (!input.localReady) return "not-installed";
+  if (!input.save(input.result)) return "storage-failed";
+  let relaunching = false;
+  try {
+    relaunching = await input.install();
+    return relaunching ? "relaunching" : "not-installed";
+  } finally {
+    if (!relaunching) input.clear();
+  }
+}
+
 export function collectUpdateEverythingResult(input: {
   readonly localVersion: string | null;
   readonly localFailures: ReadonlyArray<string>;

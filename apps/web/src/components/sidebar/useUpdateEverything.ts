@@ -18,6 +18,7 @@ import {
   collectServerUpdateTargets,
   collectUpdateEverythingResult,
   describeUpdateEverything,
+  installAfterUpdateEverything,
   runUpdateEverything,
   type UpdateRunMachine,
 } from "./updateEverything.logic";
@@ -208,9 +209,20 @@ export function useUpdateEverything(localUpdateVersion: string | null) {
             setUpdateEverythingRun(
               (run) => run && { ...run, phase: "installing", restartAt: null },
             );
-            saveUpdateEverythingResult({ ...result(finishedServers), localVersion });
-            if (await installLocal(reportLocalError)) return;
-            clearSavedUpdateEverythingResult();
+            const admission = await installAfterUpdateEverything({
+              result: { ...result(finishedServers), localVersion },
+              localReady: true,
+              save: saveUpdateEverythingResult,
+              install: () => installLocal(reportLocalError),
+              clear: clearSavedUpdateEverythingResult,
+            });
+            if (admission === "relaunching") return;
+            if (admission === "storage-failed") {
+              reportLocalError(
+                "Update postponed",
+                "Could not save the cross-machine update result.",
+              );
+            }
           }
         }
         setUpdateEverythingRun(

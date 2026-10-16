@@ -177,7 +177,7 @@ const SavedResult = Schema.Struct({
 });
 const decodeSavedResult = Schema.decodeUnknownOption(Schema.fromJsonString(SavedResult));
 
-export function saveUpdateEverythingResult(result: UpdateEverythingResult): void {
+export function saveUpdateEverythingResult(result: UpdateEverythingResult): boolean {
   const run = appAtomRegistry.get(updateEverythingRunAtom);
   const handedOff = (run?.machines ?? []).flatMap((machine): HandedOffServer[] => {
     if (machine.result !== null) return [];
@@ -210,7 +210,10 @@ export function saveUpdateEverythingResult(result: UpdateEverythingResult): void
         handedOff,
       } satisfies typeof SavedResult.Type),
     );
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function clearSavedUpdateEverythingResult(): void {
