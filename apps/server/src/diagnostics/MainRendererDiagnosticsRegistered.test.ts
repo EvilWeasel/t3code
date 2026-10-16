@@ -1,4 +1,4 @@
-import { assert, it } from "@effect/vitest";
+import { assert, expectTypeOf, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import {
@@ -29,6 +29,8 @@ import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcSerialization from "effect/rpc/RpcSerialization";
 import * as Socket from "effect/socket/Socket";
 import { layerMainRendererDiagnosticsWs } from "../server.ts";
+import * as Ws from "../ws.ts";
+import * as MainRendererDiagnosticsLocalClient from "./MainRendererDiagnosticsLocalClient.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
@@ -101,6 +103,18 @@ import * as VcsStatusBroadcaster from "../vcs/VcsStatusBroadcaster.ts";
 import * as WorkspaceEntries from "../workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "../workspace/WorkspaceFileSystem.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
+
+it("type boundary: exported WS layer requirements are not any", () => {
+  expectTypeOf<Layer.Services<typeof Ws.layer>>().not.toBeAny();
+});
+
+it("type boundary: LocalClient layer requirements are not any", () => {
+  expectTypeOf<Layer.Services<typeof MainRendererDiagnosticsLocalClient.layer>>().not.toBeAny();
+});
+
+it("type boundary: production WS LocalClient composition requirements are not any", () => {
+  expectTypeOf<Layer.Services<typeof layerMainRendererDiagnosticsWs>>().not.toBeAny();
+});
 
 // A: genuine registered /ws + real isolated auth/session store + the SAME production
 // alias/default native inspector. No positive packaged-Main claim: this hosted
