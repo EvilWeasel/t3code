@@ -764,7 +764,10 @@ describe("LiveVoiceControl passive availability", () => {
       expect(Option.isSome(AsyncResult.value(failed))).toBe(cached);
       await render({ ...loaded, configState: resolveLiveVoiceConfigState(failed) });
       expect(startButton().disabled).toBe(true);
-      expect(container.textContent).toContain("Provider information could not be loaded");
+      const failureHint = await startHint();
+      expect(failureHint).toContain("Provider information could not be loaded");
+      expect(failureHint).not.toContain("Waiting");
+      expect(failureHint).not.toContain("private-config-cause");
       expect(container.textContent).not.toContain("Waiting");
       expect(container.textContent).not.toContain("private-config-cause");
       await act(async () => startButton().click());
@@ -775,7 +778,7 @@ describe("LiveVoiceControl passive availability", () => {
         configState: resolveLiveVoiceConfigState(AsyncResult.initial()),
       });
       expect(startButton().disabled).toBe(true);
-      expect(container.textContent).toContain(
+      expect(await startHint()).toContain(
         "Waiting for this environment's provider information",
       );
       await render({
@@ -910,7 +913,8 @@ describe("LiveVoiceControl passive availability", () => {
         });
       await render(loaded);
       expect(startButton().disabled).toBe(true);
-      expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      expect(container.querySelector('[role="status"]')).toBeNull();
+      expect(await startHint()).toContain(
         missing === "WebRTC" ? "does not provide WebRTC" : "Microphone access is unavailable",
       );
       await act(async () => startButton().click());
@@ -923,12 +927,12 @@ describe("LiveVoiceControl passive availability", () => {
     expect(startButton().disabled).toBe(false);
     await render(loaded, environmentB);
     expect(startButton().disabled).toBe(true);
-    expect(container.textContent).toContain("voice availability to update");
+    expect(await startHint()).toContain("voice availability to update");
     await act(async () => startButton().click());
     expectPassive();
     await render({ ...loaded, environmentId: environmentB });
     expect(startButton().disabled).toBe(true);
-    expect(container.textContent).toContain("provider information");
+    expect(await startHint()).toContain("provider information");
     await render({
       ...loaded,
       environmentId: environmentB,
@@ -936,7 +940,7 @@ describe("LiveVoiceControl passive availability", () => {
       canOperate: false,
     });
     expect(startButton().disabled).toBe(true);
-    expect(container.textContent).toContain("permission to operate");
+    expect(await startHint()).toContain("permission to operate");
     await render({
       ...loaded,
       environmentId: environmentB,
