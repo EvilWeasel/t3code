@@ -89,6 +89,7 @@ describe("production composer mobile footer", () => {
       instanceRequested: true,
       provider: { driverKind: "codex", enabled: true, isAvailable: true },
       instanceConfigured: false,
+      config: undefined,
     });
     function Fixture() {
       const [draft, setDraft] = useState("");
