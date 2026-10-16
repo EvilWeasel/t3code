@@ -54,7 +54,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$EFFECTIVE_SOURCE_SHA"
           bash scripts/weasel/check.sh
       - name: Preserve unreviewed Observatory route generation
-        if: always() && github.ref_name == 'feature/agent-observatory-candidate-20261016'
+        if: always() && (github.ref_name == 'feature/agent-observatory-candidate-20261016' || github.ref_name == 'feature/desktop-control-bootstrap-396-20261016')
         uses: actions/upload-artifact@v4
         with:
           name: observatory-routes-${{ github.sha }}-${{ github.run_attempt }}
