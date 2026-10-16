@@ -3,6 +3,11 @@ name: Weasel CI
 on:
   workflow_dispatch:
     inputs:
+      qualifyUpstream:
+        description: Run the complete Linux upstream test suites for a merge candidate
+        required: false
+        default: false
+        type: boolean
       buildCandidateCLI:
         description: Build an unpublished Linux x64 CLI/service candidate
         required: false
@@ -236,3 +241,42 @@ jobs:
       - name: Verify Windows installer process isolation
         shell: powershell
         run: ./apps/desktop/resources/test-morrowbyte-installer-guard.ps1
+
+  upstream_tests:
+    if: github.event_name == 'workflow_dispatch' && inputs.qualifyUpstream && github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
+    runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [web, packages, server-1, server-2, server-3, server-4, server-5, server-6, server-7, server-8]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+      - name: Prepare pinned Electron runtime
+        run: node apps/desktop/scripts/ensure-electron-runtime.mjs
+      - name: Install native fixture prerequisites
+        if: matrix.suite == 'packages'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libsecret-1-dev pkg-config
+      - name: Install pinned Chromium for server integration tests
+        if: startsWith(matrix.suite, 'server-')
+        run: node apps/server/node_modules/playwright-core/cli.js install --with-deps --only-shell chromium
+      - name: Run complete upstream test suite
+        env:
+          QUALIFICATION_SUITE: ${{ matrix.suite }}
+        run: |
+          set -euo pipefail
+          case "$QUALIFICATION_SUITE" in
+            web) vp run --filter @t3tools/web test ;;
+            packages) vp run --parallel --concurrency-limit 4 --filter '!t3' --filter '!@t3tools/monorepo' --filter '!@t3tools/web' test ;;
+            server-*) vp run --filter t3 test --shard "${QUALIFICATION_SUITE#server-}/8" ;;
+            *) exit 1 ;;
+          esac
