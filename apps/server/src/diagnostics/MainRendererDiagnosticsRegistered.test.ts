@@ -116,6 +116,25 @@ it("type boundary: production WS LocalClient composition requirements are not an
   expectTypeOf<Layer.Services<typeof layerMainRendererDiagnosticsWs>>().not.toBeAny();
 });
 
+it("WS discriminant: builder RX is not any", () => {
+  expectTypeOf<Effect.Services<Ws.WsRpcInferenceBoundary["builder"]>>().not.toBeAny();
+});
+it("WS discriminant: builder handler result is not any", () => {
+  expectTypeOf<Ws.WsRpcInferenceBoundary["handlers"]>().not.toBeAny();
+});
+it("WS discriminant: mapped handler requirements are not any", () => {
+  expectTypeOf<Ws.WsRpcInferenceBoundary["mappedServices"]>().not.toBeAny();
+});
+type WsAnyHandlerTags = {
+  [K in keyof Ws.WsRpcInferenceBoundary["byTag"]]: 0 extends 1 &
+    Ws.WsRpcInferenceBoundary["byTag"][K]
+    ? K
+    : never;
+}[keyof Ws.WsRpcInferenceBoundary["byTag"]];
+it("WS discriminant: no canonical per-handler requirement is any", () => {
+  expectTypeOf<WsAnyHandlerTags>().toBeNever();
+});
+
 // A: genuine registered /ws + real isolated auth/session store + the SAME production
 // alias/default native inspector. No positive packaged-Main claim: this hosted
 // process deliberately has no canonical Nix Main/profile/listener for this stateDir.

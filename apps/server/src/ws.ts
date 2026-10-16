@@ -123,6 +123,7 @@ import {
   HttpServerResponse,
 } from "effect/http";
 import { RpcSerialization, RpcServer } from "effect/rpc";
+import type * as RpcGroup from "effect/rpc/RpcGroup";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as ServerConfig from "./config.ts";
@@ -3235,6 +3236,21 @@ const makeWsRpcHandlers = (
     });
     return handlers;
   });
+
+type WsBuiltHandlers = Effect.Success<ReturnType<typeof makeWsRpcHandlers>>;
+type WsRegisteredRpc = RpcGroup.Rpcs<typeof ServerWsRpcGroup>;
+export type WsRpcInferenceBoundary = {
+  readonly builder: ReturnType<typeof makeWsRpcHandlers>;
+  readonly handlers: WsBuiltHandlers;
+  readonly mappedServices: RpcGroup.HandlersServices<WsRegisteredRpc, WsBuiltHandlers>;
+  readonly byTag: {
+    readonly [K in keyof WsBuiltHandlers & WsRegisteredRpc["_tag"]]: RpcGroup.HandlerServices<
+      WsRegisteredRpc,
+      K,
+      WsBuiltHandlers[K]
+    >;
+  };
+};
 
 const layerWsRpc = (...args: Parameters<typeof makeWsRpcHandlers>) =>
   ServerWsRpcGroup.toLayer(makeWsRpcHandlers(...args));
