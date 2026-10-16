@@ -358,5 +358,12 @@ for transcript_http_test in "${transcript_http_tests[@]}"; do
   fi
   focused_tests+=("$transcript_http_test")
 done
+transcript_client_test=packages/client-runtime/src/state/threadTranscriptHttp.test.ts
+if [[ ! -f "$transcript_client_test" ]]; then
+  echo "Required transcript client HTTP gate is missing: $transcript_client_test" >&2
+  exit 1
+fi
+vp lint --report-unused-disable-directives packages/client-runtime/src/state/threadTranscriptHttp.ts packages/client-runtime/src/state/threadTranscriptHttp.test.ts packages/client-runtime/src/state/orchestration.ts
+focused_tests+=("$transcript_client_test")
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)
