@@ -346,5 +346,12 @@ for agent_session_test in "${agent_session_tests[@]}"; do
   fi
   focused_tests+=("$agent_session_test")
 done
+composer_thread_import_test=apps/web/src/components/chat/composerThreadImport.test.ts
+if [[ ! -f "$composer_thread_import_test" ]]; then
+  echo "Required composer thread import gate is missing: $composer_thread_import_test" >&2
+  exit 1
+fi
+focused_tests+=("$composer_thread_import_test")
+vp_cmd lint --report-unused-disable-directives apps/web/src/components/chat/composerThreadImport.ts apps/web/src/components/chat/composerThreadImport.test.ts
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)
