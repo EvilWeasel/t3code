@@ -25,6 +25,7 @@ import * as Layer from "effect/Layer";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpServer from "effect/http/HttpServer";
 import * as RpcClient from "effect/rpc/RpcClient";
+import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcSerialization from "effect/rpc/RpcSerialization";
 import * as Socket from "effect/socket/Socket";
 import { layerMainRendererDiagnosticsWs } from "../server.ts";
@@ -111,10 +112,13 @@ const target: MainRendererDiagnosticsReadInput["target"] = {
   threadId: "7cd05d6b-5e09-4691-a664-0b56c6283f12",
   providerInstanceId: "codex",
 };
-const selectorGroup = WsRpcGroup.omit(
-  ...[...WsRpcGroup.requests.keys()].filter(
-    (tag): tag is Exclude<typeof tag, typeof WS_METHODS.serverGetTraceDiagnostics> =>
-      tag !== WS_METHODS.serverGetTraceDiagnostics,
+type DiagnosticsRpc = Extract<
+  RpcGroup.Rpcs<typeof WsRpcGroup>,
+  { readonly _tag: typeof WS_METHODS.serverGetTraceDiagnostics }
+>;
+const selectorGroup = RpcGroup.make(
+  ...[...WsRpcGroup.requests.values()].filter(
+    (rpc): rpc is DiagnosticsRpc => rpc._tag === WS_METHODS.serverGetTraceDiagnostics,
   ),
 );
 
@@ -256,8 +260,12 @@ const makeRegisteredFixture = (
       Layer.mock(RelayClient.RelayClient)({}),
       Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
       Layer.mock(ServerBrowser.ServerBrowser)({}),
-      Layer.mock(CodexInstallation.CodexInstallation)({}),
-      Layer.mock(AntigravityInstallation.AntigravityInstallation)({}),
+      Layer.mock(CodexInstallation.CodexInstallation)({
+        managedDirectory: `${config.baseDir}/tools/codex`,
+      }),
+      Layer.mock(AntigravityInstallation.AntigravityInstallation)({
+        managedDirectory: `${config.baseDir}/tools/antigravity`,
+      }),
       Layer.mock(VcsProcess.VcsProcess)({}),
       Layer.mock(ThreadManagementService.ThreadManagementService)({ getThreadRecords }),
       Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
