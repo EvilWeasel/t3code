@@ -30,6 +30,7 @@ jobs:
       source_sha: ${{ steps.release.outputs.source_sha }}
       version: ${{ steps.release.outputs.version }}
       tag: ${{ steps.release.outputs.tag }}
+      observatory_route_sha256: ${{ steps.route.outputs.observatory_route_sha256 }}
     steps:
       - name: Checkout promoted source
         uses: actions/checkout@v4
@@ -42,6 +43,8 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           git fetch origin main
           git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
           test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
@@ -58,9 +61,60 @@ jobs:
         run: node apps/desktop/scripts/ensure-electron-runtime.mjs
 
       - name: Check source before release
+        env:
+          EFFECTIVE_SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
+          [[ "$EFFECTIVE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$EFFECTIVE_SOURCE_SHA"
           bash scripts/weasel/check.sh
+
+      - id: route
+        name: Verify reviewed Observatory preflight route
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f apps/web/src/routes/observatory.tsx ]]; then
+            exit 0
+          fi
+          python3 - <<'PYROUTE'
+          import hashlib, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'observatory-route-generation'
+          receipt = json.loads((root / 'receipt.json').read_bytes())
+          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          expected = '4a398647bcd2507fd8aabab1ea0119b5bb635ccb880f4c73f0570f533650480e'
+          source = os.environ['SOURCE_SHA']
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == source
+          assert receipt['status'] == 'generated-unreviewed'
+          assert receipt['source'] == receipt['effectiveSourceSha'] == source
+          assert receipt['run'] == os.environ['GITHUB_RUN_ID'] and receipt['attempt'] == os.environ['GITHUB_RUN_ATTEMPT']
+          assert receipt['trustedContextSha'] == os.environ['GITHUB_SHA']
+          assert receipt['trustedWorkflowSha'] == os.environ['GITHUB_WORKFLOW_SHA']
+          assert receipt['trustedWorkflowRef'] == os.environ['GITHUB_WORKFLOW_REF']
+          assert receipt['lockSha256'] == digest(pathlib.Path('pnpm-lock.yaml'))
+          assert receipt['checkScriptSha256'] == digest(pathlib.Path('scripts/weasel/check.sh'))
+          before = subprocess.check_output(['git', 'show', source + ':apps/web/src/routeTree.gen.ts'])
+          assert receipt['beforeSha256'] == hashlib.sha256(before).hexdigest()
+          assert receipt['generatorVersion'] == '1.167.12' and receipt['config'] == {'autoCodeSplitting': True}
+          assert receipt['afterSha256'] == digest(root / 'routeTree.gen.ts') == expected
+          assert digest(pathlib.Path('apps/web/src/routeTree.gen.ts')) == expected
+          assert (root / 'routeTree.diff').is_file()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('observatory_route_sha256=' + expected + '\n')
+          PYROUTE
+
+      - name: Preserve release Observatory preflight route evidence
+        if: always() && hashFiles('apps/web/src/routes/observatory.tsx') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-observatory-preflight-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/observatory-route-generation/receipt.json
+            ${{ runner.temp }}/observatory-route-generation/routeTree.gen.ts
+            ${{ runner.temp }}/observatory-route-generation/routeTree.diff
+          if-no-files-found: error
+          retention-days: 7
 
       - id: release
         name: Resolve distinct fork version
@@ -121,6 +175,60 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsecret-1-dev pkg-config
           vp run build:desktop
+
+      - name: Download reviewed preflight route evidence
+        if: needs.preflight.outputs.observatory_route_sha256 != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: weasel-observatory-preflight-${{ needs.preflight.outputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/observatory-release-preflight
+
+      - name: Bind independently built Observatory route
+        env:
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          PREFLIGHT_ROUTE_SHA: ${{ needs.preflight.outputs.observatory_route_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f apps/web/src/routes/observatory.tsx ]]; then
+            test -z "$PREFLIGHT_ROUTE_SHA"
+            exit 0
+          fi
+          python3 - <<'PYROUTE'
+          import hashlib, json, os, pathlib, subprocess
+          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          expected = '4a398647bcd2507fd8aabab1ea0119b5bb635ccb880f4c73f0570f533650480e'
+          source = os.environ['SOURCE_SHA']
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == source
+          assert os.environ['PREFLIGHT_ROUTE_SHA'] == expected
+          preflight = pathlib.Path(os.environ['RUNNER_TEMP']) / 'observatory-release-preflight'
+          before = json.loads((preflight / 'receipt.json').read_bytes())
+          assert before['source'] == before['effectiveSourceSha'] == source
+          assert before['run'] == os.environ['GITHUB_RUN_ID'] and before['attempt'] == os.environ['GITHUB_RUN_ATTEMPT']
+          assert before['lockSha256'] == digest(pathlib.Path('pnpm-lock.yaml'))
+          assert before['afterSha256'] == digest(preflight / 'routeTree.gen.ts') == expected
+          actual = pathlib.Path('apps/web/src/routeTree.gen.ts')
+          assert digest(actual) == expected
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'observatory-release-build'
+          output.mkdir(mode=0o700)
+          (output / 'routeTree.gen.ts').write_bytes(actual.read_bytes())
+          receipt = {'source': source, 'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                     'lockSha256': before['lockSha256'], 'generatedRouteSha256': expected,
+                     'preflightReceiptSha256': digest(preflight / 'receipt.json'),
+                     'trustedContextSha': os.environ['GITHUB_SHA'], 'trustedWorkflowSha': os.environ['GITHUB_WORKFLOW_SHA'],
+                     'trustedWorkflowRef': os.environ['GITHUB_WORKFLOW_REF']}
+          (output / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+          PYROUTE
+
+      - name: Preserve independently built Observatory route evidence
+        if: always() && hashFiles('apps/web/src/routes/observatory.tsx') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: weasel-observatory-build-${{ needs.preflight.outputs.source_sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/observatory-release-build/receipt.json
+            ${{ runner.temp }}/observatory-release-build/routeTree.gen.ts
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload shared assets
         uses: actions/upload-artifact@v4
@@ -403,6 +511,57 @@ jobs:
           merge-multiple: true
           path: release-assets
 
+      - name: Download Observatory preflight proof for publication
+        if: needs.preflight.outputs.observatory_route_sha256 != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: weasel-observatory-preflight-${{ needs.preflight.outputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/observatory-publish-preflight
+
+      - name: Download Observatory build proof for publication
+        if: needs.preflight.outputs.observatory_route_sha256 != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: weasel-observatory-build-${{ needs.preflight.outputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/observatory-publish-build
+
+      - name: Require matching Observatory route proofs before publication
+        env:
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          PREFLIGHT_ROUTE_SHA: ${{ needs.preflight.outputs.observatory_route_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f apps/web/src/routes/observatory.tsx ]]; then
+            test -z "$PREFLIGHT_ROUTE_SHA"
+            exit 0
+          fi
+          python3 - <<'PYROUTE'
+          import hashlib, json, os, pathlib, subprocess
+          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          expected = '4a398647bcd2507fd8aabab1ea0119b5bb635ccb880f4c73f0570f533650480e'
+          source = os.environ['SOURCE_SHA']
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == source
+          assert os.environ['PREFLIGHT_ROUTE_SHA'] == expected
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          preflight = root / 'observatory-publish-preflight'
+          build = root / 'observatory-publish-build'
+          pre = json.loads((preflight / 'receipt.json').read_bytes())
+          built = json.loads((build / 'receipt.json').read_bytes())
+          for receipt in [pre, built]:
+              assert receipt['source'] == source
+              assert receipt['run'] == os.environ['GITHUB_RUN_ID'] and receipt['attempt'] == os.environ['GITHUB_RUN_ATTEMPT']
+              assert receipt['lockSha256'] == digest(pathlib.Path('pnpm-lock.yaml'))
+              assert receipt['trustedContextSha'] == os.environ['GITHUB_SHA']
+              assert receipt['trustedWorkflowSha'] == os.environ['GITHUB_WORKFLOW_SHA']
+              assert receipt['trustedWorkflowRef'] == os.environ['GITHUB_WORKFLOW_REF']
+          assert pre['effectiveSourceSha'] == source and pre['status'] == 'generated-unreviewed'
+          assert pre['afterSha256'] == built['generatedRouteSha256'] == expected
+          assert digest(preflight / 'routeTree.gen.ts') == digest(build / 'routeTree.gen.ts') == expected
+          assert built['preflightReceiptSha256'] == digest(preflight / 'receipt.json')
+          assert pre['generatorVersion'] == '1.167.12' and pre['config'] == {'autoCodeSplitting': True}
+          assert (preflight / 'routeTree.diff').is_file()
+          PYROUTE
+
       - name: Setup checksum consumer runtime
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
@@ -430,6 +589,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code' }}
+          OBSERVATORY_ROUTE_SHA: ${{ needs.preflight.outputs.observatory_route_sha256 }}
         run: |
           set -euo pipefail
           tag="${{ needs.preflight.outputs.tag }}"
@@ -478,6 +638,11 @@ jobs:
           jq -e --argjson expected "$expected_assets" '([.[].name] | sort) == $expected' <<<"$assets_json"
           {
             printf 'fork_release=%s\nsource_sha=%s\npnpm_lock_sha256=%s\n' "$tag" "$source_sha" "$lock_sha"
+            if [[ -f apps/web/src/routes/observatory.tsx ]]; then
+              test "$OBSERVATORY_ROUTE_SHA" = 4a398647bcd2507fd8aabab1ea0119b5bb635ccb880f4c73f0570f533650480e
+              printf 'generated_route_sha256=%s\ngenerated_route_source_sha=%s\ngenerated_route_run_id=%s\ngenerated_route_run_attempt=%s\n' \
+                "$OBSERVATORY_ROUTE_SHA" "$source_sha" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            fi
             printf 'github_asset_digests=%s\n' "$(jq -c '[.[] | {name, digest}]' <<<"$assets_json")"
             printf 'artifact_sha256:\n'
             cat release-assets/SHA256SUMS
