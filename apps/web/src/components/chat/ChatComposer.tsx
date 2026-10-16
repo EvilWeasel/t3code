@@ -1498,10 +1498,6 @@ export interface ChatComposerHandle {
   setMultipleModelSelections: (selections: ReadonlyArray<ModelSelection>) => void;
 }
 
-// --------------------------------------------------------------------------
-// Props
-// --------------------------------------------------------------------------
-
 /** Shared by the full composer and its mounted mobile regression fixture. */
 export function ChatComposerFooter({
   controls,
