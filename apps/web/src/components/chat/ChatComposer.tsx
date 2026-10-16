@@ -7004,7 +7004,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               props.queuedRunsControl ? (
                 <div
                   data-chat-composer-queued-runs="true"
-                  className="w-full min-w-0 max-w-full max-sm:[&_[data-slot=scroll-area-viewport]]:max-h-[min(8rem,20dvh)]"
+                  className="w-full min-w-0 max-w-full [&>[data-slot=composer-banner-attachment]]:w-full [&:last-child>[data-slot=composer-banner-attachment]]:mb-0 max-sm:[&_[data-slot=scroll-area-viewport]]:max-h-[min(8rem,20dvh)]"
                 >
                   {props.queuedRunsControl}
                 </div>
