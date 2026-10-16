@@ -12,9 +12,12 @@ function validateTrigger(run, repository) {
   return run.head_sha;
 }
 
-function decideDispatch({source, main, statuses, runs, runCount}) {
+function decideDispatch({source, main, statuses, runs, runCount, releases}) {
   assert(Array.isArray(statuses) && statuses.length < 100, 'status-window-ambiguous');
   assert(Array.isArray(runs) && runCount === runs.length && runCount <= 100, 'release-run-window-ambiguous');
+  assert(Array.isArray(releases),'published-release-observation-required');
+  const published=releases.find(r=>r.target_commitish===source && r.draft===false && typeof r.published_at==='string');
+  if(published) return {action:'skip',reason:'source-already-published',releaseId:published.id};
   const marker = statuses.find(s => s.context === CONTEXT);
   const relevant = runs.filter(r => r.head_sha === source && r.path === '.github/workflows/weasel-release.yml' && r.event === 'workflow_dispatch' && r.head_branch === 'main');
   assert(relevant.length <= 1, 'duplicate-existing-nightly-runs');
@@ -42,12 +45,15 @@ async function nightlyAfterCI({github, context, core}) {
     assert(selected.length===1 && selected[0].status==='completed' && selected[0].conclusion==='success', 'required-ci-job-not-successful:'+name);
   }
   const observe = async () => {
-    const [{data:ref},{data:statuses},{data:runs}] = await Promise.all([
+    const [{data:ref},{data:statuses},{data:runs},releases] = await Promise.all([
       github.rest.git.getRef({...repo,ref:'heads/main'}),
       github.rest.repos.listCommitStatusesForRef({...repo,ref:source,per_page:100}),
       github.rest.actions.listWorkflowRuns({...repo,workflow_id:WORKFLOW,head_sha:source,branch:'main',event:'workflow_dispatch',per_page:100}),
+      // Include promotion releases: their producing workflow may use an ops ref.
+      // Pagination prevents older already-published sources from being rebuilt.
+      github.paginate(github.rest.repos.listReleases,{...repo,per_page:100}),
     ]);
-    return decideDispatch({source,main:ref.object.sha,statuses,runs:runs.workflow_runs,runCount:runs.total_count});
+    return decideDispatch({source,main:ref.object.sha,statuses,runs:runs.workflow_runs,runCount:runs.total_count,releases});
   };
   const mark = async (state,description,url) => github.rest.repos.createCommitStatus({...repo,sha:source,context:CONTEXT,state,description,target_url:url});
   const finish = async decision => {
@@ -75,7 +81,7 @@ async function nightlyAfterCI({github, context, core}) {
   for(let attempt=0;attempt<4;attempt++) {
     if(attempt) await new Promise(resolve=>setTimeout(resolve,5000));
     const decision=await observe();
-    if(decision.action==='reconcile'){await finish(decision);return;}
+    if(decision.action==='reconcile' || decision.reason==='source-already-published'){await finish(decision);return;}
   }
   throw Error(dispatchUncertain?'dispatch-ack-uncertain-reconcile-required':'dispatch-run-not-visible-reconcile-required');
 }
