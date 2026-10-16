@@ -217,6 +217,19 @@ async function captureComposerMobile() {
         const settle=()=>page.evaluate(()=>Promise.all(document.getAnimations().map(animation=>animation.finished.catch(()=>undefined))));
         const capture=async state=>{
           await settle();
+          if(variant==="after" && entry.width<640 && ["closed","configuration-focus","queue-collapsed"].includes(state)) {
+            const trigger=page.getByRole("button",{name:"Model and configuration",exact:true});
+            const label=trigger.locator("span").filter({hasText:/^Model$/});
+            if(await label.count()!==1) throw Error("Expected one actual visible Model label");
+            const readability=await label.evaluate(element=>{
+              const rect=element.getBoundingClientRect();const style=getComputedStyle(element);
+              const button=element.closest("button");if(!button) throw Error("Model label has no control");
+              const bounds=button.getBoundingClientRect();
+              return {text:element.textContent?.trim(),width:rect.width,height:rect.height,clientWidth:element.clientWidth,scrollWidth:element.scrollWidth,visible:style.visibility==="visible"&&style.opacity!=="0"&&element.getClientRects().length>0,insideControl:rect.x>=bounds.x&&rect.right<=bounds.right&&rect.y>=bounds.y&&rect.bottom<=bounds.bottom};
+            });
+            result.modelReadability??=[];result.modelReadability.push({state,...readability});
+            if(readability.text!=="Model" || !readability.visible || !readability.insideControl || readability.width<=0 || readability.height<=0 || readability.scrollWidth>readability.clientWidth) throw Error("Closed Model label is clipped or unreadable");
+          }
           const file=name+(state==="closed"?"":"-"+state)+".png";
           await page.screenshot({path:join(output,file),fullPage:true});
           result.images.push({state,file,sha256:digest(await readFile(join(output,file)))});

@@ -247,6 +247,7 @@ it("opens the production grouped configuration deliberately, preserves choices a
   await act(async () => root.render(<Fixture />));
   const trigger = control("Model and configuration");
   expect(trigger.getAttribute("aria-description")).toBe("GPT-6.1-Sol");
+  expect(trigger.textContent).toBe("Model");
   expect(document.querySelector('[aria-label="Runtime mode"]')).toBeNull();
   expect(changedMode).not.toHaveBeenCalled();
   expect(changedInteraction).not.toHaveBeenCalled();

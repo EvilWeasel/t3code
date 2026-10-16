@@ -1536,7 +1536,7 @@ export function ChatComposerFooter({
       data-chat-composer-footer-compact={compact ? "true" : "false"}
       className={cn(
         "flex min-w-0 flex-wrap items-center justify-between gap-2 overflow-visible px-3 pb-3 sm:flex-nowrap sm:px-4 sm:pb-4",
-        mobileConfiguration && "max-sm:flex-nowrap",
+        mobileConfiguration && "max-sm:justify-start",
         pendingInput && "pt-2",
         compact ? "gap-1.5" : "gap-2 sm:gap-0",
         mobilePendingActions && "hidden sm:flex",
@@ -1550,7 +1550,8 @@ export function ChatComposerFooter({
         data-chat-composer-footer-controls="true"
         className={cn(
           "relative -m-1 -ms-3.5 flex min-w-0 flex-1 basis-full items-center gap-1 overflow-x-auto p-1 ps-3.5 sm:basis-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
-          mobileConfiguration && "max-sm:m-0 max-sm:basis-0 max-sm:overflow-visible max-sm:p-0",
+          mobileConfiguration &&
+            "max-sm:m-0 max-sm:flex-none max-sm:basis-auto max-sm:overflow-visible max-sm:p-0",
           resting && "hidden",
         )}
       >
@@ -1562,11 +1563,11 @@ export function ChatComposerFooter({
                   aria-label="Model and configuration"
                   data-composer-shortcut="composer.mode composer.effort"
                   aria-description={mobileConfiguration.label}
-                  className="min-w-0 max-w-full"
+                  className="min-w-max shrink-0"
                 />
               }
             >
-              <span className="min-w-0 truncate">{mobileConfiguration.label}</span>
+              <span className="min-w-0 truncate">Model</span>
               <ComposerControlChevron />
             </PopoverTrigger>
             <PopoverPopup
@@ -1606,7 +1607,7 @@ export function ChatComposerFooter({
         className={cn(
           "flex min-w-0 max-w-full flex-1 basis-full flex-wrap items-center justify-end gap-2 sm:basis-auto sm:flex-none",
           mobileConfiguration &&
-            "max-sm:flex-none max-sm:basis-auto max-sm:flex-nowrap max-sm:gap-1",
+            "max-sm:flex-none max-sm:basis-auto max-sm:flex-nowrap max-sm:justify-start max-sm:gap-1",
         )}
       >
         {actions}
