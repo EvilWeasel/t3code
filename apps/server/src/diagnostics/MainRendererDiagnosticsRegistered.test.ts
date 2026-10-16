@@ -392,6 +392,8 @@ it.live.each([false, true])(
         [AuthDiagnosticsReadScope, AuthOrchestrationReadScope],
         f.request,
       );
+      if (!("mainRendererSnapshot" in result))
+        throw new Error("Expected explicit Main renderer diagnostic response");
       assert.deepEqual(
         result.mainRendererSnapshot,
         fd
@@ -430,6 +432,8 @@ it.live.each(targetMismatchCases)(
         [AuthDiagnosticsReadScope, AuthOrchestrationReadScope],
         f.request,
       );
+      if (!("mainRendererSnapshot" in result))
+        throw new Error("Expected explicit Main renderer diagnostic response");
       assert.deepEqual(result.mainRendererSnapshot, {
         status: "unavailable",
         reason: "target-mismatch",
