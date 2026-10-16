@@ -117,6 +117,18 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv, Path.Pat
           enabled,
           config,
         });
+      const crypto = yield* Crypto.Crypto;
+      const configurationId = yield* crypto.randomUUIDv4().pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderDriverError({
+              driver: DRIVER_KIND,
+              instanceId,
+              detail: "Failed to create native Live preparation identity.",
+              cause,
+            }),
+        ),
+      );
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const resetCreditCoordinator = yield* ResetCreditCoordinator.ResetCreditCoordinator;
       const fileSystem = yield* FileSystem.FileSystem;
@@ -175,7 +187,10 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv, Path.Pat
           enabled,
           config,
         },
-        { onUsageLimits: (update) => snapshot.applyUsageLimits(update) },
+        {
+          onUsageLimits: (update) => snapshot.applyUsageLimits(update),
+          liveVoicePreparationConfigurationId: configurationId,
+        },
       ).pipe(
         Effect.mapError(
           (cause) =>
@@ -195,7 +210,29 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv, Path.Pat
           Effect.zipWith(
             checkCodexProviderStatus(effectiveConfig, undefined, processEnv),
             currentCatalog,
-            (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
+            (draft, catalog) =>
+              stampIdentity(
+                applyCodexModelCatalog(
+                  {
+                    ...draft,
+                    ...(draft.status === "ready" &&
+                    draft.installed &&
+                    draft.auth.status === "authenticated" &&
+                    draft.auth.type === "chatgpt" &&
+                    draft.auth.subscriptionSharing !== true
+                      ? {
+                          nativeLiveVoicePreparation: {
+                            configurationId,
+                            setupMode: "existing" as const,
+                            accountSource: "native-account-read" as const,
+                            transport: "codex-webrtc-v3" as const,
+                          },
+                        }
+                      : {}),
+                  },
+                  catalog,
+                ),
+              ),
             { concurrent: true },
           ),
         ),

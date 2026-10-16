@@ -1914,6 +1914,7 @@ describe("CodexAdapterV2 session initialize", () => {
       const adapter = yield* CodexAdapterV2.makeCodexAdapterV2({
         instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
         settings: DEFAULT_CODEX_SETTINGS,
+        liveVoicePreparationConfigurationId: "factory-native-1",
         environment: {},
         clientFactory: {
           open: (openInput) =>
@@ -1953,6 +1954,7 @@ describe("CodexAdapterV2 session initialize", () => {
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
       });
       return {
+        liveVoice: runtime.liveVoice,
         ensureThread: (threadId: string) =>
           runtime.ensureThread({
             threadId: ThreadId.make(threadId),
@@ -1965,6 +1967,50 @@ describe("CodexAdapterV2 session initialize", () => {
 
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
+
+  for (const account of [null, { type: "apiKey" }] as const) {
+    it.effect(
+      `does not let native configuration provenance bypass account/read (${account?.type ?? "absent"})`,
+      () =>
+        Effect.gen(function* () {
+          const session = yield* openReplaySession(
+            makeCodexReplayTranscript({
+              scenario: "voice-account-refusal",
+              entries: [
+                ...replayPreamble("unused").slice(0, 3),
+                {
+                  type: "expect_outbound",
+                  label: "native account",
+                  frame: { id: 2, method: "account/read", params: {} },
+                },
+                {
+                  type: "emit_inbound",
+                  label: "native account",
+                  frame: { id: 2, result: { account, requiresOpenaiAuth: true } },
+                },
+              ],
+            }),
+          );
+          const voice = session.liveVoice;
+          if (!voice) return yield* Effect.die("Missing native Live runtime");
+          assert.equal(voice.preparationConfigurationId, "factory-native-1");
+          const refusal = yield* voice
+            .preparePlanner({
+              modelSelection: CODEX_TEST_MODEL_SELECTION,
+              onSubmitWork: () => Effect.die("An account refusal must not submit work"),
+            })
+            .pipe(Effect.flip);
+          assert.equal(refusal._tag, "ProviderAdapterProtocolError");
+          if (refusal._tag === "ProviderAdapterProtocolError")
+            assert.equal(refusal.detail, "Managed ChatGPT account is required for Codex Live.");
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+    );
+  }
 
   it.effect("sends one initialize when two threads start on a fresh session at once", () =>
     Effect.gen(function* () {

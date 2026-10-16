@@ -258,6 +258,15 @@ export const ServerProvider = Schema.Struct({
   version: Schema.NullOr(TrimmedNonEmptyString),
   status: ServerProviderState,
   auth: ServerProviderAuth,
+  // Observed native account provenance, never permission, entitlement or media readiness.
+  nativeLiveVoicePreparation: Schema.optionalKey(
+    Schema.Struct({
+      configurationId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+      setupMode: Schema.Literal("existing"),
+      accountSource: Schema.Literal("native-account-read"),
+      transport: Schema.Literal("codex-webrtc-v3"),
+    }),
+  ),
   checkedAt: IsoDateTime,
   message: Schema.optional(TrimmedNonEmptyString),
   availability: Schema.optional(ServerProviderAvailability),

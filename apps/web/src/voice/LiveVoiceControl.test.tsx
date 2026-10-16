@@ -64,6 +64,12 @@ const environmentA = EnvironmentId.make("voice-environment-a");
 const environmentB = EnvironmentId.make("voice-environment-b");
 const thread = ThreadId.make("voice-thread");
 type AvailabilityInput = Parameters<typeof resolveLiveVoiceAvailability>[0];
+const nativePreparation: NonNullable<ServerProvider["nativeLiveVoicePreparation"]> = {
+  configurationId: "configuration-1",
+  setupMode: "existing",
+  accountSource: "native-account-read",
+  transport: "codex-webrtc-v3",
+};
 const loaded: AvailabilityInput = {
   environmentId: environmentA,
   threadId: thread,
@@ -77,7 +83,8 @@ const loaded: AvailabilityInput = {
   instanceRequested: true,
   provider: { driverKind: "codex", enabled: true, isAvailable: true },
   instanceConfigured: true,
-  config: { setupMode: "managed" },
+  config: { setupMode: "existing" },
+  nativePreparation,
 };
 
 let root: Root;
@@ -508,7 +515,7 @@ describe("Live voice diagnostic producer model (transport absent)", () => {
     expect(model.gate).toBe(gate);
     expect(model.gate.canStart).toBe(!startButton().disabled);
     expect(model.gate.reason).toBeNull();
-    expect(model.gate.facts).toMatchObject({ driver: "codex", setupMode: "managed" });
+    expect(model.gate.facts).toMatchObject({ driver: "codex", setupMode: "existing" });
     expect(Object.isFrozen(model)).toBe(true);
     expect(Object.isFrozen(model.gate)).toBe(true);
     expect(Object.isFrozen(model.gate.facts)).toBe(true);
@@ -778,9 +785,7 @@ describe("LiveVoiceControl passive availability", () => {
         configState: resolveLiveVoiceConfigState(AsyncResult.initial()),
       });
       expect(startButton().disabled).toBe(true);
-      expect(await startHint()).toContain(
-        "Waiting for this environment's provider information",
-      );
+      expect(await startHint()).toContain("Waiting for this environment's provider information");
       await render({
         ...loaded,
         environmentId: environmentB,
@@ -795,7 +800,7 @@ describe("LiveVoiceControl passive availability", () => {
   );
 
   it("keeps the disabled reason out of the toolbar and opens it on deliberate keyboard focus", async () => {
-    await render({ ...loaded, config: { setupMode: "existing" } });
+    await render({ ...loaded, nativePreparation: undefined });
     expect(container.querySelector('[role="status"]')).toBeNull();
     expect(container.textContent).not.toContain("existing installation");
     const trigger = container.querySelector<HTMLElement>('[data-slot="tooltip-trigger"]');
@@ -806,10 +811,45 @@ describe("LiveVoiceControl passive availability", () => {
       trigger.focus();
     });
     expect(document.activeElement).toBe(trigger);
-    expect(await startHint()).toContain("existing installation");
+    expect(await startHint()).toContain("Live voice is unavailable for this thread");
     expectPassive();
   });
-  it("enables loaded managed setup without probing, and only prepares after a deliberate click", async () => {
+  it.each([undefined, {}, { setupMode: "existing" }])(
+    "qualifies canonical native provenance with implicit or explicit existing config %s",
+    async (config) => {
+      await render({ ...loaded, config, instanceConfigured: config !== undefined });
+      expect(startButton().disabled).toBe(false);
+      expectPassive();
+    },
+  );
+
+  it("retires a pending Start on same-instance configuration rollover before media", async () => {
+    let finish: ((result: ReturnType<typeof AsyncResult.failure>) => void) | undefined;
+    commands.prepare.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    await render(loaded);
+    await act(async () => startButton().click());
+    await render({
+      ...loaded,
+      nativePreparation: { ...nativePreparation, configurationId: "configuration-2" },
+    });
+    if (!finish) throw new Error("Missing held prepare response");
+    await act(async () =>
+      finish?.(
+        AsyncResult.failure(Cause.fail(new LiveVoiceError({ code: "unsupported_provider" }))),
+      ),
+    );
+    expect(startButton().disabled).toBe(false);
+    expect(commands.prepare).toHaveBeenCalledOnce();
+    expect(commands.start).not.toHaveBeenCalled();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(peer).not.toHaveBeenCalled();
+  });
+
+  it("enables observed native setup without probing, and only prepares after a deliberate click", async () => {
     await render(loaded);
     expect(startButton().disabled).toBe(false);
     expectPassive();
@@ -817,7 +857,10 @@ describe("LiveVoiceControl passive availability", () => {
     expect(commands.prepare).toHaveBeenCalledOnce();
     expect(commands.prepare.mock.calls[0]?.[0]).toMatchObject({
       environmentId: environmentA,
-      input: { threadId: thread },
+      input: {
+        threadId: thread,
+        nativePreparation: { providerInstanceId: "codex", configurationId: "configuration-1" },
+      },
     });
     expect(commands.start).not.toHaveBeenCalled();
     expect(getUserMedia).not.toHaveBeenCalled();
@@ -835,13 +878,25 @@ describe("LiveVoiceControl passive availability", () => {
       reason: "Waiting for this environment's provider settings.",
     },
     {
-      patch: { config: { setupMode: "existing" } },
-      reason: "uses an existing installation",
+      patch: { config: { setupMode: "managed" }, nativePreparation: undefined },
+      reason: "Live voice is unavailable for this thread",
     },
-    { patch: { instanceConfigured: false }, reason: "has no saved settings" },
-    { patch: { config: null }, reason: "setup mode is missing" },
-    { patch: { config: {} }, reason: "setup mode is invalid or missing" },
-    { patch: { config: "private-invalid-value" }, reason: "setup mode is invalid or missing" },
+    {
+      patch: { instanceConfigured: false, nativePreparation: undefined },
+      reason: "Live voice is unavailable for this thread",
+    },
+    {
+      patch: { config: null, nativePreparation: undefined },
+      reason: "Live voice is unavailable for this thread",
+    },
+    {
+      patch: { config: {}, nativePreparation: undefined },
+      reason: "Live voice is unavailable for this thread",
+    },
+    {
+      patch: { config: "private-invalid-value", nativePreparation: undefined },
+      reason: "Live voice is unavailable for this thread",
+    },
     {
       patch: { permissionState: "pending", canOperate: false },
       reason: "Waiting for this environment's thread permissions",
@@ -851,8 +906,8 @@ describe("LiveVoiceControl passive availability", () => {
       reason: "Thread permissions could not be verified",
     },
     {
-      patch: { config: { setupMode: "private-invalid-value" } },
-      reason: "setup mode is invalid",
+      patch: { config: { setupMode: "private-invalid-value" }, nativePreparation: undefined },
+      reason: "Live voice is unavailable for this thread",
     },
     {
       patch: { provider: null },
@@ -872,7 +927,7 @@ describe("LiveVoiceControl passive availability", () => {
     },
     {
       patch: { provider: { ...loaded.provider!, driverKind: "claudeCode" } },
-      reason: "Select a managed Codex provider",
+      reason: "Live voice is unavailable for this thread",
     },
     {
       patch: { canOperate: false },

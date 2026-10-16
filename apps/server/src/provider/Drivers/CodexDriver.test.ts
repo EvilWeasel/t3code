@@ -6,7 +6,18 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ProviderSessionId, ThreadId } from "@t3tools/contracts";
+import { vi } from "vite-plus/test";
+import * as CodexProvider from "../CodexProvider.ts";
+import * as CodexClient from "effect-codex-app-server/client";
+import * as CodexReplay from "effect-codex-app-server/replay";
+import {
+  EnvironmentId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ProviderSessionId,
+  ServerProvider,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
@@ -96,6 +107,109 @@ const noSpawn = ChildProcessSpawner.make(() =>
 const encodeCredentials = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 it.layer(layerTest)("CodexDriver", (it) => {
+  it.effect(
+    "stamps only successful existing native ChatGPT observations and binds each factory runtime",
+    () =>
+      Effect.gen(function* () {
+        const instanceId = ProviderInstanceId.make("codex-native-preparation");
+        const base = yield* Schema.decodeUnknownEffect(ServerProvider)({
+          instanceId,
+          driver: "codex",
+          enabled: true,
+          installed: true,
+          status: "ready",
+          version: null,
+          auth: { status: "authenticated", type: "chatgpt" },
+          checkedAt: "2026-10-16T00:00:00.000Z",
+          models: [],
+        });
+        const check = vi.spyOn(CodexProvider, "checkCodexProviderStatus");
+        try {
+          check.mockReturnValue(Effect.succeed(base));
+          const fixtureConfig = yield* ServerConfig.ServerConfig;
+          const clientFactory = CodexAdapterV2.CodexAppServerClientFactory.of({
+            open: (input) =>
+              Layer.build(
+                CodexReplay.layerReplay({
+                  provider: "codex",
+                  protocol: "codex.app-server",
+                  version: "0.144.0",
+                  scenario: "driver-native-binding",
+                  entries: [],
+                }),
+              ).pipe(
+                Effect.flatMap((context) =>
+                  Effect.service(CodexClient.CodexAppServerClient).pipe(Effect.provide(context)),
+                ),
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapter.ProviderAdapterOpenSessionError({
+                      driver: ProviderDriverKind.make("codex"),
+                      providerSessionId: input.providerSessionId,
+                      cause,
+                    }),
+                ),
+              ),
+          });
+          const create = (setupMode?: "existing") =>
+            CodexDriver.create({
+              instanceId,
+              displayName: "Native fixture",
+              enabled: true,
+              environment: [],
+              config: {
+                ...CodexDriver.defaultConfig(),
+                homePath: NodePath.join(fixtureConfig.stateDir, "native-preparation-home"),
+                ...(setupMode ? { setupMode } : {}),
+              },
+            }).pipe(
+              Effect.provideService(CodexAdapterV2.CodexAppServerClientFactory, clientFactory),
+            );
+          const implicit = yield* create();
+          const explicit = yield* create("existing");
+          const first = yield* implicit.snapshot.refresh;
+          const second = yield* explicit.snapshot.refresh;
+          expect(first.nativeLiveVoicePreparation).toMatchObject({
+            setupMode: "existing",
+            accountSource: "native-account-read",
+            transport: "codex-webrtc-v3",
+          });
+          const configurationId = first.nativeLiveVoicePreparation?.configurationId;
+          expect(configurationId).toBeTruthy();
+          expect(second.nativeLiveVoicePreparation?.configurationId).not.toBe(configurationId);
+          const runtime = yield* implicit.orchestrationAdapter.openSession({
+            threadId: ThreadId.make("native-fixture-thread"),
+            providerSessionId: ProviderSessionId.make("native-fixture-session"),
+            modelSelection: { instanceId, model: "gpt-test" },
+            runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              cwd: process.cwd(),
+            }),
+          });
+          expect(runtime.liveVoice?.preparationConfigurationId).toBe(configurationId);
+          for (const patch of [
+            { auth: { status: "authenticated" as const, type: "apiKey" } },
+            { auth: { status: "unknown" as const } },
+            { status: "error" as const },
+            { installed: false },
+            {
+              auth: {
+                status: "authenticated" as const,
+                type: "chatgpt",
+                subscriptionSharing: true,
+              },
+            },
+          ]) {
+            check.mockReturnValue(Effect.succeed({ ...base, ...patch }));
+            expect((yield* implicit.snapshot.refresh).nativeLiveVoicePreparation).toBeUndefined();
+          }
+        } finally {
+          check.mockRestore();
+        }
+      }).pipe(Effect.scoped),
+  );
+
   it.effect("disconnect refreshes a restored managed account while its auth flow is idle", () =>
     Effect.gen(function* () {
       const instanceId = ProviderInstanceId.make("restored-managed-account");
@@ -203,6 +317,7 @@ it.layer(layerTest)("CodexDriver", (it) => {
         yield* Deferred.await(startupChecksInterrupted);
         const restored = yield* instance.snapshot.refresh;
         expect(restored.auth.email).toBe("account@example.test");
+        expect(restored.nativeLiveVoicePreparation).toBeUndefined();
         expect(restored.runtimePaths?.homePath).toBe(sharedHome);
         expect(restored.runtimePaths?.shadowHomePath).toContain(
           `providers/codex/${instanceId}/shadow`,

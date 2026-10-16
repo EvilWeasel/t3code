@@ -19,6 +19,12 @@ export const LiveVoiceClientRequestId = TrimmedNonEmptyString.check(Schema.isMax
 export const LiveVoicePrepareInput = Schema.Struct({
   threadId: ThreadId,
   clientRequestId: LiveVoiceClientRequestId,
+  nativePreparation: Schema.optionalKey(
+    Schema.Struct({
+      providerInstanceId: ProviderInstanceId,
+      configurationId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+    }),
+  ),
 });
 export type LiveVoicePrepareInput = typeof LiveVoicePrepareInput.Type;
 

@@ -15,6 +15,7 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -80,8 +81,7 @@ it.effect.each([false, true])(
           }) => Effect.Effect<string, ProviderAdapter.ProviderAdapterV2Error>)
         | undefined;
       let plannerOptions:
-        | { serviceTier?: string | null; reasoningEffort?: string | null }
-        | undefined;
+        { serviceTier?: string | null; reasoningEffort?: string | null } | undefined;
       let controlWork: Parameters<
         ProviderAdapter.ProviderAdapterV2LiveVoiceRuntime["preparePlanner"]
       >[0]["onWorkControl"];
@@ -92,6 +92,8 @@ it.effect.each([false, true])(
       let rejectSteerAtAdmission = false;
       let sends = 0;
       let stops = 0;
+      let opens = 0;
+      let workCancels = 0;
       const spoken: Array<{ plannerNativeThreadId: string; text: string }> = [];
       let appendAttempts = 0;
       let appendSpeechFails = false;
@@ -140,11 +142,20 @@ it.effect.each([false, true])(
         ["message.updated", yield* Queue.unbounded<OrchestrationV2StoredEvent>()],
       ]);
       let plannerCalls = 0;
+      let pendingPlannerCalls = 0;
+      let plannerGate:
+        | {
+            readonly entered: Deferred.Deferred<void>;
+            readonly release: Deferred.Deferred<void>;
+            readonly failAfterRelease: boolean;
+          }
+        | undefined;
       const runtime = {
         instanceId: ProviderInstanceId.make("codex-test"),
         providerSessionId: ProviderSessionId.make("provider-session-test"),
         driver: "codex",
         liveVoice: {
+          preparationConfigurationId: "configuration-1",
           events: Stream.fromQueue(nativeEvents),
           preparePlanner: (input: {
             serviceTier?: string | null;
@@ -157,7 +168,22 @@ it.effect.each([false, true])(
             }) => Effect.Effect<string>;
             onWorkControl: NonNullable<typeof controlWork>;
           }) =>
-            Effect.sync(() => {
+            Effect.gen(function* () {
+              const gate = plannerGate;
+              plannerGate = undefined;
+              if (gate) {
+                pendingPlannerCalls += 1;
+                yield* Deferred.succeed(gate.entered, undefined);
+                yield* Deferred.await(gate.release);
+                if (gate.failAfterRelease)
+                  return yield* Effect.fail(
+                    new ProviderAdapter.ProviderAdapterProtocolError({
+                      driver: ProviderDriverKind.make("codex"),
+                      detail: "Synthetic native preparation failed after End.",
+                    }),
+                  );
+                return { plannerNativeThreadId: "planner-native-pending-end" };
+              }
               plannerCalls += 1;
               submitWork = input.onSubmitWork;
               controlWork = input.onWorkControl;
@@ -248,6 +274,45 @@ it.effect.each([false, true])(
         cwd: "/private/test-worktree",
       } as never;
       let currentPolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy = policy;
+      let primaryRuntime = runtime;
+      let snapshotGate:
+        | { readonly entered: Deferred.Deferred<void>; readonly release: Deferred.Deferred<void> }
+        | undefined;
+      const originalInstance = {
+        driverKind: "codex",
+        enabled: true,
+        snapshot: {
+          getSnapshot: Effect.gen(function* () {
+            const gate = snapshotGate;
+            snapshotGate = undefined;
+            if (gate) {
+              yield* Deferred.succeed(gate.entered, undefined);
+              yield* Deferred.await(gate.release);
+            }
+            return {
+              instanceId: providerInstanceId,
+              enabled: true,
+              installed: true,
+              status: "ready",
+              nativeLiveVoicePreparation: {
+                configurationId: "configuration-1",
+                setupMode: "existing",
+                accountSource: "native-account-read",
+                transport: "codex-webrtc-v3",
+              },
+            };
+          }),
+        },
+      };
+      let currentInstance = originalInstance;
+      let projectionRollover:
+        | {
+            readonly entered: Deferred.Deferred<void>;
+            readonly release: Deferred.Deferred<void>;
+            readonly captured: OrchestrationV2ThreadProjection;
+            readonly reads: ProviderInstanceId[];
+          }
+        | undefined;
       const dependencies = Layer.mergeAll(
         NodeSqliteClient.layer({ filename: ":memory:" }),
         NodeCrypto.layer,
@@ -276,15 +341,48 @@ it.effect.each([false, true])(
         Layer.succeed(ProviderSessionManager.ProviderSessionManagerV2, {
           get: (providerSessionId: ProviderSessionId) =>
             Effect.succeed(
-              Option.some(
-                !reuseRuntime && providerSessionId === secondProviderSessionId
-                  ? secondRuntime
-                  : runtime,
-              ),
+              projectionRollover
+                ? Option.none()
+                : Option.some(
+                    !reuseRuntime && providerSessionId === secondProviderSessionId
+                      ? secondRuntime
+                      : primaryRuntime,
+                  ),
             ),
+          open: () =>
+            Effect.sync(() => {
+              opens += 1;
+              return primaryRuntime;
+            }),
         } as unknown as ProviderSessionManager.ProviderSessionManagerV2Shape),
         Layer.succeed(ThreadManagementService.ThreadManagementService, {
-          getThreadProjection: () => Effect.succeed(durableProjection),
+          getThreadProjection: () =>
+            Effect.gen(function* () {
+              const rollover = projectionRollover;
+              if (rollover === undefined) return durableProjection;
+              if (rollover.reads.length === 1) {
+                durableProjection = rollover.captured;
+                const captured = durableProjection;
+                rollover.reads.push(captured.thread.providerInstanceId);
+                yield* Deferred.succeed(rollover.entered, undefined);
+                yield* Deferred.await(rollover.release);
+                return captured;
+              }
+              rollover.reads.push(durableProjection.thread.providerInstanceId);
+              return durableProjection;
+            }),
+          interruptThread: () =>
+            Effect.sync(() => {
+              workCancels += 1;
+            }),
+          stopWorkflow: () =>
+            Effect.sync(() => {
+              workCancels += 1;
+            }),
+          stopDelegatedTasks: () =>
+            Effect.sync(() => {
+              workCancels += 1;
+            }),
           getProjectThread: () =>
             Effect.sync(() => {
               const resolve = gateReadResolvers.shift();
@@ -355,16 +453,75 @@ it.effect.each([false, true])(
             }),
         } as unknown as ThreadManagementService.ThreadManagementServiceShape),
         Layer.succeed(ProviderInstanceRegistry.ProviderInstanceRegistry, {
-          getInstance: () => Effect.succeed({ driverKind: "codex" }),
+          getInstance: () => Effect.succeed(currentInstance),
         } as unknown as ProviderInstanceRegistry.ProviderInstanceRegistry["Service"]),
       );
       const program = Effect.gen(function* () {
         yield* runMigrations();
         const sql = yield* SqlClient.SqlClient;
         const service = yield* CodexLiveSessionService.CodexLiveSessionService;
+        const nativePreparation = { providerInstanceId, configurationId: "configuration-1" };
+        for (const invalid of [
+          { ...nativePreparation, providerInstanceId: ProviderInstanceId.make("foreign-provider") },
+          { ...nativePreparation, configurationId: "old-configuration" },
+        ]) {
+          assert.isTrue(
+            Exit.isFailure(
+              yield* Effect.exit(
+                service.prepare(session, {
+                  threadId,
+                  clientRequestId: "wrong-target",
+                  nativePreparation: invalid,
+                }),
+              ),
+            ),
+          );
+          assert.equal(plannerCalls, 0);
+          assert.equal(sends, 0);
+          const rows = yield* sql`SELECT lease_id FROM codex_live_voice_leases`;
+          assert.equal(rows.length, 0);
+        }
+        const canonicalBeforeRollover = durableProjection;
+        const capturedProviderId = ProviderInstanceId.make("captured-foreign-provider");
+        const captureEntered = yield* Deferred.make<void>();
+        const captureRelease = yield* Deferred.make<void>();
+        const projectionReads: ProviderInstanceId[] = [];
+        projectionRollover = {
+          entered: captureEntered,
+          release: captureRelease,
+          captured: {
+            ...durableProjection,
+            thread: { ...durableProjection.thread, providerInstanceId: capturedProviderId },
+          },
+          reads: projectionReads,
+        };
+        const abaPrepare = yield* service
+          .prepare(session, {
+            threadId,
+            clientRequestId: "captured-provider-rollover",
+            nativePreparation,
+          })
+          .pipe(Effect.exit, Effect.forkChild);
+        yield* Deferred.await(captureEntered);
+        assert.equal(durableProjection.thread.providerInstanceId, capturedProviderId);
+        durableProjection = canonicalBeforeRollover;
+        yield* Deferred.succeed(captureRelease, undefined);
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(abaPrepare)));
+        assert.deepEqual(projectionReads, [providerInstanceId, capturedProviderId]);
+        assert.equal(durableProjection.thread.providerInstanceId, providerInstanceId);
+        assert.equal((yield* sql`SELECT lease_id FROM codex_live_voice_leases`).length, 0);
+        assert.equal(opens, 0, "a captured foreign provider must be refused before runtime open");
+        assert.equal(plannerCalls, 0);
+        assert.equal(sends, 0);
+        assert.equal(steers, 0);
+        assert.equal(stops, 0);
+        assert.equal(workCancels, 0);
+        assert.strictEqual(durableProjection, canonicalBeforeRollover);
+        projectionRollover = undefined;
         const prepared = yield* service.prepare(session, {
           threadId,
           clientRequestId: "prepare-1",
+          nativePreparation,
         });
         assert.equal(prepared.status, "prepared");
         assert.equal(prepared.providerSessionId, "provider-session-test");
@@ -373,8 +530,42 @@ it.effect.each([false, true])(
         const duplicatePrepare = yield* service.prepare(session, {
           threadId,
           clientRequestId: "prepare-1",
+          nativePreparation,
         });
         assert.equal(duplicatePrepare.leaseId, prepared.leaseId);
+        assert.equal(plannerCalls, 1);
+        for (const replacement of ["registry", "runtime"] as const) {
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          snapshotGate = { entered, release };
+          const retry = yield* service
+            .prepare(session, {
+              threadId,
+              clientRequestId: "prepare-1",
+              nativePreparation,
+            })
+            .pipe(Effect.exit, Effect.forkChild);
+          yield* Deferred.await(entered);
+          if (replacement === "registry") currentInstance = { ...originalInstance };
+          else primaryRuntime = { ...runtime };
+          yield* Deferred.succeed(release, undefined);
+          assert.isTrue(Exit.isFailure(yield* Fiber.join(retry)));
+          assert.equal(plannerCalls, 1);
+          assert.equal(sends, 0);
+          currentInstance = originalInstance;
+          primaryRuntime = runtime;
+        }
+        assert.isTrue(
+          Exit.isFailure(
+            yield* service
+              .prepare(session, {
+                threadId,
+                clientRequestId: "prepare-1",
+                nativePreparation: { ...nativePreparation, configurationId: "different-body" },
+              })
+              .pipe(Effect.exit),
+          ),
+        );
         assert.equal(plannerCalls, 1);
 
         const delivered = yield* Queue.unbounded<LiveVoiceEvent>();
@@ -1092,6 +1283,66 @@ it.effect.each([false, true])(
           "late readiness must not resurrect a stopping call",
         );
 
+        assert.isTrue(
+          Exit.isFailure(
+            yield* service
+              .prepare(session, {
+                threadId,
+                clientRequestId: "prepare-1",
+                nativePreparation,
+              })
+              .pipe(Effect.exit),
+          ),
+        );
+        assert.equal(plannerCalls, 1, "a closed binding cannot create another planner");
+        const canonicalRunsBeforeEnd = durableProjection.runs;
+        const canonicalChildrenBeforeEnd = durableProjection.subagents;
+        for (const failAfterRelease of [false, true]) {
+          const requestId = `prepare-pending-end-${failAfterRelease}`;
+          const stopRequestId = `end-pending-prepare-${failAfterRelease}`;
+          const plannerEntered = yield* Deferred.make<void>();
+          const plannerRelease = yield* Deferred.make<void>();
+          plannerGate = { entered: plannerEntered, release: plannerRelease, failAfterRelease };
+          const interruptedPrepare = yield* service
+            .prepare(session, { threadId, clientRequestId: requestId, nativePreparation })
+            .pipe(Effect.exit, Effect.forkChild);
+          yield* Deferred.await(plannerEntered);
+          const pendingRows = yield* sql<{ lease_id: string; generation: number }>`
+            SELECT lease_id, generation FROM codex_live_voice_leases
+            WHERE client_request_id = ${requestId}`;
+          const pendingRow = pendingRows[0];
+          if (!pendingRow) return yield* Effect.die("Missing owned pending lease");
+          const endInput = {
+            leaseId: pendingRow.lease_id,
+            generation: pendingRow.generation,
+            clientRequestId: stopRequestId,
+          };
+          const endedPending = yield* service.stop(session, endInput);
+          assert.equal(endedPending.status, "closed");
+          assert.deepEqual(yield* service.stop(session, endInput), endedPending);
+          assert.equal(stops, failAfterRelease ? 2 : 1, "pending End has no provider side effect");
+          yield* Deferred.succeed(plannerRelease, undefined);
+          assert.isTrue(Exit.isFailure(yield* Fiber.join(interruptedPrepare)));
+          const retiredRows = yield* sql<{
+            status: string;
+            stop_client_request_id: string | null;
+          }>`SELECT status, stop_client_request_id FROM codex_live_voice_leases
+            WHERE lease_id = ${pendingRow.lease_id}`;
+          assert.equal(retiredRows[0]?.status, "closed", "late preparation cannot revive End");
+          assert.equal(retiredRows[0]?.stop_client_request_id, stopRequestId);
+          assert.deepEqual(
+            yield* service.stop(session, {
+              ...endInput,
+              clientRequestId: `${stopRequestId}-again`,
+            }),
+            endedPending,
+          );
+          assert.equal(stops, 2, "only a returned restricted planner is cleaned up, once");
+          assert.equal(sends, 4, "End during prepare cannot submit or cancel canonical work");
+          assert.strictEqual(durableProjection.runs, canonicalRunsBeforeEnd);
+          assert.strictEqual(durableProjection.subagents, canonicalChildrenBeforeEnd);
+        }
+        assert.equal(pendingPlannerCalls, 2);
         durableProjection = {
           ...projection,
           providerSessions: [{ id: secondProviderSessionId, providerInstanceId }],

@@ -647,6 +647,7 @@ export interface ProviderAdapterV2SessionRuntime {
 }
 
 export interface ProviderAdapterV2LiveVoiceRuntime {
+  readonly preparationConfigurationId?: string;
   readonly events: Stream.Stream<ProviderAdapterV2LiveVoiceEvent, ProviderAdapterV2Error>;
   readonly preparePlanner: (input: {
     readonly modelSelection: ModelSelection;

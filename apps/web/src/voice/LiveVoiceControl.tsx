@@ -83,6 +83,7 @@ type LiveVoiceAvailability = {
   readonly threadId: ThreadId | null;
   readonly providerInstanceId: string | null;
   readonly reason: string | null;
+  readonly nativePreparation: ServerProvider["nativeLiveVoicePreparation"] | null;
   readonly facts: Readonly<{
     driver: "codex" | "other" | "unknown";
     setupMode: "managed" | "existing" | "missing" | "invalid" | "unknown";
@@ -114,6 +115,7 @@ export function resolveLiveVoiceAvailability(input: {
     readonly enabled: boolean;
     readonly isAvailable: boolean;
   } | null;
+  readonly nativePreparation?: ServerProvider["nativeLiveVoicePreparation"];
   readonly instanceConfigured: boolean;
   readonly projectOverride?: boolean | undefined;
   readonly config: unknown;
@@ -141,39 +143,45 @@ export function resolveLiveVoiceAvailability(input: {
   else if (!input.provider.isAvailable)
     reason = "The selected provider is unavailable. Check its setup in Settings.";
   else if (input.provider.driverKind !== "codex")
-    reason = "Select a managed Codex provider to use Live voice.";
+    reason =
+      "Live voice is unavailable for this thread. Check the selected provider and permissions.";
   else if (!input.selectionCurrent || !input.providerInstanceId)
     reason = "Waiting for this thread's provider selection to update.";
-  else if (!input.instanceConfigured)
-    reason = "The selected Codex instance has no saved settings. Complete its setup in Settings.";
-  else if (input.config === null || input.config === undefined)
-    reason = "Codex setup mode is missing. Complete its setup in Settings.";
-  else if (typeof input.config !== "object" || !("setupMode" in input.config))
-    reason = "Codex setup mode is invalid or missing. Check its setup in Settings.";
-  else if (input.config.setupMode === "existing")
+  else if (
+    !input.nativePreparation ||
+    input.nativePreparation.accountSource !== "native-account-read" ||
+    input.nativePreparation.setupMode !== "existing" ||
+    input.nativePreparation.transport !== "codex-webrtc-v3" ||
+    !input.nativePreparation.configurationId.trim() ||
+    input.nativePreparation.configurationId.length > 128
+  )
     reason =
-      "This Codex provider uses an existing installation. Live voice requires managed setup.";
-  else if (input.config.setupMode !== "managed")
-    reason = "Codex setup mode is invalid. Check its setup in Settings.";
+      "Live voice is unavailable for this thread. Check the selected provider and permissions.";
   const catalogMatches = input.catalogEnvironmentId === input.environmentId;
   const catalogReady = catalogMatches && input.configState === "ready";
   const settingsReady = catalogReady && input.settingsKnown;
-  const setupMode = !settingsReady
-    ? "unknown"
-    : input.config === null || input.config === undefined
-      ? "missing"
-      : typeof input.config !== "object"
-        ? "invalid"
-        : !("setupMode" in input.config)
+  const setupMode =
+    settingsReady && input.provider?.driverKind === "codex" && input.nativePreparation
+      ? input.nativePreparation.setupMode
+      : !settingsReady
+        ? "unknown"
+        : input.config === null || input.config === undefined
           ? "missing"
-          : input.config.setupMode === "managed" || input.config.setupMode === "existing"
-            ? input.config.setupMode
-            : "invalid";
+          : typeof input.config !== "object"
+            ? "invalid"
+            : !("setupMode" in input.config)
+              ? "missing"
+              : input.config.setupMode === "managed" || input.config.setupMode === "existing"
+                ? input.config.setupMode
+                : "invalid";
   return Object.freeze({
     environmentId: input.environmentId,
     threadId: input.threadId,
     providerInstanceId: input.providerInstanceId,
     reason,
+    nativePreparation: input.nativePreparation
+      ? Object.freeze({ ...input.nativePreparation })
+      : null,
     facts: Object.freeze({
       driver:
         !catalogReady || !input.provider
@@ -226,7 +234,6 @@ export function resolveLiveVoiceControlGate(input: {
   );
   const supported = isLiveVoiceSupported({
     provider: "codex",
-    setupMode: "managed",
     RTCPeerConnection: input.RTCPeerConnection,
     getUserMedia: input.getUserMedia,
   });
@@ -649,15 +656,29 @@ export function LiveVoiceControl(props: {
       if (diagnosticProducer.current === producer) diagnosticProducer.current = null;
     };
   }, [diagnosticBridge]);
+  const preparationConfigurationId = props.availability.nativePreparation?.configurationId;
   const target = useMemo<LiveVoiceTarget | null>(() => {
-    if (!props.threadId || !props.providerInstanceId || !targetPresent) return null;
+    if (
+      !props.threadId ||
+      !props.providerInstanceId ||
+      !targetPresent ||
+      !preparationConfigurationId
+    )
+      return null;
     return {
       environmentId: props.environmentId,
       threadId: props.threadId,
       provider: "codex",
       providerInstanceId: props.providerInstanceId,
+      preparationConfigurationId,
     };
-  }, [targetPresent, props.environmentId, props.providerInstanceId, props.threadId]);
+  }, [
+    targetPresent,
+    props.environmentId,
+    props.providerInstanceId,
+    props.threadId,
+    preparationConfigurationId,
+  ]);
   const bridge = useMemo(() => createVoiceEventBridge(), []);
   const signaling = useMemo<LiveVoiceSignalingAdapter>(
     () => ({

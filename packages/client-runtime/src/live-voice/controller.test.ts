@@ -611,12 +611,11 @@ describe("LiveVoiceController", () => {
     expect(
       isLiveVoiceSupported({
         provider: "claude",
-        setupMode: "managed",
         RTCPeerConnection: FakeRTCPeerConnection,
         getUserMedia: () => undefined,
       }),
     ).toBe(false);
-    expect(isLiveVoiceSupported({ provider: "codex", setupMode: "managed" })).toBe(false);
+    expect(isLiveVoiceSupported({ provider: "codex" })).toBe(false);
   });
 
   it("marks blocked browser playback separately from RTC readiness and can retry", async () => {
@@ -842,5 +841,35 @@ describe("LiveVoiceController", () => {
     );
     await harness.controller.end();
     expect(harness.calls.filter((call) => call === "unsubscribe")).toHaveLength(1);
+  });
+});
+
+describe("native preparation configuration fencing", () => {
+  it("sends the captured same-instance expectation only after deliberate Start", async () => {
+    const pending = deferred<LiveVoiceLease>();
+    const harness = createHarness({ prepare: () => pending.promise });
+    const bound = { ...target, preparationConfigurationId: "configuration-1" };
+    expect(harness.signaling.prepare).not.toHaveBeenCalled();
+    const starting = harness.controller.start(bound);
+    expect(harness.signaling.prepare).toHaveBeenCalledWith(
+      {
+        threadId: target.threadId,
+        clientRequestId: expect.any(String),
+        nativePreparation: {
+          providerInstanceId: target.providerInstanceId,
+          configurationId: "configuration-1",
+        },
+      },
+      expect.any(AbortSignal),
+    );
+    await harness.controller.contextChanged({
+      ...bound,
+      preparationConfigurationId: "configuration-2",
+    });
+    pending.resolve(lease);
+    await starting;
+    expect(harness.signaling.stop).toHaveBeenCalledOnce();
+    expect(harness.calls).not.toContain("add-track");
+    expect(harness.calls).not.toContain("signaling-start");
   });
 });
