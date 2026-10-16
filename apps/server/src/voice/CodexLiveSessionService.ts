@@ -632,7 +632,24 @@ export const layer: Layer.Layer<
             AND status IN ('preparing', 'prepared', 'starting', 'active', 'stopping', 'unknown')
           ORDER BY updated_at DESC LIMIT 1
         `.pipe(Effect.map((rows) => rows[0]));
-            if (previousLease !== undefined) return yield* liveError("dispatch_conflict");
+            if (previousLease !== undefined) {
+              if (
+                previousLease.principal_session_id !== session.sessionId ||
+                previousLease.principal_subject !== session.subject
+              ) {
+                return yield* liveError("dispatch_conflict");
+              }
+              const retired = yield* stopLease(
+                session,
+                {
+                  leaseId: previousLease.lease_id,
+                  generation: previousLease.generation,
+                  clientRequestId: yield* crypto.randomUUIDv4(),
+                },
+                true,
+              );
+              if (retired.status !== "failed") return yield* liveError("dispatch_conflict");
+            }
 
             const leaseId = yield* crypto.randomUUIDv4();
             const generation = 1;
@@ -889,13 +906,31 @@ export const layer: Layer.Layer<
         )
         .pipe(Effect.mapError(toLiveError));
 
-    const stop: CodexLiveSessionService["Service"]["stop"] = (session, input) =>
+    const stopLease = (
+      session: EnvironmentAuth.AuthenticatedSession,
+      input: LiveVoiceStopInput,
+      recoverNeverStartedOrphan = false,
+    ) =>
       leaseLocks
         .withLock(
           leaseKey(input.leaseId, input.generation),
           Effect.gen(function* () {
             yield* ensurePrincipal(session);
             const row = yield* getOwnedLease(session.sessionId, input.leaseId, input.generation);
+            // Recheck after acquiring the lease lock: a new prepare must never
+            // stop a native call or a lease belonging to another subject.
+            if (
+              recoverNeverStartedOrphan &&
+              (row.principal_subject !== session.subject ||
+                row.status !== "unknown" ||
+                row.planner_native_thread_id !== null ||
+                row.native_started !== 0 ||
+                row.native_sdp_received !== 0 ||
+                row.start_client_request_id !== null ||
+                active.has(leaseKey(input.leaseId, input.generation)))
+            ) {
+              return yield* liveError("dispatch_conflict");
+            }
             if (
               row.stop_client_request_id === input.clientRequestId ||
               row.status === "closed" ||
@@ -944,6 +979,9 @@ export const layer: Layer.Layer<
           }),
         )
         .pipe(Effect.mapError(toLiveError));
+
+    const stop: CodexLiveSessionService["Service"]["stop"] = (session, input) =>
+      stopLease(session, input);
 
     const status: CodexLiveSessionService["Service"]["status"] = (session, input) =>
       Effect.gen(function* () {

@@ -17,6 +17,9 @@ import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+const showToast = vi.hoisted(() => vi.fn());
+vi.mock("~/components/ui/toast", () => ({ toastManager: { add: showToast } }));
+
 const commands = vi.hoisted(() => ({
   prepare: vi.fn(),
   start: vi.fn(),
@@ -107,6 +110,7 @@ beforeEach(() => {
   commands.prepare.mockResolvedValue(
     AsyncResult.failure(Cause.fail(new LiveVoiceError({ code: "managed_account_required" }))),
   );
+  showToast.mockReset();
   peer.mockClear();
   getUserMedia.mockClear();
   container = document.createElement("div");
@@ -778,6 +782,63 @@ describe("LiveVoice instance defaults", () => {
 });
 
 describe("LiveVoiceControl passive availability", () => {
+  it("toasts each failed start once while preserving the draft and Start/End controls", async () => {
+    let finishSaving!: () => void;
+    const saving = new Promise<void>((resolve) => {
+      finishSaving = resolve;
+    });
+    const beforePrepare = () => saving;
+    commands.prepare.mockResolvedValue(
+      AsyncResult.failure(Cause.fail(new LiveVoiceError({ code: "dispatch_conflict" }))),
+    );
+    container.style.width = "390px";
+    const renderComposer = () =>
+      act(async () =>
+        root.render(
+          <TooltipProvider delay={0}>
+            <textarea aria-label="Draft" defaultValue="unsent sentinel" />
+            <LiveVoiceControl
+              environmentId={loaded.environmentId}
+              threadId={loaded.threadId}
+              providerInstanceId={loaded.providerInstanceId}
+              eligible={true}
+              availability={resolveLiveVoiceAvailability(loaded)}
+              beforePrepare={beforePrepare}
+            />
+          </TooltipProvider>,
+        ),
+      );
+    await renderComposer();
+    const draft = container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Draft"]')!;
+    await act(async () => startButton().click());
+    expect(container.querySelector('[aria-label="End Live voice"]')).not.toBeNull();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Preparing");
+    expect(showToast).not.toHaveBeenCalled();
+    await act(async () => {
+      finishSaving();
+      await saving;
+    });
+    expect(showToast).toHaveBeenCalledOnce();
+    expect(showToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        description: expect.stringContaining("Wait a moment, then start the call again"),
+      }),
+    );
+    expect(container.querySelector('[role="status"]')).toBeNull();
+    expect(container.textContent).not.toContain("Another voice request");
+    expect(startButton().disabled).toBe(false);
+    expect(container.querySelector('[aria-label="End Live voice"]')).toBeNull();
+    await renderComposer();
+    expect(container.querySelector("textarea")).toBe(draft);
+    expect(draft.value).toBe("unsent sentinel");
+    expect(showToast).toHaveBeenCalledOnce();
+    await act(async () => startButton().click());
+    expect(showToast).toHaveBeenCalledTimes(2);
+    expect(draft.value).toBe("unsent sentinel");
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(peer).not.toHaveBeenCalled();
+  });
   it("uses the replacement controller's actual state after changing thread during a draft save", async () => {
     let finishSaving!: () => void;
     const saving = new Promise<void>((resolve) => {
@@ -830,7 +891,19 @@ describe("LiveVoiceControl passive availability", () => {
       await render(loaded);
       expectPassive();
       await act(async () => startButton().click());
-      expect(container.textContent).toContain(liveVoicePublicErrorMessage(code));
+      expect(showToast).toHaveBeenCalledOnce();
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "error",
+          description: expect.stringContaining(
+            code === "dispatch_conflict"
+              ? "Another voice request is still being handled"
+              : liveVoicePublicErrorMessage(code),
+          ),
+        }),
+      );
+      expect(container.querySelector('[role="status"]')).toBeNull();
+      expect(startButton().disabled).toBe(false);
       expect(commands.prepare).toHaveBeenCalledOnce();
       expect(commands.start).not.toHaveBeenCalled();
       expect(getUserMedia).not.toHaveBeenCalled();
@@ -872,6 +945,7 @@ describe("LiveVoiceControl passive availability", () => {
     );
     expect(startButton().disabled).toBe(false);
     expect(container.textContent).not.toContain("Sign in");
+    expect(showToast).not.toHaveBeenCalled();
     expect(commands.prepare).toHaveBeenCalledOnce();
     expect(commands.start).not.toHaveBeenCalled();
     expect(getUserMedia).not.toHaveBeenCalled();
@@ -1010,7 +1084,9 @@ describe("LiveVoiceControl passive availability", () => {
       expect(commands.start).not.toHaveBeenCalled();
       expect(getUserMedia).not.toHaveBeenCalled();
       expect(peer).not.toHaveBeenCalled();
-      expect(container.textContent).toContain("ChatGPT");
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ description: expect.stringContaining("ChatGPT") }),
+      );
     },
   );
 

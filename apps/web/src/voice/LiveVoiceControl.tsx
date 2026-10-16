@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
 import {
   LiveVoiceError,
+  liveVoicePublicErrorMessage,
   defaultInstanceIdForDriver,
   MainRendererDiagnosticsGate,
   MainRendererDiagnosticsRequest,
@@ -44,6 +45,7 @@ import {
 import { liveVoiceEnvironment } from "../state/liveVoice";
 import { useAtomCommand } from "../state/use-atom-command";
 import { Button } from "~/components/ui/button";
+import { toastManager } from "~/components/ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { randomUUID } from "~/lib/utils";
 import { LiveVoiceTranscript } from "./LiveVoiceTranscript";
@@ -724,7 +726,7 @@ export function LiveVoiceControl(props: {
     [bridge, prepare, props.environmentId, props.providerInstanceId, startRpc, statusRpc, stopRpc],
   );
   const stateObserver = useMemo(
-    () => ({ active: true }),
+    () => ({ active: true, errorNotified: false }),
     [signaling, props.beforePrepare, props.onPhaseChange],
   );
   const dependencies = useMemo<LiveVoiceControllerDependencies>(
@@ -748,6 +750,18 @@ export function LiveVoiceControl(props: {
         if (!stateObserver.active) return;
         setState(next);
         props.onPhaseChange?.(next.phase);
+        if (next.phase !== "error") stateObserver.errorNotified = false;
+        else if (!stateObserver.errorNotified) {
+          stateObserver.errorNotified = true;
+          toastManager.add({
+            type: "error",
+            title: "Live voice couldn't continue",
+            description:
+              next.error === liveVoicePublicErrorMessage("dispatch_conflict")
+                ? "Another voice request is still being handled. Wait a moment, then start the call again. Your draft is still here."
+                : `${next.error ?? "Could not connect to Live voice."} Try starting the call again. Your draft is still here.`,
+          });
+        }
       },
     }),
     [signaling, props.beforePrepare, props.onPhaseChange, stateObserver],
@@ -792,9 +806,7 @@ export function LiveVoiceControl(props: {
               ? "Live connected"
               : state.phase === "stopping"
                 ? "Ending Live…"
-                : state.phase === "error"
-                  ? state.error
-                  : null;
+                : null;
 
   const toggleMicrophone = useCallback(
     () => void controller.setLocalMuted(!state.localMuted),
@@ -807,9 +819,10 @@ export function LiveVoiceControl(props: {
   const onStart = useCallback(() => {
     if (canStart && target) {
       setPrepareFailure(null);
+      stateObserver.errorNotified = false;
       void controller.start(target);
     }
-  }, [canStart, controller, target]);
+  }, [canStart, controller, stateObserver, target]);
 
   return (
     <div
@@ -825,14 +838,6 @@ export function LiveVoiceControl(props: {
       ) : null}
       {!active && !busy ? (
         <>
-          {state.phase === "error" ? (
-            <span
-              role="status"
-              className="min-w-0 max-w-full wrap-break-word text-xs text-destructive"
-            >
-              {statusText}
-            </span>
-          ) : null}
           <Tooltip>
             <TooltipTrigger
               aria-describedby={hintId}

@@ -1295,16 +1295,67 @@ it.effect.each([false, true])(
         const stopsBeforeHistorical = stops;
         assert.equal((yield* service.stop(session, lease)).status, "failed");
         assert.equal(stops, stopsBeforeHistorical, "no native session exists to stop");
+        const neverStartedOrphan = {
+          principalSessionId: String(sessionId),
+          principalSubject: session.subject,
+          status: "unknown",
+          plannerNativeThreadId: null as string | null,
+          nativeStarted: 0,
+          nativeSdpReceived: 0,
+          startClientRequestId: null as string | null,
+        };
+        for (const unsafe of [
+          { ...neverStartedOrphan, reason: "foreign-session", principalSessionId: "different-owner" },
+          { ...neverStartedOrphan, reason: "foreign-subject", principalSubject: "different-subject" },
+          { ...neverStartedOrphan, reason: "not-unknown", status: "prepared" },
+          { ...neverStartedOrphan, reason: "planner", plannerNativeThreadId: "unresolved-planner" },
+          { ...neverStartedOrphan, reason: "native-started", nativeStarted: 1 },
+          { ...neverStartedOrphan, reason: "native-sdp", nativeSdpReceived: 1 },
+          { ...neverStartedOrphan, reason: "start-request", startClientRequestId: "uncertain-start" },
+        ]) {
+          yield* sql`UPDATE codex_live_voice_leases SET
+            principal_session_id = ${unsafe.principalSessionId},
+            principal_subject = ${unsafe.principalSubject}, status = ${unsafe.status},
+            planner_native_thread_id = ${unsafe.plannerNativeThreadId},
+            native_started = ${unsafe.nativeStarted}, native_sdp_received = ${unsafe.nativeSdpReceived},
+            start_client_request_id = ${unsafe.startClientRequestId}
+            WHERE lease_id = ${lease.leaseId}`;
+          const error = yield* Effect.flip(
+            service.prepare(session, { threadId, clientRequestId: `unsafe-orphan-${unsafe.reason}` }),
+          );
+          assert.equal(error.code, "dispatch_conflict", unsafe.reason);
+          const persisted = yield* sql<{ status: string }>`
+            SELECT status FROM codex_live_voice_leases WHERE lease_id = ${lease.leaseId}
+          `;
+          assert.equal(persisted[0]!.status, unsafe.status, "unsafe leases remain untouched");
+        }
+        yield* sql`UPDATE codex_live_voice_leases SET
+          principal_session_id = ${sessionId}, principal_subject = ${session.subject}, status = 'unknown',
+          planner_native_thread_id = NULL, native_started = 0, native_sdp_received = 0,
+          start_client_request_id = NULL WHERE lease_id = ${lease.leaseId}`;
         plannerFailure = undefined;
         const retry = yield* service.prepare(session, {
           threadId,
-          clientRequestId: "prepare-after-failure",
+          clientRequestId: "prepare-after-restart-orphan",
         });
+        const retiredOrphan = yield* sql<{ status: string }>`
+          SELECT status FROM codex_live_voice_leases WHERE lease_id = ${lease.leaseId}
+        `;
+        assert.equal(retiredOrphan[0]!.status, "failed", "new prepare retires only its own never-started orphan");
+        assert.equal(stops, stopsBeforeHistorical, "orphan recovery never calls the native runtime");
         assert.equal(
           retry.status,
           "prepared",
           "failed preparation and historical empty leases do not block a new call",
         );
+        yield* sql`UPDATE codex_live_voice_leases SET status = 'unknown',
+          planner_native_thread_id = NULL WHERE lease_id = ${retry.leaseId}`;
+        const activeConflict = yield* Effect.flip(
+          service.prepare(session, { threadId, clientRequestId: "active-runtime-is-not-an-orphan" }),
+        );
+        assert.equal(activeConflict.code, "dispatch_conflict", "an in-memory active lease cannot be retired");
+        yield* sql`UPDATE codex_live_voice_leases SET status = 'prepared',
+          planner_native_thread_id = ${retry.plannerNativeThreadId} WHERE lease_id = ${retry.leaseId}`;
       });
       yield* program.pipe(
         Effect.provide(Layer.provideMerge(CodexLiveSessionService.layer, dependencies)),
