@@ -3,6 +3,11 @@ name: Weasel CI
 on:
   workflow_dispatch:
     inputs:
+      nativeRpcDiagnostic:
+        description: Run the bounded serialized native RPC compiler diagnostic only
+        required: false
+        default: false
+        type: boolean
       buildCandidateCLI:
         description: Build an unpublished Linux x64 CLI/service candidate
         required: false
@@ -32,7 +37,7 @@ permissions:
 
 jobs:
   check:
-    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
+    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code') && !(github.event_name == 'workflow_dispatch' && inputs.nativeRpcDiagnostic)
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 45
     steps:
@@ -92,7 +97,7 @@ jobs:
           packages/provider-core/src/server/ProviderAdapter.ts
   product_bundle:
     needs: [check]
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.nativeRpcDiagnostic
     runs-on: ${{ vars.WEASEL_LINUX_RUNNER || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 30
     steps:
@@ -228,7 +233,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
   windows_installer_guard:
-    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code')
+    if: github.repository == (vars.WEASEL_RELEASE_REPOSITORY || 'EvilWeasel/t3code') && !(github.event_name == 'workflow_dispatch' && inputs.nativeRpcDiagnostic)
     runs-on: ${{ vars.WEASEL_WINDOWS_RUNNER || 'blacksmith-8vcpu-windows-2025' }}
     timeout-minutes: 5
     steps:
@@ -236,3 +241,67 @@ jobs:
       - name: Verify Windows installer process isolation
         shell: powershell
         run: ./apps/desktop/resources/test-morrowbyte-installer-guard.ps1
+
+  native_rpc_diagnostic:
+    if: github.event_name == 'workflow_dispatch' && inputs.nativeRpcDiagnostic && github.repository == 'morrowbyte/t3code' && github.ref_name == 'feature/live-native-rpc-diagnostic-20261016'
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+      - name: Run bounded serialized RPC compiler diagnostic
+        env:
+          EXPECTED_LOCK_SHA: 92d93fb6cc31e4f7da200e8e0d78c6fd178c1e8d5d78d9a63e2873e617f2d269
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(sha256sum pnpm-lock.yaml | cut -d' ' -f1)" = "$EXPECTED_LOCK_SHA"
+          test "$(sha256sum packages/contracts/src/rpc.test.ts | cut -d' ' -f1)" = 7a08a3fb9c085da6816cb0262ca7744a2c9765b1ca74f9858221a74a23a471ca
+          test "$(sha256sum apps/server/src/observability/RpcInstrumentation.test.ts | cut -d' ' -f1)" = 9dc5770bf9d0f099dc60f7fc5bc737e83078784cbac8115bc8a63c03745ad525
+          diagnostic_dir="$RUNNER_TEMP/native-rpc-diagnostic"
+          mkdir -m 700 "$diagnostic_dir"
+          export DIAGNOSTIC_DIR="$diagnostic_dir"
+          set +e
+          vp run --filter=@t3tools/contracts typecheck > "$diagnostic_dir/contracts.log" 2>&1
+          contracts_exit=$?
+          vp run --filter=t3 typecheck > "$diagnostic_dir/server.log" 2>&1
+          server_exit=$?
+          tests_exit=NOT_REACHED
+          if [[ "$contracts_exit" == 0 && "$server_exit" == 0 ]]; then
+            vp test run packages/contracts/src/rpc.test.ts apps/server/src/observability/RpcInstrumentation.test.ts > "$diagnostic_dir/tests.log" 2>&1
+            tests_exit=$?
+          fi
+          set -e
+          export CONTRACTS_EXIT="$contracts_exit" SERVER_EXIT="$server_exit" TESTS_EXIT="$tests_exit"
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+          const hash=p=>crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+          const tests=['packages/contracts/src/rpc.test.ts','apps/server/src/observability/RpcInstrumentation.test.ts'];
+          const logs=fs.readdirSync(process.env.DIAGNOSTIC_DIR).filter(n=>n.endsWith('.log')).map(name=>{
+            const path=process.env.DIAGNOSTIC_DIR+'/'+name;
+            const bytes=fs.statSync(path).size;
+            if(bytes>4*1024*1024) throw Error('Diagnostic log exceeds bound');
+            return {name,bytes,sha256:hash(path)};
+          });
+          fs.writeFileSync(process.env.DIAGNOSTIC_DIR+'/receipt.json',JSON.stringify({kind:'bounded-diagnostic-not-qualification',source:process.env.GITHUB_SHA,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,lockSha256:hash('pnpm-lock.yaml'),tests:tests.map(path=>({path,sha256:hash(path)})),commands:['vp run --filter=@t3tools/contracts typecheck','vp run --filter=t3 typecheck','vp test run packages/contracts/src/rpc.test.ts apps/server/src/observability/RpcInstrumentation.test.ts'],exits:{contracts:Number(process.env.CONTRACTS_EXIT),server:Number(process.env.SERVER_EXIT),tests:process.env.TESTS_EXIT==='NOT_REACHED'?'NOT_REACHED':Number(process.env.TESTS_EXIT)},logs},null,2)+'\n',{flag:'wx',mode:0o600});
+          NODE
+          test "$contracts_exit" == 0
+          test "$server_exit" == 0
+          test "$tests_exit" == 0
+      - name: Preserve bounded serialized RPC diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-rpc-diagnostic-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-rpc-diagnostic
+          if-no-files-found: error
+          retention-days: 7

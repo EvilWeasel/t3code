@@ -293,3 +293,140 @@ describe("registered observatory read JSON codecs", () => {
     expect(Schema.encodeSync(codec)(Schema.decodeUnknownSync(codec)(offline))).toEqual(offline);
   });
 });
+
+describe("native preparation registered JSON codecs", () => {
+  it("keeps the exact selected expectation optional, bounded and private-extra free", () => {
+    const rpc = WsRpcGroup.requests.get(WS_METHODS.liveVoicePrepare);
+    if (rpc?._tag !== WS_METHODS.liveVoicePrepare) throw new Error("Missing native prepare RPC");
+    const codec = Schema.toCodecJson(rpc.payloadSchema);
+    const decode = Schema.decodeUnknownSync(codec);
+    const legacy = { threadId: "native-thread", clientRequestId: "native-request" };
+    const nativePreparation = {
+      providerInstanceId: "codex-personal",
+      configurationId: "factory-1",
+    };
+    expect(Schema.encodeSync(codec)(decode(legacy))).toEqual(legacy);
+    expect(
+      Schema.encodeSync(codec)(
+        decode({
+          ...legacy,
+          nativePreparation: {
+            ...nativePreparation,
+            token: "synthetic-private",
+            accountId: "private",
+          },
+        }),
+      ),
+    ).toEqual({ ...legacy, nativePreparation });
+    for (const configurationId of ["", "x".repeat(129)]) {
+      expect(
+        Exit.isFailure(
+          Schema.decodeUnknownExit(codec)({
+            ...legacy,
+            nativePreparation: { ...nativePreparation, configurationId },
+          }),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it("carries native provenance through all four registered config response codecs", () => {
+    const get = WsRpcGroup.requests.get(WS_METHODS.serverGetConfig);
+    if (get?._tag !== WS_METHODS.serverGetConfig) throw new Error("Missing config RPC");
+    const refresh = WsRpcGroup.requests.get(WS_METHODS.serverRefreshProviders);
+    if (refresh?._tag !== WS_METHODS.serverRefreshProviders) throw new Error("Missing refresh RPC");
+    const update = WsRpcGroup.requests.get(WS_METHODS.serverUpdateProvider);
+    if (update?._tag !== WS_METHODS.serverUpdateProvider) throw new Error("Missing update RPC");
+    const stream = WsRpcGroup.requests.get(WS_METHODS.subscribeServerConfig);
+    if (stream?._tag !== WS_METHODS.subscribeServerConfig) throw new Error("Missing config stream");
+    const native = {
+      configurationId: "factory-1",
+      setupMode: "existing",
+      accountSource: "native-account-read",
+      transport: "codex-webrtc-v3",
+    };
+    for (const provenance of [undefined, native]) {
+      const provider = {
+        instanceId: "codex-personal",
+        driver: "codex",
+        enabled: true,
+        installed: true,
+        version: null,
+        status: "ready",
+        auth: { status: "authenticated", type: "chatgpt" },
+        checkedAt: "2026-10-16T00:00:00.000Z",
+        models: [],
+        slashCommands: [],
+        skills: [],
+        ...(provenance === undefined
+          ? {}
+          : {
+              nativeLiveVoicePreparation: { ...provenance, token: "synthetic-private" },
+            }),
+      };
+      const config = {
+        environment: {
+          environmentId: "native-env",
+          label: "Synthetic",
+          platform: { os: "linux", arch: "x64" },
+          serverVersion: "synthetic",
+          capabilities: {},
+        },
+        auth: {
+          policy: "remote-reachable",
+          bootstrapMethods: [],
+          sessionMethods: [],
+          sessionCookieName: "synthetic",
+        },
+        cwd: "/synthetic",
+        keybindingsConfigPath: "/synthetic/keybindings",
+        keybindings: [],
+        issues: [],
+        providers: [provider],
+        availableEditors: [],
+        settings: {},
+        observability: {
+          logsDirectoryPath: "/synthetic/logs",
+          localTracingEnabled: false,
+          otlpTracesEnabled: false,
+          otlpMetricsEnabled: false,
+        },
+      };
+      const getCodec = Schema.toCodecJson(get.successSchema);
+      const refreshCodec = Schema.toCodecJson(refresh.successSchema);
+      const updateCodec = Schema.toCodecJson(update.successSchema);
+      const decodedGet = Schema.decodeUnknownSync(getCodec)(config);
+      const decodedRefresh = Schema.decodeUnknownSync(refreshCodec)({ providers: [provider] });
+      const decodedUpdate = Schema.decodeUnknownSync(updateCodec)({ providers: [provider] });
+      for (const result of [decodedGet, decodedRefresh, decodedUpdate]) {
+        expect(result.providers).toHaveLength(1);
+        expect(result.providers[0]?.nativeLiveVoicePreparation).toEqual(provenance);
+      }
+      for (const encoded of [
+        Schema.encodeSync(getCodec)(decodedGet),
+        Schema.encodeSync(refreshCodec)(decodedRefresh),
+        Schema.encodeSync(updateCodec)(decodedUpdate),
+      ]) {
+        expect(encoded.providers).toHaveLength(1);
+        expect(encoded.providers[0]?.nativeLiveVoicePreparation).toEqual(provenance);
+      }
+      const streamCodec = Schema.toCodecJson(stream.successSchema.success);
+      const event = Schema.decodeUnknownSync(streamCodec)({
+        version: 1,
+        type: "providerStatuses",
+        payload: { providers: [provider] },
+      });
+      if (event.type !== "providerStatuses") throw new Error("Wrong config event");
+      expect(event.payload.providers[0]?.nativeLiveVoicePreparation).toEqual(provenance);
+      expect(Schema.encodeSync(streamCodec)(event)).toEqual({
+        version: 1,
+        type: "providerStatuses",
+        payload: {
+          providers: Schema.encodeSync(refreshCodec)(
+            Schema.decodeUnknownSync(refreshCodec)({ providers: [provider] }),
+          ).providers,
+        },
+      });
+    }
+  });
+});

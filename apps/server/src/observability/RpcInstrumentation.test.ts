@@ -2,6 +2,12 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   AuthEnvironmentMaintainScope,
   AuthOrchestrationReadScope,
+  AuthOrchestrationOperateScope,
+  AuthProvidersManageScope,
+  LiveVoiceSession,
+  ServerConfig,
+  ServerConfigStreamEvent,
+  ServerProvider,
   type AuthEnvironmentScope,
   ScheduledTaskError,
   ScheduledTaskId,
@@ -19,6 +25,12 @@ import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import * as RpcTest from "effect/rpc/RpcTest";
+import * as Rpc from "effect/rpc/Rpc";
+import * as RpcServer from "effect/rpc/RpcServer";
+import * as RpcSerialization from "effect/rpc/RpcSerialization";
+import type { RequestEncoded, FromServerEncoded } from "effect/rpc/RpcMessage";
+import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 
 import { RPC_REQUIRED_SCOPES } from "../auth/RpcAuthorization.ts";
@@ -330,6 +342,340 @@ describe("WS RPC instrumentation middleware", () => {
         assert.deepStrictEqual(appSpans(ended), []);
         const snapshots = yield* Metric.snapshot;
         assert.equal(requestCount(snapshots, WS_METHODS.serverSignalProcess, "success")?.count, 1);
+      }),
+    ),
+  );
+});
+
+// Each expression is an independent compiler attribution point. Only the two
+// selected groups below get fixture handlers; the complete group is never run.
+const serializedNativeGroup = groupOf(WS_METHODS.liveVoicePrepare);
+const serializedMetadataGroup = groupOf(
+  WS_METHODS.serverGetConfig,
+  WS_METHODS.serverRefreshProviders,
+  WS_METHODS.serverUpdateProvider,
+  WS_METHODS.subscribeServerConfig,
+);
+const makeSerializedNativeBoundary = () =>
+  RpcServer.make(serializedNativeGroup, { disableTracing: true, disableFatalDefects: true });
+const makeSerializedMetadataBoundary = () =>
+  RpcServer.make(serializedMetadataGroup, { disableTracing: true, disableFatalDefects: true });
+const makeCompleteInstrumentedSerializedBoundary = () =>
+  RpcServer.make(WsRpcGroup.middleware(RpcInstrumentation), {
+    disableTracing: true,
+    disableFatalDefects: true,
+  });
+// Compile this public make expression without supplying or simulating the full
+// production handler graph. This is deliberately not a runtime acceptance test.
+void makeCompleteInstrumentedSerializedBoundary;
+
+const ownedSerializedProtocol = Effect.gen(function* () {
+  let remainingRequests = 4;
+  const outgoing = yield* Queue.bounded<string>(16);
+  const disconnects = yield* Queue.bounded<number>(1);
+  const inject = yield* Deferred.make<Parameters<RpcServer.Protocol["Service"]["run"]>[0]>();
+  yield* Effect.addFinalizer(() =>
+    Effect.all([Queue.shutdown(outgoing), Queue.shutdown(disconnects)]).pipe(Effect.asVoid),
+  );
+  const protocol = yield* RpcServer.Protocol.make((write) =>
+    Effect.gen(function* () {
+      yield* Deferred.succeed(inject, write);
+      return {
+        disconnects,
+        send: (clientId: number, response: FromServerEncoded) =>
+          Effect.gen(function* () {
+            if (clientId !== 1) return yield* Effect.die("Unexpected synthetic client");
+            const bytes = RpcSerialization.json.makeUnsafe().encode(response);
+            if (typeof bytes !== "string") return yield* Effect.die("Expected JSON frame");
+            yield* Queue.offer(outgoing, bytes);
+          }),
+        end: (clientId: number) =>
+          clientId === 1 ? Effect.void : Effect.die("Unexpected synthetic disconnect"),
+        clientIds: Effect.succeed(new Set([1])),
+        initialMessage: Effect.succeed(Option.none()),
+        supportsAck: false,
+        supportsTransferables: false,
+        supportsSpanPropagation: false,
+        supportsNotifications: false,
+        codecFor: RpcSerialization.json.codecFor,
+      };
+    }),
+  );
+  return {
+    protocol,
+    outgoing,
+    send: (request: RequestEncoded) =>
+      Effect.gen(function* () {
+        if (remainingRequests === 0) return yield* Effect.die("Synthetic request budget exhausted");
+        remainingRequests -= 1;
+        // JSON encode/decode the actual request envelope before the server's
+        // registered payload decoder. No socket, provider or RpcTest shortcut.
+        const bytes = RpcSerialization.json.makeUnsafe().encode(request);
+        if (typeof bytes !== "string") return yield* Effect.die("Expected JSON request");
+        const frame = yield* Schema.decodeUnknownEffect(
+          Schema.fromJsonString(
+            Schema.Struct({
+              _tag: Schema.Literal("Request"),
+              id: Schema.String,
+              tag: Schema.String,
+              payload: Schema.Unknown,
+              headers: Schema.Array(
+                Schema.Tuple([Schema.String, Schema.String]).pipe(Schema.mutable),
+              ),
+            }),
+          ),
+        )(bytes);
+        yield* (yield* Deferred.await(inject))(1, frame);
+      }),
+  };
+});
+
+const nativeMetadataFixture = {
+  configurationId: "synthetic-factory",
+  setupMode: "existing",
+  accountSource: "native-account-read",
+  transport: "codex-webrtc-v3",
+};
+const providerMetadataFixture = {
+  instanceId: "codex-personal",
+  driver: "codex",
+  enabled: true,
+  installed: true,
+  version: null,
+  status: "ready",
+  auth: { status: "authenticated", type: "chatgpt" },
+  checkedAt: "2026-10-16T00:00:00.000Z",
+  models: [],
+  nativeLiveVoicePreparation: nativeMetadataFixture,
+};
+
+describe("actual serialized native RPC boundaries", () => {
+  it.effect.each([false, true])(
+    "decodes the selected native tuple with scope checked before handler (operate: %s)",
+    (operate) =>
+      withTelemetry((ended) =>
+        Effect.gen(function* () {
+          const rpc = serializedNativeGroup.requests.get(WS_METHODS.liveVoicePrepare);
+          if (rpc?._tag !== WS_METHODS.liveVoicePrepare)
+            return yield* Effect.die("Missing prepare RPC");
+          const transport = yield* ownedSerializedProtocol;
+          const calls: Array<unknown> = [];
+          const prepared = yield* Schema.decodeUnknownEffect(LiveVoiceSession)({
+            leaseId: "synthetic-lease",
+            generation: 1,
+            environmentId: "synthetic-env",
+            threadId: "synthetic-thread",
+            providerInstanceId: "codex-personal",
+            providerSessionId: "synthetic-session",
+            plannerNativeThreadId: "synthetic-planner",
+            status: "prepared",
+          });
+          yield* makeSerializedNativeBoundary().pipe(
+            Effect.provideService(RpcServer.Protocol, transport.protocol),
+            Effect.provide(
+              Layer.merge(
+                serializedNativeGroup.toLayerHandler(WS_METHODS.liveVoicePrepare, (input) =>
+                  Effect.sync(() => {
+                    calls.push(input);
+                    return prepared;
+                  }),
+                ),
+                connectionMiddleware(operate ? [AuthOrchestrationOperateScope] : []),
+              ),
+            ),
+            Effect.forkScoped,
+          );
+          const expected = {
+            threadId: "synthetic-thread",
+            clientRequestId: "synthetic-request",
+            nativePreparation: {
+              providerInstanceId: "codex-personal",
+              configurationId: "synthetic-factory",
+            },
+          };
+          yield* transport.send({
+            _tag: "Request",
+            id: "native-1",
+            tag: WS_METHODS.liveVoicePrepare,
+            headers: [],
+            payload: {
+              ...expected,
+              nativePreparation: { ...expected.nativePreparation, token: "private-extra" },
+            },
+          });
+          const wire = yield* Queue.take(transport.outgoing);
+          const response = yield* Schema.decodeUnknownEffect(
+            Schema.fromJsonString(
+              Schema.Struct({
+                _tag: Schema.Literal("Exit"),
+                requestId: Schema.String,
+                exit: Schema.toCodecJson(Rpc.exitSchema(rpc)),
+              }),
+            ),
+          )(wire);
+          assert.equal(response.requestId, "native-1");
+          assert.isFalse(wire.includes("private-extra"));
+          if (operate) {
+            assert.deepStrictEqual(calls, [expected]);
+            if (Exit.isFailure(response.exit))
+              return yield* Effect.die("Authorized prepare refused");
+            assert.deepStrictEqual(response.exit.value, prepared);
+          } else {
+            assert.equal(calls.length, 0);
+            assert.isTrue(Exit.isFailure(response.exit));
+            assert.include(wire, "EnvironmentAuthorizationError");
+          }
+          const snapshots = yield* Metric.snapshot;
+          assert.equal(
+            requestCount(snapshots, WS_METHODS.liveVoicePrepare, operate ? "success" : "failure")
+              ?.count,
+            1,
+          );
+          assert.equal(rpcSpans(ended).length, 1);
+          assert.equal(rpcSpans(ended)[0]?.name, "ws.rpc.liveVoice.prepare");
+        }),
+      ),
+  );
+
+  it.effect("serializes all four metadata-bearing methods without running a provider", () =>
+    withTelemetry((ended) =>
+      Effect.gen(function* () {
+        const provider = yield* Schema.decodeUnknownEffect(ServerProvider)(providerMetadataFixture);
+        const config = yield* Schema.decodeUnknownEffect(ServerConfig)({
+          environment: {
+            environmentId: "synthetic-env",
+            label: "Synthetic",
+            platform: { os: "linux", arch: "x64" },
+            serverVersion: "synthetic",
+            capabilities: {},
+          },
+          auth: {
+            policy: "remote-reachable",
+            bootstrapMethods: [],
+            sessionMethods: [],
+            sessionCookieName: "synthetic",
+          },
+          cwd: "/synthetic",
+          keybindingsConfigPath: "/synthetic/keybindings",
+          keybindings: [],
+          issues: [],
+          providers: [provider],
+          availableEditors: [],
+          settings: {},
+          observability: {
+            logsDirectoryPath: "/synthetic/logs",
+            localTracingEnabled: false,
+            otlpTracesEnabled: false,
+            otlpMetricsEnabled: false,
+          },
+        });
+        const statuses = yield* Schema.decodeUnknownEffect(ServerConfigStreamEvent)({
+          version: 1,
+          type: "providerStatuses",
+          payload: { providers: [provider] },
+        });
+        const transport = yield* ownedSerializedProtocol;
+        const calls: string[] = [];
+        yield* makeSerializedMetadataBoundary().pipe(
+          Effect.provideService(RpcServer.Protocol, transport.protocol),
+          Effect.provide(
+            Layer.merge(
+              serializedMetadataGroup.toLayer({
+                [WS_METHODS.serverGetConfig]: () =>
+                  Effect.sync(() => {
+                    calls.push(WS_METHODS.serverGetConfig);
+                    return config;
+                  }),
+                [WS_METHODS.serverRefreshProviders]: () =>
+                  Effect.sync(() => {
+                    calls.push(WS_METHODS.serverRefreshProviders);
+                    return { providers: [provider] };
+                  }),
+                [WS_METHODS.serverUpdateProvider]: () =>
+                  Effect.sync(() => {
+                    calls.push(WS_METHODS.serverUpdateProvider);
+                    return { providers: [provider] };
+                  }),
+                [WS_METHODS.subscribeServerConfig]: () =>
+                  Stream.sync(() => {
+                    calls.push(WS_METHODS.subscribeServerConfig);
+                    return statuses;
+                  }),
+              }),
+              connectionMiddleware([AuthOrchestrationReadScope, AuthProvidersManageScope]),
+            ),
+          ),
+          Effect.forkScoped,
+        );
+        const requests: ReadonlyArray<RequestEncoded> = [
+          {
+            _tag: "Request",
+            id: "metadata-get",
+            tag: WS_METHODS.serverGetConfig,
+            headers: [],
+            payload: {},
+          },
+          {
+            _tag: "Request",
+            id: "metadata-refresh",
+            tag: WS_METHODS.serverRefreshProviders,
+            headers: [],
+            payload: {},
+          },
+          {
+            _tag: "Request",
+            id: "metadata-update",
+            tag: WS_METHODS.serverUpdateProvider,
+            headers: [],
+            payload: { provider: "codex", instanceId: "codex-personal" },
+          },
+          {
+            _tag: "Request",
+            id: "metadata-stream",
+            tag: WS_METHODS.subscribeServerConfig,
+            headers: [],
+            payload: {},
+          },
+        ];
+        for (const request of requests) {
+          yield* transport.send(request);
+          const wire = yield* Queue.take(transport.outgoing);
+          assert.include(wire, '"configurationId":"synthetic-factory"');
+          assert.include(wire, '"accountSource":"native-account-read"');
+          assert.isFalse(wire.includes("private-extra"));
+          const envelope = yield* Schema.decodeUnknownEffect(
+            Schema.fromJsonString(
+              Schema.Struct({ _tag: Schema.Literals(["Exit", "Chunk"]), requestId: Schema.String }),
+            ),
+          )(wire);
+          assert.equal(envelope.requestId, request.id);
+          assert.equal(envelope._tag, request.id === "metadata-stream" ? "Chunk" : "Exit");
+          if (request.id !== "metadata-stream") {
+            const success = yield* Schema.decodeUnknownEffect(
+              Schema.fromJsonString(
+                Schema.Struct({
+                  _tag: Schema.Literal("Exit"),
+                  requestId: Schema.String,
+                  exit: Schema.Struct({ _tag: Schema.Literal("Success"), value: Schema.Unknown }),
+                }),
+              ),
+            )(wire);
+            assert.equal(success.requestId, request.id);
+          }
+          if (request.id === "metadata-stream") {
+            const terminal = yield* Queue.take(transport.outgoing);
+            assert.include(terminal, '"_tag":"Success"');
+            assert.include(terminal, '"requestId":"metadata-stream"');
+          }
+        }
+        assert.deepStrictEqual(
+          calls,
+          requests.map((request) => request.tag),
+        );
+        const snapshots = yield* Metric.snapshot;
+        for (const request of requests)
+          assert.equal(requestCount(snapshots, request.tag, "success")?.count, 1);
+        assert.equal(rpcSpans(ended).length, 4);
       }),
     ),
   );
