@@ -634,7 +634,7 @@ export const layer: Layer.Layer<
         `.pipe(Effect.map((rows) => rows[0]));
             if (previousLease !== undefined) return yield* liveError("dispatch_conflict");
 
-            const leaseId = yield* crypto.randomUUIDv4;
+            const leaseId = yield* crypto.randomUUIDv4();
             const generation = 1;
             const now = DateTime.formatIso(yield* DateTime.now);
             yield* sql`
@@ -670,7 +670,7 @@ export const layer: Layer.Layer<
             );
             const providerSessionId =
               providerSession?.id ??
-              ProviderSessionId.make(`provider-session-live-${yield* crypto.randomUUIDv4}`);
+              ProviderSessionId.make(`provider-session-live-${yield* crypto.randomUUIDv4()}`);
             const runtimeOption = yield* providerSessions
               .get(providerSessionId)
               .pipe(Effect.mapError(() => liveError("runtime_unavailable")));

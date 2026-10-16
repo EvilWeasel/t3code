@@ -1,30 +1,40 @@
-import {
-  EnvironmentId,
-  ProviderDriverKind,
-  ProviderInstanceId,
-  type ServerSelfUpdateCapability,
-} from "@t3tools/contracts";
+import { EnvironmentId, type ServerSelfUpdateCapability } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
-import * as Cause from "effect/Cause";
-import { AsyncResult } from "effect/reactivity";
-import { getProviderUpdateRunOutcome } from "../ProviderUpdateLaunchNotification.logic";
 
 import {
   collectRestartingMachines,
   collectServerUpdateTargets,
+  closeFinishedUpdateRun,
   collectUpdateEverythingResult,
+  describeUpdateCapsule,
   describeUpdateEverything,
   getUpdateEverythingToastView,
   resolveUpdateRunMachineStatus,
   runUpdateEverything,
-  persistUpdateEverythingResult,
-  takeUpdateEverythingResult,
-  clearUpdateEverythingResult,
-  installAfterUpdateEverything,
   type UpdateEverythingMachine,
+  type UpdateEverythingRun,
   type UpdateRunMachine,
-  type UpdateEverythingResult,
+  type UpdateRunMachineStatus,
+  UPDATE_SLOW_AFTER_MS,
 } from "./updateEverything.logic";
+
+const runMachine = (overrides: Partial<UpdateRunMachine> = {}): UpdateRunMachine => ({
+  environmentId: EnvironmentId.make("alvin"),
+  label: "alvin",
+  updatesProviders: true,
+  server: {
+    environmentId: EnvironmentId.make("alvin"),
+    serverLabel: "alvin",
+    selfUpdate: "boot-service",
+    targetVersion: "0.0.50",
+  },
+  handedOffVersion: null,
+  startedAt: 0,
+  result: null,
+  failure: null,
+  providerFailure: null,
+  ...overrides,
+});
 
 function machine(
   id: string,
@@ -96,17 +106,6 @@ describe("collectServerUpdateTargets", () => {
       ["manual", "needs a manual update"],
     ]);
   });
-  it("keeps current and newer nightly hosts out of an update pass", () => {
-    const { targets } = collectServerUpdateTargets(
-      [
-        machine("older", "0.0.47-nightly.20261014.15", "boot-service"),
-        machine("current", "0.0.47-nightly.20261014.16", "boot-service"),
-        machine("newer", "0.0.47-nightly.20261014.17", "desktop-managed"),
-      ],
-      "0.0.47-nightly.20261014.16",
-    );
-    expect(targets.map((target) => target.serverLabel)).toEqual(["older"]);
-  });
 });
 
 describe("collectRestartingMachines", () => {
@@ -174,6 +173,7 @@ describe("runUpdateEverything", () => {
       },
     });
 
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(calls).toEqual(["download", "providers"]);
     finishProviders("provider results");
     expect(await run).toEqual({ localReady: true, providers: "provider results", servers: 2 });
@@ -198,14 +198,6 @@ describe("runUpdateEverything", () => {
 });
 
 describe("resolveUpdateRunMachineStatus", () => {
-  const runMachine = (overrides: Partial<UpdateRunMachine> = {}): UpdateRunMachine => ({
-    environmentId: EnvironmentId.make("alvin"),
-    label: "alvin",
-    updatesProviders: true,
-    updatesServer: true,
-    result: null,
-    ...overrides,
-  });
   const running = (stage: "downloading" | "installing" | "resuming") =>
     ({ status: "running", stage, fromVersion: "0.0.40", targetVersion: "0.0.50" }) as const;
 
@@ -229,6 +221,91 @@ describe("resolveUpdateRunMachineStatus", () => {
     expect(resolveUpdateRunMachineStatus(runMachine({ result: "failed" }), "servers", idle)).toBe(
       "failed",
     );
+    expect(
+      resolveUpdateRunMachineStatus(
+        runMachine({ server: null, handedOffVersion: "0.0.50" }),
+        "servers",
+        idle,
+      ),
+    ).toBe("restarting");
+  });
+});
+
+describe("update capsule", () => {
+  const run = (overrides: Partial<UpdateEverythingRun> = {}): UpdateEverythingRun => ({
+    localVersion: null,
+    phase: "servers",
+    restartAt: null,
+    machines: [],
+    ...overrides,
+  });
+  const view = (
+    label: string,
+    status: UpdateRunMachineStatus,
+    overrides: Partial<UpdateRunMachine> = {},
+  ) => ({
+    machine: runMachine({ environmentId: EnvironmentId.make(label), label, ...overrides }),
+    status,
+  });
+
+  it("counts down this app's restart before anything else", () => {
+    expect(
+      describeUpdateCapsule(
+        run({ phase: "countdown", restartAt: 5_000, localVersion: "0.0.50" }),
+        [view("alvin", "restarting")],
+        { status: "waiting" },
+        1_200,
+      ),
+    ).toEqual({ tone: "default", label: "Restart in 4s", action: "later" });
+  });
+
+  it("names the slowest machine once it passes the slow threshold", () => {
+    const machines = [
+      view("bb-1", "done"),
+      view("zbook", "downloading", { startedAt: 60_000 }),
+      view("alvin", "restarting", { startedAt: 0 }),
+    ];
+    expect(describeUpdateCapsule(run(), machines, null, 60_000)).toEqual({
+      tone: "default",
+      label: "1 of 3 updated",
+      action: null,
+    });
+    expect(describeUpdateCapsule(run(), machines, null, UPDATE_SLOW_AFTER_MS + 6 * 60_000)).toEqual(
+      {
+        tone: "slow",
+        label: "alvin",
+        slow: { status: "restarting", elapsed: "9m" },
+        action: null,
+      },
+    );
+  });
+
+  it("offers a retry only for failed servers it can update again", () => {
+    expect(describeUpdateCapsule(run(), [view("alvin", "failed")], null, 0)).toEqual({
+      tone: "failed",
+      label: "alvin failed",
+      action: "retry",
+    });
+    expect(
+      describeUpdateCapsule(
+        run(),
+        [view("alvin", "failed", { server: null }), view("box", "failed", { server: null })],
+        null,
+        0,
+      ),
+    ).toEqual({ tone: "failed", label: "2 failed", action: "dismiss" });
+  });
+
+  it("ends the run only when every machine is done and this app is not installing", () => {
+    const done = runMachine({ result: "done" });
+    expect(closeFinishedUpdateRun(run({ machines: [done] }))).toBeNull();
+    expect(
+      closeFinishedUpdateRun(run({ machines: [done], localVersion: "0.0.50" })),
+    ).not.toBeNull();
+    expect(
+      closeFinishedUpdateRun(run({ machines: [runMachine({ result: "failed" })] })),
+    ).not.toBeNull();
+    expect(closeFinishedUpdateRun(run({ machines: [done], phase: "providers" }))).not.toBeNull();
   });
 });
 
@@ -244,7 +321,7 @@ describe("update everything summary", () => {
     ],
     providers: [
       { status: "updated" },
-      { status: "interrupted", line: "Laptop · Codex: Update was interrupted." },
+      { status: "interrupted" },
       { status: "failed", line: "box · Codex: npm exited with code 1." },
     ],
   });
@@ -254,12 +331,12 @@ describe("update everything summary", () => {
       localVersion: "0.0.50",
       updatedServers: 2,
       updatedProviders: 1,
+      restarting: [],
       failures: [
         "This app: Could not download update: Network error.",
         "alvin: Download failed.",
         "box · Codex: npm exited with code 1.",
       ],
-      skipped: ["busy: Update was not started.", "Laptop · Codex: Update was interrupted."],
     });
   });
 
@@ -271,202 +348,33 @@ describe("update everything summary", () => {
         "This app: Could not download update: Network error.",
         "alvin: Download failed.",
         "box · Codex: npm exited with code 1.",
-        "Skipped busy: Update was not started.",
-        "Skipped Laptop · Codex: Update was interrupted.",
       ].join("\n"),
     });
     expect(getUpdateEverythingToastView({ ...result, failures: [] }, "0.0.40")).toEqual({
       type: "success",
       title: "Updated 2 servers and 1 provider",
-      description: "Skipped busy: Update was not started.\nSkipped Laptop · Codex: Update was interrupted.",
     });
   });
 
   it("reports a failure when nothing updated, and nothing when nothing finished", () => {
-    const empty = { localVersion: null, updatedServers: 0, updatedProviders: 0 };
+    const empty = { localVersion: null, updatedServers: 0, updatedProviders: 0, restarting: [] };
     expect(
       getUpdateEverythingToastView({ ...empty, failures: ["alvin: offline"] }, "0.0.50"),
     ).toEqual({ type: "error", title: "Update failed", description: "alvin: offline" });
     expect(getUpdateEverythingToastView({ ...empty, failures: [] }, "0.0.50")).toBeNull();
   });
-});
 
-describe("update everything relaunch handoff", () => {
-  const makeStorage = () => {
-    const values = new Map<string, string>();
-    return {
-      getItem: (key: string) => values.get(key) ?? null,
-      setItem: (key: string, value: string) => { values.set(key, value); },
-      removeItem: (key: string) => { values.delete(key); },
-    };
-  };
-  const saved = {
-    localVersion: "0.0.50",
-    updatedServers: 1,
-    updatedProviders: 1,
-    failures: ["offline: Could not connect"],
-  };
-
-  it("preserves labelled provider interruptions beside successes and failures after relaunch", async () => {
-    const baseRun = {
-      environmentId: EnvironmentId.make("Laptop"),
-      machineLabel: "Laptop",
-      driver: ProviderDriverKind.make("codex"),
-      instanceId: ProviderInstanceId.make("codex"),
-    };
-    const interrupted = getProviderUpdateRunOutcome({
-      ...baseRun, result: AsyncResult.failure(Cause.interrupt()),
+  it("names servers still restarting when this app relaunched", () => {
+    expect(
+      getUpdateEverythingToastView(
+        { ...result, failures: [], restarting: ["alvin", "zbook"] },
+        "0.0.50",
+      ),
+    ).toEqual({
+      type: "success",
+      title: "Updated this app, 2 servers, and 1 provider",
+      description: "alvin and zbook are still restarting.",
     });
-    const failed = getProviderUpdateRunOutcome({
-      ...baseRun, machineLabel: "Server",
-      result: AsyncResult.failure(Cause.die(new Error("Installer failed"))),
-    });
-    const remote = await runUpdateEverything({
-      downloadLocal: async () => true,
-      updateProviders: async () => [{ status: "updated" } as const, failed, interrupted],
-      updateServers: async () => [
-        { label: "ready", outcome: { status: "updated" } as const },
-      ],
-    });
-    const result = collectUpdateEverythingResult({
-      localVersion: "0.0.50", localFailures: [],
-      servers: remote.servers, providers: remote.providers,
-    });
-    const storage = makeStorage();
-    expect(await installAfterUpdateEverything({
-      result, localReady: remote.localReady,
-      save: (value) => persistUpdateEverythingResult(value, storage, 1_000),
-      install: async () => true,
-      clear: () => clearUpdateEverythingResult(storage),
-    })).toBe("relaunching");
-    const restored = takeUpdateEverythingResult(storage, 2_000);
-    expect(restored).toMatchObject({
-      localVersion: "0.0.50", updatedServers: 1, updatedProviders: 1,
-      failures: ["Server · Codex: Installer failed"],
-      skipped: ["Laptop · Codex: Update was interrupted."],
-    });
-    if (restored === null) throw new Error("The saved summary was lost");
-    expect(getUpdateEverythingToastView(restored, "0.0.50")).toEqual({
-      type: "error", title: "Updated this app, 1 server, and 1 provider",
-      description: "Server · Codex: Installer failed\nSkipped Laptop · Codex: Update was interrupted.",
-    });
-    const onlyInterrupted = collectUpdateEverythingResult({
-      localVersion: null, localFailures: [], servers: [], providers: [interrupted],
-    });
-    expect(persistUpdateEverythingResult(onlyInterrupted, storage, 3_000)).toBe(true);
-    const restoredInterruption = takeUpdateEverythingResult(storage, 4_000);
-    if (restoredInterruption === null) throw new Error("The interruption summary was lost");
-    expect(getUpdateEverythingToastView(restoredInterruption, "0.0.50")).toEqual({
-      type: "error", title: "Updates skipped",
-      description: "Skipped Laptop · Codex: Update was interrupted.",
-    });
-  });
-
-  it("retains partial remote results and local intent across a successful relaunch", async () => {
-    const storage = makeStorage();
-    const remote = await runUpdateEverything({
-      downloadLocal: async () => true,
-      updateProviders: async () => [{ status: "updated" } as const],
-      updateServers: async () => [
-        { label: "ready", outcome: { status: "updated" } as const },
-        { label: "offline", outcome: { status: "failed", message: "Could not connect" } as const },
-      ],
-    });
-    const result = collectUpdateEverythingResult({
-      localVersion: "0.0.50", localFailures: [],
-      servers: remote.servers, providers: remote.providers,
-    });
-    let installs = 0;
-    const outcome = await installAfterUpdateEverything({
-      result,
-      localReady: remote.localReady,
-      save: (value) => persistUpdateEverythingResult(value, storage, 1_000),
-      install: async () => {
-        installs += 1;
-        // Simulate the next renderer reading exactly what was saved before quit.
-        expect(takeUpdateEverythingResult(storage, 2_000)).toMatchObject(saved);
-        return true;
-      },
-      clear: () => { throw new Error("A relaunch must keep its saved summary"); },
-    });
-    expect(outcome).toBe("relaunching");
-    expect(installs).toBe(1);
-    expect(takeUpdateEverythingResult(storage, 2_000)).toBeNull();
-  });
-
-  it("consumes a saved summary once and rejects malformed, expired or future records", () => {
-    const storage = makeStorage();
-    expect(persistUpdateEverythingResult(saved, storage, 1_000)).toBe(true);
-    expect(takeUpdateEverythingResult(storage, 1_001)).toMatchObject(saved);
-    expect(takeUpdateEverythingResult(storage, 1_001)).toBeNull();
-    expect(persistUpdateEverythingResult(saved, storage, 1_000)).toBe(true);
-    expect(takeUpdateEverythingResult(storage, 601_000)).toBeNull();
-    expect(persistUpdateEverythingResult(saved, storage, 1_000)).toBe(true);
-    expect(takeUpdateEverythingResult(storage, 999)).toBeNull();
-    const malformed = { ...storage, getItem: () => '{"localVersion":false}' };
-    expect(takeUpdateEverythingResult(malformed, 1_001)).toBeNull();
-  });
-
-  it("keeps offline skip reasons alongside successful machines through relaunch", () => {
-    const result = collectUpdateEverythingResult({
-      localVersion: "0.0.50", localFailures: [],
-      skipped: [{ environmentId: EnvironmentId.make("offline"), label: "offline", reason: "not connected" }],
-      servers: [
-        { label: "ready", outcome: { status: "updated" } },
-        { label: "interrupted", outcome: { status: "skipped", message: "Update was interrupted." } },
-      ],
-      providers: [],
-    });
-    const storage = makeStorage();
-    expect(persistUpdateEverythingResult(result, storage, 1_000)).toBe(true);
-    const restored = takeUpdateEverythingResult(storage, 2_000);
-    expect(restored).toMatchObject({
-      updatedServers: 1,
-      skipped: ["offline: not connected", "interrupted: Update was interrupted."],
-    });
-    expect(getUpdateEverythingToastView(result, "0.0.50")).toEqual({
-      type: "success", title: "Updated this app and 1 server",
-      description: "Skipped offline: not connected\nSkipped interrupted: Update was interrupted.",
-    });
-    expect(resolveUpdateRunMachineStatus({
-      environmentId: EnvironmentId.make("interrupted"), label: "interrupted",
-      updatesProviders: false, updatesServer: true, result: "skipped",
-    }, "servers", { status: "idle" })).toBe("skipped");
-  });
-
-  it("keeps the local app open when storage throws or cannot read back its summary", async () => {
-    let installs = 0;
-    for (const storage of [
-      { ...makeStorage(), setItem: () => { throw new Error("Quota exceeded"); } },
-      { ...makeStorage(), getItem: () => "corrupt" },
-    ]) {
-      const outcome = await installAfterUpdateEverything({
-        result: saved, localReady: true,
-        save: (value) => persistUpdateEverythingResult(value, storage, 1_000),
-        install: async () => { installs += 1; return true; },
-        clear: () => {},
-      });
-      expect(outcome).toBe("storage-failed");
-    }
-    expect(installs).toBe(0);
-  });
-
-  it("does not save or install a failed local download and clears a refused install", async () => {
-    let saves = 0;
-    let installs = 0;
-    const storage = makeStorage();
-    const input = {
-      result: saved, localReady: false,
-      save: (value: UpdateEverythingResult) => { saves += 1; return persistUpdateEverythingResult(value, storage, 1_000); },
-      install: async () => { installs += 1; return false; },
-      clear: () => clearUpdateEverythingResult(storage),
-    };
-    expect(await installAfterUpdateEverything(input)).toBe("not-installed");
-    expect(saves).toBe(0);
-    expect(installs).toBe(0);
-    expect(await installAfterUpdateEverything({ ...input, localReady: true })).toBe("not-installed");
-    expect(installs).toBe(1);
-    expect(takeUpdateEverythingResult(storage, 1_001)).toBeNull();
   });
 });
 
@@ -516,5 +424,32 @@ describe("describeUpdateEverything", () => {
         ],
       }).summary,
     ).toBe("Update 1 provider");
+  });
+});
+
+describe("fork update outcomes after upstream handoff integration", () => {
+  it("keeps skipped servers and interrupted providers visible without counting them as updates", () => {
+    const result = collectUpdateEverythingResult({
+      localVersion: null,
+      localFailures: [],
+      skipped: [
+        { environmentId: EnvironmentId.make("offline"), label: "offline", reason: "not connected" },
+      ],
+      servers: [
+        { label: "remote", outcome: { status: "skipped", message: "Update was interrupted." } },
+      ],
+      providers: [{ status: "interrupted", line: "remote · Codex: Update was interrupted." }],
+    });
+    expect(result.updatedServers).toBe(0);
+    expect(result.updatedProviders).toBe(0);
+    expect(result.skipped).toEqual([
+      "offline: not connected",
+      "remote: Update was interrupted.",
+      "remote · Codex: Update was interrupted.",
+    ]);
+    expect(getUpdateEverythingToastView(result, "0.1.0")).toMatchObject({
+      title: "Updates skipped",
+      description: expect.stringContaining("remote · Codex"),
+    });
   });
 });

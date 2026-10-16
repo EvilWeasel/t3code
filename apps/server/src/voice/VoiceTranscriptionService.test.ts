@@ -300,7 +300,7 @@ it.effect("passes an explicit environment to Codex spawn without extending ambie
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const crypto = yield* Crypto.Crypto;
-    const suffix = yield* crypto.randomUUIDv4;
+    const suffix = yield* crypto.randomUUIDv4();
     const root = `/tmp/t3-voice-transcription-${suffix}`;
     const sharedHome = `${root}/shared`;
     const shadowHome = `${root}/shadow`;

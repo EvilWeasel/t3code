@@ -184,12 +184,8 @@ export class DesktopUpdates extends Context.Service<
   DesktopUpdates,
   {
     readonly getState: Effect.Effect<DesktopUpdateState>;
-    /** True while a check, download, install, or channel change holds the
-        updater's single action reservation. */
     readonly isActionActive: Effect.Effect<boolean>;
-    /** True only while an install owns the updater action reservation. */
     readonly isInstallActive: Effect.Effect<boolean>;
-    /** Current state plus a stream of every later state change. */
     readonly subscribe: Effect.Effect<
       {
         readonly latest: DesktopUpdateState;
@@ -210,7 +206,10 @@ export class DesktopUpdates extends Context.Service<
     readonly installPrepared: (
       expectedVersion: string,
     ) => Effect.Effect<DesktopPreparedUpdateInstallResult>;
-    readonly acknowledgeReadiness?: (senderId: number, readiness: DesktopUpdateReadiness) => Effect.Effect<boolean>;
+    readonly acknowledgeReadiness?: (
+      senderId: number,
+      readiness: DesktopUpdateReadiness,
+    ) => Effect.Effect<boolean>;
   }
 >()("@t3tools/desktop/updates/DesktopUpdates") {}
 
@@ -221,7 +220,6 @@ const {
 } = DesktopObservability.makeComponentLogger("desktop-updater");
 
 function redactMessage(message: string): string {
-  // Updater HTTP errors append response bodies and headers after the first line.
   return (message.split(/[\r\n]/, 1)[0] ?? "")
     .replace(/\b(?:https?|file):\/\/[^\s"'<>]+/gi, "[redacted URL]")
     .replace(/\b(?:Bearer|Basic)\s+[^\s,;]+/gi, "[redacted credential]")
@@ -268,7 +266,6 @@ function summarizeCause(cause: unknown, depth: number): string {
   return `${errorTag(cause)}${code}${message}${nested}`;
 }
 
-/** Log a bounded cause summary without stacks, response payloads, or request credentials. */
 export function describeUpdateErrorCause(cause: unknown): string {
   try {
     return summarizeCause(cause, 0).slice(0, 1024);
@@ -449,7 +446,8 @@ export const make = Effect.gen(function* () {
           appUpdateYmlConfig.value.pathPrefix === undefined &&
           (appUpdateYmlConfig.value.host === undefined ||
             appUpdateYmlConfig.value.host === "github.com")) ||
-        config.mockUpdates || isNixPackage,
+        config.mockUpdates ||
+        isNixPackage,
     ),
   );
 
@@ -624,9 +622,6 @@ export const make = Effect.gen(function* () {
     );
   }).pipe(Effect.withSpan("desktop.updates.downloadAvailableUpdate"));
 
-  // Tells the primary backend that the coming stop is an update restart, so it
-  // keeps its managed tunnel for the backend the updated app starts. Best
-  // effort: without the marker the backend only re-provisions its tunnel.
   const updateRestartMarkerDir = environment.path.join(environment.baseDir, "runtime");
   const updateRestartMarkerPath = environment.path.join(
     updateRestartMarkerDir,
@@ -748,9 +743,13 @@ export const make = Effect.gen(function* () {
               const hasExpectedDownload =
                 state.downloadedVersion !== null &&
                 (expectedVersion === undefined || state.downloadedVersion === expectedVersion);
-              if (clientOnly && (state.installLease?.phase !== "commit" ||
-                state.installLease.targetVersion !== expectedVersion ||
-                (yield* Clock.currentTimeMillis) >= state.installLease.expiresAt - 5_000)) return "refused" as const;
+              if (
+                clientOnly &&
+                (state.installLease?.phase !== "commit" ||
+                  state.installLease.targetVersion !== expectedVersion ||
+                  (yield* Clock.currentTimeMillis) >= state.installLease.expiresAt - 5_000)
+              )
+                return "refused" as const;
               if (
                 (yield* Ref.get(desktopState.quitting)) ||
                 !(yield* Ref.get(updaterConfiguredRef)) ||
@@ -759,13 +758,16 @@ export const make = Effect.gen(function* () {
                 return "refused" as const;
               }
               if (Option.isSome(activeAction)) {
-                return !clientOnly && activeAction.value === "check" && expectedVersion !== undefined
+                return !clientOnly &&
+                  activeAction.value === "check" &&
+                  expectedVersion !== undefined
                   ? ("wait-for-check" as const)
                   : ("refused" as const);
               }
               const hasInstallableDownload =
                 state.status === "downloaded" ||
-                (!clientOnly && state.status === "error" &&
+                (!clientOnly &&
+                  state.status === "error" &&
                   (state.errorContext === null || state.errorContext === "install"));
               if (!hasInstallableDownload) return "refused" as const;
               return (yield* tryStartUpdateAction("install"))
@@ -873,61 +875,112 @@ export const make = Effect.gen(function* () {
     const holdPool = pool.withUpdateInventory;
     const holdRenderers = electronWindow.withUpdateRenderers;
     const inventory = electronWindow.updateInventory;
-    if (state.status !== "downloaded" || state.downloadedVersion === null ||
+    if (
+      state.status !== "downloaded" ||
+      state.downloadedVersion === null ||
       state.notAppliedVersion === state.downloadedVersion ||
-      holdPool === undefined || holdRenderers === undefined || inventory === undefined ||
-      (yield* Ref.get(desktopState.quitting))) return;
+      holdPool === undefined ||
+      holdRenderers === undefined ||
+      inventory === undefined ||
+      (yield* Ref.get(desktopState.quitting))
+    )
+      return;
     const targetVersion = state.downloadedVersion;
     if (compareSemverVersions(targetVersion, state.currentVersion) <= 0) return;
-    yield* holdPool((instances) => holdRenderers(Effect.scoped(Effect.gen(function* () {
-      const isEmpty = Effect.forEach(instances, (instance) => instance.snapshot).pipe(
-        Effect.map((snapshots) => snapshots.every((snapshot) =>
-          snapshot.desiredRunning === false && snapshot.ready === false && Option.isNone(snapshot.activePid) &&
-          snapshot.restartScheduled === false,
-        )),
-      );
-      if (!(yield* isEmpty)) return;
-      const expected = yield* inventory;
-      if (expected.some((renderer) => renderer.audible !== false)) return;
-      const generation = `${targetVersion}:${yield* Clock.currentTimeMillis}`;
-      const expiresAt = (yield* Clock.currentTimeMillis) + 20_000;
-      for (const phase of ["prepare", "validate"] as const) {
-        const lease = { generation, targetVersion, expiresAt, phase };
-        const signal = yield* Deferred.make<boolean>();
-        yield* Ref.set(pendingReadiness, { lease, senders: new Set(expected.map((item) => item.id)), signal });
-        yield* updateState((current) => ({ ...current, installLease: lease }));
-        if (expected.length > 0) {
-          const ready = yield* Deferred.await(signal).pipe(Effect.timeoutOption(Duration.seconds(5)));
-          if (Option.isNone(ready) || !ready.value) return;
-        }
-      }
-      const currentInventory = yield* inventory;
-      const sameInventory = expected.length === currentInventory.length && expected.every((renderer, index) => {
-        const current = currentInventory[index];
-        return current !== undefined && renderer.id === current.id &&
-          renderer.generation === current.generation && renderer.audible === current.audible;
-      });
-      if (!sameInventory || !(yield* isEmpty) ||
-        (yield* Clock.currentTimeMillis) >= expiresAt - 5_000) return;
-      yield* updateState((current) => ({ ...current, installLease: {
-        generation, targetVersion, expiresAt, phase: "commit",
-      } }));
-      const completions = yield* PubSub.subscribe(finishedUpdateActions);
-      const result = yield* installDownloadedUpdate(targetVersion, true);
-      // Keep register/unregister/start and window creation fenced until the
-      // app exits. A failed installer releases through the surrounding scope.
-      if (result.accepted && !result.failed) {
-        while ((yield* PubSub.take(completions)) !== "install-recovery") { /* Await exit or recovery. */ }
-      }
-    }))).pipe(Effect.ensuring(Effect.gen(function* () {
-      yield* Ref.set(pendingReadiness, null);
-      yield* updateState(({ installLease: _lease, ...current }) => current);
-    }))));
-  }).pipe(Effect.catchCause(() => logUpdaterWarning("Client update window could not be verified; update remains prepared.")));
+    yield* holdPool((instances) =>
+      holdRenderers(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const isEmpty = Effect.forEach(instances, (instance) => instance.snapshot).pipe(
+              Effect.map((snapshots) =>
+                snapshots.every(
+                  (snapshot) =>
+                    snapshot.desiredRunning === false &&
+                    snapshot.ready === false &&
+                    Option.isNone(snapshot.activePid) &&
+                    snapshot.restartScheduled === false,
+                ),
+              ),
+            );
+            if (!(yield* isEmpty)) return;
+            const expected = yield* inventory;
+            if (expected.some((renderer) => renderer.audible !== false)) return;
+            const generation = `${targetVersion}:${yield* Clock.currentTimeMillis}`;
+            const expiresAt = (yield* Clock.currentTimeMillis) + 20_000;
+            for (const phase of ["prepare", "validate"] as const) {
+              const lease = { generation, targetVersion, expiresAt, phase };
+              const signal = yield* Deferred.make<boolean>();
+              yield* Ref.set(pendingReadiness, {
+                lease,
+                senders: new Set(expected.map((item) => item.id)),
+                signal,
+              });
+              yield* updateState((current) => ({ ...current, installLease: lease }));
+              if (expected.length > 0) {
+                const ready = yield* Deferred.await(signal).pipe(
+                  Effect.timeoutOption(Duration.seconds(5)),
+                );
+                if (Option.isNone(ready) || !ready.value) return;
+              }
+            }
+            const currentInventory = yield* inventory;
+            const sameInventory =
+              expected.length === currentInventory.length &&
+              expected.every((renderer, index) => {
+                const current = currentInventory[index];
+                return (
+                  current !== undefined &&
+                  renderer.id === current.id &&
+                  renderer.generation === current.generation &&
+                  renderer.audible === current.audible
+                );
+              });
+            if (
+              !sameInventory ||
+              !(yield* isEmpty) ||
+              (yield* Clock.currentTimeMillis) >= expiresAt - 5_000
+            )
+              return;
+            yield* updateState((current) => ({
+              ...current,
+              installLease: {
+                generation,
+                targetVersion,
+                expiresAt,
+                phase: "commit",
+              },
+            }));
+            const completions = yield* PubSub.subscribe(finishedUpdateActions);
+            const result = yield* installDownloadedUpdate(targetVersion, true);
+            // Keep register/unregister/start and window creation fenced until the
+            // app exits. A failed installer releases through the surrounding scope.
+            if (result.accepted && !result.failed) {
+              while ((yield* PubSub.take(completions)) !== "install-recovery") {
+                /* Await exit or recovery. */
+              }
+            }
+          }),
+        ),
+      ).pipe(
+        Effect.ensuring(
+          Effect.gen(function* () {
+            yield* Ref.set(pendingReadiness, null);
+            yield* updateState(({ installLease: _lease, ...current }) => current);
+          }),
+        ),
+      ),
+    );
+  }).pipe(
+    Effect.catchCause(() =>
+      logUpdaterWarning("Client update window could not be verified; update remains prepared."),
+    ),
+  );
 
   const startUpdatePollers: Effect.Effect<void, never, Scope.Scope> = Effect.gen(function* () {
     yield* Effect.sleep("1 minute").pipe(
-      Effect.andThen(attemptClientOnlyInstall), Effect.forever, Effect.forkScoped,
+      Effect.andThen(attemptClientOnlyInstall),
+      Effect.forever,
+      Effect.forkScoped,
     );
     // Keep Electron's implicit download/install hooks disabled. The same action
     // reservation and failure handling serve manual and background downloads;
@@ -1119,9 +1172,12 @@ export const make = Effect.gen(function* () {
             !isReleasedDesktopVersionForChannel(info.version, state.channel) ||
             (state.availableVersion !== null && state.availableVersion !== info.version)
           ) {
-            yield* logUpdaterWarning("ignoring downloaded update outside the selected release train", {
-              channel: state.channel,
-            });
+            yield* logUpdaterWarning(
+              "ignoring downloaded update outside the selected release train",
+              {
+                channel: state.channel,
+              },
+            );
             return;
           }
           yield* setState(reduceDesktopUpdateStateOnDownloadComplete(state, info.version));
@@ -1143,25 +1199,32 @@ export const make = Effect.gen(function* () {
   });
 
   return DesktopUpdates.of({
-    acknowledgeReadiness: (senderId, readiness) => Effect.gen(function* () {
-      const now = yield* Clock.currentTimeMillis;
-      const completed = yield* Ref.modify(pendingReadiness, (pending) => {
-        if (pending === null || now >= pending.lease.expiresAt ||
-          pending.lease.generation !== readiness.lease.generation ||
-          pending.lease.targetVersion !== readiness.lease.targetVersion ||
-          pending.lease.expiresAt !== readiness.lease.expiresAt ||
-          pending.lease.phase !== readiness.lease.phase ||
-          !pending.senders.has(senderId)) return [null, pending] as const;
-        const senders = new Set(pending.senders);
-        senders.delete(senderId);
-        return [
-          !readiness.ready || senders.size === 0 ? { signal: pending.signal, ready: readiness.ready } : null,
-          { ...pending, senders },
-        ] as const;
-      });
-      if (completed !== null) yield* Deferred.succeed(completed.signal, completed.ready);
-      return completed !== null;
-    }),
+    acknowledgeReadiness: (senderId, readiness) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        const completed = yield* Ref.modify(pendingReadiness, (pending) => {
+          if (
+            pending === null ||
+            now >= pending.lease.expiresAt ||
+            pending.lease.generation !== readiness.lease.generation ||
+            pending.lease.targetVersion !== readiness.lease.targetVersion ||
+            pending.lease.expiresAt !== readiness.lease.expiresAt ||
+            pending.lease.phase !== readiness.lease.phase ||
+            !pending.senders.has(senderId)
+          )
+            return [null, pending] as const;
+          const senders = new Set(pending.senders);
+          senders.delete(senderId);
+          return [
+            !readiness.ready || senders.size === 0
+              ? { signal: pending.signal, ready: readiness.ready }
+              : null,
+            { ...pending, senders },
+          ] as const;
+        });
+        if (completed !== null) yield* Deferred.succeed(completed.signal, completed.ready);
+        return completed !== null;
+      }),
     getState: Ref.get(updateStateRef),
     isActionActive: activeUpdateAction.pipe(Effect.map(Option.isSome)),
     isInstallActive: activeUpdateAction.pipe(

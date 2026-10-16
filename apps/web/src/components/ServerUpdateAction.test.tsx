@@ -280,8 +280,6 @@ describe("ServerUpdateAction", () => {
       targetVersion: "0.0.31",
     }) as ActionElement;
 
-    // No confirm-dialog host is mounted in this test, which the component
-    // treats as consent: the click itself was the request.
     action.props.onClick?.();
     await flushPromises();
 

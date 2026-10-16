@@ -18,11 +18,6 @@ import * as Path from "effect/Path";
 import * as ServerConfig from "../config.ts";
 import * as ProcessRunner from "../processRunner.ts";
 
-/**
- * Agents and terminals share this slice. It sits in app.slice next to the
- * server's own unit, so the server's CPUWeight and IOWeight compete with the
- * agents directly.
- */
 const AGENT_SLICE = "app-t3code-agents.slice";
 
 /**
@@ -40,10 +35,10 @@ export function ownedAgentSlice(stateDir: string): string {
 const GiB = 1024 ** 3;
 
 /**
- * Memory limits for the agents slice. Agents together leave about 6 GB free
- * before they are throttled and 4 GB before the kernel kills one, so the
- * server, sshd, and tailscaled keep working. Small machines still give agents
- * at least half of RAM before throttling and three quarters before a kill.
+ * Agents together leave about 6 GB free before they are throttled and 4 GB
+ * before the kernel kills one, so the server, sshd, and tailscaled keep
+ * working. Small machines still give agents at least half of RAM before
+ * throttling and three quarters before a kill.
  */
 export function agentSliceMemoryLimits(totalBytes: number) {
   return {
@@ -56,14 +51,11 @@ export interface ScopeState {
   readonly loadState: string;
   readonly activeState: string;
   readonly result: string;
-  /** `oom_kill` from the scope's memory.events, while its cgroup exists. */
   readonly oomKills: number;
-  /** `populated` from the scope's cgroup.events, while its cgroup exists. */
   readonly populated: boolean | undefined;
 }
 
 /**
- * Reads one scope as the server sees it right after the agent process exits.
  * Our pipe can close before systemd handles the kill, so a scope that is
  * still stopping, is empty, or already counted an OOM kill is "stopping":
  * systemd records `Result=oom-kill` for it in a moment.
@@ -238,8 +230,6 @@ export const make = Effect.gen(function* () {
     }),
   );
 
-  // The newest scope per thread, oldest thread first. A thread runs one agent
-  // at a time, so only its latest scope can explain a failure.
   const scopeByThread = new Map<string, { unit: string; oomKilled: boolean }>();
 
   const readScope = (systemctl: string, unit: string) =>
@@ -250,7 +240,6 @@ export const make = Effect.gen(function* () {
         unit,
         "--property=LoadState,ActiveState,Result,ControlGroup",
       ]);
-      // A failed query says nothing about the scope; the caller keeps the unit.
       if (shown._tag === "None" || shown.value.code !== 0) return undefined;
       const values = parseKeyValues(shown.value.stdout);
       const controlGroup = values.get("ControlGroup") ?? "";
@@ -280,20 +269,15 @@ export const make = Effect.gen(function* () {
       }
     });
 
-  // Failed scopes stay loaded so we can read their result. Clear them once
-  // systemd finishes stopping them.
   const forget = (systemctl: string, unit: string) =>
     clearFailed(systemctl, unit).pipe(Effect.forkIn(layerScope), Effect.asVoid);
 
-  // Drops the oldest thread's scope once it has ended. A scope that still
-  // runs moves to the back, so its thread keeps its OOM answer and cleanup.
   const evictOldest = (systemctl: string) =>
     Effect.gen(function* () {
       const oldest = scopeByThread.entries().next();
       if (oldest.done === true) return;
       const [threadId, tracked] = oldest.value;
       const state = yield* readScope(systemctl, tracked.unit);
-      // A newer launch replaced it while we read, and forgets it itself.
       if (scopeByThread.get(threadId) !== tracked) return;
       scopeByThread.delete(threadId);
       const status = state === undefined ? "running" : classifyScope(state);
@@ -304,8 +288,6 @@ export const make = Effect.gen(function* () {
       yield* forget(systemctl, tracked.unit);
     });
 
-  // Records a thread's newest scope, or forgets the thread when `unit` is
-  // undefined. The replaced scope has its failed state cleared.
   const track = (systemctl: string, threadId: string, unit: string | undefined) =>
     Effect.gen(function* () {
       const previous = scopeByThread.get(threadId);
@@ -360,7 +342,6 @@ export const make = Effect.gen(function* () {
       survivesRestart,
     }) {
       const resolved = yield* resolve(command, env ?? hostEnvironment);
-      // Leave unresolved commands alone so the spawn reports the missing binary.
       if (resolved === null) return { command, args };
       const scope = yield* systemd;
       if (scope === undefined) return agentScopeCommand({ command: resolved, args });

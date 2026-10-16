@@ -3,6 +3,7 @@ import * as TrustedInvocation from "../mcp/TrustedAppControlInvocation.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as OrchestrationCommandReceipts from "../persistence/OrchestrationCommandReceipts.ts";
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
@@ -38,6 +39,7 @@ import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationServic
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryService.ts";
 import * as ProviderSwitchService from "./ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
@@ -54,7 +56,6 @@ import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 
-/** The shared application event log and its command receipts. */
 export const layerEventInfrastructure = Layer.mergeAll(
   OrchestrationEventStore.layer,
   OrchestrationCommandReceipts.layer,
@@ -109,6 +110,7 @@ const layerProviderEventIngestorProvided = ProviderEventIngestor.layer.pipe(
       IdAllocator.layer,
       ProjectionStore.layer,
       ThreadCommandExecutor.layer,
+      GitVcsDriver.layer,
     ),
   ),
 );
@@ -132,9 +134,14 @@ const layerAgentObservatoryProvided = AgentObservatory.layer.pipe(
   ),
 );
 
+const layerCommandOutputHubProvided = CommandOutputHub.layer.pipe(
+  Layer.provide(Layer.merge(layerEventSinkProvided, ProjectionStore.layer)),
+);
+
 const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
+      layerCommandOutputHubProvided,
       layerProviderAdapterRegistryProvided,
       layerAgentObservatoryProvided,
       layerEventSinkProvided,
@@ -360,6 +367,7 @@ const layerMcpAppRequestsProvided = McpAppRequests.layer.pipe(
 export const layer = Layer.mergeAll(
   layerAgentObservatoryProvided,
   layerTrustedObservatoryProvided,
+  layerCommandOutputHubProvided,
   layerOrchestratorProvided,
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,

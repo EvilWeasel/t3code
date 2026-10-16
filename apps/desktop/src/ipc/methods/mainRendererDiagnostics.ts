@@ -63,7 +63,7 @@ export const make = Effect.fn("desktop.mainRendererDiagnostics.make")(function* 
   const windows = yield* ElectronWindow.ElectronWindow;
   const app = yield* ElectronApp.ElectronApp;
   const crypto = yield* Crypto.Crypto;
-  const sessionNonce = yield* crypto.randomUUIDv4.pipe(Effect.option);
+  const sessionNonce = yield* crypto.randomUUIDv4().pipe(Effect.option);
   let generation = 0;
   let requestSequence = 0;
   let pending: Pending | undefined;
@@ -157,7 +157,7 @@ export const make = Effect.fn("desktop.mainRendererDiagnostics.make")(function* 
           return unavailable("not-main");
         const metadata = yield* app.metadata.pipe(Effect.option);
         if (Option.isNone(metadata)) return unavailable("unsupported");
-        const nonce = yield* crypto.randomUUIDv4.pipe(Effect.option);
+        const nonce = yield* crypto.randomUUIDv4().pipe(Effect.option);
         if (Option.isNone(nonce)) return unavailable("unsupported");
         const requestNonce = nonce.value;
         const deferred = yield* Deferred.make<MainRendererDiagnosticsReadResult>();

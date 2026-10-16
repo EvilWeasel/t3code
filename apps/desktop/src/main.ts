@@ -135,9 +135,6 @@ const layerDesktopEnvironment = Layer.unwrap(
   }),
 );
 
-// The remote runs the exact release this app is on, from its self-contained
-// archive, so it needs neither Node nor npm. Development points the remote at
-// a source checkout instead so the two sides can be iterated together.
 const resolveDesktopSshCliRunner = (
   environment: DesktopEnvironment.DesktopEnvironment["Service"],
 ): RemoteT3RunnerOptions => {
@@ -232,6 +229,7 @@ const layerDesktopAppActivation = DesktopAppActivation.layer.pipe(
 const layerDesktopBackend = DesktopBackendPool.layer.pipe(
   Layer.provideMerge(DesktopAppIdentity.layer),
   Layer.provideMerge(DesktopBackendConfiguration.layer),
+  Layer.provideMerge(DesktopShellEnvironment.layer),
   Layer.provideMerge(DesktopWslEnvironment.layer),
   Layer.provideMerge(DesktopWslServerTree.layer),
   Layer.provideMerge(
@@ -240,9 +238,6 @@ const layerDesktopBackend = DesktopBackendPool.layer.pipe(
   Layer.provideMerge(layerDesktopWindow),
 );
 
-// WSL orchestrator hangs off the backend layer because it needs the
-// pool + configuration + serverExposure; it pulls NetService and the
-// foundation services through the same provideMerge chain.
 const layerDesktopWslBackend = DesktopWslBackend.layer.pipe(
   Layer.provideMerge(layerDesktopBackend),
 );
@@ -258,7 +253,6 @@ const layerDesktopApplication = Layer.mergeAll(
   DesktopApplicationMenu.layer,
   DesktopLinuxUrlHandler.layer,
   DesktopCliCommand.layer,
-  DesktopShellEnvironment.layer,
   layerDesktopSsh,
 ).pipe(
   Layer.provideMerge(layerDesktopSnapShot),

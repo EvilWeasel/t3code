@@ -24,6 +24,7 @@ export function isReleasedDesktopVersionForChannel(
   channel: DesktopUpdateChannel,
 ): boolean {
   return channel === "nightly"
-    ? NIGHTLY_VERSION_PATTERN.test(version) && STABLE_VERSION_PATTERN.test(version.split("-")[0] ?? "")
+    ? NIGHTLY_VERSION_PATTERN.test(version) &&
+        STABLE_VERSION_PATTERN.test(version.split("-")[0] ?? "")
     : STABLE_VERSION_PATTERN.test(version);
 }

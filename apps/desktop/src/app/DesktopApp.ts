@@ -42,7 +42,7 @@ const MAX_TCP_PORT = 65_535;
 const DESKTOP_BACKEND_PORT_PROBE_HOSTS = ["127.0.0.1", "0.0.0.0", "::"] as const;
 
 const makeDesktopRunId = Crypto.Crypto.pipe(
-  Effect.flatMap((crypto) => crypto.randomUUIDv4),
+  Effect.flatMap((crypto) => crypto.randomUUIDv4()),
   Effect.map((value) => value.replaceAll("-", "").slice(0, 12)),
 );
 
@@ -149,8 +149,6 @@ const fatalStartupCause = <E>(stage: string, cause: Cause.Cause<E>) =>
 
 export const stopAllPoolInstances = Effect.fn("desktop.app.stopAllPoolInstances")(
   function* (): Effect.fn.Return<void, never, DesktopBackendPool.DesktopBackendPool> {
-    // Stop every backend in the pool with a timeout to guarantee the quit
-    // path makes progress even if a backend hangs during teardown.
     const pool = yield* DesktopBackendPool.DesktopBackendPool;
     const instances = yield* pool.list;
     yield* Effect.forEach(

@@ -35,7 +35,6 @@ describe("classifyScope", () => {
     expect(classifyScope({ ...running, activeState: "failed", result: "oom-kill" })).toBe(
       "oom-killed",
     );
-    // The agent pipe can close before systemd handles the kill.
     expect(classifyScope({ ...running, oomKills: 1 })).toBe("stopping");
     expect(classifyScope({ ...running, populated: false })).toBe("stopping");
     expect(classifyScope({ ...running, activeState: "deactivating" })).toBe("stopping");
@@ -140,16 +139,13 @@ describe("AgentScope service", () => {
         units.set(unitOf(first), { activeState: "failed", result: "oom-kill" });
         const second = yield* scope.wrap({ command: "agent", args: [], name: "t", threadId: "a" });
         units.set(unitOf(second), { activeState: "active", result: "success" });
-        // The older scope was OOM-killed, but the newest one is still running.
         expect(yield* scope.oomKilled("a")).toBe(false);
 
         units.set(unitOf(second), { activeState: "failed", result: "oom-kill" });
         expect(yield* scope.oomKilled("a")).toBe(true);
-        // A retried failure reads the same, even after the failed unit is reset.
         units.delete(unitOf(second));
         expect(yield* scope.oomKilled("a")).toBe(true);
 
-        // The next session may run without a scope, for example on Cursor.
         yield* scope.clear("a");
         expect(yield* scope.oomKilled("a")).toBe(false);
       }),

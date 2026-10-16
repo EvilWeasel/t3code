@@ -212,7 +212,7 @@ const make = Effect.gen(function* () {
           "capability_denied",
           "The caller's configured plan mode does not submit capability work.",
         );
-      const id = yield* crypto.randomUUIDv4.pipe(Effect.mapError(unavailable));
+      const id = yield* crypto.randomUUIDv4().pipe(Effect.mapError(unavailable));
       const request = yield* Schema.decodeUnknownEffect(JarvisNativeRequest)({
         jsonrpc: "2.0",
         id,
@@ -294,7 +294,7 @@ const make = Effect.gen(function* () {
               "invalid_request",
               "Event waits must be between zero and 30000 milliseconds.",
             );
-          const id = yield* crypto.randomUUIDv4.pipe(Effect.mapError(unavailable));
+          const id = yield* crypto.randomUUIDv4().pipe(Effect.mapError(unavailable));
           const request = {
             jsonrpc: "2.0",
             id,

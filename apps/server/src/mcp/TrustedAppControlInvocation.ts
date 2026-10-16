@@ -187,7 +187,7 @@ const make = Effect.gen(function* () {
         const environmentId = yield* environment.getEnvironmentId;
         let incarnation = incarnations.get(execution.runtime);
         if (incarnation === undefined) {
-          const candidate = yield* crypto.randomUUIDv4;
+          const candidate = yield* crypto.randomUUIDv4();
           incarnation = incarnations.get(execution.runtime) ?? candidate;
           incarnations.set(execution.runtime, incarnation);
         }

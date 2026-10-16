@@ -27,7 +27,6 @@ import {
 
 const CONTINUE_PROMPT = "Continue where you left off.";
 
-/** Consecutive automatic continuations allowed before a person has to step in. */
 const MAX_CONTINUATION_CHAIN = 3;
 
 /**
@@ -63,13 +62,10 @@ function restartContinuationBlocked(
     return true;
   const waitingRequest = projection.runtimeRequests.some(
     (request) =>
-      // Tool calls and auth refreshes do not wait on a person, and a
-      // message-capable question stays answerable after the restart.
       request.kind !== "dynamic_tool_call" &&
       request.kind !== "auth_refresh" &&
       request.responseCapability.type !== "message" &&
       (request.status === "pending" ||
-        // Recovery closes live callbacks on the cut turn; it does not answer them.
         ((request.status === "expired" || request.status === "cancelled") &&
           request.responseCapability.type === "not_resumable" &&
           turn !== undefined &&
@@ -81,7 +77,6 @@ function restartContinuationBlocked(
       item.type === "secret_request" &&
       item.runId === source.id &&
       (item.secretStatus === "pending" ||
-        // Recovery cancels an open secret card and its run at the same instant.
         (item.secretStatus === "cancelled" &&
           item.completedAt !== null &&
           source.completedAt !== null &&
@@ -136,7 +131,6 @@ export function restartContinuationRun(
   >,
   now: DateTime.Utc,
 ): OrchestrationV2Run | undefined {
-  // Queued runs never started; recovery holds them behind the cut run.
   const run = projection.runs.reduce<OrchestrationV2Run | undefined>(
     (latest, candidate) =>
       candidate.status !== "queued" && (!latest || runRanAfter(candidate, latest))
@@ -226,8 +220,6 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       )
     )
       return;
-    // A user submission after reconciliation takes precedence over an automatic
-    // prompt. Queued runs never started and stay held behind this one.
     if (
       projection.runs.some(
         (run) => run.id !== source.id && run.status !== "queued" && runRanAfter(run, source),
@@ -260,7 +252,6 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         turnItemTypes: ["run_interrupt_request"],
       },
     );
-    // The user asked this run to stop before the restart cut it.
     if (
       sourceRecords.turnItems.some(
         (item) => item.runId === source.id && item.type === "run_interrupt_request",
@@ -292,7 +283,6 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
         threadId: input.threadId,
         messageId,
         text,
-        // Shown as a work log row; the prompt the agent got is its detail.
         notification: {
           source: { kind: "system" },
           outcome: "updated",

@@ -75,14 +75,10 @@ export function useProviderUpdates() {
   return { machines, updateAll };
 }
 
-/** Provider settings button for {@link useProviderUpdates}. Renders nothing
-    when no machine has a one-click update. */
 export function ProviderUpdatesAction() {
   const { machines, updateAll } = useProviderUpdates();
   const pending = useRef(false);
   const [isPending, setIsPending] = useState(false);
-  // Candidates leave the list as soon as their servers report them queued, so
-  // keep the button while the run is in flight.
   if (machines.length === 0 && !isPending) {
     return null;
   }

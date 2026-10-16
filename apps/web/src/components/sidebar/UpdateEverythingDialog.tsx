@@ -15,11 +15,9 @@ import {
 import { Button } from "../ui/button";
 import type { RestartingMachine, SkippedMachine } from "./updateEverything.logic";
 
-/** A thread an agent is working on now. A restart stops these; queued threads wait. */
 const isRunning = (status: string) =>
   status === "preparing" || status === "starting" || status === "running";
 
-/** Running threads across the environments in a newline-joined key. */
 const runningThreadCountAtom = Atom.family((environmentIds: string) =>
   Atom.make((get) =>
     environmentIds
@@ -62,7 +60,7 @@ export function UpdateEverythingDialog({
   return (
     <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogPopup>
-        {/* The popup unmounts when closed, so the thread count is read only while open. */}
+        {}
         <UpdateEverythingDialogContent {...content} />
       </AlertDialogPopup>
     </AlertDialog>
