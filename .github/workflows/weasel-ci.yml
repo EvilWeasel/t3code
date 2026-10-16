@@ -66,34 +66,6 @@ jobs:
           path: ${{ runner.temp }}/composer-mobile
           if-no-files-found: error
           retention-days: 7
-      - name: Inspect merge service type boundaries
-        if: inputs.qualifyUpstream
-        run: |
-          node --input-type=module <<'TYPE_BOUNDARIES'
-          import ts from './node_modules/.pnpm/typescript@6.0.3/node_modules/typescript/lib/typescript.js';
-          const config = ts.readConfigFile('apps/server/tsconfig.json', ts.sys.readFile);
-          const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, 'apps/server');
-          const program = ts.createProgram(parsed.fileNames, parsed.options);
-          const checker = program.getTypeChecker();
-          const selections = {
-            'server.ts': ['layerMakeRoutes', 'layerRuntimeDependencies', 'layerMakeServer'],
-            'ws.ts': ['layer'],
-            'mcp/McpHttpServer.ts': ['layer', 'layerJarvisToolkit', 'layerOrchestratorToolkit'],
-            'voice/CodexLiveSessionService.ts': ['layer'],
-            'orchestration-v2/runtimeLayer.ts': ['layer'],
-          };
-          for (const [file, names] of Object.entries(selections)) {
-            const source = program.getSourceFile('apps/server/src/' + file);
-            if (!source) throw Error('missing type source ' + file);
-            const visit = node => {
-              if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && names.includes(node.name.text)) {
-                console.log(file + ':' + node.name.text + ' = ' + checker.typeToString(checker.getTypeAtLocation(node.name), undefined, ts.TypeFormatFlags.NoTruncation));
-              }
-              ts.forEachChild(node, visit);
-            };
-            visit(source);
-          }
-          TYPE_BOUNDARIES
       - name: Run focused source gates
         env:
           EFFECTIVE_SOURCE_SHA: ${{ inputs.qualificationSourceSha || github.sha }}

@@ -31,7 +31,7 @@ vi.mock("react-native", async () => {
     },
   };
 });
-vi.mock("../../components/AppText", () => ({
+vi.mock("../../components/ui/AppText", () => ({
   AppText: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
 }));
 import { PendingApprovalCard } from "./PendingApprovalCard";
