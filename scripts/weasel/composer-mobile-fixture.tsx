@@ -240,7 +240,7 @@ function Fixture() {
     compactDisabled: false,
     compactDisabledReason: null,
     resolvedTheme: "dark",
-    settings: { ...DEFAULT_UNIFIED_SETTINGS, contextWindowMeterEnabled: true },
+    settings: { ...DEFAULT_UNIFIED_SETTINGS, contextWindowMeterEnabled: true, planModeEnabled: true },
     keybindings: [],
     terminalOpen: false,
     gitCwd: null,
