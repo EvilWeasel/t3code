@@ -1809,6 +1809,7 @@ function codexReplayPreamble(input: {
           thread: {
             id: input.nativeThreadId,
             sessionId: input.nativeThreadId,
+            projectId: null,
             forkedFromId: null,
             preview: "",
             ephemeral: false,
@@ -1836,7 +1837,7 @@ function codexReplayPreamble(input: {
           approvalsReviewer: "user",
           sandbox: { type: "workspaceWrite", writableRoots: [], networkAccess: false },
           reasoningEffort: "medium",
-        },
+        } satisfies CodexSchema.V2ThreadStartResponse,
       },
     },
     {
