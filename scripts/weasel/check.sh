@@ -150,6 +150,8 @@ for observatory_test in "${observatory_tests[@]}"; do
   focused_tests+=("$observatory_test")
 done
 main_renderer_diagnostics_tests=(
+  packages/contracts/src/ipc.test.ts
+  apps/server/src/diagnostics/MainRendererDiagnosticsRegistered.test.ts
   apps/desktop/src/app/DesktopApp.test.ts
   apps/desktop/src/app/DesktopAppActivation.test.ts
   apps/server/src/diagnostics/MainRendererDiagnosticsLocalClient.test.ts
@@ -169,6 +171,7 @@ for diagnostic_test in "${main_renderer_diagnostics_tests[@]}"; do
   fi
   focused_tests+=("$diagnostic_test")
 done
+vp_cmd lint --report-unused-disable-directives apps/desktop/src/ipc/methods/mainRendererDiagnostics.test.ts apps/desktop/src/ipc/methods/mainRendererDiagnostics.ts apps/server/src/diagnostics/MainRendererDiagnosticsLocalClient.test.ts apps/server/src/diagnostics/MainRendererDiagnosticsLocalClient.ts apps/server/src/diagnostics/MainRendererDiagnosticsRegistered.test.ts apps/server/src/resourceTelemetry/DesktopTelemetryReceiver.test.ts apps/server/src/resourceTelemetry/DesktopTelemetryReceiver.ts apps/server/src/server.ts apps/server/src/ws.test.ts apps/server/src/ws.ts packages/contracts/src/ipc.test.ts packages/contracts/src/ipc.ts
 server_continuation_tests=(
   apps/server/src/orchestration-v2/DelegatedCompletionDelivery.test.ts
   apps/server/src/orchestration-v2/FoundationPersistence.test.ts
