@@ -1,6 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { expect, it } from "@effect/vitest";
-import { expectTypeOf } from "vitest";
+import { expect, expectTypeOf, it } from "@effect/vitest";
 import {
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
