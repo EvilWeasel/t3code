@@ -30,6 +30,16 @@ function button(): HTMLButtonElement {
   return element;
 }
 
+function deferred<T>() {
+  const completion: { resolve?: (value: T | PromiseLike<T>) => void } = {};
+  const promise = new Promise<T>((resolve) => {
+    completion.resolve = resolve;
+  });
+  const resolve = completion.resolve;
+  if (resolve === undefined) throw new Error("Deferred gate resolver was not initialized");
+  return { promise, resolve };
+}
+
 function Probe({
   label,
   committed,
@@ -83,7 +93,7 @@ describe("useStableCallback", () => {
     const committed: Callback[] = [];
     const events: string[] = [];
     const renderAttempts: string[] = [];
-    const suspended = Promise.withResolvers<void>();
+    const suspended = deferred<void>();
     const tree = (label: string, pause?: Promise<void>) => (
       <Suspense fallback={<span>Pending</span>}>
         <Probe
@@ -113,7 +123,7 @@ describe("useStableCallback", () => {
     expect(committed.at(-1)).toBe(first);
     expect(first("input", 1)).toBe("replacement:input");
     await act(async () => {
-      suspended.resolve();
+      suspended.resolve(undefined);
     });
     await act(async () => button().click());
     expect(events).toEqual(["committed:eventevent", "replacement:eventevent"]);
@@ -121,8 +131,8 @@ describe("useStableCallback", () => {
   });
 
   it("keeps a deferred invocation on its original callback after a new callback commits", async () => {
-    const original = Promise.withResolvers<string>();
-    const replacement = Promise.withResolvers<string>();
+    const original = deferred<string>();
+    const replacement = deferred<string>();
     const started: string[] = [];
     const pending: Array<Promise<{ label: string; argument: number; result: string }>> = [];
     const committed: Array<(argument: number) => (typeof pending)[number]> = [];
