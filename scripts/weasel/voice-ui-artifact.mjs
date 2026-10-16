@@ -134,7 +134,8 @@ try {
 // This mode runs in check before the unrelated server type gate. Legacy product capture stays above.
 if (process.argv.includes("--composer-mobile")) await captureComposerMobile();
 async function captureComposerMobile() {
-  const baseline = "b6525bb5fe4343ea5612ba5e9ec8e1a0b2482791";
+  // Both variants use the exact a86 dependency graph. Only the production UI modules differ.
+  const baseline = "a86d942da9e89ed382d2bfd7295b1e90ab2bc429";
   const uiPaths = ["apps/web/src/components/chat/ChatComposer.tsx", "apps/web/src/voice/LiveVoiceControl.tsx"];
   const source = Object.fromEntries(uiPaths.map(path => {
     const result = spawnSync("git", ["show", `${baseline}:${path}`], { encoding: "utf8", maxBuffer: 2_000_000 });
@@ -151,10 +152,10 @@ async function captureComposerMobile() {
     const partial = (path, code) => `export * from ${JSON.stringify(path + "?fixture-real")}; ${code}`;
     const env = "composer-mobile-fixture";
     const atoms = `import {Atom,AsyncResult} from "effect/reactivity"; const empty=Atom.make(AsyncResult.initial());`;
-    const config = `const provider={driver:"codex",instanceId:"codex",enabled:true,installed:true,status:"ready",auth:{status:"authenticated"},version:null,checkedAt:"2026-10-15T00:00:00.000Z",models:[{slug:"gpt-6.1-sol",name:"GPT-6.1 Sol · long model and context selection",isCustom:false,capabilities:null}],slashCommands:[],skills:[]}; const config={environment:{environmentId:${JSON.stringify(env)}},providers:[provider],settings:{providerInstances:{},projectSettingsOverrides:{}}};`;
+    const config = `const provider={driver:"codex",instanceId:"codex",enabled:true,installed:true,status:"ready",auth:{status:"authenticated"},version:null,checkedAt:"2026-10-15T00:00:00.000Z",models:["gpt-6.1-sol","synthetic-alternate"].map(slug=>({slug,name:slug==="synthetic-alternate"?"Synthetic alternate model":new URLSearchParams(location.search).get("catalog")==="long"?"GPT-6.1-Sol · synthetic long model and context selection":"GPT-6.1-Sol",isCustom:false,capabilities:{optionDescriptors:[{id:"reasoningEffort",label:"Reasoning effort",type:"select",currentValue:"medium",options:[{id:"medium",label:"Medium",isDefault:true},{id:"high",label:"High"}]}]}})),slashCommands:[],skills:[]}; const config={environment:{environmentId:${JSON.stringify(env)}},providers:[provider],settings:{providerInstances:{},projectSettingsOverrides:{}}};`;
     const boundaries = new Map([
       [join(web,"src/hooks/useSettings"), partial(join(web,"src/hooks/useSettings.ts"), 'export const usePrimarySettingsAvailable=()=>true;export const useEnvironmentModelPreferences=()=>({favorites:[],hidden:[],recent:[]});export const useToggleEnvironmentModelFavorite=()=>()=>{throw Error("Fixture settings mutation forbidden");};')],
-      ["@tanstack/react-router", mock('export const useLocation=(o)=>o.select({hash:"",state:{},pathname:"/fixture"});const params=Object.freeze({environmentId:"composer-mobile-fixture",threadId:"composer-mobile-fixture-thread"});export const useParams=(options={})=>options.select?options.select(params):params;export const useNavigate=()=>()=>{};export const Link=({children,...p})=>React.createElement("a",p,children);')],
+      ["@tanstack/react-router", mock('export const useLocation=(o)=>o.select({hash:"",state:{},pathname:"/fixture"});const params=Object.freeze({environmentId:"composer-mobile-fixture",threadId:"composer-mobile-fixture-thread"});export const useParams=(options={})=>options.select?options.select(params):params;export const useNavigate=()=>()=>{};export const Link=({children,to,...p})=>React.createElement("a",{...p,href:to},children);')],
       [join(web,"src/state/server"), partial(join(web,"src/state/server.ts"), `${atoms}${config} import {serverEnvironment as actual} from ${JSON.stringify(join(web,"src/state/server.ts")+"?fixture-real")}; const value=Atom.make(config);const projection=Atom.make(AsyncResult.success({config}));export const serverEnvironment={...actual,configValueAtom:()=>value,configProjection:()=>projection,refreshProviders:{label:"fixture-refresh"}};`)],
       [join(web,"src/state/session"), partial(join(web,"src/state/session.ts"), `${atoms} import {environmentSession as actual} from ${JSON.stringify(join(web,"src/state/session.ts")+"?fixture-real")}; const session=Atom.make(AsyncResult.success({}));export const environmentSession={...actual,sessionStateAtom:()=>session};export const useEnvironmentScope=()=>true;export const readEnvironmentScope=()=>true;export const readPreparedConnection=()=>null;export const usePreparedConnection=()=>({_tag:"None"});`)],
       [join(web,"src/state/environments"), partial(join(web,"src/state/environments.ts"), `export const usePrimaryEnvironmentId=()=>${JSON.stringify(env)};export const usePrimaryEnvironment=()=>({environmentId:${JSON.stringify(env)},label:"Synthetic fixture"});`)],
@@ -194,9 +195,9 @@ async function captureComposerMobile() {
       await vite.listen();
       const origin=`http://127.0.0.1:${vite.httpServer.address().port}`;
       browser=await chromium.launch({headless:true});
-      const matrix=[... [360,384,390,412].flatMap(width=>[840,460].flatMap(height=>["default","large"].map(text=>({width,height,text})))),{width:1280,height:900,text:"default"}];
+      const matrix=[... [360,384,390,412].flatMap(width=>[840,460].flatMap(height=>["default","large"].map(text=>({width,height,text})))),{width:1280,height:900,text:"default"}, {width:360,height:460,text:"large",catalog:"long"}, {width:1280,height:900,text:"default",catalog:"long"}];
       for(const entry of matrix) {
-        const name=`composer-${variant}-${entry.width}x${entry.height}-${entry.text}`;
+        const name=`composer-${variant}-${entry.width}x${entry.height}-${entry.text}${entry.catalog?"-"+entry.catalog:""}`;
         const page=await browser.newPage({viewport:{width:entry.width,height:entry.height},deviceScaleFactor:1,reducedMotion:"reduce"});
         const errors=[];const forbiddenRequests=[];
         page.on("pageerror",error=>errors.push(error.message.slice(0,2000)));
@@ -212,16 +213,29 @@ async function captureComposerMobile() {
         });
         const result={name,...entry,variant,emulation:true,keyboard:entry.height===460?"reduced-height emulation":"closed",errors,forbiddenRequests};
         cases.push(result);
+        result.images=[];
+        const settle=()=>page.evaluate(()=>Promise.all(document.getAnimations().map(animation=>animation.finished.catch(()=>undefined))));
+        const capture=async state=>{
+          await settle();
+          const file=name+(state==="closed"?"":"-"+state)+".png";
+          await page.screenshot({path:join(output,file),fullPage:true});
+          result.images.push({state,file,sha256:digest(await readFile(join(output,file)))});
+        };
+        const context=()=>page.evaluate(()=>window.readComposerFixtureContext());
+        const boundedVisible=async selector=>page.locator(selector).evaluateAll(elements=>elements.filter(e=>e.getClientRects().length).map(e=>{const r=e.getBoundingClientRect();return {label:e.getAttribute("aria-label")||e.textContent?.trim(),x:r.x,y:r.y,right:r.right,bottom:r.bottom,inBounds:r.x>=-1&&r.right<=innerWidth+1&&r.y>=-1&&r.bottom<=innerHeight+1};}));
         try {
-          await page.goto(`${origin}/?text=${entry.text}`,{timeout:30000});
+          await page.goto(`${origin}/?text=${entry.text}&catalog=${entry.catalog??"exact"}`,{timeout:30000});
           await page.getByLabel("Message",{exact:true}).waitFor({timeout:30000});
           await page.evaluate(()=>document.fonts.ready);
           const editor=page.getByLabel("Message",{exact:true});
           await editor.fill("Synthetic mobile draft retained across queue and options");
-          await page.getByRole("region",{name:"16 queued messages",exact:true}).waitFor();
+          await page.getByRole("region",{name:"17 queued messages",exact:true}).waitFor();
           await page.getByRole("button",{name:"Collapse queued messages",exact:true}).click();
+          await page.getByRole("button",{name:"Expand queued messages",exact:true}).waitFor();
+          await capture("queue-collapsed");
           await page.getByRole("button",{name:"Expand queued messages",exact:true}).click();
           await editor.focus();
+          await settle();
           result.geometry=await page.evaluate(()=>{
             const box=element=>{const r=element.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,right:r.right,bottom:r.bottom};};
             const controls=[...document.querySelectorAll('[data-chat-composer-footer="true"] button,[aria-label="Message"]')].filter(element=>element.getClientRects().length).map(element=>({label:element.getAttribute("aria-label")||element.textContent?.trim(),disabled:element.disabled===true,...box(element)}));
@@ -230,33 +244,93 @@ async function captureComposerMobile() {
             return {pageWidth:document.documentElement.scrollWidth,viewportWidth:innerWidth,viewportHeight:innerHeight,controls,queue:queue?{...box(queue),scrollHeight:queue.scrollHeight,scrollTop:queue.scrollTop}:null,focused:document.activeElement?.getAttribute("aria-label"),reasonVisible:[...document.querySelectorAll('[role="status"]')].some(element=>element.textContent?.includes("has no saved settings"))};
           });
           await page.evaluate(()=>window.scrollTo(0,0));
-          await page.screenshot({path:join(output,name+".png"),fullPage:true});
+          await capture("closed");
           await page.getByRole("button",{name:"Record voice message",exact:true}).focus();
           result.micFocusable=await page.getByRole("button",{name:"Record voice message",exact:true}).evaluate(element=>element===document.activeElement);
           const voice=page.getByRole("button",{name:"Start voice call",exact:true});
           result.voiceDisabled=await voice.isDisabled();
           await page.getByRole("button",{name:"Attach files",exact:true}).focus();
           result.attachmentFocusable=await page.getByRole("button",{name:"Attach files",exact:true}).evaluate(element=>element===document.activeElement);
-          const options=page.getByRole("button",{name:/options|runtime mode|GPT-6.1/i}).first();
-          if(await options.count()) {await options.click();await page.keyboard.press("Escape");result.optionsOpened=true;} else throw Error("Actual options control not found");
+          // The actual link remains reachable without visiting settings or changing credentials.
+          const secondary=page.getByRole("link",{name:"Voice provider and API key settings",exact:true});
+          await secondary.focus();
+          result.secondaryFocusable=await secondary.evaluate(element=>element===document.activeElement);
+          if(variant==="after" && entry.width<640) {
+            const group=page.getByRole("button",{name:"Model and configuration",exact:true});
+            const close=page.getByRole("button",{name:"Close configuration",exact:true});
+            const openGroup=async()=>{if(!await close.isVisible()) await group.click();await close.waitFor();};
+            const initial=await context();
+            const callsBefore=await page.evaluate(()=>JSON.stringify([window.composerFixture.modelChoices,window.composerFixture.runtimeChoices,window.composerFixture.interactionChoices,window.composerFixture.interactionToggles]));
+            await openGroup();
+            await page.getByRole("button",{name:"Choose model",exact:true}).waitFor();
+            await page.getByRole("combobox",{name:"Runtime mode",exact:true}).waitFor();
+            const callsAfter=await page.evaluate(()=>JSON.stringify([window.composerFixture.modelChoices,window.composerFixture.runtimeChoices,window.composerFixture.interactionChoices,window.composerFixture.interactionToggles]));
+            if(callsBefore!==callsAfter || JSON.stringify(initial)!==JSON.stringify(await context())) throw Error("Configuration open changed selection");
+            await settle();
+            result.configurationGeometry=await boundedVisible('[data-slot="popover-popup"] button,[data-slot="popover-popup"] [role="combobox"]');
+            if(!result.configurationGeometry.length || !result.configurationGeometry.every(item=>item.inBounds)) throw Error("Configuration controls out of bounds");
+            await capture("configuration-open");
+            // Exercise the existing picker and controlled callbacks, then restore the original model.
+            for(const label of ["Synthetic alternate model",entry.catalog==="long"?"GPT-6.1-Sol · synthetic long model and context selection":"GPT-6.1-Sol"]) {
+              await openGroup();
+              await page.getByRole("button",{name:"Choose model",exact:true}).click();
+              await page.getByRole("option").filter({hasText:label}).click();
+              result.modelPickerFocus=await page.evaluate(()=>document.activeElement?.getAttribute("aria-label"));
+            }
+            await openGroup();
+            await page.locator('button[data-composer-shortcut="composer.effort"]').click();
+            await page.getByRole("menuitemradio",{name:"High",exact:true}).click();
+            result.reasoningChoice=await context();
+            if(result.reasoningChoice.reasoning!=="high") throw Error("Actual draft reasoning choice missing");
+            await openGroup();
+            await page.getByRole("combobox",{name:"Runtime mode",exact:true}).click();
+            await page.getByRole("option").filter({hasText:"Supervised"}).click();
+            if((await context()).runtimeMode!=="approval-required") throw Error("Runtime choice not reflected");
+            await openGroup();
+            await page.getByRole("button",{name:"Default mode — click to enter plan mode",exact:true}).click();
+            if((await context()).interactionMode!=="plan") throw Error("Interaction choice not reflected");
+            await capture("configuration-choice");
+            await close.click();
+            await page.waitForFunction(()=>document.activeElement?.getAttribute("aria-label")==="Model and configuration",null,{timeout:2000});
+            result.explicitCloseFocus=await group.evaluate(element=>element===document.activeElement);
+            if(!result.explicitCloseFocus) throw Error("Explicit configuration close lost focus");
+            await capture("configuration-focus");
+            await openGroup();
+            await page.getByRole("button",{name:"Plan mode — click to return to normal build mode",exact:true}).waitFor();
+            result.retainedChoice=await context();
+            if(result.retainedChoice.reasoning!=="high" || result.retainedChoice.runtimeMode!=="approval-required") throw Error("Configuration choice not retained");
+            await page.keyboard.press("Escape");
+            await close.waitFor({state:"hidden"});
+            await page.waitForFunction(()=>document.activeElement?.getAttribute("aria-label")==="Model and configuration",null,{timeout:2000});
+            result.escapeCloseFocus=await group.evaluate(element=>element===document.activeElement);
+            if(!result.escapeCloseFocus) throw Error("Escape configuration close lost focus");
+            result.optionsOpened=true;
+          } else {
+            const options=page.getByRole("combobox",{name:"Runtime mode",exact:true});
+            await options.click();await page.keyboard.press("Escape");result.optionsOpened=true;
+          }
           await editor.focus();
           const send=page.getByRole("button",{name:"Submit message",exact:true});
           await send.click();
           result.observation=await page.evaluate(()=>window.composerFixture);
-          result.interactionPassed=result.micFocusable&&result.attachmentFocusable&&result.voiceDisabled&&result.observation.sends.length===1&&result.observation.sends[0]==="Synthetic mobile draft retained across queue and options";
+          result.interactionPassed=result.micFocusable&&result.attachmentFocusable&&result.secondaryFocusable&&result.voiceDisabled&&result.observation.sends.length===1&&result.observation.sends[0]==="Synthetic mobile draft retained across queue and options";
+          if(variant==="after"&&entry.width<640) {
+            const choices=result.observation.modelChoices;
+            if(choices.length!==2||choices[0].model!=="synthetic-alternate"||choices[1].model!=="gpt-6.1-sol"||result.observation.runtimeChoices.length!==1||result.observation.runtimeChoices[0]!=="approval-required"||result.observation.interactionToggles!==1) throw Error("Controlled choice callbacks differ");
+          }
           result.inBounds=result.geometry.pageWidth<=entry.width&&result.geometry.controls.every(control=>control.x>=-1&&control.right<=entry.width+1&&control.y>=-1&&control.bottom<=entry.height+1);
           result.passiveCallsZero=result.observation.forbiddenCommands===0&&result.observation.mediaCalls===0&&result.observation.peerCalls===0&&forbiddenRequests.length===0;
           if(variant==="after"&&(!result.inBounds||!result.interactionPassed||!result.passiveCallsZero||result.geometry.reasonVisible||!result.geometry.queue||result.geometry.queue.scrollTop<=0||errors.length)) throw Error("Hotfix viewport acceptance failed");
         } catch(error) {
           result.failure=String(error.message).slice(0,2000);
-          await page.screenshot({path:join(output,name+"-failure.png"),fullPage:true}).catch(()=>{});
+          await capture("failure").catch(()=>{});
           // Baseline geometric failure is expected; inability to mount or interact is a harness failure.
           failure=result.failure;
           throw error;
         } finally {await page.close();}
       }
     } finally {
-      await writeFile(join(output,"composer-mobile-receipt.json"),JSON.stringify({scope:"EMULATED actual production composer; no device/native/provider acceptance",baseline,source:bindings,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,head:process.env.GITHUB_SHA,cases,failure},null,2));
+      await writeFile(join(output,"composer-mobile-receipt.json"),JSON.stringify({scope:"EMULATED actual production composer; no device/native/provider acceptance",baseline,dependencyGraph:baseline,beforeScope:"exact current-main a86 production UI on a86 dependencies; published33 S24 JPG remains separate reference",source:bindings,run:process.env.GITHUB_RUN_ID,attempt:process.env.GITHUB_RUN_ATTEMPT,head:process.env.GITHUB_SHA,cases,failure},null,2));
       await browser?.close();await vite.close();await rm(directory,{recursive:true,force:true});
     }
   }

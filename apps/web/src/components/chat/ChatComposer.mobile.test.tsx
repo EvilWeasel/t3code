@@ -2,7 +2,12 @@
 
 import { act, createRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ThreadId,
+  type RuntimeMode,
+  type ProviderInteractionMode,
+} from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const commands = vi.hoisted(() => ({
@@ -24,10 +29,11 @@ vi.mock("../../state/use-atom-command", () => ({
   useAtomCommand: (name: keyof typeof commands) => commands[name],
 }));
 
-import { ChatComposerFooter } from "./ChatComposer";
+import { ChatComposerFooter, ComposerFooterModeControls } from "./ChatComposer";
 import { LiveVoiceControl, resolveLiveVoiceAvailability } from "../../voice/LiveVoiceControl";
 import { Button } from "../ui/button";
 import { TooltipProvider } from "../ui/tooltip";
+import { runtimeModeConfig, runtimeModeOptions } from "./runtimeModeConfig";
 
 const environmentId = EnvironmentId.make("mobile-fixture");
 const threadId = ThreadId.make("mobile-fixture-thread");
@@ -170,4 +176,124 @@ describe("production composer mobile footer", () => {
     expect(send).toHaveBeenCalledExactlyOnceWith("Keep this draft");
     expectPassive();
   });
+});
+
+it("opens the production grouped configuration deliberately, preserves choices and returns focus", async () => {
+  const changedMode = vi.fn();
+  const changedInteraction = vi.fn();
+  const send = vi.fn();
+  const attach = vi.fn();
+  function Fixture() {
+    const [open, setOpen] = useState(false);
+    const [mode, setMode] = useState<RuntimeMode>("approval-required");
+    const [interaction, setInteraction] = useState<ProviderInteractionMode>("default");
+    const [draft, setDraft] = useState("Keep this draft");
+    return (
+      <TooltipProvider delay={0}>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            send(draft);
+          }}
+        >
+          <textarea
+            aria-label="Message"
+            value={draft}
+            onChange={(event) => setDraft(event.currentTarget.value)}
+          />
+          <ChatComposerFooter
+            compact={false}
+            pendingInput={false}
+            mobilePendingActions={false}
+            resting={false}
+            inlineResting={false}
+            primaryActionsCompact={false}
+            mobileConfiguration={{ label: "GPT-6.1-Sol", open, onOpenChange: setOpen }}
+            controls={
+              <ComposerFooterModeControls
+                showInteractionModeToggle
+                interactionMode={interaction}
+                runtimeMode={mode}
+                runtimeModeOptions={runtimeModeOptions.map((value) => ({
+                  mode: value,
+                  ...runtimeModeConfig[value],
+                }))}
+                onRuntimeModeChange={(value) => {
+                  changedMode(value);
+                  setMode(value);
+                }}
+                onToggleInteractionMode={() => {
+                  const value = interaction === "default" ? "plan" : "default";
+                  changedInteraction(value);
+                  setInteraction(value);
+                }}
+              />
+            }
+            actions={
+              <>
+                <Button type="button" aria-label="Attach files" onClick={attach}>
+                  Attach
+                </Button>
+                <Button type="submit" aria-label="Send message">
+                  Send
+                </Button>
+              </>
+            }
+          />
+        </form>
+      </TooltipProvider>
+    );
+  }
+  await act(async () => root.render(<Fixture />));
+  const trigger = control("Model and configuration");
+  expect(trigger.getAttribute("aria-description")).toBe("GPT-6.1-Sol");
+  expect(document.querySelector('[aria-label="Runtime mode"]')).toBeNull();
+  expect(changedMode).not.toHaveBeenCalled();
+  expect(changedInteraction).not.toHaveBeenCalled();
+  expectPassive();
+  await act(async () => {
+    trigger.focus();
+    trigger.click();
+  });
+  expect(trigger.getAttribute("aria-expanded")).toBe("true");
+  const runtime = document.querySelector<HTMLButtonElement>('[aria-label="Runtime mode"]');
+  if (!runtime) throw new Error("Missing actual runtime picker");
+  await act(async () => runtime.click());
+  const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find((element) =>
+    element.textContent?.includes("Full access"),
+  );
+  if (!option) throw new Error("Missing actual Full access choice");
+  await act(async () => option.click());
+  expect(changedMode).toHaveBeenCalledExactlyOnceWith("full-access");
+  expect(changedInteraction).not.toHaveBeenCalled();
+  const plan = document.querySelector<HTMLButtonElement>(
+    '[aria-label="Default mode — click to enter plan mode"]',
+  );
+  if (!plan) throw new Error("Missing actual interaction control");
+  await act(async () => plan.click());
+  expect(changedInteraction).toHaveBeenCalledExactlyOnceWith("plan");
+  const close = document.querySelector<HTMLButtonElement>('[aria-label="Close configuration"]');
+  if (!close) throw new Error("Missing configuration close");
+  await act(async () => close.click());
+  expect(trigger.getAttribute("aria-expanded")).toBe("false");
+  expect(document.activeElement).toBe(trigger);
+  await act(async () => trigger.click());
+  expect(document.querySelector('[aria-label="Runtime mode"]')?.textContent).toContain(
+    "Full access",
+  );
+  expect(
+    document.querySelector('[aria-label="Plan mode — click to return to normal build mode"]'),
+  ).not.toBeNull();
+  const closeAgain = document.querySelector<HTMLButtonElement>(
+    '[aria-label="Close configuration"]',
+  );
+  if (!closeAgain) throw new Error("Missing reopened configuration close");
+  await act(async () => closeAgain.click());
+  const editor = container.querySelector<HTMLTextAreaElement>('[aria-label="Message"]');
+  expect(editor?.value).toBe("Keep this draft");
+  await act(async () => control("Attach files").click());
+  expect(attach).toHaveBeenCalledOnce();
+  await act(async () => control("Send message").click());
+  expect(send).toHaveBeenCalledExactlyOnceWith("Keep this draft");
+  expectPassive();
 });

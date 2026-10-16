@@ -7,6 +7,7 @@ import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { AttachmentFilePreview } from "../files/AttachmentFilePreview";
 import { Dialog, DialogPopup, DialogTitle } from "../ui/dialog";
+import { Popover, PopoverTrigger, PopoverPopup, PopoverTitle, PopoverClose } from "../ui/popover";
 import {
   composerPullRequestsFromLinks,
   filterComposerPullRequestMatches,
@@ -303,6 +304,7 @@ import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
 import {
   ComposerControl,
+  ComposerControlChevron,
   ComposerControlIcon,
   ComposerControlSeparator,
   ComposerSelectControl,
@@ -1237,7 +1239,7 @@ const supervisedRuntimeModeOption = {
   mode: "approval-required" as const,
   ...runtimeModeConfig["approval-required"],
 };
-const ComposerFooterModeControls = memo(function ComposerFooterModeControls(props: {
+export const ComposerFooterModeControls = memo(function ComposerFooterModeControls(props: {
   showInteractionModeToggle: boolean;
   interactionMode: ProviderInteractionMode;
   runtimeMode: RuntimeMode;
@@ -1510,6 +1512,7 @@ export function ChatComposerFooter({
   resting,
   inlineResting,
   primaryActionsCompact,
+  mobileConfiguration,
 }: {
   controls: ReactNode;
   actions: ReactNode;
@@ -1521,6 +1524,11 @@ export function ChatComposerFooter({
   resting: boolean;
   inlineResting: boolean;
   primaryActionsCompact: boolean;
+  mobileConfiguration?: {
+    label: string;
+    open: boolean;
+    onOpenChange: (open: boolean) => void;
+  };
 }) {
   return (
     <div
@@ -1528,6 +1536,7 @@ export function ChatComposerFooter({
       data-chat-composer-footer-compact={compact ? "true" : "false"}
       className={cn(
         "flex min-w-0 flex-wrap items-center justify-between gap-2 overflow-visible px-3 pb-3 sm:flex-nowrap sm:px-4 sm:pb-4",
+        mobileConfiguration && "max-sm:flex-nowrap",
         pendingInput && "pt-2",
         compact ? "gap-1.5" : "gap-2 sm:gap-0",
         mobilePendingActions && "hidden sm:flex",
@@ -1541,17 +1550,64 @@ export function ChatComposerFooter({
         data-chat-composer-footer-controls="true"
         className={cn(
           "relative -m-1 -ms-3.5 flex min-w-0 flex-1 basis-full items-center gap-1 overflow-x-auto p-1 ps-3.5 sm:basis-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+          mobileConfiguration && "max-sm:m-0 max-sm:basis-0 max-sm:overflow-visible max-sm:p-0",
           resting && "hidden",
         )}
       >
-        {controls}
+        {mobileConfiguration ? (
+          <Popover open={mobileConfiguration.open} onOpenChange={mobileConfiguration.onOpenChange}>
+            <PopoverTrigger
+              render={
+                <ComposerControl
+                  aria-label="Model and configuration"
+                  data-composer-shortcut="composer.mode composer.effort"
+                  aria-description={mobileConfiguration.label}
+                  className="min-w-0 max-w-full"
+                />
+              }
+            >
+              <span className="min-w-0 truncate">{mobileConfiguration.label}</span>
+              <ComposerControlChevron />
+            </PopoverTrigger>
+            <PopoverPopup
+              side="top"
+              align="start"
+              width="md"
+              padding="compact"
+              {...composerFloatingLayerProps}
+            >
+              <div className="flex items-center justify-between gap-2 pb-2">
+                <PopoverTitle>Model and configuration</PopoverTitle>
+                <PopoverClose
+                  render={
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Close configuration"
+                    />
+                  }
+                >
+                  <XIcon />
+                </PopoverClose>
+              </div>
+              <div className="flex min-w-0 flex-wrap items-center gap-2">{controls}</div>
+            </PopoverPopup>
+          </Popover>
+        ) : (
+          controls
+        )}
       </div>
       <div
         ref={actionsRef}
         data-chat-composer-actions="right"
         data-chat-composer-transition-actions="true"
         data-chat-composer-primary-actions-compact={primaryActionsCompact ? "true" : "false"}
-        className="flex min-w-0 max-w-full flex-1 basis-full flex-wrap items-center justify-end gap-2 sm:basis-auto sm:flex-none"
+        className={cn(
+          "flex min-w-0 max-w-full flex-1 basis-full flex-wrap items-center justify-end gap-2 sm:basis-auto sm:flex-none",
+          mobileConfiguration &&
+            "max-sm:flex-none max-sm:basis-auto max-sm:flex-nowrap max-sm:gap-1",
+        )}
       >
         {actions}
       </div>
@@ -2507,7 +2563,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [isComposerFooterCompact, setIsComposerFooterCompact] = useState(false);
   const [isComposerPrimaryActionsCompact, setIsComposerPrimaryActionsCompact] = useState(false);
   const [isComposerModelPickerOpen, setIsComposerModelPickerOpen] = useState(false);
+  const [isMobileConfigurationOpen, setIsMobileConfigurationOpen] = useState(false);
   const isMobileViewport = useMediaQuery("max-sm");
+  useEffect(() => {
+    if (isMobileViewport && isComposerModelPickerOpen) setIsMobileConfigurationOpen(true);
+  }, [isMobileViewport, isComposerModelPickerOpen]);
+  useEffect(() => {
+    if (!isMobileViewport) return;
+    setIsMobileConfigurationOpen(false);
+    setIsComposerModelPickerOpen(false);
+  }, [isMobileViewport, environmentId, activeThreadId, draftId]);
   const {
     isComposerFocused,
     setIsComposerFocused,
@@ -5257,12 +5322,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     setIsComposerScrollCollapsed,
   ]);
 
-  const restingHiddenBlockCount = composerControlsCollapsed
-    ? restingControlsHiddenBlockCount
-    : expandedControlsLayout.hiddenBlockCount;
-  const iconOnlyBlockCount = composerControlsCollapsed
-    ? restingControlsIconOnlyBlockCount
-    : expandedControlsLayout.iconOnlyBlockCount;
+  const mobileConfigurationVisible = isMobileViewport && !composerControlsCollapsed;
+  const restingHiddenBlockCount = mobileConfigurationVisible
+    ? 0
+    : composerControlsCollapsed
+      ? restingControlsHiddenBlockCount
+      : expandedControlsLayout.hiddenBlockCount;
+  const iconOnlyBlockCount = mobileConfigurationVisible
+    ? 0
+    : composerControlsCollapsed
+      ? restingControlsIconOnlyBlockCount
+      : expandedControlsLayout.iconOnlyBlockCount;
   const restingProviderTraitsPicker = renderProviderTraitsPicker({
     ...providerTraitsPickerInput,
     size: composerControlsCollapsed ? "xs" : "sm",
@@ -5383,14 +5453,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         keybindings={keybindings}
         modelOptionsByInstance={modelOptionsByInstance}
         size={composerControlsCollapsed ? "xs" : "sm"}
+        {...(mobileConfigurationVisible ? { triggerAriaLabel: "Choose model" } : {})}
         triggerClassName={
-          composerControlsCollapsed
-            ? cn(
-                "min-w-13 shrink text-xs!",
-                !showInlineRestingControls &&
-                  "@max-[640px]/composer-surface:[&_[data-chat-provider-model-picker-label]]:w-0 @max-[640px]/composer-surface:[&_[data-chat-provider-model-picker-label]]:flex-none",
-              )
-            : "-ms-2.5 min-w-13"
+          mobileConfigurationVisible
+            ? "-ms-2.5 min-w-13 max-w-full"
+            : composerControlsCollapsed
+              ? cn(
+                  "min-w-13 shrink text-xs!",
+                  !showInlineRestingControls &&
+                    "@max-[640px]/composer-surface:[&_[data-chat-provider-model-picker-label]]:w-0 @max-[640px]/composer-surface:[&_[data-chat-provider-model-picker-label]]:flex-none",
+                )
+              : "-ms-2.5 min-w-13"
         }
         terminalOpen={terminalOpen}
         open={isComposerModelPickerOpen}
@@ -7430,6 +7503,22 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 controlsRef={expandedControlsLayout.attachControls}
                 actionsRef={setRestingActionsElement}
                 controls={composerControlsCollapsed ? null : composerControls}
+                {...(mobileConfigurationVisible
+                  ? {
+                      mobileConfiguration: {
+                        label:
+                          resolveContextWindowModelDisplayName(
+                            selectedModelSelection,
+                            modelOptionsByInstance,
+                          ) ?? selectedModelForPickerWithCustomFallback,
+                        open: isMobileConfigurationOpen,
+                        onOpenChange: (open: boolean) => {
+                          setIsMobileConfigurationOpen(open);
+                          if (!open) setIsComposerModelPickerOpen(false);
+                        },
+                      },
+                    }
+                  : {})}
                 actions={
                   <>
                     {!isComposerApprovalState && pendingUserInputs.length === 0 ? (
