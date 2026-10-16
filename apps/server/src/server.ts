@@ -695,6 +695,10 @@ const layerCommandReadiness = HttpRouter.middleware(
   { global: true },
 );
 
+export const layerMainRendererDiagnosticsWs = Ws.layer.pipe(
+  Layer.provide(MainRendererDiagnosticsLocalClient.layer),
+);
+
 const layerMakeRoutes = Layer.mergeAll(
   Layer.mergeAll(
     HttpApiBuilder.layer(EnvironmentHttpApi).pipe(
@@ -715,7 +719,7 @@ const layerMakeRoutes = Layer.mergeAll(
     DeviceHubProxy.layer,
     ServerBrowserStream.routeLayer,
     ServerHttp.layerStaticAndDevRoute,
-    Ws.layer.pipe(Layer.provide(MainRendererDiagnosticsLocalClient.layer)),
+    layerMainRendererDiagnosticsWs,
   ),
   // The MCP session registry is provided globally (shared with V2 provider
   // sessions) rather than inline here. The orchestrator toolkit resolves

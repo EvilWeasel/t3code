@@ -2493,27 +2493,47 @@ const layerWsRpc = (
                 .getThreadRecords(ThreadId.make(request.target.threadId), [])
                 .pipe(Effect.option, Effect.map(Option.isSome));
               // Choose topology before issuing a read. An FD refusal is never retried locally.
-              const read =
+              const route =
                 config.desktopTelemetryFd === undefined &&
                 config.desktopTelemetryControlFd === undefined
+                  ? "local"
+                  : "fd";
+              const selectedRead =
+                route === "local"
                   ? Option.isSome(localMainDiagnostics)
-                    ? localMainDiagnostics.value.read(request, environmentId)
-                    : Effect.succeed({
-                        status: "unavailable" as const,
-                        reason: "unsupported" as const,
-                      })
-                  : desktopDiagnostics.readMainRendererDiagnostics === undefined
-                    ? Effect.succeed({
-                        status: "unavailable" as const,
-                        reason: "unsupported" as const,
-                      })
-                    : desktopDiagnostics.readMainRendererDiagnostics(request, environmentId);
+                    ? localMainDiagnostics.value.read
+                    : undefined
+                  : desktopDiagnostics.readMainRendererDiagnostics;
+              const handlerAvailable = selectedRead !== undefined;
+              const read: Effect.Effect<MainRendererDiagnosticsReadResult> =
+                selectedRead === undefined
+                  ? Effect.succeed({
+                      status: "unavailable",
+                      reason: "unsupported",
+                      unsupportedDiagnostic: {
+                        site:
+                          route === "local" ? "ws-local-service-missing" : "ws-fd-method-missing",
+                      },
+                    })
+                  : selectedRead(request, environmentId);
               const result = yield* readMainRendererDiagnosticsForTarget(
                 request,
                 environmentId,
                 threadExists,
                 read,
               );
+              if (result.status === "unavailable" && result.reason === "unsupported") {
+                return {
+                  mainRendererSnapshot: {
+                    ...result,
+                    unsupportedDiagnostic: {
+                      site: result.unsupportedDiagnostic?.site ?? "unattributed",
+                      route,
+                      handlerAvailable,
+                    },
+                  },
+                };
+              }
               return { mainRendererSnapshot: result };
             }),
           );

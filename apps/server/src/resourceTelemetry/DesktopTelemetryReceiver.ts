@@ -9,6 +9,7 @@ import {
   DesktopMainRendererDiagnosticsReply,
   MainRendererDiagnosticsReadInput,
   type MainRendererDiagnosticsReadResult,
+  type MainRendererDiagnosticsUnsupportedSite,
   type DesktopHostTelemetryMessage as DesktopHostTelemetryMessageValue,
   type DesktopHostTelemetrySnapshot,
   DesktopTelemetryControlMessage,
@@ -366,7 +367,15 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
     | undefined;
   const unavailable = (
     reason: Extract<MainRendererDiagnosticsReadResult, { status: "unavailable" }>["reason"],
-  ): MainRendererDiagnosticsReadResult => ({ status: "unavailable", reason });
+    site?: MainRendererDiagnosticsUnsupportedSite,
+  ): MainRendererDiagnosticsReadResult =>
+    reason === "unsupported"
+      ? {
+          status: "unavailable",
+          reason,
+          ...(site === undefined ? {} : { unsupportedDiagnostic: { site } }),
+        }
+      : { status: "unavailable", reason };
   const closeDiagnostics = () => {
     desktopNonce = undefined;
     serverNonce = undefined;
@@ -712,15 +721,13 @@ export const make = Effect.fn("resourceTelemetry.desktopTelemetryReceiver.make")
       const start = DateTime.toEpochMillis(yield* DateTime.now);
       if (input.expiresAtMs <= start || input.expiresAtMs - start > 5_000)
         return unavailable("expired");
-      if (
-        desktopNonce === undefined ||
-        config.desktopTelemetryControlFd === undefined ||
-        Option.isNone(crypto)
-      )
-        return unavailable("unsupported");
+      if (desktopNonce === undefined) return unavailable("unsupported", "fd-peer-missing");
+      if (config.desktopTelemetryControlFd === undefined)
+        return unavailable("unsupported", "fd-control-missing");
+      if (Option.isNone(crypto)) return unavailable("unsupported", "fd-crypto-missing");
       if (diagnosticPending) return unavailable("busy");
       const nonce = yield* crypto.value.randomUUIDv4.pipe(Effect.option);
-      if (Option.isNone(nonce)) return unavailable("unsupported");
+      if (Option.isNone(nonce)) return unavailable("unsupported", "fd-request-nonce");
       const pair = desktopNonce;
       const peer = serverNonce ?? nonce.value;
       serverNonce = peer;

@@ -1273,6 +1273,40 @@ export const MainRendererDiagnosticsReadInput = Schema.Struct({
   expiresAtMs: NonNegativeInt,
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type MainRendererDiagnosticsReadInput = typeof MainRendererDiagnosticsReadInput.Type;
+export const MainRendererDiagnosticsUnsupportedSite = Schema.Literals([
+  "unattributed",
+  "ws-local-service-missing",
+  "ws-fd-method-missing",
+  "local-platform",
+  "local-user-id",
+  "local-fd-conflict",
+  "local-address",
+  "local-capability",
+  "local-socket-error",
+  "local-exchange-rejected",
+  "fd-peer-missing",
+  "fd-control-missing",
+  "fd-crypto-missing",
+  "fd-request-nonce",
+  "main-session-nonce",
+  "main-metadata",
+  "main-request-nonce",
+  "main-sequence-exhausted",
+]);
+export type MainRendererDiagnosticsUnsupportedSite =
+  typeof MainRendererDiagnosticsUnsupportedSite.Type;
+
+const MainRendererDiagnosticsUnsupportedDiagnostic = Schema.Union([
+  Schema.Struct({ site: MainRendererDiagnosticsUnsupportedSite }).annotate({
+    parseOptions: { onExcessProperty: "error" },
+  }),
+  Schema.Struct({
+    site: MainRendererDiagnosticsUnsupportedSite,
+    route: Schema.Literals(["local", "fd"]),
+    handlerAvailable: Schema.Boolean,
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+]);
+
 export const MainRendererDiagnosticsReadResult = Schema.Union([
   Schema.Struct({
     status: Schema.Literal("ready"),
@@ -1280,11 +1314,15 @@ export const MainRendererDiagnosticsReadResult = Schema.Union([
     appVersion: TrimmedNonEmptyString,
     observedAtMs: NonNegativeInt,
     expiresAtMs: NonNegativeInt,
-  }),
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
+  Schema.Struct({
+    status: Schema.Literal("unavailable"),
+    reason: Schema.Literal("unsupported"),
+    unsupportedDiagnostic: Schema.optionalKey(MainRendererDiagnosticsUnsupportedDiagnostic),
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
   Schema.Struct({
     status: Schema.Literal("unavailable"),
     reason: Schema.Literals([
-      "unsupported",
       "off",
       "busy",
       "target-mismatch",
@@ -1296,7 +1334,7 @@ export const MainRendererDiagnosticsReadResult = Schema.Union([
       "source-closed",
       "invalid-response",
     ]),
-  }),
+  }).annotate({ parseOptions: { onExcessProperty: "error" } }),
 ]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type MainRendererDiagnosticsReadResult = typeof MainRendererDiagnosticsReadResult.Type;
 

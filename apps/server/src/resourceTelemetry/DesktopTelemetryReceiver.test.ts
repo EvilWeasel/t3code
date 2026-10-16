@@ -1,10 +1,7 @@
 import * as NodeStream from "@effect/platform-node/NodeStream";
 import * as Queue from "effect/Queue";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import {
-  DesktopTelemetryControlMessage,
-  DEFAULT_SERVER_SETTINGS,
-} from "@t3tools/contracts";
+import { DesktopTelemetryControlMessage, DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import type * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
@@ -168,7 +165,11 @@ for (const extra of ["none", "top", "nested"] as const) {
         };
         assert.deepEqual(
           yield* receiver.readMainRendererDiagnostics!(request, request.target.environmentId),
-          { status: "unavailable", reason: "unsupported" },
+          {
+            status: "unavailable",
+            reason: "unsupported",
+            unsupportedDiagnostic: { site: "fd-peer-missing" },
+          },
         );
         assert.equal(
           commands.some((m) => m.type === "mainRendererDiagnosticsPeer"),

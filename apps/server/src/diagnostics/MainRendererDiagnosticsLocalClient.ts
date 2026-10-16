@@ -10,6 +10,7 @@ import {
   MainRendererLocalDiagnosticsResult,
   MainRendererDiagnosticsReadInput,
   type MainRendererDiagnosticsReadResult,
+  type MainRendererDiagnosticsUnsupportedSite,
 } from "@t3tools/contracts";
 import { resolveDesktopAppControlAddress } from "@t3tools/shared/desktopAppControl";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -23,7 +24,15 @@ import * as ServerConfig from "../config.ts";
 
 const unavailable = (
   reason: Extract<MainRendererDiagnosticsReadResult, { status: "unavailable" }>["reason"],
-): MainRendererDiagnosticsReadResult => ({ status: "unavailable", reason });
+  site?: MainRendererDiagnosticsUnsupportedSite,
+): MainRendererDiagnosticsReadResult =>
+  reason === "unsupported"
+    ? {
+        status: "unavailable",
+        reason,
+        ...(site === undefined ? {} : { unsupportedDiagnostic: { site } }),
+      }
+    : { status: "unavailable", reason };
 const decodeCapability = Schema.decodeUnknownOption(
   Schema.fromJsonString(MainRendererLocalDiagnosticsCapability),
   { onExcessProperty: "error" },
@@ -184,7 +193,7 @@ function exchange(input: {
           if (!capability) {
             const parsed = decodeCapability(line);
             if (Option.isNone(parsed)) {
-              finish(unavailable("unsupported"));
+              finish(unavailable("unsupported", "local-capability"));
               return;
             }
             const cap = parsed.value;
@@ -240,7 +249,7 @@ function exchange(input: {
         () => finish(unavailable("not-main")),
       );
     });
-    socket.once("error", () => finish(unavailable("unsupported")));
+    socket.once("error", () => finish(unavailable("unsupported", "local-socket-error")));
     socket.once("end", () => {
       if (!receiving) finish(unavailable("source-closed"));
     });
@@ -277,13 +286,13 @@ export const make = Effect.fn("MainRendererDiagnosticsLocalClient.make")(functio
         })(request).pipe(Effect.option);
         if (Option.isNone(decoded)) return unavailable("invalid-response");
         if (request.target.environmentId !== environmentId) return unavailable("target-mismatch");
+        if (platform !== "linux") return unavailable("unsupported", "local-platform");
+        if (userId === undefined) return unavailable("unsupported", "local-user-id");
         if (
-          platform !== "linux" ||
-          userId === undefined ||
           config.desktopTelemetryFd !== undefined ||
           config.desktopTelemetryControlFd !== undefined
         )
-          return unavailable("unsupported");
+          return unavailable("unsupported", "local-fd-conflict");
         const started = DateTime.toEpochMillis(yield* DateTime.now);
         if (request.expiresAtMs <= started || request.expiresAtMs - started > 5_000)
           return unavailable("expired");
@@ -298,7 +307,7 @@ export const make = Effect.fn("MainRendererDiagnosticsLocalClient.make")(functio
             userId,
             joinPath: NodePath.join,
           });
-          if (address.directory === null) return unavailable("unsupported");
+          if (address.directory === null) return unavailable("unsupported", "local-address");
           const directory = address.directory;
           const inspect = () =>
             options?.inspect?.(address.address, directory) ??
@@ -333,11 +342,15 @@ export const make = Effect.fn("MainRendererDiagnosticsLocalClient.make")(functio
                 inspect,
                 signal,
               }),
-            catch: () => "unsupported" as const,
+            catch: () => "local-exchange-rejected" as const,
           });
         }).pipe(
           Effect.catch((reason) =>
-            Effect.succeed(unavailable(typeof reason === "string" ? reason : "invalid-response")),
+            Effect.succeed(
+              reason === "local-exchange-rejected"
+                ? unavailable("unsupported", reason)
+                : unavailable(typeof reason === "string" ? reason : "invalid-response"),
+            ),
           ),
           Effect.timeoutOption("2 seconds"),
           Effect.map((result) => Option.getOrElse(result, () => unavailable("timeout"))),

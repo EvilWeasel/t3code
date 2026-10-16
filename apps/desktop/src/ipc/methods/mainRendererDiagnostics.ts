@@ -3,6 +3,7 @@ import {
   MainRendererDiagnosticsResponse,
   type MainRendererDiagnosticsReadInput,
   type MainRendererDiagnosticsReadResult,
+  type MainRendererDiagnosticsUnsupportedSite,
   type MainRendererDiagnosticsRequest,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -25,7 +26,15 @@ const sameTarget = Schema.toEquivalence(
 );
 const unavailable = (
   reason: Extract<MainRendererDiagnosticsReadResult, { status: "unavailable" }>["reason"],
-): MainRendererDiagnosticsReadResult => ({ status: "unavailable", reason });
+  site?: MainRendererDiagnosticsUnsupportedSite,
+): MainRendererDiagnosticsReadResult =>
+  reason === "unsupported"
+    ? {
+        status: "unavailable",
+        reason,
+        ...(site === undefined ? {} : { unsupportedDiagnostic: { site } }),
+      }
+    : { status: "unavailable", reason };
 
 export class MainRendererDiagnostics extends Context.Service<
   MainRendererDiagnostics,
@@ -147,7 +156,7 @@ export const make = Effect.fn("desktop.mainRendererDiagnostics.make")(function* 
     read: (source, alive, input) =>
       Effect.gen(function* () {
         const startedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
-        if (Option.isNone(sessionNonce)) return unavailable("unsupported");
+        if (Option.isNone(sessionNonce)) return unavailable("unsupported", "main-session-nonce");
         if (input.expiresAtMs <= startedAtMs || input.expiresAtMs - startedAtMs > 5_000)
           return unavailable("expired");
         if (!alive()) return unavailable("source-closed");
@@ -156,16 +165,17 @@ export const make = Effect.fn("desktop.mainRendererDiagnostics.make")(function* 
         if (Option.isNone(main) || main.value.isDestroyed() || main.value.webContents.isDestroyed())
           return unavailable("not-main");
         const metadata = yield* app.metadata.pipe(Effect.option);
-        if (Option.isNone(metadata)) return unavailable("unsupported");
+        if (Option.isNone(metadata)) return unavailable("unsupported", "main-metadata");
         const nonce = yield* crypto.randomUUIDv4.pipe(Effect.option);
-        if (Option.isNone(nonce)) return unavailable("unsupported");
+        if (Option.isNone(nonce)) return unavailable("unsupported", "main-request-nonce");
         const requestNonce = nonce.value;
         const deferred = yield* Deferred.make<MainRendererDiagnosticsReadResult>();
         if (pending || !alive()) return unavailable("busy");
         const window = main.value;
         watch(window);
         const frame = window.webContents.mainFrame;
-        if (requestSequence >= Number.MAX_SAFE_INTEGER) return unavailable("unsupported");
+        if (requestSequence >= Number.MAX_SAFE_INTEGER)
+          return unavailable("unsupported", "main-sequence-exhausted");
         const request: MainRendererDiagnosticsRequest = {
           version: 1,
           requestSequence: ++requestSequence,
