@@ -4,8 +4,11 @@ import {
   ProjectId,
   ProviderInstanceId,
   ComposerContextId,
-  type OrchestrationMessageContext,
+  EnvironmentId,
+  ThreadId,
+  OrchestrationMessageContext,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { collectComposerInlineTokens } from "@t3tools/shared/composerInlineTokens";
 import {
   ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
@@ -24,6 +27,7 @@ import {
   uploadedComposerContext,
   serializeComposerMessageForServer,
   pullRequestComposerContext,
+  threadComposerContext,
 } from "./composerContext";
 
 const terminal = {
@@ -317,4 +321,101 @@ describe("host context compatibility", () => {
     expect(serializeComposerMessageForServer(text, context, true)).toEqual({ text, context });
     expect(context.records).toEqual([terminal, review, pr]);
   });
+});
+
+describe("native-child thread composer context", () => {
+  const environmentId = EnvironmentId.make("selected-environment");
+  const nativeIds = [
+    "thread:mcp:child:review:0",
+    "thread:mcp:child%3Areview%2Fpart:0",
+    `thread:mcp:${encodeURIComponent("3f2b:delegate/🦦")}:review:0`,
+    `thread:mcp:${"long-child:part/".repeat(30)}:review:0`,
+  ];
+
+  it.each(nativeIds)(
+    "produces a schema-valid stable ID while retaining the exact native binding: %s",
+    (raw) => {
+      const ref = { environmentId, threadId: ThreadId.make(raw) };
+      const original = threadComposerContext(ref, "Original title");
+      const renamed = threadComposerContext(ref, "Renamed title");
+      expect(Schema.decodeUnknownSync(ComposerContextId)(original.contextId)).toBe(
+        original.contextId,
+      );
+      expect(original.contextId).toMatch(/^[a-z0-9_-]{1,128}$/i);
+      expect(original.contextId.length).toBeLessThanOrEqual(128);
+      expect(renamed.contextId).toBe(original.contextId);
+      expect(threadComposerContext(ref, "Original title")).toEqual(original);
+      expect(original).toMatchObject({
+        kind: "thread",
+        label: "Original title",
+        title: "Original title",
+        environmentId,
+        threadId: raw,
+      });
+      expect(renamed).toMatchObject({
+        label: "Renamed title",
+        title: "Renamed title",
+        environmentId,
+        threadId: raw,
+      });
+    },
+  );
+
+  it("keeps ordinary identity and scopes an already-prefixed raw ID distinctly", () => {
+    const ordinary = threadComposerContext(
+      { environmentId, threadId: ThreadId.make("abc-123") },
+      "Ordinary thread",
+    );
+    const prefixed = threadComposerContext(
+      { environmentId, threadId: ThreadId.make("thread_abc-123") },
+      "Prefixed producer ID",
+    );
+    expect(ordinary.contextId).toBe("thread_abc-123");
+    expect(prefixed.contextId).toBe("thread_thread_abc-123");
+    expect(prefixed.contextId).not.toBe(ordinary.contextId);
+    expect(Schema.decodeUnknownSync(ComposerContextId)(ordinary.contextId)).toBe(
+      ordinary.contextId,
+    );
+    expect(Schema.decodeUnknownSync(ComposerContextId)(prefixed.contextId)).toBe(
+      prefixed.contextId,
+    );
+    expect(ordinary.threadId).toBe("abc-123");
+    expect(prefixed.threadId).toBe("thread_abc-123");
+  });
+
+  it.each(nativeIds)(
+    "retains the exact selected reference and environment/thread through canonical serialization: %s",
+    (raw) => {
+      const record = threadComposerContext(
+        { environmentId, threadId: ThreadId.make(raw) },
+        "Research child",
+      );
+      const context: OrchestrationMessageContext = { version: 1, records: [record] };
+      const reference = formatComposerContextReference(record);
+      const text = `Compare ${reference}`;
+      const wire = serializeComposerMessageForServer(text, context, true);
+      const decoded = Schema.decodeUnknownSync(OrchestrationMessageContext)(wire.context);
+      expect(wire.text).toBe(text);
+      expect(decoded.records).toEqual([record]);
+      expect(composerContextSendBlockReason(decoded)).toBeNull();
+      expect(referencedComposerContext(wire.text, decoded)).toEqual(context);
+      expect(
+        collectComposerContextReferences(wire.text).map((ref) => ({
+          kind: ref.kind,
+          contextId: ref.contextId,
+          label: ref.label,
+        })),
+      ).toEqual([{ kind: "thread", contextId: record.contextId, label: "Research child" }]);
+
+      const tokens = composerContextEditorTokens(wire.text, collectComposerInlineTokens(wire.text));
+      const token = tokens.find((candidate) => candidate.type === "context");
+      if (!token || token.type !== "context") throw new Error("Missing canonical thread token");
+      expect(tokens.filter((candidate) => candidate.type === "context")).toHaveLength(1);
+      expect(token.kind).toBe("thread");
+      expect(token.contextId).toBe(record.contextId);
+      expect(token.source).toBe(reference);
+      expect(wire.text.slice(token.start, token.end)).toBe(reference);
+      expect(decoded.records).toEqual([{ ...record, environmentId, threadId: raw }]);
+    },
+  );
 });
