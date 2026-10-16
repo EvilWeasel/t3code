@@ -346,5 +346,12 @@ for agent_session_test in "${agent_session_tests[@]}"; do
   fi
   focused_tests+=("$agent_session_test")
 done
+composer_context_id_test=packages/shared/src/composerContextReferences.test.ts
+if [[ ! -f "$composer_context_id_test" ]]; then
+  echo "Required composer context ID gate is missing: $composer_context_id_test" >&2
+  exit 1
+fi
+focused_tests+=("$composer_context_id_test")
+vp_cmd lint --report-unused-disable-directives packages/shared/src/composerContextReferences.ts packages/shared/src/composerContextReferences.test.ts
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)
