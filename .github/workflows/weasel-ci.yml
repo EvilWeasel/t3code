@@ -74,6 +74,16 @@ jobs:
           [[ "$EFFECTIVE_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$EFFECTIVE_SOURCE_SHA"
           bash scripts/weasel/check.sh
+      - name: Preserve bounded native compiler provenance
+        if: always() && github.ref_name == 'feature/native-compiler-provenance-candidate-20261016'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-compiler-provenance-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/native-compiler-provenance
+            ${{ runner.temp }}/native-compiler-provenance-exit.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Preserve unreviewed Observatory route generation
         if: always() && (github.ref_name == 'feature/agent-observatory-candidate-20261016' || github.ref_name == 'feature/desktop-control-bootstrap-396-20261016')
         uses: actions/upload-artifact@v4

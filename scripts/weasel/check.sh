@@ -74,8 +74,23 @@ for package in \
   @t3tools/web \
   @t3tools/desktop \
   @t3tools/mobile; do
-  if ! vp_cmd run --filter="$package" typecheck; then
+  native_observer_pid=""
+  native_typecheck_started=$EPOCHREALTIME
+  if [[ "$package" == t3 && "${GITHUB_ACTIONS:-}" == true && "${GITHUB_REF_NAME:-}" == feature/native-compiler-provenance-candidate-20261016 ]]; then
+    node scripts/weasel/native-compiler-provenance.mjs observe "$$" >/dev/null 2>/dev/null &
+    native_observer_pid=$!
+  fi
+  native_typecheck_exit=0
+  if vp_cmd run --filter="$package" typecheck; then
+    :
+  else
+    native_typecheck_exit=$?
     typecheck_failed=1
+  fi
+  if [[ -n "$native_observer_pid" ]]; then
+    native_typecheck_ended=$EPOCHREALTIME
+    ( umask 077; set -o noclobber; printf '{"observerPid":%s,"exit":%s,"started":"%s","ended":"%s"}\n' "$native_observer_pid" "$native_typecheck_exit" "$native_typecheck_started" "$native_typecheck_ended" > "$RUNNER_TEMP/native-compiler-provenance-exit.json" ) 2>/dev/null || true
+    wait "$native_observer_pid" || true
   fi
 done
 
