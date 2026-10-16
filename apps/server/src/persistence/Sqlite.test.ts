@@ -88,7 +88,12 @@ it.effect("collects planner statistics for an existing database on open", () => 
       const rows = yield* sql<{ readonly stat: string }>`
         SELECT stat FROM sqlite_stat1 WHERE idx = 'stats_probe_thread_idx'
       `;
-      assert.deepEqual([...rows], [{ stat: "1000 100" }]);
+      assert.lengthOf(rows, 1);
+      const [rowCount, rowsPerThread] = rows[0]!.stat.split(" ").map(Number);
+      assert.equal(rowCount, 1000);
+      // PRAGMA optimize samples the index; its cardinality estimate is approximate.
+      assert.isAtLeast(rowsPerThread!, 50);
+      assert.isAtMost(rowsPerThread!, 150);
     }).pipe(Effect.provide(persistence()));
   }).pipe(
     Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),

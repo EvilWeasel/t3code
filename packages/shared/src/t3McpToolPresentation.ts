@@ -125,6 +125,17 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
     "capabilities",
   ),
   delegate_task: tool(["Delegate", "Delegating", "Delegated", "a child task"], "delegate"),
+  external_delegate_task: tool(
+    ["Delegate", "Delegating", "Delegated", "an external child task"],
+    "delegate",
+  ),
+  external_task_status: tool(["Get", "Getting", "Got", "external task status"], "task-status"),
+  external_task_cancel: tool(
+    ["Cancel", "Canceling", "Requested cancellation of", "an external task"],
+    "task-cancel",
+  ),
+  external_task_steer: tool(["Steer", "Steering", "Steered", "an external task"], "queue-steer"),
+  external_task_events: tool(["Read", "Reading", "Read", "external task events"], "task-status"),
   task_status: tool(["Get", "Getting", "Got", "delegated task status"], "task-status"),
   task_cancel: tool(
     ["Cancel", "Canceling", "Requested cancellation of", "delegated task"],

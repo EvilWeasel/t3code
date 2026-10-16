@@ -1272,7 +1272,7 @@ describe("DesktopBackendConfiguration", () => {
           assert.isTrue(Option.isNone(config.preflightFailure));
         }).pipe(
           Effect.provide(
-            DesktopBackendConfiguration.layer.pipe(
+            layerBackendConfiguration().pipe(
               Layer.provideMerge(layerServerExposure),
               Layer.provideMerge(
                 DesktopAppSettings.layerTest({

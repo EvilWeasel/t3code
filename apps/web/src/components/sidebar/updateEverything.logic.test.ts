@@ -333,6 +333,7 @@ describe("update everything summary", () => {
       updatedServers: 2,
       updatedProviders: 1,
       restarting: [],
+      skipped: ["busy: Update was not started.", "Provider update was interrupted."],
       failures: [
         "This app: Could not download update: Network error.",
         "alvin: Download failed.",
@@ -349,9 +350,13 @@ describe("update everything summary", () => {
         "This app: Could not download update: Network error.",
         "alvin: Download failed.",
         "box · Codex: npm exited with code 1.",
+        "Skipped busy: Update was not started.",
+        "Skipped Provider update was interrupted.",
       ].join("\n"),
     });
-    expect(getUpdateEverythingToastView({ ...result, failures: [] }, "0.0.40")).toEqual({
+    expect(
+      getUpdateEverythingToastView({ ...result, failures: [], skipped: [] }, "0.0.40"),
+    ).toEqual({
       type: "success",
       title: "Updated 2 servers and 1 provider",
     });
@@ -368,7 +373,7 @@ describe("update everything summary", () => {
   it("names servers still restarting when this app relaunched", () => {
     expect(
       getUpdateEverythingToastView(
-        { ...result, failures: [], restarting: ["alvin", "zbook"] },
+        { ...result, failures: [], skipped: [], restarting: ["alvin", "zbook"] },
         "0.0.50",
       ),
     ).toEqual({

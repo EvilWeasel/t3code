@@ -322,7 +322,11 @@ export function DesktopUpdateLaunchNotice() {
     const saved = takeSavedUpdateEverythingResult();
     if (!saved) return;
     const handedOff = saved.handedOff ?? [];
-    showUpdateEverythingResult({ ...saved, restarting: handedOff.map((server) => server.label) });
+    showUpdateEverythingResult({
+      ...saved,
+      skipped: saved.skipped ?? [],
+      restarting: handedOff.map((server) => server.label),
+    });
     followHandedOffServers(handedOff);
   }, []);
 

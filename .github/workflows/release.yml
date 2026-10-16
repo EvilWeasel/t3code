@@ -564,7 +564,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: macOS arm64
-      runner: blacksmith-8vcpu-macos-26
+      runner: blacksmith-12vcpu-macos-26
       platform: mac
       target: dmg
       arch: arm64
@@ -587,7 +587,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: macOS x64
-      runner: blacksmith-8vcpu-macos-26
+      runner: blacksmith-12vcpu-macos-26
       platform: mac
       target: dmg
       arch: x64
@@ -638,7 +638,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: Linux arm64
-      runner: blacksmith-8vcpu-ubuntu-2404-arm
+      runner: blacksmith-16vcpu-ubuntu-2404-arm
       platform: linux
       target: AppImage
       arch: arm64
@@ -664,7 +664,7 @@ jobs:
       clerk_cli_oauth_client_id: ${{ needs.relay_public_config.outputs.clerk_cli_oauth_client_id }}
       relay_url: ${{ needs.relay_public_config.outputs.relay_url }}
       label: Windows x64
-      runner: blacksmith-8vcpu-windows-2025
+      runner: blacksmith-32vcpu-windows-2025
       platform: win
       target: nsis
       arch: x64
@@ -909,7 +909,7 @@ jobs:
     name: Publish CLI to npm
     needs: [preflight, release]
     if: ${{ !failure() && !cancelled() && needs.preflight.result == 'success' && needs.release.result == 'success' }}
-    runs-on: ubuntu-24.04 # blacksmith-8vcpu-ubuntu-2404
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 15
     permissions:
       contents: read
