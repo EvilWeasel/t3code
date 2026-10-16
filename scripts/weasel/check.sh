@@ -279,6 +279,7 @@ if [[ ! -f "$server_http_test" ]]; then
 fi
 focused_tests+=("$server_http_test")
 live_tests=(
+  apps/server/src/provider/Drivers/CodexDriver.test.ts
   packages/client-runtime/src/live-voice/controller.test.ts
   packages/client-runtime/src/state/commandPermissions.test.ts
   packages/contracts/src/liveVoice.test.ts
@@ -353,5 +354,22 @@ if [[ ! -f "$mobile_composer_test" ]]; then
 fi
 focused_tests+=("$mobile_composer_test")
 vp_cmd lint --report-unused-disable-directives "$mobile_composer_test"
+vp_cmd lint --report-unused-disable-directives \
+  packages/contracts/src/server.ts \
+  packages/contracts/src/liveVoice.ts \
+  apps/server/src/provider/Drivers/CodexDriver.ts \
+  packages/provider-core/src/server/ProviderAdapter.ts \
+  apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts \
+  apps/server/src/voice/CodexLiveSessionService.ts \
+  apps/web/src/components/chat/ChatComposer.tsx \
+  apps/web/src/voice/LiveVoiceControl.tsx \
+  packages/client-runtime/src/live-voice/controller.ts \
+  packages/contracts/src/server.test.ts \
+  packages/contracts/src/liveVoice.test.ts \
+  apps/server/src/provider/Drivers/CodexDriver.test.ts \
+  apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts \
+  apps/server/src/voice/CodexLiveSessionService.test.ts \
+  apps/web/src/voice/LiveVoiceControl.test.tsx \
+  packages/client-runtime/src/live-voice/controller.test.ts
 vp_cmd test run --config vite.config.ts "${focused_tests[@]}"
 (cd scripts && vp_cmd test run --config ../vite.config.ts build-desktop-artifact.test.ts lib/morrowbyte-branding.test.ts)

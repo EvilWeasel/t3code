@@ -1672,7 +1672,10 @@ export type CodexAdapterV2DriverEnv =
 
 export const createCodexAdapterV2 = (
   { instanceId, environment, enabled, config }: ProviderAdapterDriverCreateInput<CodexSettings>,
-  hooks: Pick<CodexAdapterV2Options, "onUsageLimits" | "resolveRuntime"> = {},
+  hooks: Pick<
+    CodexAdapterV2Options,
+    "onUsageLimits" | "resolveRuntime" | "liveVoicePreparationConfigurationId"
+  > = {},
 ) =>
   Effect.gen(function* () {
     const clientFactory = yield* CodexAppServerClientFactory;
@@ -1759,6 +1762,7 @@ const layer: Layer.Layer<
 );
 
 export interface CodexAdapterV2Options {
+  readonly liveVoicePreparationConfigurationId?: string;
   readonly instanceId: ProviderInstanceId;
   readonly settings: CodexSettings;
   readonly environment: NodeJS.ProcessEnv;
@@ -7488,6 +7492,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             ),
           mcpApps,
           liveVoice: {
+            ...(adapterOptions.liveVoicePreparationConfigurationId === undefined
+              ? {}
+              : { preparationConfigurationId: adapterOptions.liveVoicePreparationConfigurationId }),
             events: Stream.fromQueue(liveVoiceEvents),
             preparePlanner: (plannerInput) =>
               Effect.gen(function* () {

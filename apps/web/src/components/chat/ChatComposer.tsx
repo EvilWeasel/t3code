@@ -282,7 +282,6 @@ import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
 import * as Option from "effect/Option";
 import { transcribeVoiceRecording } from "../../voice/transcriptionClient";
-import { readCodexSetupMode } from "../settings/CodexSetupSection.logic";
 import { ComposerPendingApprovalPanel } from "./ComposerPendingApprovalPanel";
 import { ComposerPendingUserInputPanel } from "./ComposerPendingUserInputPanel";
 import { ComposerPlanFollowUpBanner } from "./ComposerPlanFollowUpBanner";
@@ -2337,6 +2336,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       liveVoiceSelection.unavailableProviderInstanceId !== undefined,
     provider: liveVoiceProvider,
     instanceConfigured: liveVoiceInstanceSettings !== undefined,
+    nativePreparation: liveVoiceProvider?.snapshot.nativeLiveVoicePreparation,
     projectOverride:
       activeProjectId && liveVoiceProvider
         ? liveVoiceConfig?.settings.projectSettingsOverrides[activeProjectId]?.providerInstances?.[
@@ -2345,11 +2345,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         : undefined,
     config: liveVoiceInstanceSettings?.config,
   });
-  const selectedCodexConfig = liveVoiceInstanceSettings?.config;
   const liveVoiceProviderEligible =
-    selectedProviderEntry?.driverKind === "codex" &&
-    readCodexSetupMode(selectedCodexConfig) === "managed" &&
-    liveVoiceAvailability.reason === null;
+    selectedProviderEntry?.driverKind === "codex" && liveVoiceAvailability.reason === null;
   const supportedRuntimeModes = selectedProviderEntry?.snapshot.supportedRuntimeModes;
   const compatibleRuntimeModeOptions =
     supportedRuntimeModes && supportedRuntimeModes.length > 0

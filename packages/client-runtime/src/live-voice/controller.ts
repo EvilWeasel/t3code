@@ -1,5 +1,6 @@
 import {
   LiveVoiceError,
+  ProviderInstanceId,
   liveVoicePublicErrorMessage,
   type LiveVoiceEvent,
   type LiveVoicePrepareInput,
@@ -18,6 +19,7 @@ export type LiveVoiceTarget = {
   readonly threadId: string;
   readonly provider: string;
   readonly providerInstanceId: string;
+  readonly preparationConfigurationId?: string;
 };
 
 /** The workspace Codex thread and the restricted voice planner are different native threads. */
@@ -291,6 +293,14 @@ export class LiveVoiceController {
         {
           threadId: target.threadId as LiveVoicePrepareInput["threadId"],
           clientRequestId: this.dependencies.createRequestId(),
+          ...(target.preparationConfigurationId === undefined
+            ? {}
+            : {
+                nativePreparation: {
+                  providerInstanceId: ProviderInstanceId.make(target.providerInstanceId),
+                  configurationId: target.preparationConfigurationId,
+                },
+              }),
         },
         signal,
       );
@@ -489,7 +499,8 @@ export class LiveVoiceController {
       (this.target.environmentId !== target.environmentId ||
         this.target.threadId !== target.threadId ||
         this.target.provider !== target.provider ||
-        this.target.providerInstanceId !== target.providerInstanceId)
+        this.target.providerInstanceId !== target.providerInstanceId ||
+        this.target.preparationConfigurationId !== target.preparationConfigurationId)
     )
       await this.end();
   }
@@ -675,7 +686,8 @@ export class LiveVoiceController {
       this.target.environmentId === target.environmentId &&
       this.target.threadId === target.threadId &&
       this.target.providerInstanceId === target.providerInstanceId &&
-      this.target.provider === target.provider
+      this.target.provider === target.provider &&
+      this.target.preparationConfigurationId === target.preparationConfigurationId
     );
   }
 
@@ -789,13 +801,11 @@ export class LiveVoiceController {
 
 export function isLiveVoiceSupported(scope: {
   readonly provider: string;
-  readonly setupMode: string;
   readonly RTCPeerConnection?: unknown;
   readonly getUserMedia?: unknown;
 }): boolean {
   return (
     scope.provider === "codex" &&
-    scope.setupMode === "managed" &&
     typeof scope.RTCPeerConnection === "function" &&
     typeof scope.getUserMedia === "function"
   );

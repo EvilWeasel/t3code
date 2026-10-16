@@ -33,6 +33,39 @@ const baseProviderSnapshot = {
 };
 
 describe("ServerProvider", () => {
+  it("keeps native prepare provenance optional and excludes unsupported or secret metadata", () => {
+    expect(decodeServerProvider(baseProviderSnapshot).nativeLiveVoicePreparation).toBeUndefined();
+    const nativeLiveVoicePreparation = {
+      configurationId: "factory-1",
+      setupMode: "existing",
+      accountSource: "native-account-read",
+      transport: "codex-webrtc-v3",
+    };
+    expect(
+      decodeServerProvider({
+        ...baseProviderSnapshot,
+        nativeLiveVoicePreparation: {
+          ...nativeLiveVoicePreparation,
+          token: "private",
+          accountId: "private",
+        },
+      }).nativeLiveVoicePreparation,
+    ).toEqual(nativeLiveVoicePreparation);
+    for (const patch of [
+      { setupMode: "managed" },
+      { accountSource: "subscription-sharing" },
+      { transport: "api-realtime" },
+      { configurationId: "" },
+      { configurationId: "x".repeat(129) },
+    ])
+      expect(() =>
+        decodeServerProvider({
+          ...baseProviderSnapshot,
+          nativeLiveVoicePreparation: { ...nativeLiveVoicePreparation, ...patch },
+        }),
+      ).toThrow();
+  });
+
   it.each([undefined, true, false])("decodes workspace command discovery pending=%s", (pending) => {
     const workspace = {
       cwd: "/workspace/project",

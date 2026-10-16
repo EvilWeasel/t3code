@@ -12,6 +12,31 @@ import { clientRpcRequiredScopes } from "./clientRpcPermissions.ts";
 import { AuthOrchestrationOperateScope } from "./auth.ts";
 
 describe("subscription Codex Live contracts", () => {
+  it("binds optional preparation expectations without promoting them to authority", () => {
+    const base = { threadId: "thread-1", clientRequestId: "request-1" };
+    const nativePreparation = {
+      providerInstanceId: "codex-personal",
+      configurationId: "factory-1",
+    };
+    const decoded = Schema.decodeUnknownSync(LiveVoicePrepareInput)({ ...base, nativePreparation });
+    expect(Schema.decodeUnknownSync(LiveVoicePrepareInput)({ ...base })).toEqual(base);
+    expect(Schema.decodeUnknownSync(LiveVoicePrepareInput)(decoded)).toEqual(decoded);
+    expect(decoded.nativePreparation).toEqual(nativePreparation);
+    for (const configurationId of ["", "x".repeat(129)])
+      expect(() =>
+        Schema.decodeUnknownSync(LiveVoicePrepareInput)({
+          ...base,
+          nativePreparation: { ...nativePreparation, configurationId },
+        }),
+      ).toThrow();
+    expect(
+      Schema.decodeUnknownSync(LiveVoicePrepareInput)({
+        ...base,
+        nativePreparation: { ...nativePreparation, token: "private", setupMode: "managed" },
+      }).nativePreparation,
+    ).toEqual(nativePreparation);
+  });
+
   it("bounds offer size and requires a positive lease generation", () => {
     expect(
       Schema.decodeUnknownSync(LiveVoiceStartInput)({
