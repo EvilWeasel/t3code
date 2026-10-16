@@ -1525,7 +1525,10 @@ it.effect.each(["projection", "legacy"] as const)(
         ),
         Layer.provide(
           Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
-            ensureTranscript: () => (source === "legacy" ? Effect.fail(legacyError) : Effect.void),
+            ensureTranscript: () =>
+              source === "legacy"
+                ? Effect.fail(legacyError)
+                : Effect.succeed({ importedThreadCount: 0, importedMessageCount: 0 }),
           }),
         ),
         Layer.provide(ServerSettings.layerTest()),
