@@ -1,4 +1,5 @@
-import type { ComposerContextId, ComposerContextRecord } from "@t3tools/contracts";
+import { ComposerContextId, type ComposerContextRecord } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -11,6 +12,8 @@ import {
   projectComposerContextForProvider,
   replaceComposerContextReferences,
   sanitizeComposerContextLabel,
+  toComposerContextId,
+  toKindScopedComposerContextId,
 } from "./composerContextReferences.ts";
 
 const ctx = (value: string) => value as ComposerContextId;
@@ -296,5 +299,82 @@ describe("provider projection", () => {
     expect(projected).toContain('<context kind="terminal" id="ctx_t" unavailable="true"/>');
     expect(projected).not.toContain("another payload");
     expect(projected).not.toContain("boom");
+  });
+});
+
+describe("producer context ID encoding", () => {
+  const decodeId = Schema.decodeUnknownSync(ComposerContextId);
+
+  it.each(["a", "CTX_1-file-comment-1700", "a".repeat(128)])(
+    "preserves already-valid producer identity %s",
+    (raw) => {
+      const id = toComposerContextId(raw);
+      expect(id).toBe(raw);
+      expect(decodeId(id)).toBe(raw);
+      expect(toComposerContextId(raw)).toBe(id);
+    },
+  );
+
+  it.each([
+    "",
+    " \t\n ",
+    "::",
+    "🦦/路徑",
+    "Größe:src/ä.ts:4-9",
+    "pull-request-selection:src/a.ts:4-9",
+    "x".repeat(129),
+    `thread:mcp:${"native:child/".repeat(20)}`,
+  ])("folds an invalid producer ID into a stable bounded wire identity: %s", (raw) => {
+    const id = toComposerContextId(raw);
+    expect(id).not.toBe(raw);
+    expect(id).toMatch(/^[a-z0-9_-]{1,128}$/i);
+    expect(id.length).toBeGreaterThan(0);
+    expect(id.length).toBeLessThanOrEqual(128);
+    expect(decodeId(id)).toBe(id);
+    expect(toComposerContextId(raw)).toBe(id);
+    expect(parseComposerContextHref(formatComposerContextHref("thread", id))).toEqual({
+      kind: "thread",
+      contextId: id,
+    });
+  });
+
+  it("uses the fallback slug for empty or entirely non-grammar input", () => {
+    for (const raw of ["", "  ", "::", "🦦/路徑"]) {
+      expect(toComposerContextId(raw)).toMatch(/^ctx-[0-9a-f]{16}$/);
+    }
+  });
+
+  it("always adds the kind scope even when the raw ID already begins with that prefix", () => {
+    const raw = toKindScopedComposerContextId("image", "x");
+    const alreadyPrefixedRaw = toKindScopedComposerContextId("image", "image_x");
+    expect(raw).toBe("image_x");
+    expect(alreadyPrefixedRaw).toBe("image_image_x");
+    expect(raw).not.toBe(alreadyPrefixedRaw);
+    expect(decodeId(raw)).toBe(raw);
+    expect(decodeId(alreadyPrefixedRaw)).toBe(alreadyPrefixedRaw);
+  });
+
+  it("keeps the same raw producer ID in distinct kind scopes", () => {
+    const image = toKindScopedComposerContextId("image", "native:child/42");
+    const file = toKindScopedComposerContextId("file", "native:child/42");
+    const thread = toKindScopedComposerContextId("thread", "native:child/42");
+    expect(new Set([image, file, thread]).size).toBe(3);
+    for (const id of [image, file, thread]) expect(decodeId(id)).toBe(id);
+    expect(toKindScopedComposerContextId("thread", "native:child/42")).toBe(thread);
+  });
+
+  it("distinguishes concrete long IDs with the same 48-character slug and different tails", () => {
+    const common = `pull-request-finding:${"a".repeat(160)}`;
+    const first = toComposerContextId(`${common}:first`);
+    const second = toComposerContextId(`${common}:second`);
+    expect(first.slice(0, 48)).toBe(second.slice(0, 48));
+    expect(first).not.toBe(second);
+    for (const id of [first, second]) {
+      expect(id).toMatch(/^[a-z0-9_-]{48}-[0-9a-f]{16}$/i);
+      expect(id.length).toBeLessThanOrEqual(128);
+      expect(decodeId(id)).toBe(id);
+    }
+    expect(toComposerContextId(`${common}:first`)).toBe(first);
+    expect(toComposerContextId(`${common}:second`)).toBe(second);
   });
 });
