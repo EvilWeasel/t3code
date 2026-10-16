@@ -6973,7 +6973,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (isInsideRestingComposerControlScope(event.target)) return;
         composerMentionDragHandlers.onDrop(event);
       }}
-      className="mx-auto w-full min-w-0 max-w-(--chat-content-max-width) max-sm:pb-[env(safe-area-inset-bottom,0px)]"
+      className="mx-auto w-full min-w-0 max-w-(--chat-content-max-width) max-sm:pb-safe"
       data-chat-composer-form="true"
       {...threadContextDropTargetProps()}
     >
