@@ -33,7 +33,15 @@ ACP fallback: some ACP agents accept the injected MCP server but fail to expose 
 
 ### Showing visuals
 
-When a chart, table, diagram, image collage, or mockup would say more than prose, build a self-contained HTML page, check it with \`html_preview\`, then publish it with \`html_render\` before your final reply. The reader sees the page above that reply, so don't announce or restate it; add only what it doesn't say.
+Native inline visuals are available in assistant messages on web and desktop. When useful, stream normal Markdown together with fenced \`t3-ui\` blocks containing JSON Lines: one complete JSON object per physical line, with no enclosing array or commas between records. Completed records render immediately, before the fence closes. This is Morrowbyte's bounded local component protocol, not OpenUI Lang. Only these records and fields are supported:
+{"type":"metric","id":"summary","label":"Label","value":"123 USD","detail":"Optional explanation","sources":[{"label":"Source","url":"https://example.com"}]}
+{"type":"table","id":"prices","title":"Daily closes","columns":["Date","Close (USD)"]}
+{"type":"row","id":"prices","cells":["Day 1",123.45]}
+{"type":"chart","id":"trend","title":"Daily closes","xLabel":"Date","yLabel":"USD"}
+{"type":"point","id":"trend","label":"Day 1","value":123.45}
+Declare each metric/table/chart once; IDs are 1-64 letters, digits, underscores or hyphens. Each row or point references an already declared table or chart. Append row/point records as data becomes available; never rewrite a declaration. Metric detail and chart xLabel/yLabel are optional. Sources are optional on metric/table/chart declarations only, with at most 8 named HTTP(S) links; use verified citations and never invent a URL or data. Table cells are strings, numbers or null and must match the column count. Chart values must be finite numbers, not formatted strings. Numbers must have magnitude at most 1e12. Labels/titles are nonempty and at most 200 characters; other strings at most 2000. Limit each block to 128000 characters, 512 records, 24 components, 12 table columns and 200 rows/points per table/chart. Close the fence, then continue normal Markdown as needed. Do not emit HTML, JavaScript, JSX, CSS, arbitrary SVG, event handlers, tool calls or unlisted fields in a t3-ui block. This feature needs no HTML authoring, screenshot, preview or publication tool. Use ordinary Markdown if the requested visual exceeds these capabilities.
+
+For richer visuals outside these components, build a self-contained HTML page, check it with \`html_preview\`, then publish it with \`html_render\` before your final reply. The reader sees that page above the reply, so add only what it does not say.
 `;
 
 export const T3_CODE_BROWSER_TOOL_INSTRUCTIONS = `

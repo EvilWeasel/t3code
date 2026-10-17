@@ -82,6 +82,42 @@ describe("V2 assistant streaming", () => {
     expect(buffered(final, 501)).toBe(final);
   });
 
+  it("streams complete native visual records before the fence closes", () => {
+    const opening = "```t3-ui\n";
+    const chart = '{"type":"chart","id":"c","title":"Test"}\n';
+    const point = '{"type":"point","id":"c","label":"Day 1","value":12}\n';
+    const partial = '{"type":"point","id":"c","label":"Day 2","value":1';
+    const filter = makeAssistantStreamingFilter("paragraph");
+    expect(filter(turnItem(opening + chart + partial), 0)).toMatchObject({
+      turnItem: { text: opening + chart, streaming: true },
+    });
+    expect(filter(turnItem(opening + chart + point + partial), 100)).toBeNull();
+    expect(filter(turnItem(opening + chart + point + partial), 400)).toMatchObject({
+      turnItem: { text: opening + chart + point, streaming: true },
+    });
+    const final = turnItem(opening + chart + point + "```", false);
+    expect(filter(final, 401)).toBe(final);
+    expect(makeAssistantStreamingFilter("turn")(turnItem(opening + chart), 0)).toBeNull();
+  });
+
+  it.each(["```t3-ui", "~~~~t3-ui", "  ```t3-ui"])(
+    "uses terminated record boundaries within %s fences",
+    (opening) => {
+      const ready = `${opening}\n{"type":"metric","id":"m","label":"Value","value":12}\n`;
+      const partial = '{"type":"row","id":"t","cells":[1';
+      expect(splitBufferedAssistantText(ready + partial)).toEqual({ ready, rest: partial });
+    },
+  );
+
+  it("does not stream ordinary code or nested visual-looking text inside code", () => {
+    for (const opening of ["```json", "```t3-ui-example", "```t3-ui extra"]) {
+      const text = `${opening}\n{"type":"metric","value":12}\n`;
+      expect(splitBufferedAssistantText(text)).toEqual({ ready: "", rest: text });
+    }
+    const nested = '````text\n```t3-ui\n{"type":"metric","value":12}\n';
+    expect(splitBufferedAssistantText(nested)).toEqual({ ready: "", rest: nested });
+  });
+
   it.each(["assistant_message", "reasoning"] as const)(
     "buffers %s at paragraph boundaries and flushes the final item",
     (type) => {
