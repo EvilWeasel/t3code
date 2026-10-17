@@ -16,6 +16,7 @@ import {
 import { loadRepoEnv } from "../../scripts/lib/public-config";
 import { thirdPartyLicensesPlugin } from "../../scripts/lib/third-party-licenses";
 import { tailwindPlugins } from "./vite/tailwind";
+import { localDevLoginPlugin } from "./vite/localDevLogin";
 
 const repoEnv = loadRepoEnv();
 Object.assign(process.env, repoEnv);
@@ -138,6 +139,11 @@ export default defineConfig(() => {
   return {
     assetsInclude: ["**/*.wasm"],
     plugins: [
+      localDevLoginPlugin({
+        enabled: isSingleOriginDev && process.env.T3CODE_DEV_AUTO_LOGIN === "1",
+        credential: process.env.T3CODE_DEV_AUTH_TOKEN,
+        backend: devProxyTarget,
+      }),
       devCompressionPlugin(),
       thirdPartyLicensesPlugin({
         bundleName: "web",

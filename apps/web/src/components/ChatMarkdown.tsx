@@ -213,6 +213,7 @@ import {
 } from "../browser/openFileInPreview";
 import { resolveLinkTarget } from "../browser/browserLinkTarget";
 import { PullRequestLinkPreview } from "./pullRequest/PullRequestLinkPreview";
+import { StreamableUi } from "./streamable-ui/StreamableUi";
 
 interface ChatMarkdownProps {
   text: string;
@@ -222,6 +223,7 @@ interface ChatMarkdownProps {
   environmentId?: EnvironmentId | undefined;
   onTaskListChange?: ((input: { markerOffset: number; checked: boolean }) => void) | undefined;
   isStreaming?: boolean;
+  streamableUi?: boolean;
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   className?: string;
   lineBreaks?: boolean;
@@ -2238,6 +2240,7 @@ function useChatMarkdownState({
   environmentId: explicitEnvironmentId,
   onTaskListChange,
   isStreaming = false,
+  streamableUi = false,
   skills = EMPTY_MARKDOWN_SKILLS,
   onUseArtifactTemplate,
   onRunShellCommand,
@@ -2652,6 +2655,7 @@ function useChatMarkdownState({
       imageBaseDir,
       inlineCodeFileLinkMetaByText,
       isStreaming,
+      streamableUi,
       linkTargetPreference,
       markdownFileLinkMetaByHref,
       onTaskListChange,
@@ -2685,6 +2689,7 @@ function useChatMarkdownState({
       imageBaseDir,
       inlineCodeFileLinkMetaByText,
       isStreaming,
+      streamableUi,
       linkTargetPreference,
       markdownFileLinkMetaByHref,
       onTaskListChange,
@@ -3249,15 +3254,29 @@ const CHAT_MARKDOWN_COMPONENTS = {
     return <MarkdownDetails open={detailsOpen}>{children}</MarkdownDetails>;
   },
   pre: function MarkdownPre({ node, children, ...props }) {
-    const { resolvedTheme, diffThemeName, expandMedia, isStreaming, onRunShellCommand, text } = use(
-      ChatMarkdownRendererContext,
-    );
+    const {
+      resolvedTheme,
+      diffThemeName,
+      expandMedia,
+      isStreaming,
+      streamableUi,
+      onRunShellCommand,
+      text,
+    } = use(ChatMarkdownRendererContext);
     const codeBlock = extractCodeBlock(children);
     if (!codeBlock) {
       return <pre {...props}>{children}</pre>;
     }
 
     const language = extractFenceLanguage(codeBlock.className);
+    if (streamableUi && language === "t3-ui") {
+      return (
+        <StreamableUi
+          code={codeBlock.code.replace(/\n$/, "")}
+          isStreaming={isStreaming && !isClosedCodeFence(node, text)}
+        />
+      );
+    }
     const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));
     const highlightedCode = (
       <RenderErrorBoundary

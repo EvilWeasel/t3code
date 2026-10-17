@@ -96,6 +96,15 @@ startup and keeps its own SQLite data, signing key, and revocation state. Deskto
 servers ignore the value. See [environment authentication](../internals/environment-auth.md#reusable-dev-credential)
 for the security model.
 
+For automatic first login in a local browser, also set `T3CODE_DEV_AUTO_LOGIN=1`.
+In single-origin web dev, Vite then exchanges the configured reusable token through
+the backend's normal browser-session endpoint and returns its HttpOnly cookie.
+No token is included in frontend JavaScript or the page URL. This opt-in requires
+loopback frontend/backend hosts, a loopback client and a same-origin browser
+request. Existing credentials keep precedence, including rejected or revoked
+grants. LAN/shared origins, production builds and direct backend requests retain
+ordinary authentication. Without this opt-in, use the startup pairing URL once.
+
 ## Checks
 
 Run checks for the files and packages you changed:

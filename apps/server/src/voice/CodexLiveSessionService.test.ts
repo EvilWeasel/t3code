@@ -553,8 +553,21 @@ it.effect.each([false, true])(
                 rootNodeId: `root-${runId}`,
                 providerInstanceId,
                 providerThreadId: "provider-thread-test",
-                providerTurnId: "provider-turn-test",
+                providerTurnId: null,
                 reason: "initial",
+                status: "completed",
+                startedAt: "2026-10-14T00:00:01.000Z",
+                completedAt: "2026-10-14T00:00:03.000Z",
+              },
+            ],
+            providerTurns: [
+              {
+                id: "provider-turn-test",
+                providerThreadId: "provider-thread-test",
+                nodeId: `root-${runId}`,
+                runAttemptId: `attempt-${runId}`,
+                nativeTurnRef: null,
+                ordinal: 1,
                 status: "completed",
                 startedAt: "2026-10-14T00:00:01.000Z",
                 completedAt: "2026-10-14T00:00:03.000Z",
@@ -844,6 +857,9 @@ it.effect.each([false, true])(
         durableProjection = {
           ...durableProjection,
           subagents: [{ ...durableProjection.subagents[0]!, status: "completed" }],
+          checkpoints: [
+            { id: "checkpoint-durable-run-1", runId: "durable-run-1", status: "missing" },
+          ],
         } as unknown as OrchestrationV2ThreadProjection;
         const childGateRead = waitForGateRead();
         yield* Queue.offer(
@@ -860,42 +876,6 @@ it.effect.each([false, true])(
           } as never),
         );
         yield* childGateRead;
-        assert.equal(spoken.length, 0, "speech waits for the matching checkpoint");
-
-        durableProjection = {
-          ...durableProjection,
-          checkpoints: [
-            {
-              id: "checkpoint-durable-run-1",
-              threadId,
-              scopeId: "scope-root-1",
-              runId: "durable-run-1",
-              nodeId: "root-durable-run-1",
-              parentCheckpointId: null,
-              ordinalWithinScope: 1,
-              appRunOrdinal: 1,
-              ref: "checkpoint-ref-1",
-              status: "ready",
-              files: [],
-              capturedAt: "2026-10-14T00:00:03.000Z",
-            },
-          ],
-        } as unknown as OrchestrationV2ThreadProjection;
-        const checkpointGateRead = waitForGateRead();
-        yield* Queue.offer(
-          t3EventQueues.get("checkpoint.captured")!,
-          eventFor({
-            type: "checkpoint.captured",
-            id: "event-checkpoint-1",
-            threadId,
-            runId: "durable-run-1",
-            nodeId: "root-durable-run-1",
-            providerInstanceId,
-            occurredAt: "2026-10-14T00:00:03.000Z",
-            payload: durableProjection.checkpoints[0] as never,
-          } as never),
-        );
-        yield* checkpointGateRead;
         yield* Effect.promise(() => speechObserved);
         yield* Deferred.await(workFinished);
         assert.equal(completedWork, 1, "the held canonical job completes exactly once");
@@ -903,6 +883,11 @@ it.effect.each([false, true])(
           decodeWorkStatus(yield* control("status", "result-ready", "durable-run-1")).tasks,
           [{ runId: "durable-run-1", status: "completed", resultReady: true, commentary: null }],
         );
+        const followUp = decodeJson(yield* control("status", "follow-up-after-completion")) as {
+          tasks: Array<{ runId: string; result: string }>;
+        };
+        assert.equal(followUp.tasks[0]!.runId, "durable-run-1");
+        assert.include(followUp.tasks[0]!.result, "durable answer for durable-run-1");
         assert.deepEqual(spoken, [
           {
             plannerNativeThreadId: "planner-native-1",
@@ -1265,7 +1250,8 @@ it.effect.each([false, true])(
           clientRequestId: "stop-historical",
         };
         yield* sql`UPDATE codex_live_voice_leases SET status = 'unknown' WHERE lease_id = ${lease.leaseId}`;
-        const status = () => service.status(session, lease).pipe(Effect.map((value) => value.status));
+        const status = () =>
+          service.status(session, lease).pipe(Effect.map((value) => value.status));
         for (const invalidPrincipal of [
           { ...session, scopes: [] },
           { ...session, subject: "different-subject" },
@@ -1305,13 +1291,25 @@ it.effect.each([false, true])(
           startClientRequestId: null as string | null,
         };
         for (const unsafe of [
-          { ...neverStartedOrphan, reason: "foreign-session", principalSessionId: "different-owner" },
-          { ...neverStartedOrphan, reason: "foreign-subject", principalSubject: "different-subject" },
+          {
+            ...neverStartedOrphan,
+            reason: "foreign-session",
+            principalSessionId: "different-owner",
+          },
+          {
+            ...neverStartedOrphan,
+            reason: "foreign-subject",
+            principalSubject: "different-subject",
+          },
           { ...neverStartedOrphan, reason: "not-unknown", status: "prepared" },
           { ...neverStartedOrphan, reason: "planner", plannerNativeThreadId: "unresolved-planner" },
           { ...neverStartedOrphan, reason: "native-started", nativeStarted: 1 },
           { ...neverStartedOrphan, reason: "native-sdp", nativeSdpReceived: 1 },
-          { ...neverStartedOrphan, reason: "start-request", startClientRequestId: "uncertain-start" },
+          {
+            ...neverStartedOrphan,
+            reason: "start-request",
+            startClientRequestId: "uncertain-start",
+          },
         ]) {
           yield* sql`UPDATE codex_live_voice_leases SET
             principal_session_id = ${unsafe.principalSessionId},
@@ -1321,7 +1319,10 @@ it.effect.each([false, true])(
             start_client_request_id = ${unsafe.startClientRequestId}
             WHERE lease_id = ${lease.leaseId}`;
           const error = yield* Effect.flip(
-            service.prepare(session, { threadId, clientRequestId: `unsafe-orphan-${unsafe.reason}` }),
+            service.prepare(session, {
+              threadId,
+              clientRequestId: `unsafe-orphan-${unsafe.reason}`,
+            }),
           );
           assert.equal(error.code, "dispatch_conflict", unsafe.reason);
           const persisted = yield* sql<{ status: string }>`
@@ -1341,8 +1342,16 @@ it.effect.each([false, true])(
         const retiredOrphan = yield* sql<{ status: string }>`
           SELECT status FROM codex_live_voice_leases WHERE lease_id = ${lease.leaseId}
         `;
-        assert.equal(retiredOrphan[0]!.status, "failed", "new prepare retires only its own never-started orphan");
-        assert.equal(stops, stopsBeforeHistorical, "orphan recovery never calls the native runtime");
+        assert.equal(
+          retiredOrphan[0]!.status,
+          "failed",
+          "new prepare retires only its own never-started orphan",
+        );
+        assert.equal(
+          stops,
+          stopsBeforeHistorical,
+          "orphan recovery never calls the native runtime",
+        );
         assert.equal(
           retry.status,
           "prepared",
@@ -1351,9 +1360,16 @@ it.effect.each([false, true])(
         yield* sql`UPDATE codex_live_voice_leases SET status = 'unknown',
           planner_native_thread_id = NULL WHERE lease_id = ${retry.leaseId}`;
         const activeConflict = yield* Effect.flip(
-          service.prepare(session, { threadId, clientRequestId: "active-runtime-is-not-an-orphan" }),
+          service.prepare(session, {
+            threadId,
+            clientRequestId: "active-runtime-is-not-an-orphan",
+          }),
         );
-        assert.equal(activeConflict.code, "dispatch_conflict", "an in-memory active lease cannot be retired");
+        assert.equal(
+          activeConflict.code,
+          "dispatch_conflict",
+          "an in-memory active lease cannot be retired",
+        );
         yield* sql`UPDATE codex_live_voice_leases SET status = 'prepared',
           planner_native_thread_id = ${retry.plannerNativeThreadId} WHERE lease_id = ${retry.leaseId}`;
       });

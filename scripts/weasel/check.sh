@@ -294,6 +294,11 @@ live_tests=(
   apps/server/src/persistence/Migrations/063_CodexLiveVoice.test.ts
   apps/server/src/voice/CodexLiveEventHub.test.ts
   apps/server/src/voice/CodexLiveSessionService.test.ts
+  apps/server/src/orchestration-v2/assistantStreaming.test.ts
+  apps/web/src/components/ChatMarkdown.test.tsx
+  apps/web/src/components/streamable-ui/protocol.test.ts
+  apps/web/src/components/streamable-ui/StreamableUi.test.tsx
+  apps/web/src/localDevLogin.test.ts
   apps/server/src/observability/RpcInstrumentation.test.ts
 )
 for live_test in "${live_tests[@]}"; do

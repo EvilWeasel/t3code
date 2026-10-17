@@ -2,6 +2,7 @@ import {
   AuthOrchestrationOperateScope,
   CommandId,
   LiveVoiceError,
+  latestProviderTurnForAttempt,
   MessageId,
   ModelSelection,
   ProviderDriverKind,
@@ -211,28 +212,28 @@ export const layer: Layer.Layer<
 
     const readbackResult = (projection: OrchestrationV2ThreadProjection, runId: string) => {
       const run = projection.runs.find((candidate) => candidate.id === runId);
-      if (
-        run === undefined ||
-        run.status !== "completed" ||
-        run.rootNodeId === null ||
-        run.checkpointId === null
-      )
+      if (run === undefined || run.status !== "completed" || run.rootNodeId === null)
         return undefined;
-      const attempts = projection.attempts.filter(
-        (attempt) => attempt.runId === runId && attempt.status === "completed",
+      const attempt = projection.attempts.find(
+        (candidate) =>
+          candidate.id === run.activeAttemptId &&
+          candidate.runId === runId &&
+          candidate.rootNodeId === run.rootNodeId &&
+          candidate.status === "completed",
       );
-      if (
-        attempts.length !== 1 ||
-        run.activeAttemptId !== attempts[0]!.id ||
-        attempts[0]!.providerTurnId === null
-      )
-        return undefined;
+      if (attempt === undefined) return undefined;
+      // A run can span several native turns, and its attempt need not store a
+      // providerTurnId. The provider turn's runAttemptId is the canonical link.
+      const providerTurn = latestProviderTurnForAttempt(projection.providerTurns, attempt.id);
+      if (providerTurn !== undefined && providerTurn.status !== "completed") return undefined;
+      const providerTurnId = providerTurn?.id ?? attempt.providerTurnId;
+      if (providerTurnId === null) return undefined;
       const resultNodeIds = new Set(
         projection.nodes
           .filter(
             (node) =>
               node.rootNodeId === run.rootNodeId &&
-              node.providerTurnId === attempts[0]!.providerTurnId &&
+              node.providerTurnId === providerTurnId &&
               node.kind === "assistant_message" &&
               node.status === "completed",
           )
@@ -244,7 +245,7 @@ export const layer: Layer.Layer<
           item.runId === runId &&
           item.nodeId !== null &&
           resultNodeIds.has(item.nodeId) &&
-          item.providerTurnId === attempts[0]!.providerTurnId &&
+          item.providerTurnId === providerTurnId &&
           item.status === "completed" &&
           !item.streaming,
       );
@@ -264,16 +265,14 @@ export const layer: Layer.Layer<
       );
       if (finalMessages.length !== 1) return undefined;
       if (finalMessages[0]!.text.trim().length === 0) return undefined;
-      const checkpoint = projection.checkpoints.find(
-        (candidate) => candidate.id === run.checkpointId && candidate.runId === runId,
-      );
-      if (checkpoint?.status !== "ready") return undefined;
+      // Git snapshots support undo, not conversation delivery. Research in a
+      // non-repository workspace legitimately completes with a missing snapshot.
       if (
         projection.subagents.some((child) => child.runId === runId && child.status !== "completed")
       )
         return undefined;
       return {
-        attemptId: attempts[0]!.id,
+        attemptId: attempt.id,
         finalMessageId: finalMessages[0]!.id,
         text: finalMessages[0]!.text,
       };
@@ -286,7 +285,7 @@ export const layer: Layer.Layer<
         ["preparing", "queued", "starting", "running", "waiting"].includes(run.status)
       )
         return { type: "pending" } as const;
-      if (run.status !== "completed" || run.rootNodeId === null || run.checkpointId === null) {
+      if (run.status !== "completed" || run.rootNodeId === null) {
         return { type: "blocked" } as const;
       }
       const children = projection.subagents.filter((child) => child.runId === runId);
@@ -297,13 +296,8 @@ export const layer: Layer.Layer<
           ? ({ type: "pending" } as const)
           : ({ type: "blocked" } as const);
       }
-      const checkpoint = projection.checkpoints.find(
-        (candidate) => candidate.id === run.checkpointId && candidate.runId === runId,
-      );
-      if (checkpoint === undefined) return { type: "pending" } as const;
-      if (checkpoint.status !== "ready") return { type: "blocked" } as const;
       const result = readbackResult(projection, runId);
-      if (result === undefined) return { type: "blocked" } as const;
+      if (result === undefined) return { type: "pending" } as const;
       return { type: "ready", ...result } as const;
     };
 
@@ -894,6 +888,13 @@ export const layer: Layer.Layer<
                 plannerNativeThreadId,
                 realtimeSessionId: `${input.leaseId}:${input.generation}`,
                 offerSdp: input.offerSdp,
+                initialItems: projection.messages
+                  .flatMap((message) =>
+                    !message.streaming && message.role !== "system" && message.text.trim()
+                      ? [{ role: message.role, text: message.text.slice(0, 1_000) }]
+                      : [],
+                  )
+                  .slice(-6),
               })
               .pipe(
                 Effect.mapError(() => liveError("runtime_unavailable")),
@@ -1086,15 +1087,7 @@ export const layer: Layer.Layer<
             return yield* liveError("session_not_found");
           if (input.action === "status") {
             if (input.message !== undefined) return yield* liveError("invalid_state");
-            const selected = run
-              ? [run]
-              : runs
-                  .filter((candidate) =>
-                    ["preparing", "queued", "starting", "running", "waiting"].includes(
-                      candidate.status,
-                    ),
-                  )
-                  .slice(-8);
+            const selected = run ? [run] : runs.slice(-8);
             return encodeReceipt({
               environmentId,
               threadId: row.thread_id,
@@ -1104,6 +1097,7 @@ export const layer: Layer.Layer<
                 runId: task.id,
                 status: task.status,
                 resultReady: inspectReadback(projection, task.id).type === "ready",
+                result: readbackResult(projection, task.id)?.text.slice(0, 16_384) ?? null,
                 commentary: !["preparing", "queued", "starting", "running", "waiting"].includes(
                   task.status,
                 )

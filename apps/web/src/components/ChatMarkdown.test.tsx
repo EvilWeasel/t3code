@@ -95,6 +95,55 @@ function codeButton(renderer: ReactTestRenderer, label: string) {
   return button.props as ComponentProps<typeof Button>;
 }
 
+describe("ChatMarkdown assistant visual fences", () => {
+  it("preserves surrounding Markdown and progressively renders an unfinished visual fence only when enabled", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const container = document.createElement("div");
+    const root = createRoot(container);
+    const prefix =
+      '**NVDA example** with a [citation](https://example.com/nvda).\n\n```t3-ui\n{"type":"table","id":"prices","title":"Daily close","columns":["Day","USD"]}\n{"type":"row","id":"prices","cells":["Day 1",123.45]}';
+    const partial = prefix + '\n{"type":"row","id":"prices","cells":["Day 2",12';
+    try {
+      await act(async () =>
+        root.render(<ChatMarkdown text={prefix} cwd={undefined} isStreaming />),
+      );
+      expect(container.querySelector("[data-streamable-ui]")).toBeNull();
+      await act(async () =>
+        root.render(<ChatMarkdown text={partial} cwd={undefined} isStreaming streamableUi />),
+      );
+      expect(container.querySelector("strong")?.textContent).toBe("NVDA example");
+      expect(container.querySelector("a")?.textContent).toBe("citation");
+      expect(container.querySelectorAll("tbody tr")).toHaveLength(1);
+      expect(container.querySelector("tbody")?.textContent).toContain("123.45");
+      expect(container.querySelector('[role="status"]')?.textContent).toContain("Receiving");
+      expect(container.querySelector("details")).toBeNull();
+
+      await act(async () =>
+        root.render(<ChatMarkdown text={partial} cwd={undefined} streamableUi />),
+      );
+      expect(container.querySelectorAll("tbody tr")).toHaveLength(1);
+      expect(container.querySelector('[role="status"]')).toBeNull();
+      expect(container.querySelector("summary")?.textContent).toContain("line 3");
+
+      const closed = partial + "4.56]}\n```\n\nStill streaming **normal text**.";
+      await act(async () =>
+        root.render(<ChatMarkdown text={closed} cwd={undefined} isStreaming streamableUi />),
+      );
+      expect(container.querySelectorAll("tbody tr")).toHaveLength(2);
+      expect(container.querySelector("tbody")?.textContent).toContain("124.56");
+      expect(container.querySelector('[role="status"]')).toBeNull();
+      expect(container.textContent).toContain("Still streaming normal text.");
+      await act(async () =>
+        root.render(<ChatMarkdown text={closed} cwd={undefined} streamableUi />),
+      );
+      expect(container.querySelectorAll("tbody tr")).toHaveLength(2);
+    } finally {
+      await act(async () => root.unmount());
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("ChatMarkdown bare anchor placeholders", () => {
   it.each(["<A>", "<a>", "<a >", "<a/>", "<A/>", "<a />"])(
     "preserves unmatched %s without linking later blocks",

@@ -26,7 +26,7 @@ const TOP_LEVEL_HEADING_PATTERN = /^#{1,6}(?:[ \t]|$)/;
  * title never lands alone and waits above a block that is still streaming.
  */
 export function splitBufferedAssistantText(text: string): { ready: string; rest: string } {
-  let openFence: { marker: string; indent: number } | null = null;
+  let openFence: { marker: string; indent: number; streamableUi: boolean } | null = null;
   let boundary = -1;
   let lineStart = 0;
   let titleAwaitingContent = false;
@@ -51,7 +51,11 @@ export function splitBufferedAssistantText(text: string): { ready: string; rest:
       const indent = fenceMatch[1]!.length;
       const marker = fenceMatch[2]!;
       if (openFence === null) {
-        openFence = { marker, indent };
+        openFence = {
+          marker,
+          indent,
+          streamableUi: line.slice(indent + marker.length).trim() === "t3-ui",
+        };
         titleAwaitingContent = false;
       } else if (
         marker[0] === openFence.marker[0] &&
@@ -63,6 +67,10 @@ export function splitBufferedAssistantText(text: string): { ready: string; rest:
         openFence = null;
         boundary = newline + 1;
       }
+    } else if (openFence?.streamableUi) {
+      // Native visuals commit one JSONL record at a time. Keep the unfinished
+      // trailing record buffered, while letting the client render completed ones.
+      boundary = newline + 1;
     } else if (openFence === null && BLANK_LINE_PATTERN.test(line) && lineStart > 0) {
       if (!titleAwaitingContent) {
         boundary = newline + 1;
