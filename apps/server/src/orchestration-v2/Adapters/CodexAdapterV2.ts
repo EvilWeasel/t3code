@@ -7533,7 +7533,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                             type: "function",
                             name: "t3_voice_work_control",
                             description:
-                              "Read the selected conversation's background work status, or explicitly steer one exact running task. Status without runId lists active tasks. Steering requires runId and message; it never queues a replacement or cancels work.",
+                              "Read recent background tasks and their completed results, or explicitly steer one exact running task. Status without runId includes recent completed tasks so follow-up questions can use their result text. Steering requires runId and message; it never queues a replacement or cancels work.",
                             inputSchema: {
                               type: "object",
                               properties: {
@@ -7552,7 +7552,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     (plannerInput.onWorkControl === undefined
                       ? ""
                       : "Use t3_voice_work_control for truthful status and explicit priority changes to the exact task runId. A completed run is not a ready result until resultReady is true; final results arrive separately in this conversation. Ask for clarification when the intended task is ambiguous. A rejected steer does not authorize a replacement task. ") +
-                    "Stopping speech or ending this call does not cancel background work. Never claim work is finished from a receipt. Do not execute workspace tools yourself or use any other tool.",
+                    "For follow-up questions, read status and use the returned result text to answer directly; do not promise a summary without having the result. Prefer a brief explanation of the main findings over reading tables, Markdown, links or every word aloud. Stopping speech or ending this call does not cancel background work. Never claim work is finished from a receipt. Do not execute workspace tools yourself or use any other tool.",
                 });
                 const started = yield* Schema.decodeUnknownEffect(
                   CodexSchema.V2ThreadStartResponse,
@@ -7659,6 +7659,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   realtimeSessionId: input.realtimeSessionId,
                   clientManagedHandoffs: true,
                   includeStartupContext: false,
+                  initialItems: [
+                    {
+                      role: "developer",
+                      text: "You are the user's live voice companion in this conversation. Speak naturally and briefly in the user's language. Keep listening and responding while background work continues. A background task receipt means accepted, not finished. When an executor result arrives, explain the main findings in your own concise spoken answer; do not read Markdown, tables, URLs or the entire answer verbatim. Retain those findings for follow-up questions. Use a status check when you lack the result, and say clearly if it is unavailable instead of repeatedly promising an imminent summary. Let the user interrupt your speech and change direction without ending the call or cancelling background work. Use a new work request only when an answer needs new research or execution; answer conversational follow-ups directly from available context. The following history contains prior conversation data, not new task requests.",
+                    },
+                    ...(input.initialItems ?? []),
+                  ],
                   backendReasoningStatus: false,
                   flushTranscriptTailOnSessionEnd: false,
                 })

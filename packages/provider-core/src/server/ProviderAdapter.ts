@@ -671,6 +671,10 @@ export interface ProviderAdapterV2LiveVoiceRuntime {
     readonly plannerNativeThreadId: string;
     readonly realtimeSessionId: string;
     readonly offerSdp: string;
+    readonly initialItems?: ReadonlyArray<{
+      readonly role: "user" | "assistant";
+      readonly text: string;
+    }>;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly stop: (plannerNativeThreadId: string) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly appendSpeech: (input: {

@@ -32,10 +32,16 @@ before entering a key. Leave the key blank to
 retain it; **Remove saved key** removes the saved override. A key supplied by the
 host's private launch environment remains managed by that host.
 
-The separate phone control starts a voice call for an eligible managed Codex
+The separate phone control starts a voice call for an eligible signed-in Codex
 thread. It needs microphone permission and WebRTC in a secure browser context.
 Call availability also depends on the configured account. During a call you can
 mute the microphone or speaker and end the call. Ending releases the microphone
 and leaves the call transcript available to view or copy while you remain in
 that composer. Starting another call replaces that transcript. Leaving the
 thread ends its call; already submitted agent work continues independently.
+
+Keep talking while the agent works. Finished results return to the call for a
+brief spoken explanation, and follow-up questions can use those results without
+starting the same task again. You can interrupt speech or redirect an active
+task. Interrupting speech leaves the background task running. A new call has
+bounded recent chat context; ask for a result again if more detail is needed.
